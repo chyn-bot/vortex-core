@@ -1,0 +1,7 @@
+# Migration metadata for 001_initial_schema
+module = "core"
+description = "Initial database schema with companies, users, roles, sessions, and audit logging"
+reversible = false
+
+# No dependencies for initial schema
+dependencies = []

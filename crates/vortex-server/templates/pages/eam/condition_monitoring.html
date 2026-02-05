@@ -1,0 +1,167 @@
+{% extends "layouts/base.html" %}
+
+{% block title %}Condition Monitoring - Asset Management - Remicle{% endblock %}
+
+{% block content %}
+<!-- Page Header -->
+<div class="flex justify-between items-center mb-6">
+    <div>
+        <div class="breadcrumbs text-sm">
+            <ul>
+                <li><a href="/eam">Asset Management</a></li>
+                <li>Condition Monitoring</li>
+            </ul>
+        </div>
+        <h1 class="text-2xl font-bold">Condition Monitoring</h1>
+        <p class="text-base-content/60">Equipment health and diagnostic tests</p>
+    </div>
+    <div class="dropdown dropdown-end">
+        <label tabindex="0" class="btn btn-primary">
+            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/>
+            </svg>
+            New Test
+        </label>
+        <ul tabindex="0" class="dropdown-content z-[1] menu p-2 shadow bg-base-100 rounded-box w-52">
+            <li><a href="/eam/condition/dga/new">DGA Analysis</a></li>
+            <li><a href="/eam/condition/oil-quality/new">Oil Quality Test</a></li>
+            <li><a href="/eam/condition/thermal/new">Thermal Imaging</a></li>
+            <li><a href="/eam/condition/pd/new">Partial Discharge</a></li>
+            <li><a href="/eam/condition/ir/new">Insulation Resistance</a></li>
+        </ul>
+    </div>
+</div>
+
+<!-- Stats Cards -->
+<div class="grid grid-cols-2 md:grid-cols-6 gap-4 mb-6">
+    <div class="stat bg-base-100 rounded-lg shadow p-4">
+        <div class="stat-title text-xs">DGA Tests</div>
+        <div class="stat-value text-2xl">{{ condition_stats.dga_tests }}</div>
+    </div>
+    <div class="stat bg-base-100 rounded-lg shadow p-4">
+        <div class="stat-title text-xs">Oil Quality</div>
+        <div class="stat-value text-2xl">{{ condition_stats.oil_quality_tests }}</div>
+    </div>
+    <div class="stat bg-base-100 rounded-lg shadow p-4">
+        <div class="stat-title text-xs">Thermal Scans</div>
+        <div class="stat-value text-2xl">{{ condition_stats.thermal_scans }}</div>
+    </div>
+    <div class="stat bg-base-100 rounded-lg shadow p-4">
+        <div class="stat-title text-xs">PD Tests</div>
+        <div class="stat-value text-2xl">{{ condition_stats.pd_tests }}</div>
+    </div>
+    <div class="stat bg-base-100 rounded-lg shadow p-4">
+        <div class="stat-title text-xs">IR Tests</div>
+        <div class="stat-value text-2xl">{{ condition_stats.ir_tests }}</div>
+    </div>
+    <div class="stat bg-base-100 rounded-lg shadow p-4 {% if condition_stats.critical_alerts > 0 %}bg-error/10{% endif %}">
+        <div class="stat-title text-xs">Critical Alerts</div>
+        <div class="stat-value text-2xl {% if condition_stats.critical_alerts > 0 %}text-error{% endif %}">{{ condition_stats.critical_alerts }}</div>
+    </div>
+</div>
+
+<!-- Test Type Tabs -->
+<div class="tabs tabs-boxed bg-base-100 p-1 mb-6">
+    <a href="/eam/condition" class="tab tab-active">DGA Analysis</a>
+    <a href="/eam/condition?type=oil" class="tab">Oil Quality</a>
+    <a href="/eam/condition?type=thermal" class="tab">Thermal Imaging</a>
+    <a href="/eam/condition?type=pd" class="tab">Partial Discharge</a>
+    <a href="/eam/condition?type=ir" class="tab">Insulation Resistance</a>
+</div>
+
+<!-- DGA Results Table -->
+<div class="card bg-base-100 shadow">
+    <div class="card-header p-4 border-b border-base-300">
+        <h2 class="card-title text-lg">Dissolved Gas Analysis (DGA) Results</h2>
+        <p class="text-sm text-base-content/60">IEEE C57.104 compliant transformer oil analysis</p>
+    </div>
+    <div class="card-body">
+        {% if !dga_results.is_empty() %}
+        <div class="overflow-x-auto">
+            <table class="table table-zebra table-sm">
+                <thead>
+                    <tr>
+                        <th>Equipment</th>
+                        <th>Sample Date</th>
+                        <th class="text-right">H2 (ppm)</th>
+                        <th class="text-right">CH4 (ppm)</th>
+                        <th class="text-right">C2H6 (ppm)</th>
+                        <th class="text-right">C2H4 (ppm)</th>
+                        <th class="text-right">C2H2 (ppm)</th>
+                        <th class="text-right">TCG (ppm)</th>
+                        <th>Fault Type</th>
+                        <th>Status</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for dga in dga_results %}
+                    <tr>
+                        <td>
+                            <div class="font-semibold">{{ dga.equipment_code }}</div>
+                            <div class="text-xs text-base-content/60">{{ dga.equipment_name }}</div>
+                        </td>
+                        <td>{{ dga.sample_date }}</td>
+                        <td class="text-right font-mono">{{ dga.hydrogen_display }}</td>
+                        <td class="text-right font-mono">{{ dga.methane_display }}</td>
+                        <td class="text-right font-mono">{{ dga.ethane_display }}</td>
+                        <td class="text-right font-mono">{{ dga.ethylene_display }}</td>
+                        <td class="text-right font-mono {% if dga.acetylene > 0.0 %}text-error font-bold{% endif %}">{{ dga.acetylene_display }}</td>
+                        <td class="text-right font-mono font-semibold">{{ dga.tcg_display }}</td>
+                        <td>
+                            {% if dga.fault_type.is_some() %}
+                            <span class="badge badge-outline badge-sm">{{ dga.fault_type.as_ref().unwrap() }}</span>
+                            {% else %}
+                            <span class="text-base-content/40">-</span>
+                            {% endif %}
+                        </td>
+                        <td>
+                            <span class="badge badge-sm" style="background-color: {{ dga.status_color }}; color: white;">
+                                {{ dga.status }}
+                            </span>
+                        </td>
+                        <td>
+                            <a href="/eam/condition/dga/{{ dga.id }}" class="btn btn-ghost btn-xs">View</a>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+
+        <!-- Legend -->
+        <div class="mt-4 p-3 bg-base-200 rounded-lg">
+            <h4 class="font-semibold text-sm mb-2">IEEE C57.104 Status Legend</h4>
+            <div class="flex flex-wrap gap-4 text-sm">
+                <div class="flex items-center gap-2">
+                    <span class="badge badge-sm" style="background-color: #10B981; color: white;">Normal</span>
+                    <span>Gas levels within normal limits</span>
+                </div>
+                <div class="flex items-center gap-2">
+                    <span class="badge badge-sm" style="background-color: #EAB308; color: white;">Caution</span>
+                    <span>Elevated levels, monitor closely</span>
+                </div>
+                <div class="flex items-center gap-2">
+                    <span class="badge badge-sm" style="background-color: #F97316; color: white;">Warning</span>
+                    <span>High levels, plan maintenance</span>
+                </div>
+                <div class="flex items-center gap-2">
+                    <span class="badge badge-sm" style="background-color: #EF4444; color: white;">Critical</span>
+                    <span>Immediate action required</span>
+                </div>
+            </div>
+        </div>
+        {% else %}
+        <div class="text-center py-12">
+            <svg class="w-16 h-16 mx-auto text-base-content/30 mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                      d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/>
+            </svg>
+            <h3 class="text-lg font-semibold mb-2">No DGA Results Yet</h3>
+            <p class="text-base-content/60 mb-4">Record dissolved gas analysis results to monitor transformer health</p>
+            <a href="/eam/condition/dga/new" class="btn btn-primary">Add DGA Analysis</a>
+        </div>
+        {% endif %}
+    </div>
+</div>
+{% endblock %}

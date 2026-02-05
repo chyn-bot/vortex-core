@@ -1,0 +1,5 @@
+[migration]
+version = "013"
+name = "malaysian_states"
+description = "Add Malaysian states and federal territories"
+module = "contacts"

@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Home - Remicle</title>
+    <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/htmx.org@1.9.10"></script>
+    <style>
+        body {
+            background: #0f0f1a;
+            color: #e8e8e8;
+        }
+        .navbar {
+            background: #1a1a2e;
+            border-bottom: 1px solid #2a2a4a;
+        }
+        .module-card {
+            background: #1a1a2e;
+            border: 1px solid #2a2a4a;
+            transition: all 0.2s ease;
+        }
+        .module-card:hover {
+            background: #222244;
+            border-color: #3a3a5a;
+            transform: translateY(-4px);
+            box-shadow: 0 20px 25px -5px rgb(0 0 0 / 0.3);
+        }
+        .module-card:hover .arrow-icon {
+            opacity: 1;
+        }
+        .arrow-icon {
+            opacity: 0;
+            transition: opacity 0.2s ease;
+        }
+        .text-muted {
+            color: #a0a0b0;
+        }
+        .icon-circle {
+            background: rgba(139, 197, 63, 0.15);
+        }
+        .icon-circle svg {
+            color: #8BC53F;
+        }
+        .dropdown-content {
+            background: #1a1a2e;
+            border: 1px solid #2a2a4a;
+        }
+        @media (max-width: 768px) {
+            .module-card .card-body {
+                padding: 1.25rem;
+            }
+            h1 {
+                font-size: 1.5rem;
+            }
+            .icon-circle {
+                width: 3rem;
+                height: 3rem;
+            }
+            .icon-circle svg {
+                width: 1.5rem;
+                height: 1.5rem;
+            }
+        }
+    </style>
+</head>
+<body class="min-h-screen">
+    <!-- Top Navigation -->
+    <div class="navbar px-4 md:px-6 sticky top-0 z-50">
+        <div class="flex-1">
+            <a href="/home" class="text-xl font-bold"><span style="color:#8BC53F">re</span><span class="text-muted">micle</span></a>
+        </div>
+        <div class="flex items-center gap-2 md:gap-3">
+            <a href="/settings" class="text-white text-sm hover:underline hidden md:inline">Settings</a>
+            <a href="/notifications" class="btn btn-ghost btn-circle btn-sm relative" title="Notifications">
+                <svg class="w-5 h-5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9"/></svg>
+                <span class="absolute top-0 right-0 w-2 h-2 bg-red-500 rounded-full"></span>
+            </a>
+            <div class="dropdown dropdown-end">
+                <label tabindex="0" class="btn btn-ghost btn-circle avatar placeholder">
+                    <div class="rounded-full w-10 flex items-center justify-center" style="background:#8BC53F">
+                        <span class="text-sm text-black font-bold">{{user_initials}}</span>
+                    </div>
+                </label>
+                <ul tabindex="0" class="mt-3 z-[1] p-2 shadow menu menu-sm dropdown-content rounded-box w-52">
+                    <li class="menu-title"><span class="text-white">{{user_name}}</span></li>
+                    <li><a href="/profile" class="text-white">Profile</a></li>
+                    <li><a href="/settings" class="text-white">Settings</a></li>
+                    <li>
+                        <form hx-post="/auth/logout" hx-swap="none">
+                            <button type="submit" class="w-full text-left text-error">Logout</button>
+                        </form>
+                    </li>
+                </ul>
+            </div>
+        </div>
+    </div>
+
+    <!-- Main Content -->
+    <main class="container mx-auto px-4 md:px-6 py-8 md:py-12 max-w-6xl">
+        <!-- Header -->
+        <div class="text-center mb-8 md:mb-12">
+            <h1 class="text-2xl md:text-3xl font-bold mb-2 text-white">Welcome, {{user_name}}</h1>
+            <p class="text-muted">Select a module to get started</p>
+        </div>
+
+        <!-- Module Cards Grid -->
+        <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 md:gap-6">
+            <!-- Dashboard -->
+            <a href="/dashboard" class="card module-card cursor-pointer">
+                <div class="card-body items-center text-center">
+                    <div class="icon-circle w-14 h-14 md:w-16 md:h-16 rounded-full flex items-center justify-center mb-4">
+                        <svg class="w-7 h-7 md:w-8 md:h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6"/>
+                        </svg>
+                    </div>
+                    <h2 class="card-title text-base md:text-lg text-white">Dashboard</h2>
+                    <p class="text-muted text-sm">View system overview and statistics</p>
+                    <div class="mt-4 arrow-icon" style="color:#8BC53F">
+                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 7l5 5m0 0l-5 5m5-5H6"/>
+                        </svg>
+                    </div>
+                </div>
+            </a>
+
+            <!-- Contacts -->
+            <a href="/list/contacts" class="card module-card cursor-pointer">
+                <div class="card-body items-center text-center">
+                    <div class="icon-circle w-14 h-14 md:w-16 md:h-16 rounded-full flex items-center justify-center mb-4">
+                        <svg class="w-7 h-7 md:w-8 md:h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"/>
+                        </svg>
+                    </div>
+                    <h2 class="card-title text-base md:text-lg text-white">Contacts</h2>
+                    <p class="text-muted text-sm">Manage contacts and stakeholders</p>
+                    <div class="mt-4 arrow-icon" style="color:#8BC53F">
+                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 7l5 5m0 0l-5 5m5-5H6"/>
+                        </svg>
+                    </div>
+                </div>
+            </a>
+
+            <!-- Asset Management -->
+            <a href="/eam" class="card module-card cursor-pointer">
+                <div class="card-body items-center text-center">
+                    <div class="w-14 h-14 md:w-16 md:h-16 rounded-full flex items-center justify-center mb-4" style="background: rgba(251, 191, 36, 0.15);">
+                        <svg class="w-7 h-7 md:w-8 md:h-8" style="color: #FBBF24;" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5M9 7h1m-1 4h1m4-4h1m-1 4h1m-5 10v-5a1 1 0 011-1h2a1 1 0 011 1v5m-4 0h4"/>
+                        </svg>
+                    </div>
+                    <h2 class="card-title text-base md:text-lg text-white">Asset Management</h2>
+                    <p class="text-muted text-sm">Substations, equipment & maintenance</p>
+                    <div class="mt-4 arrow-icon" style="color:#FBBF24">
+                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 7l5 5m0 0l-5 5m5-5H6"/>
+                        </svg>
+                    </div>
+                </div>
+            </a>
+
+            <!-- Settings -->
+            <a href="/settings" class="card module-card cursor-pointer">
+                <div class="card-body items-center text-center">
+                    <div class="icon-circle w-14 h-14 md:w-16 md:h-16 rounded-full flex items-center justify-center mb-4">
+                        <svg class="w-7 h-7 md:w-8 md:h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/>
+                        </svg>
+                    </div>
+                    <h2 class="card-title text-base md:text-lg text-white">Settings</h2>
+                    <p class="text-muted text-sm">System configuration & admin</p>
+                    <div class="mt-4 arrow-icon" style="color:#8BC53F">
+                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 7l5 5m0 0l-5 5m5-5H6"/>
+                        </svg>
+                    </div>
+                </div>
+            </a>
+
+            {{admin_modules}}
+        </div>
+
+        <!-- Quick Info -->
+        <div class="mt-8 md:mt-12 text-center text-muted text-sm">
+            <p>Need help? Contact your system administrator</p>
+        </div>
+    </main>
+</body>
+</html>

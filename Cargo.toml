@@ -1,0 +1,91 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/vortex-common",
+    "crates/vortex-macros",
+    "crates/vortex-orm",
+    "crates/vortex-security",
+    "crates/vortex-module",
+    "crates/vortex-chatter",
+    "crates/vortex-server",
+    "crates/vortex-cli",
+    "crates/vortex-eam",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["Vortex Team"]
+license = "AGPL-3.0"
+repository = "https://github.com/vortex-core/vortex"
+rust-version = "1.93"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1.43", features = ["full"] }
+async-trait = "0.1"
+
+# Database
+# Note: MSSQL support requires sqlx 0.7 or alternative like tiberius
+# The dialect abstraction layer is ready for when MSSQL is enabled
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono", "json"] }
+deadpool-postgres = "0.14"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Web framework
+axum = { version = "0.8", features = ["macros", "multipart"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace", "compression-gzip"] }
+
+# Security & Crypto
+argon2 = "0.5"
+ring = "0.17"
+jsonwebtoken = "9"
+uuid = { version = "1.11", features = ["v4", "v7", "serde"] }
+sha2 = "0.10"
+hex = "0.4"
+rand = "0.8"
+
+# Logging & Tracing (NERC CIP audit compliance)
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Time handling
+chrono = { version = "0.4", features = ["serde"] }
+
+# Error handling
+thiserror = "2.0"
+anyhow = "1.0"
+
+# Configuration
+config = "0.14"
+dotenvy = "0.15"
+
+# Proc macros
+syn = { version = "2.0", features = ["full", "extra-traits"] }
+quote = "1.0"
+proc-macro2 = "1.0"
+darling = "0.20"
+
+# Internal crates
+vortex-common = { path = "crates/vortex-common" }
+vortex-macros = { path = "crates/vortex-macros" }
+vortex-orm = { path = "crates/vortex-orm" }
+vortex-security = { path = "crates/vortex-security" }
+vortex-module = { path = "crates/vortex-module" }
+vortex-chatter = { path = "crates/vortex-chatter" }
+vortex-server = { path = "crates/vortex-server" }
+vortex-eam = { path = "crates/vortex-eam" }
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.dev]
+opt-level = 0
+debug = true

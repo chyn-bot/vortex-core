@@ -1,0 +1,7 @@
+# Migration metadata for 002_access_control
+module = "core"
+description = "Access control system with model access, record rules, and field access tables"
+reversible = false
+
+# Depends on initial schema for roles table
+dependencies = ["001_initial_schema"]

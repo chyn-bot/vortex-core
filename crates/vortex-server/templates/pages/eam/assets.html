@@ -1,0 +1,80 @@
+{% extends "layouts/base.html" %}
+
+{% block title %}Assets - Asset Management - Remicle{% endblock %}
+
+{% block content %}
+<!-- Page Header -->
+<div class="flex justify-between items-center mb-6">
+    <div>
+        <div class="breadcrumbs text-sm">
+            <ul>
+                <li><a href="/eam">Asset Management</a></li>
+                <li>Assets</li>
+            </ul>
+        </div>
+        <h1 class="text-2xl font-bold">Assets</h1>
+        <p class="text-base-content/60">Equipment and components</p>
+    </div>
+    <a href="/eam/assets/new" class="btn btn-primary">
+        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/>
+        </svg>
+        New Asset
+    </a>
+</div>
+
+<!-- Assets Table -->
+<div class="card bg-base-100 shadow">
+    <div class="card-body">
+        {% if !assets.is_empty() %}
+        <div class="overflow-x-auto">
+            <table class="table table-zebra">
+                <thead>
+                    <tr>
+                        <th>Asset Number</th>
+                        <th>Name</th>
+                        <th>Category</th>
+                        <th>Site</th>
+                        <th>Location</th>
+                        <th>Status</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for asset in assets %}
+                    <tr>
+                        <td class="font-mono font-semibold">{{ asset.asset_number }}</td>
+                        <td>{{ asset.name }}</td>
+                        <td>{{ asset.category }}</td>
+                        <td>{{ asset.site_name }}</td>
+                        <td>{{ asset.location_name }}</td>
+                        <td>
+                            <span class="badge" style="background-color: {{ asset.status_color }}; color: white;">
+                                {{ asset.status }}
+                            </span>
+                        </td>
+                        <td>
+                            <div class="flex gap-2">
+                                <a href="/eam/assets/{{ asset.id }}" class="btn btn-ghost btn-xs">View</a>
+                                <a href="/eam/assets/{{ asset.id }}/edit" class="btn btn-ghost btn-xs">Edit</a>
+                            </div>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% else %}
+        <div class="text-center py-12">
+            <svg class="w-16 h-16 mx-auto text-base-content/30 mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                      d="M13 10V3L4 14h7v7l9-11h-7z"/>
+            </svg>
+            <h3 class="text-lg font-semibold mb-2">No Assets Yet</h3>
+            <p class="text-base-content/60 mb-4">Create sites and functional locations first, then add assets</p>
+            <a href="/eam/sites" class="btn btn-primary">Manage Sites</a>
+        </div>
+        {% endif %}
+    </div>
+</div>
+{% endblock %}

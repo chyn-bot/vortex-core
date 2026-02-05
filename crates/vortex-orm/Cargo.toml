@@ -1,0 +1,48 @@
+[package]
+name = "vortex-orm"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Type-safe ORM with multi-database support for large-scale data management"
+
+[features]
+default = ["postgres"]
+postgres = ["sqlx/postgres"]
+# Note: MSSQL support requires sqlx with mssql feature or alternative driver
+# The dialect abstraction is ready - uncomment when mssql is available
+# mssql = ["sqlx/mssql"]
+all-backends = ["postgres"]
+
+[dependencies]
+vortex-common = { workspace = true }
+vortex-macros = { workspace = true }
+
+# Async
+tokio = { workspace = true }
+async-trait = { workspace = true }
+
+# Database
+sqlx = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = "0.8"
+
+# Types
+uuid = { workspace = true }
+chrono = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Utilities
+hex = "0.4"
+
+[dev-dependencies]
+tempfile = "3.10"

@@ -1,0 +1,332 @@
+{% extends "layouts/base.html" %}
+
+{% block title %}Access Control - Remicle{% endblock %}
+
+{% block content %}
+<!-- Page Header -->
+<div class="flex justify-between items-center mb-6">
+    <div>
+        <h1 class="text-2xl font-bold">Access Control</h1>
+        <p class="text-base-content/60">Manage model access, record rules, and field permissions</p>
+    </div>
+</div>
+
+<!-- Tabs -->
+<div class="tabs tabs-boxed bg-base-100 mb-6 p-1">
+    <a href="/admin/access?tab=models" class="tab{% if active_tab == "models" %} tab-active{% endif %}">
+        Model Access
+    </a>
+    <a href="/admin/access?tab=rules" class="tab{% if active_tab == "rules" %} tab-active{% endif %}">
+        Record Rules
+    </a>
+    <a href="/admin/access?tab=fields" class="tab{% if active_tab == "fields" %} tab-active{% endif %}">
+        Field Access
+    </a>
+</div>
+
+{% if active_tab == "models" %}
+<!-- Model Access Section -->
+<div class="card bg-base-100 shadow">
+    <div class="card-body">
+        <div class="flex justify-between items-center mb-4">
+            <h2 class="card-title">Model Access Rules</h2>
+            <a href="/admin/access/models/new" class="btn btn-primary btn-sm">
+                <svg class="w-4 h-4 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6v6m0 0v6m0-6h6m-6 0H6"/>
+                </svg>
+                Add Rule
+            </a>
+        </div>
+        <p class="text-sm text-base-content/60 mb-4">
+            Control which roles can create, read, update, and delete records in each model.
+        </p>
+        <div class="overflow-x-auto">
+            <table class="table table-sm">
+                <thead>
+                    <tr>
+                        <th>Model</th>
+                        <th>Role</th>
+                        <th class="text-center">Read</th>
+                        <th class="text-center">Write</th>
+                        <th class="text-center">Create</th>
+                        <th class="text-center">Delete</th>
+                        <th>Status</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for rule in model_access_rules %}
+                    <tr>
+                        <td class="font-medium">{{ rule.model_name }}</td>
+                        <td>
+                            <span class="badge badge-outline badge-sm">{{ rule.display_role_name() }}</span>
+                        </td>
+                        <td class="text-center">
+                            {% if rule.perm_read %}
+                            <svg class="w-5 h-5 text-success mx-auto" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/>
+                            </svg>
+                            {% else %}
+                            <svg class="w-5 h-5 text-error mx-auto" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+                            </svg>
+                            {% endif %}
+                        </td>
+                        <td class="text-center">
+                            {% if rule.perm_write %}
+                            <svg class="w-5 h-5 text-success mx-auto" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/>
+                            </svg>
+                            {% else %}
+                            <svg class="w-5 h-5 text-error mx-auto" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+                            </svg>
+                            {% endif %}
+                        </td>
+                        <td class="text-center">
+                            {% if rule.perm_create %}
+                            <svg class="w-5 h-5 text-success mx-auto" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/>
+                            </svg>
+                            {% else %}
+                            <svg class="w-5 h-5 text-error mx-auto" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+                            </svg>
+                            {% endif %}
+                        </td>
+                        <td class="text-center">
+                            {% if rule.perm_delete %}
+                            <svg class="w-5 h-5 text-success mx-auto" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/>
+                            </svg>
+                            {% else %}
+                            <svg class="w-5 h-5 text-error mx-auto" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+                            </svg>
+                            {% endif %}
+                        </td>
+                        <td>
+                            {% if rule.active %}
+                            <span class="badge badge-success badge-sm">Active</span>
+                            {% else %}
+                            <span class="badge badge-ghost badge-sm">Inactive</span>
+                            {% endif %}
+                        </td>
+                        <td>
+                            <div class="flex gap-1">
+                                <a href="/admin/access/models/{{ rule.id }}/edit" class="btn btn-ghost btn-xs">Edit</a>
+                                <button class="btn btn-ghost btn-xs text-error"
+                                        hx-delete="/admin/access/models/{{ rule.id }}"
+                                        hx-confirm="Are you sure you want to delete this rule?">Delete</button>
+                            </div>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                    {% if model_access_rules.is_empty() %}
+                    <tr>
+                        <td colspan="8" class="text-center text-base-content/60 py-8">
+                            No model access rules defined
+                        </td>
+                    </tr>
+                    {% endif %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+{% else if active_tab == "rules" %}
+<!-- Record Rules Section -->
+<div class="card bg-base-100 shadow">
+    <div class="card-body">
+        <div class="flex justify-between items-center mb-4">
+            <h2 class="card-title">Record Rules</h2>
+            <a href="/admin/access/rules/new" class="btn btn-primary btn-sm">
+                <svg class="w-4 h-4 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6v6m0 0v6m0-6h6m-6 0H6"/>
+                </svg>
+                Add Rule
+            </a>
+        </div>
+        <p class="text-sm text-base-content/60 mb-4">
+            Domain-based filters that control which records users can access. Global rules apply to all users.
+        </p>
+        <div class="overflow-x-auto">
+            <table class="table table-sm">
+                <thead>
+                    <tr>
+                        <th>Name</th>
+                        <th>Model</th>
+                        <th>Role</th>
+                        <th>Domain Expression</th>
+                        <th>Type</th>
+                        <th>Priority</th>
+                        <th>Status</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for rule in record_rules %}
+                    <tr>
+                        <td class="font-medium">{{ rule.name }}</td>
+                        <td>{{ rule.model_name }}</td>
+                        <td>
+                            {% match rule.role_name %}
+                            {% when Some with (role_name) %}
+                            <span class="badge badge-outline badge-sm">{{ role_name }}</span>
+                            {% when None %}
+                            <span class="text-base-content/40">-</span>
+                            {% endmatch %}
+                        </td>
+                        <td>
+                            <code class="text-xs bg-base-200 px-2 py-1 rounded" title="{{ rule.domain_expression }}">{{ rule.truncated_domain() }}</code>
+                        </td>
+                        <td>
+                            {% if rule.is_global %}
+                            <span class="badge badge-warning badge-sm">Global</span>
+                            {% else %}
+                            <span class="badge badge-info badge-sm">Role</span>
+                            {% endif %}
+                        </td>
+                        <td>{{ rule.priority }}</td>
+                        <td>
+                            {% if rule.active %}
+                            <span class="badge badge-success badge-sm">Active</span>
+                            {% else %}
+                            <span class="badge badge-ghost badge-sm">Inactive</span>
+                            {% endif %}
+                        </td>
+                        <td>
+                            <div class="flex gap-1">
+                                <a href="/admin/access/rules/{{ rule.id }}/edit" class="btn btn-ghost btn-xs">Edit</a>
+                                <button class="btn btn-ghost btn-xs text-error"
+                                        hx-delete="/admin/access/rules/{{ rule.id }}"
+                                        hx-confirm="Are you sure you want to delete this rule?">Delete</button>
+                            </div>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                    {% if record_rules.is_empty() %}
+                    <tr>
+                        <td colspan="8" class="text-center text-base-content/60 py-8">
+                            No record rules defined
+                        </td>
+                    </tr>
+                    {% endif %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+{% else %}
+<!-- Field Access Section -->
+<div class="card bg-base-100 shadow">
+    <div class="card-body">
+        <div class="flex justify-between items-center mb-4">
+            <h2 class="card-title">Field Access Rules</h2>
+            <a href="/admin/access/fields/new" class="btn btn-primary btn-sm">
+                <svg class="w-4 h-4 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6v6m0 0v6m0-6h6m-6 0H6"/>
+                </svg>
+                Add Rule
+            </a>
+        </div>
+        <p class="text-sm text-base-content/60 mb-4">
+            Control which fields are visible or editable for each role.
+        </p>
+        <div class="overflow-x-auto">
+            <table class="table table-sm">
+                <thead>
+                    <tr>
+                        <th>Model</th>
+                        <th>Field</th>
+                        <th>Role</th>
+                        <th class="text-center">Readable</th>
+                        <th class="text-center">Writable</th>
+                        <th>Status</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for rule in field_access_rules %}
+                    <tr>
+                        <td class="font-medium">{{ rule.model_name }}</td>
+                        <td><code class="text-sm">{{ rule.field_name }}</code></td>
+                        <td>
+                            <span class="badge badge-outline badge-sm">{{ rule.display_role_name() }}</span>
+                        </td>
+                        <td class="text-center">
+                            {% if rule.readable %}
+                            <svg class="w-5 h-5 text-success mx-auto" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/>
+                            </svg>
+                            {% else %}
+                            <svg class="w-5 h-5 text-error mx-auto" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+                            </svg>
+                            {% endif %}
+                        </td>
+                        <td class="text-center">
+                            {% if rule.writable %}
+                            <svg class="w-5 h-5 text-success mx-auto" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/>
+                            </svg>
+                            {% else %}
+                            <svg class="w-5 h-5 text-error mx-auto" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+                            </svg>
+                            {% endif %}
+                        </td>
+                        <td>
+                            {% if rule.active %}
+                            <span class="badge badge-success badge-sm">Active</span>
+                            {% else %}
+                            <span class="badge badge-ghost badge-sm">Inactive</span>
+                            {% endif %}
+                        </td>
+                        <td>
+                            <div class="flex gap-1">
+                                <a href="/admin/access/fields/{{ rule.id }}/edit" class="btn btn-ghost btn-xs">Edit</a>
+                                <button class="btn btn-ghost btn-xs text-error"
+                                        hx-delete="/admin/access/fields/{{ rule.id }}"
+                                        hx-confirm="Are you sure you want to delete this rule?">Delete</button>
+                            </div>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                    {% if field_access_rules.is_empty() %}
+                    <tr>
+                        <td colspan="7" class="text-center text-base-content/60 py-8">
+                            No field access rules defined
+                        </td>
+                    </tr>
+                    {% endif %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+{% endif %}
+
+<!-- Info Card -->
+<div class="card bg-base-100 shadow mt-6">
+    <div class="card-body">
+        <h3 class="font-semibold mb-2">Access Control Overview</h3>
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-4 text-sm">
+            <div>
+                <h4 class="font-medium text-primary">Model Access</h4>
+                <p class="text-base-content/60">Defines which roles can perform CRUD operations on each model.</p>
+            </div>
+            <div>
+                <h4 class="font-medium text-primary">Record Rules</h4>
+                <p class="text-base-content/60">Domain expressions that filter which records users can see (e.g., multi-tenant isolation).</p>
+            </div>
+            <div>
+                <h4 class="font-medium text-primary">Field Access</h4>
+                <p class="text-base-content/60">Controls visibility and editability of specific fields per role.</p>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

@@ -1,0 +1,54 @@
+{% extends "layouts/base.html" %}
+
+{% block title %}Home - Remicle{% endblock %}
+
+{% block content %}
+<!-- Page Header -->
+<div class="mb-8 text-center">
+    <h1 class="text-3xl font-bold mb-2">Welcome, {{ user_name }}</h1>
+    <p class="text-base-content/60">Select a module to get started</p>
+</div>
+
+<!-- Module Cards Grid -->
+<div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6 max-w-6xl mx-auto">
+    {% for module in modules %}
+    <a href="{{ module.href }}" class="card bg-base-100 shadow-lg hover:shadow-xl transition-all duration-200 hover:-translate-y-1 cursor-pointer group">
+        <div class="card-body items-center text-center">
+            <!-- Icon -->
+            <div class="w-16 h-16 rounded-full bg-{{ module.color }}/10 flex items-center justify-center mb-4 group-hover:bg-{{ module.color }}/20 transition-colors">
+                <svg class="w-8 h-8 text-{{ module.color }}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    {{ module.icon|safe }}
+                </svg>
+            </div>
+
+            <!-- Title -->
+            <h2 class="card-title text-lg">
+                {{ module.name }}
+                {% if module.system_admin_only %}
+                <span class="badge badge-warning badge-sm">System Admin</span>
+                {% else %}
+                {% if module.admin_only %}
+                <span class="badge badge-info badge-sm">Admin</span>
+                {% endif %}
+                {% endif %}
+            </h2>
+
+            <!-- Description -->
+            <p class="text-base-content/60 text-sm">{{ module.description }}</p>
+
+            <!-- Arrow indicator -->
+            <div class="mt-4 text-{{ module.color }} opacity-0 group-hover:opacity-100 transition-opacity">
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 7l5 5m0 0l-5 5m5-5H6"/>
+                </svg>
+            </div>
+        </div>
+    </a>
+    {% endfor %}
+</div>
+
+<!-- Quick Info -->
+<div class="mt-12 text-center text-base-content/50 text-sm">
+    <p>Need help? Press <kbd class="kbd kbd-sm">?</kbd> for keyboard shortcuts</p>
+</div>
+{% endblock %}

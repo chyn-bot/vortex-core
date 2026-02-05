@@ -1,0 +1,5 @@
+# Migration metadata for 003_module_registry
+module = "core"
+description = "Module registry for tracking installed modules per database"
+reversible = true
+dependencies = ["001_initial_schema"]

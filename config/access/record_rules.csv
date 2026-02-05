@@ -1,0 +1,11 @@
+name,model,role,domain,is_global,perm_read,perm_write,perm_create,perm_delete,priority
+# Global multi-tenant rules (apply to all roles)
+multi_tenant_users,users,,company_id = current_company,1,1,1,1,1,100
+multi_tenant_roles,roles,,["|", ("company_id", "=", current_company), ("company_id", "=", null)],1,1,1,1,1,100
+multi_tenant_sessions,sessions,,user_id = current_user,1,1,0,0,0,100
+# Audit log - filter by company
+multi_tenant_audit,audit_log,,company_id = current_company,1,1,0,0,0,100
+# User self-read rule (users can always read their own record)
+user_self_read,users,user,id = current_user,0,1,0,0,0,50
+# User self-update rule (users can update their own non-sensitive fields)
+user_self_update,users,user,id = current_user,0,0,1,0,0,50

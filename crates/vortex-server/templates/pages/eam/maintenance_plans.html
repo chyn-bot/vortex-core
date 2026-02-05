@@ -1,0 +1,71 @@
+{% extends "layouts/base.html" %}
+
+{% block title %}Maintenance Plans - Asset Management - Remicle{% endblock %}
+
+{% block content %}
+<!-- Page Header -->
+<div class="flex justify-between items-center mb-6">
+    <div>
+        <div class="breadcrumbs text-sm">
+            <ul>
+                <li><a href="/eam">Asset Management</a></li>
+                <li>Maintenance Plans</li>
+            </ul>
+        </div>
+        <h1 class="text-2xl font-bold">Maintenance Plans</h1>
+        <p class="text-base-content/60">Recurring maintenance schedules with automatic work order generation</p>
+    </div>
+</div>
+
+<!-- Plans Table -->
+<div class="card bg-base-100 shadow">
+    <div class="card-body">
+        {% if !plans.is_empty() %}
+        <div class="overflow-x-auto">
+            <table class="table table-zebra">
+                <thead>
+                    <tr>
+                        <th>Plan Code</th>
+                        <th>Asset</th>
+                        <th>Type</th>
+                        <th>Frequency</th>
+                        <th>Next Due</th>
+                        <th>State</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for plan in plans %}
+                    <tr>
+                        <td class="font-mono font-semibold">{{ plan.plan_code }}</td>
+                        <td>{{ plan.asset_name }}</td>
+                        <td>
+                            <span class="badge badge-outline badge-sm">{{ plan.maintenance_type }}</span>
+                        </td>
+                        <td>{{ plan.frequency }}</td>
+                        <td>{{ plan.next_date }}</td>
+                        <td>
+                            <span class="badge badge-sm text-white" style="background-color: {{ plan.state_color }}">
+                                {{ plan.state }}
+                            </span>
+                        </td>
+                        <td>
+                            <a href="/eam/plans/{{ plan.id }}" class="btn btn-xs btn-ghost">View</a>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% else %}
+        <div class="text-center py-12">
+            <svg class="w-16 h-16 mx-auto text-base-content/20 mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"/>
+            </svg>
+            <h3 class="text-lg font-semibold mb-1">No maintenance plans</h3>
+            <p class="text-base-content/60">Create plans to schedule recurring maintenance and auto-generate work orders.</p>
+        </div>
+        {% endif %}
+    </div>
+</div>
+{% endblock %}

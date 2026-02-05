@@ -1,0 +1,5 @@
+[migration]
+version = "011"
+name = "countries"
+description = "Country and state/province tables for address management"
+module = "contacts"

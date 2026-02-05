@@ -1,0 +1,88 @@
+{% extends "layouts/base.html" %}
+
+{% block title %}{{ page_title }} - Vortex{% endblock %}
+
+{% block content %}
+<!-- Page Header -->
+<div class="flex justify-between items-center mb-6">
+    <div>
+        <h1 class="text-2xl font-bold">{{ page_title }}</h1>
+        <p class="text-base-content/60">{{ page_description }}</p>
+    </div>
+    <a href="{{ create_url }}" class="btn btn-primary">
+        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                  d="M12 6v6m0 0v6m0-6h6m-6 0H6"/>
+        </svg>
+        Create New
+    </a>
+</div>
+
+<!-- Filters & Search -->
+<div class="card bg-base-100 shadow mb-6">
+    <div class="card-body p-4">
+        <div class="flex flex-wrap gap-4 items-center">
+            <!-- Search -->
+            <div class="form-control flex-1 min-w-[200px]">
+                <input type="text"
+                       placeholder="Search..."
+                       class="input input-bordered input-sm"
+                       name="search"
+                       hx-get="{{ list_url }}"
+                       hx-trigger="keyup changed delay:300ms"
+                       hx-target="#records-table"
+                       hx-include="[name='status'], [name='sort']">
+            </div>
+
+            <!-- Status Filter -->
+            <select name="status"
+                    class="select select-bordered select-sm"
+                    hx-get="{{ list_url }}"
+                    hx-trigger="change"
+                    hx-target="#records-table"
+                    hx-include="[name='search'], [name='sort']">
+                <option value="">All Status</option>
+                <option value="active">Active</option>
+                <option value="inactive">Inactive</option>
+            </select>
+
+            <!-- Sort -->
+            <select name="sort"
+                    class="select select-bordered select-sm"
+                    hx-get="{{ list_url }}"
+                    hx-trigger="change"
+                    hx-target="#records-table"
+                    hx-include="[name='search'], [name='status']">
+                <option value="created_desc">Newest First</option>
+                <option value="created_asc">Oldest First</option>
+                <option value="name_asc">Name A-Z</option>
+                <option value="name_desc">Name Z-A</option>
+            </select>
+
+            <!-- Refresh -->
+            <button class="btn btn-ghost btn-sm"
+                    hx-get="{{ list_url }}"
+                    hx-target="#records-table">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                          d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>
+                </svg>
+            </button>
+        </div>
+    </div>
+</div>
+
+<!-- Records Table -->
+<div class="card bg-base-100 shadow">
+    <div class="card-body p-0">
+        <div id="records-table"
+             hx-get="{{ list_url }}"
+             hx-trigger="load"
+             hx-swap="innerHTML">
+            <div class="flex justify-center py-12">
+                <span class="loading loading-spinner loading-lg"></span>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

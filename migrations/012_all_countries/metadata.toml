@@ -1,0 +1,5 @@
+[migration]
+version = "012"
+name = "all_countries"
+description = "Add all ISO 3166-1 countries"
+module = "contacts"

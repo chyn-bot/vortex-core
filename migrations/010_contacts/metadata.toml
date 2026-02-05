@@ -1,0 +1,7 @@
+# Migration metadata for 010_contacts
+module = "contacts"
+description = "Contacts management module for customers and suppliers"
+reversible = true
+
+# Depends on initial schema for companies, users tables
+dependencies = ["001_initial_schema"]

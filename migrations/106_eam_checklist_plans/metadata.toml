@@ -1,0 +1,5 @@
+[migration]
+module = "asset_management"
+description = "Add checklist system, maintenance plans, part lines, and extended condition monitoring models"
+reversible = true
+dependencies = ["105_eam_maintenance_workflows"]

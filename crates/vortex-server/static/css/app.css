@@ -1,0 +1,156 @@
+/* Vortex Custom Styles */
+
+/* Smooth page transitions */
+.htmx-swapping {
+    opacity: 0.5;
+    transition: opacity 0.2s ease-out;
+}
+
+/* Loading states */
+.htmx-request .htmx-indicator {
+    display: inline-flex !important;
+}
+
+.htmx-indicator {
+    display: none;
+}
+
+/* Card hover effects */
+.card {
+    transition: box-shadow 0.2s ease-in-out;
+}
+
+.card:hover {
+    box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1);
+}
+
+/* Table row transitions */
+table tbody tr {
+    transition: background-color 0.15s ease-in-out;
+}
+
+/* Sidebar active state */
+.menu li > a.active {
+    background-color: hsl(var(--p) / 0.1);
+    color: hsl(var(--p));
+    font-weight: 600;
+}
+
+/* Toast animations */
+.toast .alert {
+    animation: slideIn 0.3s ease-out;
+}
+
+@keyframes slideIn {
+    from {
+        transform: translateX(100%);
+        opacity: 0;
+    }
+    to {
+        transform: translateX(0);
+        opacity: 1;
+    }
+}
+
+/* Modal animations */
+.modal {
+    transition: opacity 0.2s ease-out;
+}
+
+.modal-box {
+    animation: scaleIn 0.2s ease-out;
+}
+
+@keyframes scaleIn {
+    from {
+        transform: scale(0.95);
+        opacity: 0;
+    }
+    to {
+        transform: scale(1);
+        opacity: 1;
+    }
+}
+
+/* Form focus states */
+.input:focus,
+.select:focus,
+.textarea:focus {
+    outline: none;
+    border-color: hsl(var(--p));
+    box-shadow: 0 0 0 2px hsl(var(--p) / 0.2);
+}
+
+/* Button loading state */
+.btn.htmx-request {
+    pointer-events: none;
+    opacity: 0.7;
+}
+
+/* Stat card improvements */
+.stat {
+    transition: transform 0.2s ease-in-out;
+}
+
+.stat:hover {
+    transform: translateY(-2px);
+}
+
+/* Breadcrumbs styling */
+.breadcrumbs {
+    font-size: 0.875rem;
+}
+
+.breadcrumbs a:hover {
+    text-decoration: underline;
+}
+
+/* Status badges */
+.badge-active {
+    background-color: hsl(var(--su) / 0.2);
+    color: hsl(var(--su));
+}
+
+.badge-inactive {
+    background-color: hsl(var(--wa) / 0.2);
+    color: hsl(var(--wa));
+}
+
+.badge-archived {
+    background-color: hsl(var(--n) / 0.2);
+    color: hsl(var(--n));
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+}
+
+::-webkit-scrollbar-track {
+    background: hsl(var(--b2));
+}
+
+::-webkit-scrollbar-thumb {
+    background: hsl(var(--bc) / 0.2);
+    border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background: hsl(var(--bc) / 0.3);
+}
+
+/* Print styles */
+@media print {
+    .sidebar,
+    .navbar,
+    .btn,
+    .dropdown {
+        display: none !important;
+    }
+
+    .card {
+        box-shadow: none;
+        border: 1px solid #ccc;
+    }
+}

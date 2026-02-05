@@ -1,0 +1,93 @@
+{% extends "layouts/base.html" %}
+
+{% block title %}{% if is_new %}New{% else %}Edit{% endif %} Model Access - Remicle{% endblock %}
+
+{% block content %}
+<!-- Page Header -->
+<div class="flex items-center gap-4 mb-6">
+    <a href="/admin/access?tab=models" class="btn btn-ghost btn-sm">
+        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/>
+        </svg>
+    </a>
+    <div>
+        <h1 class="text-2xl font-bold">{% if is_new %}New Model Access Rule{% else %}Edit Model Access Rule{% endif %}</h1>
+        <p class="text-base-content/60">Define CRUD permissions for a role on a model</p>
+    </div>
+</div>
+
+<!-- Form Card -->
+<div class="card bg-base-100 shadow max-w-2xl">
+    <div class="card-body">
+        <form method="post" action="{% if is_new %}/admin/access/models{% else %}/admin/access/models/{{ form_data.id }}{% endif %}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+
+            <!-- Model Name -->
+            <div class="form-control mb-4">
+                <label class="label">
+                    <span class="label-text font-medium">Model Name</span>
+                </label>
+                <input type="text" name="model_name" value="{{ form_data.model_name }}"
+                       class="input input-bordered" placeholder="e.g., users, orders, products" required>
+                <label class="label">
+                    <span class="label-text-alt">The database table or model name</span>
+                </label>
+            </div>
+
+            <!-- Role -->
+            <div class="form-control mb-4">
+                <label class="label">
+                    <span class="label-text font-medium">Role</span>
+                </label>
+                <select name="role_id" class="select select-bordered" required>
+                    <option value="">Select a role...</option>
+                    {% for role in available_roles %}
+                    <option value="{{ role.id }}"{% if role.selected %} selected{% endif %}>{{ role.name }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+
+            <!-- Permissions -->
+            <div class="form-control mb-4">
+                <label class="label">
+                    <span class="label-text font-medium">Permissions</span>
+                </label>
+                <div class="grid grid-cols-2 gap-4">
+                    <label class="label cursor-pointer justify-start gap-3">
+                        <input type="checkbox" name="perm_read" class="checkbox checkbox-primary"{% if form_data.perm_read %} checked{% endif %}>
+                        <span class="label-text">Read</span>
+                    </label>
+                    <label class="label cursor-pointer justify-start gap-3">
+                        <input type="checkbox" name="perm_write" class="checkbox checkbox-primary"{% if form_data.perm_write %} checked{% endif %}>
+                        <span class="label-text">Write (Update)</span>
+                    </label>
+                    <label class="label cursor-pointer justify-start gap-3">
+                        <input type="checkbox" name="perm_create" class="checkbox checkbox-primary"{% if form_data.perm_create %} checked{% endif %}>
+                        <span class="label-text">Create</span>
+                    </label>
+                    <label class="label cursor-pointer justify-start gap-3">
+                        <input type="checkbox" name="perm_delete" class="checkbox checkbox-primary"{% if form_data.perm_delete %} checked{% endif %}>
+                        <span class="label-text">Delete</span>
+                    </label>
+                </div>
+            </div>
+
+            <!-- Active -->
+            <div class="form-control mb-6">
+                <label class="label cursor-pointer justify-start gap-3">
+                    <input type="checkbox" name="active" class="toggle toggle-primary"{% if form_data.active %} checked{% endif %}>
+                    <span class="label-text font-medium">Active</span>
+                </label>
+            </div>
+
+            <!-- Actions -->
+            <div class="flex justify-end gap-2">
+                <a href="/admin/access?tab=models" class="btn btn-ghost">Cancel</a>
+                <button type="submit" class="btn btn-primary">
+                    {% if is_new %}Create Rule{% else %}Save Changes{% endif %}
+                </button>
+            </div>
+        </form>
+    </div>
+</div>
+{% endblock %}

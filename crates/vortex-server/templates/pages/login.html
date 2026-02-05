@@ -1,0 +1,86 @@
+{% extends "layouts/auth.html" %}
+
+{% block title %}Login - Remicle{% endblock %}
+
+{% block content %}
+<div class="card bg-base-100 shadow-2xl">
+    <div class="card-body">
+        <!-- Logo -->
+        <div class="text-center mb-6">
+            <div class="flex justify-center mb-4">
+                <img src="/static/images/remiclelogo.png" alt="Remicle" class="h-12">
+            </div>
+            <p class="text-base-content/60 text-sm">NERC CIP Compliant Platform</p>
+        </div>
+
+        <!-- Error message -->
+        <div id="login-error" class="hidden">
+            <div class="alert alert-error mb-4">
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                          d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
+                </svg>
+                <span id="login-error-text"></span>
+            </div>
+        </div>
+
+        <!-- Login Form -->
+        <form hx-post="/auth/login"
+              hx-target="#login-error"
+              hx-swap="innerHTML"
+              hx-on::after-request="handleLoginResponse(event)">
+
+            <div class="form-control mb-4">
+                <label class="label">
+                    <span class="label-text">Username</span>
+                </label>
+                <input type="text"
+                       name="username"
+                       placeholder="Enter your username"
+                       class="input input-bordered"
+                       required
+                       autofocus>
+            </div>
+
+            <div class="form-control mb-4">
+                <label class="label">
+                    <span class="label-text">Password</span>
+                </label>
+                <input type="password"
+                       name="password"
+                       placeholder="Enter your password"
+                       class="input input-bordered"
+                       required>
+            </div>
+
+            <div class="form-control mb-6">
+                <label class="label cursor-pointer justify-start gap-2">
+                    <input type="checkbox" name="remember" class="checkbox checkbox-sm">
+                    <span class="label-text">Remember me</span>
+                </label>
+            </div>
+
+            <button type="submit" class="btn btn-primary w-full">
+                <span class="htmx-indicator loading loading-spinner loading-sm"></span>
+                Sign In
+            </button>
+        </form>
+
+        <!-- Footer -->
+        <div class="mt-6 text-center text-xs text-base-content/50">
+            <p>Session timeout: 30 minutes (CIP-007 compliant)</p>
+            <p class="mt-1">All access is logged for audit purposes</p>
+        </div>
+    </div>
+</div>
+
+<script>
+function handleLoginResponse(event) {
+    if (event.detail.successful && event.detail.xhr.status === 200) {
+        window.location.href = '/dashboard';
+    } else {
+        document.getElementById('login-error').classList.remove('hidden');
+    }
+}
+</script>
+{% endblock %}

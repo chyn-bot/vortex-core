@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="remicle">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Login - Remicle</title>
+    <link href="https://cdn.jsdelivr.net/npm/daisyui@4.4.24/dist/full.min.css" rel="stylesheet">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/htmx.org@1.9.10"></script>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        'remicle': {
+                            'green': '#8BC53F',
+                            'green-dark': '#6BA32E',
+                            'gray': '#6D6E71',
+                            'gray-light': '#9D9FA2',
+                        }
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        [data-theme="remicle"] {
+            --p: 93 54% 51%;           /* Primary - Remicle Green #8BC53F */
+            --pf: 93 45% 42%;          /* Primary focus - darker green */
+            --pc: 0 0% 100%;           /* Primary content - white */
+            --s: 210 11% 45%;          /* Secondary - Professional slate */
+            --sf: 210 11% 35%;         /* Secondary focus */
+            --sc: 0 0% 100%;           /* Secondary content */
+            --a: 93 54% 51%;           /* Accent - same as primary */
+            --af: 93 45% 42%;          /* Accent focus */
+            --ac: 0 0% 100%;           /* Accent content */
+            --n: 220 13% 26%;          /* Neutral - dark slate */
+            --nf: 220 13% 18%;         /* Neutral focus */
+            --nc: 210 20% 98%;         /* Neutral content */
+            --b1: 0 0% 100%;           /* Base 100 - white */
+            --b2: 210 20% 98%;         /* Base 200 - off-white */
+            --b3: 214 14% 94%;         /* Base 300 - light gray */
+            --bc: 220 13% 26%;         /* Base content - dark text */
+            --in: 212 96% 54%;         /* Info - blue */
+            --inc: 0 0% 100%;          /* Info content */
+            --su: 158 64% 42%;         /* Success - green */
+            --suc: 0 0% 100%;          /* Success content */
+            --wa: 43 96% 50%;          /* Warning - amber */
+            --wac: 0 0% 20%;           /* Warning content */
+            --er: 0 72% 51%;           /* Error - red */
+            --erc: 0 0% 100%;          /* Error content */
+            --rounded-box: 0.75rem;
+            --rounded-btn: 0.5rem;
+            --rounded-badge: 1.5rem;
+            --btn-text-case: none;
+        }
+        .htmx-request .htmx-indicator { display: inline-flex !important; }
+        .htmx-indicator { display: none; }
+    </style>
+</head>
+<body class="min-h-screen bg-base-200 flex items-center justify-center p-4">
+    <div class="w-full max-w-md">
+        <div class="card bg-base-100 shadow-2xl">
+            <div class="card-body">
+                <!-- Logo -->
+                <div class="text-center mb-6">
+                    <div class="flex justify-center mb-4">
+                        <img src="/static/images/remiclelogo.png" alt="Remicle" class="h-12">
+                    </div>
+                    <p class="text-base-content/60 text-sm">NERC CIP Compliant Platform</p>
+                </div>
+
+                <!-- Error message -->
+                <div id="login-error"></div>
+
+                <!-- Login Form -->
+                <form hx-post="/auth/login"
+                      hx-target="#login-error"
+                      hx-swap="innerHTML">
+
+                    <div class="form-control mb-4">
+                        <label class="label">
+                            <span class="label-text">Username</span>
+                        </label>
+                        <input type="text" name="username" placeholder="admin"
+                               class="input input-bordered" required autofocus>
+                    </div>
+
+                    <div class="form-control mb-6">
+                        <label class="label">
+                            <span class="label-text">Password</span>
+                        </label>
+                        <input type="password" name="password" placeholder="admin"
+                               class="input input-bordered" required>
+                    </div>
+
+                    <button type="submit" class="btn btn-primary w-full">
+                        <span class="htmx-indicator loading loading-spinner loading-sm"></span>
+                        Sign In
+                    </button>
+                </form>
+
+                <!-- Demo notice -->
+                <div class="mt-6 p-3 bg-info/10 rounded-lg text-center text-sm">
+                    <p class="font-medium text-info">Demo Mode</p>
+                    <p class="text-base-content/60">Username: admin | Password: Admin@123!</p>
+                </div>
+
+                <!-- Footer -->
+                <div class="mt-4 text-center text-xs text-base-content/50">
+                    <p>Session timeout: 30 minutes (CIP-007)</p>
+                    <p>All access is logged for audit</p>
+                </div>
+            </div>
+        </div>
+    </div>
+</body>
+</html>

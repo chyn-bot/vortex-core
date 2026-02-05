@@ -1,0 +1,25 @@
+model,role,perm_read,perm_write,perm_create,perm_delete
+# System Administrator - full access to all models
+users,super_admin,1,1,1,1
+roles,super_admin,1,1,1,1
+companies,super_admin,1,1,1,1
+audit_log,super_admin,1,0,0,0
+sessions,super_admin,1,0,0,1
+model_access,super_admin,1,1,1,1
+record_rules,super_admin,1,1,1,1
+field_access,super_admin,1,1,1,1
+# Administrator - company-level admin
+users,admin,1,1,1,0
+roles,admin,1,0,0,0
+companies,admin,1,0,0,0
+audit_log,admin,1,0,0,0
+sessions,admin,1,0,0,0
+# Standard User - limited access
+users,user,1,0,0,0
+# Auditor - read access for compliance
+users,auditor,1,0,0,0
+roles,auditor,1,0,0,0
+audit_log,auditor,1,0,0,0
+sessions,auditor,1,0,0,0
+# Viewer - read-only access
+users,viewer,1,0,0,0

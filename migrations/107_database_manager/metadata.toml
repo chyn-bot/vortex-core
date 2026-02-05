@@ -1,0 +1,5 @@
+[migration]
+module = "core"
+description = "Add managed_databases registry and db_manager_config for multi-database support"
+reversible = true
+dependencies = []

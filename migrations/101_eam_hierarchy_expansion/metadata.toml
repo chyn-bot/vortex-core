@@ -1,0 +1,5 @@
+[migration]
+module = "asset_management"
+description = "Expand hierarchy from 4-level to 8-level (Region, Substation, Bay, Part)"
+reversible = true
+dependencies = ["100_eam_base"]

@@ -1,0 +1,38 @@
+[package]
+name = "vortex-chatter"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Chatter system for Vortex - messages, activities, followers on any record"
+
+[dependencies]
+vortex-common = { workspace = true }
+vortex-orm = { workspace = true }
+vortex-security = { workspace = true }
+
+# Async
+tokio = { workspace = true }
+async-trait = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Database
+sqlx = { workspace = true }
+
+# IDs
+uuid = { workspace = true }
+
+# Time
+chrono = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Regex for @mention parsing
+regex = "1.10"

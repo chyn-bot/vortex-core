@@ -1,0 +1,5 @@
+[migration]
+module = "asset_management"
+description = "Enhance WorkOrder with state machine, add checklist fields to InspectionResult, add state history"
+reversible = true
+dependencies = ["104_eam_condition_monitoring"]

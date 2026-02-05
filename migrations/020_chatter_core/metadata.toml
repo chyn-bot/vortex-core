@@ -1,0 +1,5 @@
+[migration]
+version = "020"
+name = "chatter_core"
+description = "Chatter system - messages, activities, followers, attachments, notifications"
+module = "chatter"

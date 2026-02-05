@@ -1,0 +1,57 @@
+[package]
+name = "vortex-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "vortex"
+path = "src/main.rs"
+
+[dependencies]
+vortex-common = { workspace = true }
+vortex-orm = { workspace = true }
+vortex-security = { workspace = true }
+vortex-module = { workspace = true }
+vortex-server = { workspace = true }
+vortex-eam = { workspace = true }
+
+# Async
+tokio = { workspace = true }
+
+# Web (for demo server)
+axum = { workspace = true }
+tower-http = { workspace = true, features = ["fs"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Config
+config = { workspace = true }
+dotenvy = { workspace = true }
+toml = "0.8"
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Utilities
+uuid = { workspace = true }
+chrono = { workspace = true }
+anyhow = { workspace = true }
+hex = { workspace = true }
+
+# Database
+sqlx = { workspace = true }
+
+# Security
+argon2 = "0.5"
+sha2 = "0.10"
+rand = { workspace = true }
+md5 = "0.7"

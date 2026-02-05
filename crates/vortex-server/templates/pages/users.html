@@ -1,0 +1,84 @@
+{% extends "layouts/base.html" %}
+
+{% block title %}Users - Remicle{% endblock %}
+
+{% block content %}
+<!-- Page Header -->
+<div class="flex justify-between items-center mb-6">
+    <div>
+        <h1 class="text-2xl font-bold">Users</h1>
+        <p class="text-base-content/60">Manage user accounts and role assignments</p>
+    </div>
+    {% if is_admin %}
+    <a href="/users/new" class="btn btn-primary">
+        <svg class="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6v6m0 0v6m0-6h6m-6 0H6"/>
+        </svg>
+        Add User
+    </a>
+    {% endif %}
+</div>
+
+<!-- Users Table -->
+<div class="card bg-base-100 shadow">
+    <div class="card-body">
+        <div class="overflow-x-auto">
+            <table class="table">
+                <thead>
+                    <tr>
+                        <th>Username</th>
+                        <th>Name</th>
+                        <th>Email</th>
+                        <th>Roles</th>
+                        {% if is_system_admin %}<th>Company</th>{% endif %}
+                        <th>Status</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for user in users %}
+                    <tr>
+                        <td class="font-medium">{{ user.username }}</td>
+                        <td>{{ user.name.as_deref().unwrap_or("-") }}</td>
+                        <td>{{ user.email.as_deref().unwrap_or("-") }}</td>
+                        <td>
+                            {% for role in user.roles %}
+                            <span class="badge badge-outline badge-sm mr-1">{{ role }}</span>
+                            {% endfor %}
+                            {% if user.roles.is_empty() %}
+                            <span class="text-base-content/40">No roles</span>
+                            {% endif %}
+                        </td>
+                        {% if is_system_admin %}
+                        <td>{{ user.company_name.as_deref().unwrap_or("-") }}</td>
+                        {% endif %}
+                        <td>
+                            {% if user.active %}
+                            <span class="badge badge-success badge-sm">Active</span>
+                            {% else %}
+                            <span class="badge badge-error badge-sm">Inactive</span>
+                            {% endif %}
+                        </td>
+                        <td>
+                            <a href="/users/{{ user.id }}/edit" class="btn btn-ghost btn-xs">
+                                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"/>
+                                </svg>
+                                Edit
+                            </a>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                    {% if users.is_empty() %}
+                    <tr>
+                        <td colspan="{% if is_system_admin %}7{% else %}6{% endif %}" class="text-center text-base-content/60 py-8">
+                            No users found
+                        </td>
+                    </tr>
+                    {% endif %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+{% endblock %}

@@ -1,0 +1,128 @@
+{% extends "layouts/base.html" %}
+
+{% block title %}Configuration - Asset Management - Remicle{% endblock %}
+
+{% block content %}
+<!-- Page Header -->
+<div class="mb-6">
+    <div class="breadcrumbs text-sm">
+        <ul>
+            <li><a href="/eam">Asset Management</a></li>
+            <li>Configuration</li>
+        </ul>
+    </div>
+    <h1 class="text-2xl font-bold">EAM Configuration</h1>
+    <p class="text-base-content/60">Manage voltage levels, unit types, categories, and statuses</p>
+</div>
+
+<!-- Configuration Cards -->
+<div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+    <!-- Voltage Levels -->
+    <div class="card bg-base-100 shadow">
+        <div class="card-body">
+            <div class="flex items-center justify-between">
+                <div class="flex items-center gap-3">
+                    <div class="bg-warning/20 p-3 rounded-lg">
+                        <svg class="w-6 h-6 text-warning" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                  d="M13 10V3L4 14h7v7l9-11h-7z"/>
+                        </svg>
+                    </div>
+                    <div>
+                        <h2 class="card-title text-lg">Voltage Levels</h2>
+                        <p class="text-base-content/60 text-sm">275kV, 132kV, 33kV, 11kV, etc.</p>
+                    </div>
+                </div>
+                <div class="badge badge-lg">{{ voltage_levels_count }}</div>
+            </div>
+            <div class="card-actions justify-end mt-4">
+                <a href="/eam/config/voltage-levels" class="btn btn-outline btn-sm">Manage</a>
+            </div>
+        </div>
+    </div>
+
+    <!-- Unit Types -->
+    <div class="card bg-base-100 shadow">
+        <div class="card-body">
+            <div class="flex items-center justify-between">
+                <div class="flex items-center gap-3">
+                    <div class="bg-info/20 p-3 rounded-lg">
+                        <svg class="w-6 h-6 text-info" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                  d="M9 3v2m6-2v2M9 19v2m6-2v2M5 9H3m2 6H3m18-6h-2m2 6h-2M7 19h10a2 2 0 002-2V7a2 2 0 00-2-2H7a2 2 0 00-2 2v10a2 2 0 002 2zM9 9h6v6H9V9z"/>
+                        </svg>
+                    </div>
+                    <div>
+                        <h2 class="card-title text-lg">Unit Types</h2>
+                        <p class="text-base-content/60 text-sm">PPU, SSU, PP, PE classifications</p>
+                    </div>
+                </div>
+                <div class="badge badge-lg">{{ unit_types_count }}</div>
+            </div>
+            <div class="card-actions justify-end mt-4">
+                <a href="/eam/config/unit-types" class="btn btn-outline btn-sm">Manage</a>
+            </div>
+        </div>
+    </div>
+
+    <!-- Asset Categories -->
+    <div class="card bg-base-100 shadow">
+        <div class="card-body">
+            <div class="flex items-center justify-between">
+                <div class="flex items-center gap-3">
+                    <div class="bg-secondary/20 p-3 rounded-lg">
+                        <svg class="w-6 h-6 text-secondary" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                  d="M7 7h.01M7 3h5c.512 0 1.024.195 1.414.586l7 7a2 2 0 010 2.828l-7 7a2 2 0 01-2.828 0l-7-7A2 2 0 013 12V7a4 4 0 014-4z"/>
+                        </svg>
+                    </div>
+                    <div>
+                        <h2 class="card-title text-lg">Asset Categories</h2>
+                        <p class="text-base-content/60 text-sm">Transformer, Switchgear, RMU, etc.</p>
+                    </div>
+                </div>
+                <div class="badge badge-lg">{{ asset_categories_count }}</div>
+            </div>
+            <div class="card-actions justify-end mt-4">
+                <a href="/eam/config/categories" class="btn btn-outline btn-sm">Manage</a>
+            </div>
+        </div>
+    </div>
+
+    <!-- Asset Statuses -->
+    <div class="card bg-base-100 shadow">
+        <div class="card-body">
+            <div class="flex items-center justify-between">
+                <div class="flex items-center gap-3">
+                    <div class="bg-success/20 p-3 rounded-lg">
+                        <svg class="w-6 h-6 text-success" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                  d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/>
+                        </svg>
+                    </div>
+                    <div>
+                        <h2 class="card-title text-lg">Asset Statuses</h2>
+                        <p class="text-base-content/60 text-sm">In Service, Maintenance, Faulty, etc.</p>
+                    </div>
+                </div>
+                <div class="badge badge-lg">{{ asset_statuses_count }}</div>
+            </div>
+            <div class="card-actions justify-end mt-4">
+                <a href="/eam/config/statuses" class="btn btn-outline btn-sm">Manage</a>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Info Alert -->
+<div class="alert mt-6">
+    <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+              d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
+    </svg>
+    <div>
+        <h3 class="font-bold">Default Configuration</h3>
+        <div class="text-sm">Standard Malaysian electrical utility voltage levels and equipment categories are pre-configured. Customize as needed for your organization.</div>
+    </div>
+</div>
+{% endblock %}

@@ -1,0 +1,46 @@
+[package]
+name = "vortex-server"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+vortex-common = { workspace = true }
+vortex-orm = { workspace = true }
+vortex-security = { workspace = true }
+vortex-module = { workspace = true }
+vortex-chatter = { workspace = true }
+vortex-eam = { path = "../vortex-eam" }
+
+# Async
+tokio = { workspace = true }
+async-trait = { workspace = true }
+
+# Web framework
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true, features = ["fs", "cors", "trace", "compression-gzip"] }
+
+# Templating
+askama = { version = "0.12", features = ["with-axum"] }
+askama_axum = "0.4"
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Utilities
+uuid = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+rand = "0.8"
+hex = "0.4"
+
+# JWT
+jsonwebtoken = { workspace = true }
+
+# Database (for direct queries)
+sqlx = { workspace = true }

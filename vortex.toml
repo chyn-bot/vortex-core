@@ -1,0 +1,62 @@
+# Vortex Configuration File
+
+[server]
+host = "0.0.0.0"
+port = 3000
+workers = 4
+
+[database]
+url = "postgres://vortex:vortex@localhost:5432/vortex"
+min_connections = 5
+max_connections = 100
+ssl_mode = "prefer"
+
+[security]
+# JWT secret for token signing (generate a secure random value in production)
+jwt_secret = "change-me-in-production"
+jwt_expiry_hours = 24
+
+# Session settings (NERC CIP-007 compliant)
+session_idle_timeout_minutes = 30
+session_absolute_timeout_hours = 24
+max_concurrent_sessions = 3
+
+# Password policy (NERC CIP-007 compliant)
+password_min_length = 8
+password_require_uppercase = true
+password_require_lowercase = true
+password_require_numbers = true
+password_require_special = true
+password_expiry_days = 365
+password_history_count = 24
+max_failed_attempts = 5
+lockout_duration_minutes = 30
+
+[audit]
+# Audit log settings (NERC CIP-007 compliant)
+enabled = true
+log_security_events = true
+log_data_changes = true
+retention_days = 90
+
+[modules]
+# Auto-install core modules
+auto_install_core = true
+
+[database_manager]
+# Multi-database management (Odoo-style). Set enabled = true to activate.
+enabled = false
+master_database = "vortex_master"
+# Master password (Argon2 hash). Set via CLI or database manager UI.
+master_password = ""
+# Database filter pattern. "" = show all, "^%h$" = match subdomain to db name
+db_filter = ""
+# Enforced naming prefix for new databases
+db_name_prefix = "vortex_"
+
+[logging]
+level = "info"
+format = "json"
+file = "logs/vortex.log"
+max_size_mb = 100
+max_files = 10

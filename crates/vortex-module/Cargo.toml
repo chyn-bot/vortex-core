@@ -1,0 +1,31 @@
+[package]
+name = "vortex-module"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+vortex-common = { workspace = true }
+vortex-orm = { workspace = true }
+vortex-security = { workspace = true }
+
+# Async
+tokio = { workspace = true }
+async-trait = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Utilities
+uuid = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# Database
+sqlx = { workspace = true }
+
+# Dependency graph
+petgraph = "0.6"

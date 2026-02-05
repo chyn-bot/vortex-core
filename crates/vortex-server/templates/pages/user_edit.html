@@ -1,0 +1,122 @@
+{% extends "layouts/base.html" %}
+
+{% block title %}{% if is_new %}New User{% else %}Edit User{% endif %} - Remicle{% endblock %}
+
+{% block content %}
+<!-- Page Header -->
+<div class="mb-6">
+    <div class="flex items-center gap-2 text-sm text-base-content/60 mb-2">
+        <a href="/users" class="hover:text-primary">Users</a>
+        <span>/</span>
+        <span>{% if is_new %}New{% else %}Edit{% endif %}</span>
+    </div>
+    <h1 class="text-2xl font-bold">{% if is_new %}Create New User{% else %}Edit User{% endif %}</h1>
+</div>
+
+<!-- User Form -->
+<div class="card bg-base-100 shadow max-w-2xl">
+    <div class="card-body">
+        <form method="POST" action="{% if is_new %}/users{% else %}/users/{{ form_data.id }}{% endif %}">
+            <input type="hidden" name="_csrf" value="{{ csrf_token }}">
+
+            <!-- Username -->
+            <div class="form-control mb-4">
+                <label class="label">
+                    <span class="label-text font-medium">Username <span class="text-error">*</span></span>
+                </label>
+                <input type="text" name="username"
+                       value="{{ form_data.username }}"
+                       class="input input-bordered"
+                       required
+                       {% if !is_new %}readonly{% endif %}>
+                {% if !is_new %}
+                <label class="label">
+                    <span class="label-text-alt text-base-content/60">Username cannot be changed</span>
+                </label>
+                {% endif %}
+            </div>
+
+            <!-- Name -->
+            <div class="form-control mb-4">
+                <label class="label">
+                    <span class="label-text font-medium">Full Name</span>
+                </label>
+                <input type="text" name="name"
+                       value="{{ form_data.name }}"
+                       class="input input-bordered">
+            </div>
+
+            <!-- Email -->
+            <div class="form-control mb-4">
+                <label class="label">
+                    <span class="label-text font-medium">Email</span>
+                </label>
+                <input type="email" name="email"
+                       value="{{ form_data.email }}"
+                       class="input input-bordered">
+            </div>
+
+            <!-- Password -->
+            <div class="form-control mb-4">
+                <label class="label">
+                    <span class="label-text font-medium">Password {% if is_new %}<span class="text-error">*</span>{% endif %}</span>
+                </label>
+                <input type="password" name="password"
+                       class="input input-bordered"
+                       {% if is_new %}required{% endif %}>
+                {% if !is_new %}
+                <label class="label">
+                    <span class="label-text-alt text-base-content/60">Leave blank to keep current password</span>
+                </label>
+                {% endif %}
+            </div>
+
+            <!-- Active Status -->
+            <div class="form-control mb-4">
+                <label class="label cursor-pointer justify-start gap-3">
+                    <input type="checkbox" name="active" value="1"
+                           class="checkbox checkbox-primary"
+                           {% if form_data.active %}checked{% endif %}>
+                    <span class="label-text font-medium">Active</span>
+                </label>
+                <label class="label">
+                    <span class="label-text-alt text-base-content/60">Inactive users cannot log in</span>
+                </label>
+            </div>
+
+            <!-- Roles -->
+            <div class="form-control mb-6">
+                <label class="label">
+                    <span class="label-text font-medium">Roles</span>
+                </label>
+                <div class="bg-base-200 rounded-lg p-4 space-y-2">
+                    {% for role in available_roles %}
+                    <label class="label cursor-pointer justify-start gap-3 py-1">
+                        <input type="checkbox" name="roles" value="{{ role.id }}"
+                               class="checkbox checkbox-primary checkbox-sm"
+                               {% if role.selected %}checked{% endif %}>
+                        <span class="label-text">{{ role.name }}</span>
+                    </label>
+                    {% endfor %}
+                    {% if available_roles.is_empty() %}
+                    <p class="text-base-content/60 text-sm">No roles available</p>
+                    {% endif %}
+                </div>
+                <label class="label">
+                    <span class="label-text-alt text-base-content/60">
+                        Roles determine what the user can access in the system
+                    </span>
+                </label>
+            </div>
+
+            <!-- Actions -->
+            <div class="flex gap-3">
+                <button type="submit" class="btn btn-primary">
+                    {% if is_new %}Create User{% else %}Save Changes{% endif %}
+                </button>
+                <a href="/users" class="btn btn-ghost">Cancel</a>
+            </div>
+        </form>
+    </div>
+</div>
+{% endblock %}

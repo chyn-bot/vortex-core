@@ -1,0 +1,115 @@
+{% extends "layouts/base.html" %}
+
+{% block title %}{% if is_new %}New{% else %}Edit{% endif %} Field Access - Remicle{% endblock %}
+
+{% block content %}
+<!-- Page Header -->
+<div class="flex items-center gap-4 mb-6">
+    <a href="/admin/access?tab=fields" class="btn btn-ghost btn-sm">
+        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/>
+        </svg>
+    </a>
+    <div>
+        <h1 class="text-2xl font-bold">{% if is_new %}New Field Access Rule{% else %}Edit Field Access Rule{% endif %}</h1>
+        <p class="text-base-content/60">Control field visibility and editability per role</p>
+    </div>
+</div>
+
+<!-- Form Card -->
+<div class="card bg-base-100 shadow max-w-2xl">
+    <div class="card-body">
+        <form method="post" action="{% if is_new %}/admin/access/fields{% else %}/admin/access/fields/{{ form_data.id }}{% endif %}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+
+            <!-- Model Name -->
+            <div class="form-control mb-4">
+                <label class="label">
+                    <span class="label-text font-medium">Model Name</span>
+                </label>
+                <input type="text" name="model_name" value="{{ form_data.model_name }}"
+                       class="input input-bordered" placeholder="e.g., users" required>
+            </div>
+
+            <!-- Field Name -->
+            <div class="form-control mb-4">
+                <label class="label">
+                    <span class="label-text font-medium">Field Name</span>
+                </label>
+                <input type="text" name="field_name" value="{{ form_data.field_name }}"
+                       class="input input-bordered" placeholder="e.g., password_hash" required>
+                <label class="label">
+                    <span class="label-text-alt">The column/field name to restrict</span>
+                </label>
+            </div>
+
+            <!-- Role -->
+            <div class="form-control mb-4">
+                <label class="label">
+                    <span class="label-text font-medium">Role</span>
+                </label>
+                <select name="role_id" class="select select-bordered" required>
+                    <option value="">Select a role...</option>
+                    {% for role in available_roles %}
+                    <option value="{{ role.id }}"{% if role.selected %} selected{% endif %}>{{ role.name }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+
+            <!-- Permissions -->
+            <div class="form-control mb-4">
+                <label class="label">
+                    <span class="label-text font-medium">Permissions</span>
+                </label>
+                <div class="space-y-3">
+                    <label class="label cursor-pointer justify-start gap-3 bg-base-200 rounded-lg p-3">
+                        <input type="checkbox" name="readable" class="checkbox checkbox-success"{% if form_data.readable %} checked{% endif %}>
+                        <div>
+                            <span class="label-text font-medium">Readable</span>
+                            <p class="text-xs text-base-content/60">User can see this field in records</p>
+                        </div>
+                    </label>
+                    <label class="label cursor-pointer justify-start gap-3 bg-base-200 rounded-lg p-3">
+                        <input type="checkbox" name="writable" class="checkbox checkbox-warning"{% if form_data.writable %} checked{% endif %}>
+                        <div>
+                            <span class="label-text font-medium">Writable</span>
+                            <p class="text-xs text-base-content/60">User can modify this field</p>
+                        </div>
+                    </label>
+                </div>
+            </div>
+
+            <!-- Common Patterns -->
+            <div class="alert mb-4">
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
+                </svg>
+                <div class="text-sm">
+                    <p class="font-medium">Common Patterns:</p>
+                    <ul class="list-disc list-inside mt-1 space-y-1">
+                        <li><b>Hidden field:</b> Uncheck both readable and writable</li>
+                        <li><b>Read-only:</b> Check readable, uncheck writable</li>
+                        <li><b>Full access:</b> Check both (or don't create a rule)</li>
+                    </ul>
+                </div>
+            </div>
+
+            <!-- Active -->
+            <div class="form-control mb-6">
+                <label class="label cursor-pointer justify-start gap-3">
+                    <input type="checkbox" name="active" class="toggle toggle-primary"{% if form_data.active %} checked{% endif %}>
+                    <span class="label-text font-medium">Active</span>
+                </label>
+            </div>
+
+            <!-- Actions -->
+            <div class="flex justify-end gap-2">
+                <a href="/admin/access?tab=fields" class="btn btn-ghost">Cancel</a>
+                <button type="submit" class="btn btn-primary">
+                    {% if is_new %}Create Rule{% else %}Save Changes{% endif %}
+                </button>
+            </div>
+        </form>
+    </div>
+</div>
+{% endblock %}

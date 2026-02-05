@@ -1,0 +1,21 @@
+model,field,role,readable,writable
+# Hide sensitive user fields from regular users
+users,password_hash,user,0,0
+users,mfa_secret,user,0,0
+users,failed_login_attempts,user,0,0
+users,locked_reason,user,0,0
+# Hide from viewers
+users,password_hash,viewer,0,0
+users,mfa_secret,viewer,0,0
+users,failed_login_attempts,viewer,0,0
+users,locked_reason,viewer,0,0
+# Admin can see lockout status but not write password directly
+users,password_hash,admin,0,0
+users,mfa_secret,admin,0,0
+users,failed_login_attempts,admin,1,0
+users,locked_reason,admin,1,1
+# Auditor can see all fields but write nothing
+users,password_hash,auditor,0,0
+users,mfa_secret,auditor,0,0
+users,failed_login_attempts,auditor,1,0
+users,locked_reason,auditor,1,0
