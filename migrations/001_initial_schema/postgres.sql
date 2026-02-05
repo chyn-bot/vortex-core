@@ -34,7 +34,7 @@ CREATE TABLE users (
     username VARCHAR(100) NOT NULL,
     email VARCHAR(255) NOT NULL,
     password_hash VARCHAR(255) NOT NULL,
-    name VARCHAR(255),
+    full_name VARCHAR(255),
     active BOOLEAN NOT NULL DEFAULT true,
     locked BOOLEAN NOT NULL DEFAULT false,
     locked_at TIMESTAMPTZ,
@@ -218,7 +218,7 @@ INSERT INTO users (
     username,
     email,
     password_hash,
-    name,
+    full_name,
     must_change_password
 ) VALUES (
     '00000000-0000-0000-0000-000000000001',

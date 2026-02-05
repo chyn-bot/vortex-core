@@ -31,7 +31,7 @@ CREATE TABLE users (
     username NVARCHAR(100) NOT NULL,
     email NVARCHAR(255) NOT NULL,
     password_hash NVARCHAR(255) NOT NULL,
-    name NVARCHAR(255),
+    full_name NVARCHAR(255),
     active BIT NOT NULL DEFAULT 1,
     locked BIT NOT NULL DEFAULT 0,
     locked_at DATETIMEOFFSET,
@@ -236,7 +236,7 @@ INSERT INTO users (
     username,
     email,
     password_hash,
-    name,
+    full_name,
     must_change_password
 ) VALUES (
     '00000000-0000-0000-0000-000000000001',
