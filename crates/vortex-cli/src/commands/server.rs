@@ -84,7 +84,6 @@ impl AuthUser {
 /// Auth middleware - verifies session and injects AuthUser + DatabaseContext
 async fn auth_middleware(
     State(state): State<Arc<AppState>>,
-    Db(db): Db,
     mut request: Request,
     next: Next,
 ) -> Response {
@@ -345,13 +344,74 @@ pub async fn run(host: String, port: u16, _workers: Option<usize>) -> Result<()>
 
     // Set up master database if multi-db enabled
     let master_db = if multi_db_enabled {
-        let master_url = format!("{}/{}", base_url_from_full(&database_url), master_database);
+        let base_url = base_url_from_full(&database_url);
+        let master_url = format!("{}/{}", base_url, master_database);
         info!("Connecting to master database '{}'...", master_database);
+
+        // Auto-create master database if it doesn't exist
+        let admin_url = format!("{}/postgres", base_url);
+        let admin_pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&admin_url)
+            .await?;
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)"
+        )
+        .bind(&master_database)
+        .fetch_one(&admin_pool)
+        .await?;
+        if !exists {
+            info!("Creating master database '{}'...", master_database);
+            let create_sql = format!("CREATE DATABASE \"{}\"", master_database);
+            sqlx::query(&create_sql).execute(&admin_pool).await?;
+            info!("Master database created");
+        }
+        drop(admin_pool);
+
         let mdb = PgPoolOptions::new()
             .max_connections(5)
             .connect(&master_url)
             .await?;
-        sqlx::query("SELECT 1").execute(&mdb).await?;
+
+        // Ensure master tables exist
+        sqlx::raw_sql(
+            "CREATE TABLE IF NOT EXISTS managed_databases (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                name VARCHAR(63) NOT NULL UNIQUE,
+                display_name VARCHAR(255),
+                state VARCHAR(20) NOT NULL DEFAULT 'active',
+                demo_data BOOLEAN NOT NULL DEFAULT false,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                last_accessed_at TIMESTAMPTZ,
+                size_bytes BIGINT,
+                notes TEXT
+            )"
+        ).execute(&mdb).await?;
+        sqlx::raw_sql(
+            "CREATE TABLE IF NOT EXISTS db_manager_config (
+                key VARCHAR(100) PRIMARY KEY,
+                value TEXT NOT NULL
+            )"
+        ).execute(&mdb).await?;
+
+        // Auto-register the default database if not already registered
+        let registered: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM managed_databases WHERE name = $1)"
+        )
+        .bind(&default_db)
+        .fetch_one(&mdb)
+        .await?;
+        if !registered {
+            info!("Registering default database '{}' in master registry", default_db);
+            sqlx::query(
+                "INSERT INTO managed_databases (name, display_name, state) VALUES ($1, $2, 'active')"
+            )
+            .bind(&default_db)
+            .bind(&default_db)
+            .execute(&mdb)
+            .await?;
+        }
+
         info!("Master database connected");
         Some(mdb)
     } else {
