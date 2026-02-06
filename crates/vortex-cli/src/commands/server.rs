@@ -315,6 +315,7 @@ fn module_not_installed_page(module_name: &str) -> String {
         _ => module_name,
     };
     format!(r#"<!DOCTYPE html><html data-theme="dark"><head><title>Module Not Installed</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/>
 <script src="https://cdn.tailwindcss.com"></script></head>
 <body class="min-h-screen bg-base-200 flex items-center justify-center">
@@ -642,6 +643,8 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/partials/home/announcements", get(home_announcements_partial))
         .route("/partials/home/shortcuts", get(home_shortcuts_partial))
         .route("/partials/home/activities", get(home_activities_partial))
+        .route("/partials/home/calendar", get(home_calendar_partial))
+        .route("/partials/home/calendar/{year}/{month}", get(home_calendar_partial_month))
         // Announcements CRUD (admin)
         .route("/announcements", get(announcements_list))
         .route("/announcements/new", get(announcement_new))
@@ -1164,18 +1167,6 @@ async fn home_page(
     let installed = db_ctx.installed_modules.clone();
     let sidebar = build_sidebar("home", display_name, &initials, &installed, user.is_admin());
 
-    // Get company_id for chatter feed
-    let company_id: Option<uuid::Uuid> = sqlx::query_scalar("SELECT company_id FROM users WHERE id = $1")
-        .bind(user.id).fetch_optional(&db).await.ok().flatten();
-    let chatter_url = company_id
-        .map(|c| format!("/partials/chatter/home.feed/{}", c))
-        .unwrap_or_default();
-    let chatter_attr = if company_id.is_some() {
-        format!(r#"hx-get="{}" hx-trigger="load" hx-swap="innerHTML""#, chatter_url)
-    } else {
-        String::new()
-    };
-
     // Build condensed module links for the "Modules" section
     let mut module_links = String::new();
     if installed.contains("contacts") {
@@ -1263,12 +1254,16 @@ async fn home_page(
 
     let html = format!(
         r#"<!DOCTYPE html><html data-theme="dark"><head><title>Home - Remicle</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/>
 <script src="https://cdn.tailwindcss.com"></script>
 <script src="https://unpkg.com/htmx.org@1.9.10"></script>
 </head>
-<body class="min-h-screen bg-base-200"><div class="flex">{sidebar}
-<main class="flex-1 p-6">
+<body class="min-h-screen bg-base-200">
+<div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a></div>
+<div id="sidebar-overlay" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
+<div class="flex">{sidebar}
+<main class="flex-1 p-4 lg:p-6 min-w-0">
 <div class="mb-6"><h1 class="text-2xl font-bold">Welcome, {display_name}</h1><p class="text-base-content/60">Here's what's happening today</p></div>
 
 <!-- Announcements (full width) -->
@@ -1289,11 +1284,11 @@ async fn home_page(
 <div id="shortcuts-panel" hx-get="/partials/home/shortcuts" hx-trigger="load" hx-swap="innerHTML"><span class="loading loading-spinner loading-sm"></span></div>
 </div></div>
 
-<!-- Discussion Feed -->
+<!-- My Calendar -->
 <div class="card bg-base-100 shadow">
 <div class="card-body">
-<h2 class="card-title text-lg"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"/></svg>Discussion</h2>
-<div id="discussion-panel" {chatter_attr}><span class="loading loading-spinner loading-sm"></span></div>
+<h2 class="card-title text-lg"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"/></svg>My Calendar</h2>
+<div id="calendar-panel" hx-get="/partials/home/calendar" hx-trigger="load" hx-swap="innerHTML"><span class="loading loading-spinner loading-sm"></span></div>
 </div></div>
 
 </div>
@@ -1322,7 +1317,6 @@ async fn home_page(
 </body></html>"#,
         sidebar = sidebar,
         display_name = html_escape(display_name),
-        chatter_attr = chatter_attr,
         module_links = module_links,
         shortcuts_modal = shortcuts_modal,
         shortcuts_js = shortcuts_js,
@@ -1460,9 +1454,9 @@ fn build_sidebar(active_page: &str, user_name: &str, initials: &str, installed: 
         }
     }
 
-    format!(r#"<aside class="w-64 bg-base-100 shadow-lg min-h-screen flex flex-col">
+    format!(r#"<aside id="sidebar" class="w-64 bg-base-100 shadow-lg min-h-screen flex flex-col fixed lg:static top-0 left-0 z-40 h-full -translate-x-full lg:translate-x-0 transition-transform duration-200">
 <div class="p-4 border-b border-base-300"><a href="/home" class="text-xl font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a></div>
-<nav class="flex-1 p-4"><ul class="menu menu-sm gap-1">{}</ul></nav>
+<nav class="flex-1 p-4 overflow-y-auto"><ul class="menu menu-sm gap-1">{}</ul></nav>
 <div class="p-4 border-t border-base-300"><div class="flex items-center gap-3">
 <div class="avatar placeholder"><div class="bg-primary text-primary-content rounded-full w-10"><span>{}</span></div></div>
 <div class="flex-1 min-w-0"><p class="font-medium truncate">{}</p></div>
@@ -1790,6 +1784,258 @@ async fn home_activities_partial(
     Html(html)
 }
 
+// -- Home Calendar partial (replaces dead Discussion feed) --------------------
+
+/// Default entry: current month
+async fn home_calendar_partial(
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+) -> Html<String> {
+    let now = chrono::Utc::now();
+    build_home_calendar(&db, &user, now.year(), now.month()).await
+}
+
+/// Parameterized entry: specific year/month
+async fn home_calendar_partial_month(
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Path((year, month)): Path<(i32, u32)>,
+) -> Html<String> {
+    let month = month.clamp(1, 12);
+    build_home_calendar(&db, &user, year, month).await
+}
+
+/// Calendar event sourced from one of three tables
+struct CalendarEvent {
+    label: String,
+    url: Option<String>,
+    /// CSS class for the dot: bg-error, bg-warning, bg-info, bg-success
+    color_class: &'static str,
+    sort_key: u8,
+}
+
+async fn build_home_calendar(
+    db: &sqlx::PgPool,
+    user: &AuthUser,
+    year: i32,
+    month: u32,
+) -> Html<String> {
+    let first_day = chrono::NaiveDate::from_ymd_opt(year, month, 1).unwrap();
+    let last_day = if month == 12 {
+        chrono::NaiveDate::from_ymd_opt(year + 1, 1, 1).unwrap().pred_opt().unwrap()
+    } else {
+        chrono::NaiveDate::from_ymd_opt(year, month + 1, 1).unwrap().pred_opt().unwrap()
+    };
+
+    let mut events_by_date: std::collections::HashMap<chrono::NaiveDate, Vec<CalendarEvent>> =
+        std::collections::HashMap::new();
+
+    // 1) Activities (pending / overdue) assigned to this user
+    let act_rows = sqlx::query(
+        "SELECT a.summary, a.due_date, a.state, a.res_model, a.res_id
+         FROM chatter_activities a
+         WHERE a.assigned_to_id = $1 AND a.state IN ('pending','overdue') AND a.active = true
+           AND a.due_date >= $2 AND a.due_date <= $3
+         ORDER BY a.due_date"
+    )
+    .bind(user.id)
+    .bind(first_day)
+    .bind(last_day)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+
+    for row in &act_rows {
+        let date: chrono::NaiveDate = row.get("due_date");
+        let state: String = row.get("state");
+        let summary: Option<String> = row.get("summary");
+        let res_model: String = row.get("res_model");
+        let res_id: uuid::Uuid = row.get("res_id");
+        let (color_class, sort_key) = if state == "overdue" {
+            ("bg-error", 0u8)
+        } else {
+            ("bg-warning", 1)
+        };
+        events_by_date.entry(date).or_default().push(CalendarEvent {
+            label: summary.unwrap_or_else(|| "Activity".to_string()),
+            url: model_to_url(&res_model, &res_id),
+            color_class,
+            sort_key,
+        });
+    }
+
+    // 2) Work Orders (not draft/cancelled) assigned to this user, within month
+    let wo_rows = sqlx::query(
+        "SELECT id, title, scheduled_start::date as event_date
+         FROM eam_work_orders
+         WHERE assigned_to = $1
+           AND state NOT IN ('draft','cancelled')
+           AND scheduled_start IS NOT NULL
+           AND scheduled_start::date >= $2 AND scheduled_start::date <= $3
+         ORDER BY scheduled_start"
+    )
+    .bind(user.id)
+    .bind(first_day)
+    .bind(last_day)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+
+    for row in &wo_rows {
+        let date: chrono::NaiveDate = row.get("event_date");
+        let id: uuid::Uuid = row.get("id");
+        let title: String = row.get("title");
+        events_by_date.entry(date).or_default().push(CalendarEvent {
+            label: title,
+            url: Some(format!("/eam/work-orders/{}", id)),
+            color_class: "bg-info",
+            sort_key: 2,
+        });
+    }
+
+    // 3) Inspections (not approved/rejected) where user is inspector, within month
+    let insp_rows = sqlx::query(
+        "SELECT i.id, i.inspection_code, i.inspection_date::date as event_date, a.name as asset_name
+         FROM eam_inspection_results i
+         LEFT JOIN eam_equipment a ON a.id = i.asset_id
+         WHERE i.inspector_id = $1
+           AND COALESCE(i.state, 'draft') NOT IN ('approved','rejected')
+           AND i.inspection_date::date >= $2 AND i.inspection_date::date <= $3
+         ORDER BY i.inspection_date"
+    )
+    .bind(user.id)
+    .bind(first_day)
+    .bind(last_day)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+
+    for row in &insp_rows {
+        let date: chrono::NaiveDate = row.get("event_date");
+        let id: uuid::Uuid = row.get("id");
+        let code: Option<String> = row.get("inspection_code");
+        let asset_name: Option<String> = row.get("asset_name");
+        let label = code.unwrap_or_else(|| asset_name.unwrap_or_else(|| "Inspection".to_string()));
+        events_by_date.entry(date).or_default().push(CalendarEvent {
+            label,
+            url: Some(format!("/eam/inspections/{}", id)),
+            color_class: "bg-success",
+            sort_key: 3,
+        });
+    }
+
+    // Sort events within each day by priority
+    for events in events_by_date.values_mut() {
+        events.sort_by_key(|e| e.sort_key);
+    }
+
+    // Build calendar grid
+    let weekday_of_first = first_day.weekday().num_days_from_sunday();
+    let days_in_month = last_day.day();
+    let today = chrono::Utc::now().date_naive();
+
+    let mut cells = String::new();
+
+    // Empty leading cells
+    for _ in 0..weekday_of_first {
+        cells.push_str(r#"<div class="min-h-[3.5rem] bg-base-200/30 rounded"></div>"#);
+    }
+
+    // Day cells
+    for day in 1..=days_in_month {
+        let date = chrono::NaiveDate::from_ymd_opt(year, month, day).unwrap();
+        let is_today = date == today;
+        let ring = if is_today { " ring-2 ring-primary" } else { "" };
+        let day_color = if is_today { " text-primary font-bold" } else { "" };
+
+        cells.push_str(&format!(
+            "<div class=\"min-h-[3.5rem] bg-base-100 p-1 border border-base-300 rounded{}\">",
+            ring
+        ));
+        cells.push_str(&format!("<div class=\"text-xs{}\">{}</div>", day_color, day));
+
+        if let Some(events) = events_by_date.get(&date) {
+            cells.push_str("<div class=\"flex flex-wrap gap-0.5 mt-0.5\">");
+            let show = events.len().min(3);
+            for ev in events.iter().take(show) {
+                if let Some(ref href) = ev.url {
+                    cells.push_str(&format!(
+                        "<a href=\"{}\" class=\"w-2 h-2 rounded-full {} hover:ring-1 ring-white\" title=\"{}\"></a>",
+                        html_escape(href),
+                        ev.color_class,
+                        html_escape(&ev.label)
+                    ));
+                } else {
+                    cells.push_str(&format!(
+                        "<span class=\"w-2 h-2 rounded-full {}\" title=\"{}\"></span>",
+                        ev.color_class,
+                        html_escape(&ev.label)
+                    ));
+                }
+            }
+            if events.len() > 3 {
+                cells.push_str(&format!(
+                    "<span class=\"text-[0.6rem] text-base-content/50\">+{}</span>",
+                    events.len() - 3
+                ));
+            }
+            cells.push_str("</div>");
+        }
+        cells.push_str("</div>");
+    }
+
+    // Trailing empty cells
+    let total_cells = weekday_of_first + days_in_month;
+    let remaining = (7 - (total_cells % 7)) % 7;
+    for _ in 0..remaining {
+        cells.push_str(r#"<div class="min-h-[3.5rem] bg-base-200/30 rounded"></div>"#);
+    }
+
+    // Navigation
+    let (prev_year, prev_month) = if month == 1 { (year - 1, 12u32) } else { (year, month - 1) };
+    let (next_year, next_month) = if month == 12 { (year + 1, 1u32) } else { (year, month + 1) };
+
+    let month_names = ["", "January", "February", "March", "April", "May", "June",
+                       "July", "August", "September", "October", "November", "December"];
+    let month_name = month_names[month as usize];
+
+    let mut html = String::with_capacity(4096);
+    // Nav bar
+    html.push_str("<div class=\"flex items-center justify-between mb-3\">");
+    html.push_str(&format!(
+        "<button class=\"btn btn-ghost btn-xs\" hx-get=\"/partials/home/calendar/{}/{}\" hx-target=\"#calendar-panel\" hx-swap=\"innerHTML\">&larr;</button>",
+        prev_year, prev_month
+    ));
+    html.push_str(&format!("<span class=\"font-semibold text-sm\">{} {}</span>", month_name, year));
+    html.push_str(&format!(
+        "<button class=\"btn btn-ghost btn-xs\" hx-get=\"/partials/home/calendar/{}/{}\" hx-target=\"#calendar-panel\" hx-swap=\"innerHTML\">&rarr;</button>",
+        next_year, next_month
+    ));
+    html.push_str("</div>");
+
+    // Day-of-week header
+    html.push_str("<div class=\"grid grid-cols-7 gap-px text-center text-xs font-semibold text-base-content/60 mb-1\">");
+    for d in &["Sun","Mon","Tue","Wed","Thu","Fri","Sat"] {
+        html.push_str(&format!("<div>{}</div>", d));
+    }
+    html.push_str("</div>");
+
+    // Calendar grid
+    html.push_str("<div class=\"grid grid-cols-7 gap-px\">");
+    html.push_str(&cells);
+    html.push_str("</div>");
+
+    // Legend
+    html.push_str("<div class=\"flex flex-wrap gap-3 mt-3 text-xs text-base-content/60\">");
+    html.push_str("<span class=\"flex items-center gap-1\"><span class=\"w-2 h-2 rounded-full bg-error\"></span>Overdue</span>");
+    html.push_str("<span class=\"flex items-center gap-1\"><span class=\"w-2 h-2 rounded-full bg-warning\"></span>Activity</span>");
+    html.push_str("<span class=\"flex items-center gap-1\"><span class=\"w-2 h-2 rounded-full bg-info\"></span>Work Order</span>");
+    html.push_str("<span class=\"flex items-center gap-1\"><span class=\"w-2 h-2 rounded-full bg-success\"></span>Inspection</span>");
+    html.push_str("</div>");
+
+    Html(html)
+}
+
 // -- Announcement CRUD (admin-only) -------------------------------------------
 
 #[derive(serde::Deserialize)]
@@ -1863,10 +2109,14 @@ async fn announcements_list(
     }
 
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><title>Announcements - Remicle</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/>
 <script src="https://cdn.tailwindcss.com"></script></head>
-<body class="min-h-screen bg-base-200"><div class="flex">{sidebar}
-<main class="flex-1 p-6">
+<body class="min-h-screen bg-base-200">
+<div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a></div>
+<div id="sidebar-overlay" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
+<div class="flex">{sidebar}
+<main class="flex-1 p-4 lg:p-6 min-w-0">
 <div class="flex justify-between items-center mb-6">
 <div><h1 class="text-2xl font-bold">Announcements</h1><p class="text-base-content/60">Manage company announcements shown on the home screen</p></div>
 <a href="/announcements/new" class="btn btn-primary">+ New Announcement</a>
@@ -1892,18 +2142,22 @@ async fn announcement_new(
     let sidebar = build_sidebar("home", display_name, &initials, &installed, user.is_admin());
 
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><title>New Announcement - Remicle</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/>
 <script src="https://cdn.tailwindcss.com"></script></head>
-<body class="min-h-screen bg-base-200"><div class="flex">{sidebar}
-<main class="flex-1 p-6"><h1 class="text-2xl font-bold mb-6">New Announcement</h1>
+<body class="min-h-screen bg-base-200">
+<div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a></div>
+<div id="sidebar-overlay" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
+<div class="flex">{sidebar}
+<main class="flex-1 p-4 lg:p-6 min-w-0"><h1 class="text-2xl font-bold mb-6">New Announcement</h1>
 <form action="/announcements" method="POST" class="card bg-base-100 shadow p-6 max-w-2xl">
 <div class="form-control mb-4"><label class="label"><span class="label-text">Title *</span></label><input name="title" class="input input-bordered" required/></div>
 <div class="form-control mb-4"><label class="label"><span class="label-text">Body *</span></label><textarea name="body" class="textarea textarea-bordered h-32" required></textarea></div>
-<div class="grid grid-cols-2 gap-4 mb-4">
+<div class="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4">
 <div class="form-control"><label class="label"><span class="label-text">Severity</span></label><select name="severity" class="select select-bordered"><option value="info">Info</option><option value="success">Success</option><option value="warning">Warning</option><option value="error">Error</option></select></div>
 <div class="form-control"><label class="label cursor-pointer justify-start gap-2"><span class="label-text">Pinned</span><input type="checkbox" name="is_pinned" value="on" class="checkbox checkbox-primary"/></label></div>
 </div>
-<div class="grid grid-cols-2 gap-4 mb-4">
+<div class="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4">
 <div class="form-control"><label class="label"><span class="label-text">Publish At (leave empty for immediate)</span></label><input name="publish_at" type="datetime-local" class="input input-bordered"/></div>
 <div class="form-control"><label class="label"><span class="label-text">Expire At (leave empty for never)</span></label><input name="expire_at" type="datetime-local" class="input input-bordered"/></div>
 </div>
@@ -2000,18 +2254,22 @@ async fn announcement_edit(
     let sidebar = build_sidebar("home", display_name, &initials, &installed, user.is_admin());
 
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><title>Edit Announcement - Remicle</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/>
 <script src="https://cdn.tailwindcss.com"></script></head>
-<body class="min-h-screen bg-base-200"><div class="flex">{sidebar}
-<main class="flex-1 p-6"><h1 class="text-2xl font-bold mb-6">Edit Announcement</h1>
+<body class="min-h-screen bg-base-200">
+<div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a></div>
+<div id="sidebar-overlay" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
+<div class="flex">{sidebar}
+<main class="flex-1 p-4 lg:p-6 min-w-0"><h1 class="text-2xl font-bold mb-6">Edit Announcement</h1>
 <form action="/announcements/{id}" method="POST" class="card bg-base-100 shadow p-6 max-w-2xl">
 <div class="form-control mb-4"><label class="label"><span class="label-text">Title *</span></label><input name="title" class="input input-bordered" value="{title}" required/></div>
 <div class="form-control mb-4"><label class="label"><span class="label-text">Body *</span></label><textarea name="body" class="textarea textarea-bordered h-32" required>{body}</textarea></div>
-<div class="grid grid-cols-2 gap-4 mb-4">
+<div class="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4">
 <div class="form-control"><label class="label"><span class="label-text">Severity</span></label><select name="severity" class="select select-bordered">{sev_options}</select></div>
 <div class="form-control"><label class="label cursor-pointer justify-start gap-2"><span class="label-text">Pinned</span><input type="checkbox" name="is_pinned" value="on" class="checkbox checkbox-primary" {pinned_checked}/></label></div>
 </div>
-<div class="grid grid-cols-2 gap-4 mb-4">
+<div class="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4">
 <div class="form-control"><label class="label"><span class="label-text">Publish At</span></label><input name="publish_at" type="datetime-local" class="input input-bordered" value="{publish_val}"/></div>
 <div class="form-control"><label class="label"><span class="label-text">Expire At</span></label><input name="expire_at" type="datetime-local" class="input input-bordered" value="{expire_val}"/></div>
 </div>
@@ -3462,9 +3720,11 @@ async fn modules_list_with_filter(
     <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="min-h-screen bg-base-200">
+    <div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar-modules').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay-modules').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="text-base-content/60">micle</span></a></div>
+    <div id="sidebar-overlay-modules" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar-modules').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
     <div class="flex">
         <!-- Sidebar -->
-        <aside class="w-64 bg-base-100 shadow-lg flex flex-col min-h-screen">
+        <aside id="sidebar-modules" class="w-64 bg-base-100 shadow-lg flex flex-col min-h-screen fixed lg:static top-0 left-0 z-40 h-full -translate-x-full lg:translate-x-0 transition-transform duration-200">
             <div class="p-4 border-b border-base-300">
                 <a href="/dashboard" class="flex justify-center">
                     <span class="text-xl font-bold"><span class="text-success">re</span><span class="text-base-content/60">micle</span></span>
@@ -3483,7 +3743,7 @@ async fn modules_list_with_filter(
         </aside>
 
         <!-- Main Content -->
-        <main class="flex-1 p-6">
+        <main class="flex-1 p-4 lg:p-6 min-w-0">
             <div class="flex flex-col md:flex-row md:items-center md:justify-between mb-6">
                 <div>
                     <h1 class="text-2xl font-bold">Apps & Modules</h1>
@@ -4368,7 +4628,7 @@ body {{ background: #0f0f1a; color: #e8e8e8; }}
 </style>
 </head><body class="min-h-screen">
 <nav class="top-navbar px-4 py-3 flex items-center justify-between">
-    <a href="/home" class="text-xl font-bold"><span style="color:#8BC53F">re</span><span class="text-muted">micle</span></a>
+    <div class="flex items-center gap-2"><button class="btn btn-ghost btn-sm btn-square md:hidden" onclick="var s=document.querySelector('.sidebar');s.classList.toggle('hidden');s.classList.toggle('md:block')"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="text-xl font-bold"><span style="color:#8BC53F">re</span><span class="text-muted">micle</span></a></div>
     <div class="flex items-center gap-2 md:gap-3">
         <a href="/home" class="text-white text-sm hover:underline hidden md:inline">Home</a>
         <a href="/settings" class="text-white text-sm hover:underline hidden md:inline">Settings</a>
@@ -4614,7 +4874,7 @@ body {{ background: #0f0f1a; color: #e8e8e8; }}
 </style>
 </head><body class="min-h-screen">
 <nav class="top-navbar px-4 py-3 flex items-center justify-between">
-    <a href="/home" class="text-xl font-bold"><span style="color:#8BC53F">re</span><span class="text-muted">micle</span></a>
+    <div class="flex items-center gap-2"><button class="btn btn-ghost btn-sm btn-square md:hidden" onclick="var s=document.querySelector('.sidebar');s.classList.toggle('hidden');s.classList.toggle('md:block')"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="text-xl font-bold"><span style="color:#8BC53F">re</span><span class="text-muted">micle</span></a></div>
     <div class="flex items-center gap-2 md:gap-3">
         <a href="/home" class="text-white text-sm hover:underline hidden md:inline">Home</a>
         <a href="/settings" class="text-white text-sm hover:underline hidden md:inline">Settings</a>
@@ -4758,7 +5018,7 @@ body {{ background: #0f0f1a; color: #e8e8e8; }}
 </style>
 </head><body class="min-h-screen">
 <nav class="top-navbar px-4 py-3 flex items-center justify-between">
-    <a href="/home" class="text-xl font-bold"><span style="color:#8BC53F">re</span><span class="text-muted">micle</span></a>
+    <div class="flex items-center gap-2"><button class="btn btn-ghost btn-sm btn-square md:hidden" onclick="var s=document.querySelector('.sidebar');s.classList.toggle('hidden');s.classList.toggle('md:block')"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="text-xl font-bold"><span style="color:#8BC53F">re</span><span class="text-muted">micle</span></a></div>
     <div class="flex items-center gap-2 md:gap-3">
         <a href="/home" class="text-white text-sm hover:underline hidden md:inline">Home</a>
         <a href="/settings" class="text-white text-sm hover:underline hidden md:inline">Settings</a>
@@ -5016,12 +5276,14 @@ async fn generic_calendar_view(
     <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="min-h-screen bg-base-200">
+<div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar-inline').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay-inline').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a></div>
+<div id="sidebar-overlay-inline" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar-inline').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
 <div class="flex">
-    <aside class="w-64 bg-base-100 shadow-lg min-h-screen p-4">
+    <aside id="sidebar-inline" class="w-64 bg-base-100 shadow-lg min-h-screen p-4 fixed lg:static top-0 left-0 z-40 h-full -translate-x-full lg:translate-x-0 transition-transform duration-200">
         <div class="text-xl font-bold mb-6"><span class="text-success">re</span><span class="opacity-60">micle</span></div>
         <ul class="menu">{}</ul>
     </aside>
-    <main class="flex-1 p-6">
+    <main class="flex-1 p-4 lg:p-6 min-w-0">
         <div class="flex justify-between items-center mb-6">
             <div>
                 <h1 class="text-2xl font-bold">{}</h1>
@@ -5576,7 +5838,7 @@ async fn generic_pivot_view(
 </head>
 <body class="min-h-screen">
 <nav class="top-navbar px-4 py-3 flex items-center justify-between">
-    <a href="/home" class="text-xl font-bold"><span style="color:#8BC53F">re</span><span class="text-muted">micle</span></a>
+    <div class="flex items-center gap-2"><button class="btn btn-ghost btn-sm btn-square md:hidden" onclick="var s=document.querySelector('.sidebar');s.classList.toggle('hidden');s.classList.toggle('md:block')"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="text-xl font-bold"><span style="color:#8BC53F">re</span><span class="text-muted">micle</span></a></div>
     <div class="flex items-center gap-2 md:gap-3">
         <a href="/home" class="text-white text-sm hover:underline hidden md:inline">Home</a>
         <a href="/settings" class="text-white text-sm hover:underline hidden md:inline">Settings</a>
@@ -6073,10 +6335,14 @@ async fn contacts_list(
     }
 
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><title>Contacts - Remicle</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/>
 <script src="https://cdn.tailwindcss.com"></script></head>
-<body class="min-h-screen bg-base-200"><div class="flex">{sidebar}
-<main class="flex-1 p-6">
+<body class="min-h-screen bg-base-200">
+<div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a></div>
+<div id="sidebar-overlay" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
+<div class="flex">{sidebar}
+<main class="flex-1 p-4 lg:p-6 min-w-0">
 <div class="flex justify-between items-center mb-6">
 <div><h1 class="text-2xl font-bold">Contacts</h1><p class="text-base-content/60">Manage customers, suppliers, and stakeholders</p></div>
 <a href="/contacts/new" class="btn btn-primary">+ New Contact</a>
@@ -6103,7 +6369,7 @@ async fn contacts_new(State(state): State<Arc<AppState>>, Db(db): Db, Extension(
         country_options.push_str(&format!(r#"<div class="dropdown-item" data-id="{}" onclick="selectCountry('{}', '{}')">{}</div>"#, id, id, escaped_name, name));
     }
 
-    Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><title>New Contact</title><link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/><script src="https://cdn.tailwindcss.com"></script>
+    Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><title>New Contact</title><meta name="viewport" content="width=device-width, initial-scale=1.0"><link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/><script src="https://cdn.tailwindcss.com"></script>
 <style>
 .country-dropdown {{ position: relative; }}
 .country-dropdown .dropdown-content {{ max-height: 300px; overflow-y: auto; width: 100%; }}
@@ -6114,22 +6380,25 @@ async fn contacts_new(State(state): State<Arc<AppState>>, Db(db): Db, Extension(
 .state-dropdown .dropdown-item {{ padding: 8px 12px; cursor: pointer; }}
 .state-dropdown .dropdown-item:hover {{ background: oklch(var(--b2)); }}
 </style>
-</head><body class="min-h-screen bg-base-200"><div class="flex"><aside class="w-64 bg-base-100 shadow-lg min-h-screen p-4"><div class="text-xl font-bold mb-6"><span class="text-success">re</span><span class="opacity-60">micle</span></div><ul class="menu"><li><a href="/contacts">← Contacts</a></li></ul></aside><main class="flex-1 p-6"><h1 class="text-2xl font-bold mb-6">New Contact</h1><form action="/contacts" method="POST" class="card bg-base-100 shadow p-6 max-w-3xl overflow-visible">
+</head><body class="min-h-screen bg-base-200">
+<div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar-contact').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay-contact').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a></div>
+<div id="sidebar-overlay-contact" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar-contact').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
+<div class="flex"><aside id="sidebar-contact" class="w-64 bg-base-100 shadow-lg min-h-screen p-4 fixed lg:static top-0 left-0 z-40 h-full -translate-x-full lg:translate-x-0 transition-transform duration-200"><div class="text-xl font-bold mb-6"><span class="text-success">re</span><span class="opacity-60">micle</span></div><ul class="menu"><li><a href="/contacts">← Contacts</a></li></ul></aside><main class="flex-1 p-4 lg:p-6 min-w-0"><h1 class="text-2xl font-bold mb-6">New Contact</h1><form action="/contacts" method="POST" class="card bg-base-100 shadow p-6 max-w-3xl overflow-visible">
 <h3 class="font-semibold text-lg mb-4">Basic Information</h3>
-<div class="grid grid-cols-2 gap-4">
+<div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
 <div class="form-control"><label class="label">Name *</label><input name="name" class="input input-bordered" required/></div>
 <div class="form-control"><label class="label">Display Name</label><input name="display_name" class="input input-bordered"/></div>
 <div class="form-control"><label class="label">Type</label><select name="contact_type" class="select select-bordered"><option value="customer">Customer</option><option value="vendor">Vendor</option><option value="employee">Employee</option><option value="other">Other</option></select></div>
 <div class="form-control"><label class="label cursor-pointer justify-start gap-2"><input type="checkbox" name="is_company" class="checkbox"/><span>This is a Company</span></label></div>
 </div>
 <h3 class="font-semibold text-lg mt-6 mb-4">Contact Details</h3>
-<div class="grid grid-cols-2 gap-4">
+<div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
 <div class="form-control"><label class="label">Email</label><input name="email" type="email" class="input input-bordered"/></div>
 <div class="form-control"><label class="label">Phone</label><input name="phone" class="input input-bordered"/></div>
 <div class="form-control"><label class="label">Mobile</label><input name="mobile" class="input input-bordered"/></div>
 </div>
 <h3 class="font-semibold text-lg mt-6 mb-4">Address</h3>
-<div class="grid grid-cols-2 gap-4">
+<div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
 <div class="form-control col-span-2"><label class="label">Street</label><input name="street" class="input input-bordered"/></div>
 <div class="form-control col-span-2"><label class="label">Street 2</label><input name="street2" class="input input-bordered"/></div>
 <div class="form-control"><label class="label">City</label><input name="city" class="input input-bordered"/></div>
@@ -6402,7 +6671,7 @@ async fn contacts_edit(
         "Select country first"
     };
 
-    Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><title>Edit Contact</title><link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/><script src="https://cdn.tailwindcss.com"></script><script src="https://unpkg.com/htmx.org@1.9.10"></script>
+    Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><title>Edit Contact</title><meta name="viewport" content="width=device-width, initial-scale=1.0"><link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/><script src="https://cdn.tailwindcss.com"></script><script src="https://unpkg.com/htmx.org@1.9.10"></script>
 <style>
 .country-dropdown {{ position: relative; }}
 .country-dropdown .dropdown-content {{ max-height: 300px; overflow-y: auto; width: 100%; }}
@@ -6413,7 +6682,10 @@ async fn contacts_edit(
 .state-dropdown .dropdown-item {{ padding: 8px 12px; cursor: pointer; }}
 .state-dropdown .dropdown-item:hover {{ background: oklch(var(--b2)); }}
 </style>
-</head><body class="min-h-screen bg-base-200"><div class="flex"><aside class="w-64 bg-base-100 shadow-lg min-h-screen p-4"><div class="text-xl font-bold mb-6"><span class="text-success">re</span><span class="opacity-60">micle</span></div><ul class="menu"><li><a href="/contacts">← Contacts</a></li></ul></aside><main class="flex-1 p-6">
+</head><body class="min-h-screen bg-base-200">
+<div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar-contact').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay-contact').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a></div>
+<div id="sidebar-overlay-contact" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar-contact').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
+<div class="flex"><aside id="sidebar-contact" class="w-64 bg-base-100 shadow-lg min-h-screen p-4 fixed lg:static top-0 left-0 z-40 h-full -translate-x-full lg:translate-x-0 transition-transform duration-200"><div class="text-xl font-bold mb-6"><span class="text-success">re</span><span class="opacity-60">micle</span></div><ul class="menu"><li><a href="/contacts">← Contacts</a></li></ul></aside><main class="flex-1 p-4 lg:p-6 min-w-0">
 <!-- State Bar -->
 <div class="card bg-base-100 shadow mb-6">
   <div class="card-body py-3">
@@ -6436,20 +6708,20 @@ async fn contacts_edit(
 <form action="/contacts/{}" method="POST" class="card bg-base-100 shadow p-6 xl:col-span-2 overflow-visible">
 {}
 <h3 class="font-semibold text-lg mb-4">Basic Information</h3>
-<div class="grid grid-cols-2 gap-4">
+<div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
 <div class="form-control"><label class="label">Name *</label><input name="name" value="{}" class="input input-bordered" {} required/></div>
 <div class="form-control"><label class="label">Display Name</label><input name="display_name" value="{}" class="input input-bordered" {}/></div>
 <div class="form-control"><label class="label">Type</label><select name="contact_type" class="select select-bordered" {}><option value="customer"{}>Customer</option><option value="vendor"{}>Vendor</option><option value="employee"{}>Employee</option><option value="other"{}>Other</option></select></div>
 <div class="form-control"><label class="label cursor-pointer justify-start gap-2"><input type="checkbox" name="is_company" class="checkbox" {} {}/><span>This is a Company</span></label></div>
 </div>
 <h3 class="font-semibold text-lg mt-6 mb-4">Contact Details</h3>
-<div class="grid grid-cols-2 gap-4">
+<div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
 <div class="form-control"><label class="label">Email</label><input name="email" type="email" value="{}" class="input input-bordered" {}/></div>
 <div class="form-control"><label class="label">Phone</label><input name="phone" value="{}" class="input input-bordered" {}/></div>
 <div class="form-control"><label class="label">Mobile</label><input name="mobile" value="{}" class="input input-bordered" {}/></div>
 </div>
 <h3 class="font-semibold text-lg mt-6 mb-4">Address</h3>
-<div class="grid grid-cols-2 gap-4">
+<div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
 <div class="form-control col-span-2"><label class="label">Street</label><input name="street" value="{}" class="input input-bordered" {}/></div>
 <div class="form-control col-span-2"><label class="label">Street 2</label><input name="street2" value="{}" class="input input-bordered" {}/></div>
 <div class="form-control"><label class="label">City</label><input name="city" value="{}" class="input input-bordered" {}/></div>
@@ -6883,10 +7155,14 @@ async fn eam_dashboard(
     let sidebar = build_sidebar("eam_dashboard", display_name, &initials, &installed, user.is_admin());
 
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><title>Asset Management - Remicle</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/>
 <script src="https://cdn.tailwindcss.com"></script></head>
-<body class="min-h-screen bg-base-200"><div class="flex">{sidebar}
-<main class="flex-1 p-6">
+<body class="min-h-screen bg-base-200">
+<div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a></div>
+<div id="sidebar-overlay" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
+<div class="flex">{sidebar}
+<main class="flex-1 p-4 lg:p-6 min-w-0">
 <div class="mb-6"><h1 class="text-2xl font-bold">Enterprise Asset Management</h1><p class="text-base-content/60">Distribution substation asset tracking</p></div>
 <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
 <div class="stat bg-base-100 rounded-lg shadow"><div class="stat-title">Sites</div><div class="stat-value text-primary">{total_sites}</div><div class="stat-desc">Substations</div></div>
@@ -6900,7 +7176,7 @@ async fn eam_dashboard(
 <div class="flex items-center justify-between"><div class="flex items-center gap-2"><span class="badge badge-warning badge-sm"></span><span>Under Maintenance</span></div><span class="font-semibold">{under_maint}</span></div>
 <div class="flex items-center justify-between"><div class="flex items-center gap-2"><span class="badge badge-error badge-sm"></span><span>Faulty</span></div><span class="font-semibold">{faulty}</span></div>
 </div></div></div>
-<div class="card bg-base-100 shadow"><div class="card-body"><h2 class="card-title">Quick Actions</h2><div class="grid grid-cols-2 gap-3 mt-4">
+<div class="card bg-base-100 shadow"><div class="card-body"><h2 class="card-title">Quick Actions</h2><div class="grid grid-cols-1 sm:grid-cols-2 gap-3 mt-4">
 <a href="/eam/sites" class="btn btn-outline btn-primary">View Sites</a>
 <a href="/eam/assets" class="btn btn-outline btn-secondary">View Assets</a>
 <a href="/eam/sites/new" class="btn btn-outline btn-accent">New Site</a>
@@ -7054,10 +7330,14 @@ async fn eam_sites(
     );
 
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><title>Sites - Asset Management</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/>
 <script src="https://cdn.tailwindcss.com"></script></head>
-<body class="min-h-screen bg-base-200"><div class="flex">{sidebar}
-<main class="flex-1 p-6">
+<body class="min-h-screen bg-base-200">
+<div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a></div>
+<div id="sidebar-overlay" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
+<div class="flex">{sidebar}
+<main class="flex-1 p-4 lg:p-6 min-w-0">
 <div class="flex justify-between items-center mb-6">
 <div><div class="breadcrumbs text-sm"><ul><li><a href="/eam">Asset Management</a></li><li>Sites</li></ul></div>
 <h1 class="text-2xl font-bold">Sites</h1><p class="text-base-content/60">Substations and distribution locations</p></div>
@@ -7256,10 +7536,14 @@ async fn eam_assets(
         if view == "pivot" { "btn-active btn-primary" } else { "btn-ghost" });
 
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><title>Assets - Asset Management</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/>
 <script src="https://cdn.tailwindcss.com"></script></head>
-<body class="min-h-screen bg-base-200"><div class="flex">{sidebar}
-<main class="flex-1 p-6">
+<body class="min-h-screen bg-base-200">
+<div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a></div>
+<div id="sidebar-overlay" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
+<div class="flex">{sidebar}
+<main class="flex-1 p-4 lg:p-6 min-w-0">
 <div class="flex justify-between items-center mb-6">
 <div><div class="breadcrumbs text-sm"><ul><li><a href="/eam">Asset Management</a></li><li>Assets</li></ul></div>
 <h1 class="text-2xl font-bold">Assets</h1><p class="text-base-content/60">Equipment and components</p></div>
@@ -7309,10 +7593,14 @@ async fn eam_configuration(
     let sidebar = build_sidebar("eam_configuration", display_name, &initials, &installed, user.is_admin());
 
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><title>Configuration - Asset Management</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/>
 <script src="https://cdn.tailwindcss.com"></script></head>
-<body class="min-h-screen bg-base-200"><div class="flex">{sidebar}
-<main class="flex-1 p-6">
+<body class="min-h-screen bg-base-200">
+<div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a></div>
+<div id="sidebar-overlay" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
+<div class="flex">{sidebar}
+<main class="flex-1 p-4 lg:p-6 min-w-0">
 <div class="mb-6"><div class="breadcrumbs text-sm"><ul><li><a href="/eam">Asset Management</a></li><li>Configuration</li></ul></div>
 <h1 class="text-2xl font-bold">EAM Configuration</h1><p class="text-base-content/60">Manage voltage levels, unit types, categories, and statuses</p></div>
 <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
@@ -7420,13 +7708,17 @@ async fn eam_work_orders(
     let installed = db_ctx.installed_modules.clone();
     let sidebar = build_sidebar("eam_work_orders", display_name, &initials, &installed, user.is_admin());
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><title>Work Orders - Asset Management</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/><script src="https://cdn.tailwindcss.com"></script></head>
-<body class="min-h-screen bg-base-200"><div class="flex">{sidebar}
-<main class="flex-1 p-6">
+<body class="min-h-screen bg-base-200">
+<div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a></div>
+<div id="sidebar-overlay" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
+<div class="flex">{sidebar}
+<main class="flex-1 p-4 lg:p-6 min-w-0">
 <div class="flex justify-between items-center mb-6"><div><div class="breadcrumbs text-sm"><ul><li><a href="/eam">Asset Management</a></li><li>Work Orders</li></ul></div>
 <h1 class="text-2xl font-bold">Work Orders</h1><p class="text-base-content/60">Maintenance work order management</p></div>
 <a href="/eam/work-orders/new" class="btn btn-primary"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/></svg>New Work Order</a></div>
-<div class="grid grid-cols-6 gap-4 mb-6">
+<div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-4 mb-6">
 <div class="stat bg-base-100 rounded-lg shadow p-4"><div class="stat-title text-xs">Total</div><div class="stat-value text-2xl">{total}</div></div>
 <div class="stat bg-base-100 rounded-lg shadow p-4"><div class="stat-title text-xs">Draft</div><div class="stat-value text-2xl text-gray-500">{draft}</div></div>
 <div class="stat bg-base-100 rounded-lg shadow p-4"><div class="stat-title text-xs">Scheduled</div><div class="stat-value text-2xl text-blue-500">{scheduled}</div></div>
@@ -7496,7 +7788,7 @@ async fn eam_work_order_new(
 <input type="text" name="title" class="input input-bordered" placeholder="Enter work order title" required/></div>
 <div class="form-control mb-3"><label class="label"><span class="label-text">Description</span></label>
 <textarea name="description" class="textarea textarea-bordered h-24" placeholder="Describe the work to be done"></textarea></div>
-<div class="grid grid-cols-2 gap-4">
+<div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
 <div class="form-control"><label class="label"><span class="label-text">Maintenance Type</span></label>
 <select name="maintenance_type" class="select select-bordered">{mtype_html}</select></div>
 <div class="form-control"><label class="label"><span class="label-text">Priority</span></label>
@@ -7533,9 +7825,13 @@ async fn eam_work_order_new(
     let installed = db_ctx.installed_modules.clone();
     let sidebar = build_sidebar("eam_work_orders", display_name, &initials, &installed, user.is_admin());
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><title>New Work Order - Asset Management</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/><script src="https://cdn.tailwindcss.com"></script></head>
-<body class="min-h-screen bg-base-200"><div class="flex">{sidebar}
-<main class="flex-1 p-6">
+<body class="min-h-screen bg-base-200">
+<div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a></div>
+<div id="sidebar-overlay" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
+<div class="flex">{sidebar}
+<main class="flex-1 p-4 lg:p-6 min-w-0">
 <div class="flex justify-between items-center mb-6"><div><div class="breadcrumbs text-sm"><ul><li><a href="/eam">Asset Management</a></li><li><a href="/eam/work-orders">Work Orders</a></li><li>New</li></ul></div>
 <h1 class="text-2xl font-bold">New Work Order</h1></div>
 <a href="/eam/work-orders" class="btn btn-ghost"><svg class="w-5 h-5 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 19l-7-7m0 0l7-7m-7 7h18"/></svg>Back</a></div>
@@ -7851,9 +8147,13 @@ async fn eam_work_order_detail(
     let installed = db_ctx.installed_modules.clone();
     let sidebar = build_sidebar("eam_work_orders", display_name, &initials, &installed, user.is_admin());
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><title>Work Order Detail - Asset Management</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/><script src="https://cdn.tailwindcss.com"></script></head>
-<body class="min-h-screen bg-base-200"><div class="flex">{sidebar}
-<main class="flex-1 p-6">
+<body class="min-h-screen bg-base-200">
+<div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a></div>
+<div id="sidebar-overlay" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
+<div class="flex">{sidebar}
+<main class="flex-1 p-4 lg:p-6 min-w-0">
 <div class="flex justify-between items-center mb-6"><div><div class="breadcrumbs text-sm"><ul><li><a href="/eam">Asset Management</a></li><li><a href="/eam/work-orders">Work Orders</a></li><li>Detail</li></ul></div>
 <h1 class="text-2xl font-bold">Work Order Detail</h1></div>
 <a href="/eam/work-orders" class="btn btn-ghost"><svg class="w-5 h-5 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 19l-7-7m0 0l7-7m-7 7h18"/></svg>Back</a></div>
@@ -7959,7 +8259,7 @@ async fn eam_work_order_edit(
 <input type="text" name="title" class="input input-bordered" value="{title}" required/></div>
 <div class="form-control mb-3"><label class="label"><span class="label-text">Description</span></label>
 <textarea name="description" class="textarea textarea-bordered h-24">{description}</textarea></div>
-<div class="grid grid-cols-2 gap-4">
+<div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
 <div class="form-control"><label class="label"><span class="label-text">Maintenance Type</span></label>
 <select name="maintenance_type" class="select select-bordered">{mtype_html}</select></div>
 <div class="form-control"><label class="label"><span class="label-text">Priority</span></label>
@@ -8010,9 +8310,13 @@ async fn eam_work_order_edit(
     let installed = db_ctx.installed_modules.clone();
     let sidebar = build_sidebar("eam_work_orders", display_name, &initials, &installed, user.is_admin());
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><title>Edit Work Order - Asset Management</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/><script src="https://cdn.tailwindcss.com"></script></head>
-<body class="min-h-screen bg-base-200"><div class="flex">{sidebar}
-<main class="flex-1 p-6">
+<body class="min-h-screen bg-base-200">
+<div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a></div>
+<div id="sidebar-overlay" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
+<div class="flex">{sidebar}
+<main class="flex-1 p-4 lg:p-6 min-w-0">
 <div class="flex justify-between items-center mb-6"><div><div class="breadcrumbs text-sm"><ul><li><a href="/eam">Asset Management</a></li><li><a href="/eam/work-orders">Work Orders</a></li><li>Edit</li></ul></div>
 <h1 class="text-2xl font-bold">Edit Work Order</h1></div>
 <a href="/eam/work-orders/{id}" class="btn btn-ghost"><svg class="w-5 h-5 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 19l-7-7m0 0l7-7m-7 7h18"/></svg>Back</a></div>
@@ -8216,9 +8520,13 @@ async fn eam_equipment(
     let installed = db_ctx.installed_modules.clone();
     let sidebar = build_sidebar("eam_equipment", display_name, &initials, &installed, user.is_admin());
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><title>Equipment - Asset Management</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/><script src="https://cdn.tailwindcss.com"></script></head>
-<body class="min-h-screen bg-base-200"><div class="flex">{sidebar}
-<main class="flex-1 p-6">
+<body class="min-h-screen bg-base-200">
+<div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a></div>
+<div id="sidebar-overlay" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
+<div class="flex">{sidebar}
+<main class="flex-1 p-4 lg:p-6 min-w-0">
 <div class="flex justify-between items-center mb-6"><div><div class="breadcrumbs text-sm"><ul><li><a href="/eam">Asset Management</a></li><li>Equipment</li></ul></div>
 <h1 class="text-2xl font-bold">Equipment</h1><p class="text-base-content/60">All equipment types across the system</p></div>
 <a href="/eam/equipment/new" class="btn btn-primary"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/></svg>New Equipment</a></div>
@@ -8286,9 +8594,13 @@ async fn eam_inspections(
     let installed = db_ctx.installed_modules.clone();
     let sidebar = build_sidebar("eam_inspections", display_name, &initials, &installed, user.is_admin());
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><title>Inspections - Asset Management</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/><script src="https://cdn.tailwindcss.com"></script></head>
-<body class="min-h-screen bg-base-200"><div class="flex">{sidebar}
-<main class="flex-1 p-6">
+<body class="min-h-screen bg-base-200">
+<div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a></div>
+<div id="sidebar-overlay" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
+<div class="flex">{sidebar}
+<main class="flex-1 p-4 lg:p-6 min-w-0">
 <div class="flex justify-between items-center mb-6"><div><div class="breadcrumbs text-sm"><ul><li><a href="/eam">Asset Management</a></li><li>Inspections</li></ul></div>
 <h1 class="text-2xl font-bold">Inspections</h1><p class="text-base-content/60">Asset inspection results and approval workflow</p></div>
 <a href="/eam/inspections/new" class="btn btn-primary"><svg class="w-5 h-5 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/></svg>New Inspection</a></div>
@@ -8349,9 +8661,13 @@ async fn eam_checklists(
     let installed = db_ctx.installed_modules.clone();
     let sidebar = build_sidebar("eam_checklists", display_name, &initials, &installed, user.is_admin());
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><title>Checklist Templates - Asset Management</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/><script src="https://cdn.tailwindcss.com"></script></head>
-<body class="min-h-screen bg-base-200"><div class="flex">{sidebar}
-<main class="flex-1 p-6">
+<body class="min-h-screen bg-base-200">
+<div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a></div>
+<div id="sidebar-overlay" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
+<div class="flex">{sidebar}
+<main class="flex-1 p-4 lg:p-6 min-w-0">
 <div class="flex justify-between items-center mb-6"><div><div class="breadcrumbs text-sm"><ul><li><a href="/eam">Asset Management</a></li><li>Checklist Templates</li></ul></div>
 <h1 class="text-2xl font-bold">Checklist Templates</h1><p class="text-base-content/60">Reusable checklists for equipment maintenance and inspection</p></div>
 <a href="/eam/checklists/new" class="btn btn-primary"><svg class="w-5 h-5 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/></svg>New Checklist</a></div>
@@ -8418,9 +8734,13 @@ async fn eam_plans(
     let installed = db_ctx.installed_modules.clone();
     let sidebar = build_sidebar("eam_plans", display_name, &initials, &installed, user.is_admin());
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><title>Maintenance Plans - Asset Management</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/><script src="https://cdn.tailwindcss.com"></script></head>
-<body class="min-h-screen bg-base-200"><div class="flex">{sidebar}
-<main class="flex-1 p-6">
+<body class="min-h-screen bg-base-200">
+<div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a></div>
+<div id="sidebar-overlay" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
+<div class="flex">{sidebar}
+<main class="flex-1 p-4 lg:p-6 min-w-0">
 <div class="flex justify-between items-center mb-6"><div><div class="breadcrumbs text-sm"><ul><li><a href="/eam">Asset Management</a></li><li>Maintenance Plans</li></ul></div>
 <h1 class="text-2xl font-bold">Maintenance Plans</h1><p class="text-base-content/60">Recurring maintenance schedules with automatic work order generation</p></div>
 <a href="/eam/plans/new" class="btn btn-primary"><svg class="w-5 h-5 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/></svg>New Plan</a></div>
@@ -8520,9 +8840,13 @@ async fn eam_inspection_new(
     let installed = db_ctx.installed_modules.clone();
     let sidebar = build_sidebar("eam_inspections", display_name, &initials, &installed, user.is_admin());
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><title>New Inspection - Asset Management</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/><script src="https://cdn.tailwindcss.com"></script></head>
-<body class="min-h-screen bg-base-200"><div class="flex">{sidebar}
-<main class="flex-1 p-6">
+<body class="min-h-screen bg-base-200">
+<div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a></div>
+<div id="sidebar-overlay" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
+<div class="flex">{sidebar}
+<main class="flex-1 p-4 lg:p-6 min-w-0">
 <div class="flex justify-between items-center mb-6"><div><div class="breadcrumbs text-sm"><ul><li><a href="/eam">Asset Management</a></li><li><a href="/eam/inspections">Inspections</a></li><li>New</li></ul></div>
 <h1 class="text-2xl font-bold">New Inspection</h1></div>
 <a href="/eam/inspections" class="btn btn-ghost"><svg class="w-5 h-5 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 19l-7-7m0 0l7-7m-7 7h18"/></svg>Back</a></div>
@@ -8640,9 +8964,13 @@ async fn eam_checklist_new(
     let installed = db_ctx.installed_modules.clone();
     let sidebar = build_sidebar("eam_checklists", display_name, &initials, &installed, user.is_admin());
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><title>New Checklist Template - Asset Management</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/><script src="https://cdn.tailwindcss.com"></script></head>
-<body class="min-h-screen bg-base-200"><div class="flex">{sidebar}
-<main class="flex-1 p-6">
+<body class="min-h-screen bg-base-200">
+<div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a></div>
+<div id="sidebar-overlay" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
+<div class="flex">{sidebar}
+<main class="flex-1 p-4 lg:p-6 min-w-0">
 <div class="flex justify-between items-center mb-6"><div><div class="breadcrumbs text-sm"><ul><li><a href="/eam">Asset Management</a></li><li><a href="/eam/checklists">Checklist Templates</a></li><li>New</li></ul></div>
 <h1 class="text-2xl font-bold">New Checklist Template</h1></div>
 <a href="/eam/checklists" class="btn btn-ghost"><svg class="w-5 h-5 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 19l-7-7m0 0l7-7m-7 7h18"/></svg>Back</a></div>
@@ -8738,7 +9066,7 @@ async fn eam_plan_new(
 <select name="asset_id" class="select select-bordered" required>{asset_options}</select></div>
 <div class="form-control mb-3"><label class="label"><span class="label-text">Description</span></label>
 <textarea name="description" class="textarea textarea-bordered h-24" placeholder="Describe the maintenance plan"></textarea></div>
-<div class="grid grid-cols-2 gap-4">
+<div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
 <div class="form-control"><label class="label"><span class="label-text">Maintenance Type *</span></label>
 <select name="maintenance_type" class="select select-bordered" required>
 <option value="">-- Select Type --</option>
@@ -8768,7 +9096,7 @@ async fn eam_plan_new(
 <h3 class="font-semibold text-lg mb-4">Schedule</h3>
 <div class="form-control mb-3"><label class="label"><span class="label-text">Start Date</span></label>
 <input type="date" name="start_date" class="input input-bordered"/></div>
-<div class="grid grid-cols-2 gap-4 mb-3">
+<div class="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-3">
 <div class="form-control"><label class="label"><span class="label-text">Frequency Interval</span></label>
 <input type="number" name="frequency_interval" class="input input-bordered" min="1" placeholder="e.g. 3"/></div>
 <div class="form-control"><label class="label"><span class="label-text">Frequency Unit</span></label>
@@ -8778,7 +9106,7 @@ async fn eam_plan_new(
 <option value="month" selected>Month</option><option value="year">Year</option>
 </select></div>
 </div>
-<div class="grid grid-cols-2 gap-4">
+<div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
 <div class="form-control"><label class="label"><span class="label-text">Planning Horizon Interval</span></label>
 <input type="number" name="planning_horizon_interval" class="input input-bordered" min="1" placeholder="e.g. 12"/></div>
 <div class="form-control"><label class="label"><span class="label-text">Horizon Unit</span></label>
@@ -8804,9 +9132,13 @@ async fn eam_plan_new(
     let installed = db_ctx.installed_modules.clone();
     let sidebar = build_sidebar("eam_plans", display_name, &initials, &installed, user.is_admin());
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><title>New Maintenance Plan - Asset Management</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/><script src="https://cdn.tailwindcss.com"></script></head>
-<body class="min-h-screen bg-base-200"><div class="flex">{sidebar}
-<main class="flex-1 p-6">
+<body class="min-h-screen bg-base-200">
+<div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a></div>
+<div id="sidebar-overlay" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
+<div class="flex">{sidebar}
+<main class="flex-1 p-4 lg:p-6 min-w-0">
 <div class="flex justify-between items-center mb-6"><div><div class="breadcrumbs text-sm"><ul><li><a href="/eam">Asset Management</a></li><li><a href="/eam/plans">Maintenance Plans</a></li><li>New</li></ul></div>
 <h1 class="text-2xl font-bold">New Maintenance Plan</h1></div>
 <a href="/eam/plans" class="btn btn-ghost"><svg class="w-5 h-5 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 19l-7-7m0 0l7-7m-7 7h18"/></svg>Back</a></div>
@@ -8933,9 +9265,13 @@ async fn eam_functional_locations(
     let installed = db_ctx.installed_modules.clone();
     let sidebar = build_sidebar("eam_functional_locations", display_name, &initials, &installed, user.is_admin());
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><title>Functional Locations - Asset Management</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/><script src="https://cdn.tailwindcss.com"></script></head>
-<body class="min-h-screen bg-base-200"><div class="flex">{sidebar}
-<main class="flex-1 p-6">
+<body class="min-h-screen bg-base-200">
+<div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a></div>
+<div id="sidebar-overlay" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
+<div class="flex">{sidebar}
+<main class="flex-1 p-4 lg:p-6 min-w-0">
 <div class="flex justify-between items-center mb-6"><div><div class="breadcrumbs text-sm"><ul><li><a href="/eam">Asset Management</a></li><li>Functional Locations</li></ul></div>
 <h1 class="text-2xl font-bold">Functional Locations</h1><p class="text-base-content/60">Hierarchical organization of plant units (PPU, SSU, PP, PE)</p></div>
 <a href="/eam/functional-locations/new" class="btn btn-primary"><svg class="w-5 h-5 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/></svg>New Location</a></div>
@@ -9053,9 +9389,13 @@ async fn eam_functional_location_new(
     let installed = db_ctx.installed_modules.clone();
     let sidebar = build_sidebar("eam_functional_locations", display_name, &initials, &installed, user.is_admin());
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><title>New Functional Location - Asset Management</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/><script src="https://cdn.tailwindcss.com"></script></head>
-<body class="min-h-screen bg-base-200"><div class="flex">{sidebar}
-<main class="flex-1 p-6">
+<body class="min-h-screen bg-base-200">
+<div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a></div>
+<div id="sidebar-overlay" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
+<div class="flex">{sidebar}
+<main class="flex-1 p-4 lg:p-6 min-w-0">
 <div class="flex justify-between items-center mb-6"><div><div class="breadcrumbs text-sm"><ul><li><a href="/eam">Asset Management</a></li><li><a href="/eam/functional-locations">Functional Locations</a></li><li>New</li></ul></div>
 <h1 class="text-2xl font-bold">New Functional Location</h1></div>
 <a href="/eam/functional-locations" class="btn btn-ghost"><svg class="w-5 h-5 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 19l-7-7m0 0l7-7m-7 7h18"/></svg>Back</a></div>
@@ -9224,9 +9564,13 @@ async fn eam_functional_location_detail(
     let installed = db_ctx.installed_modules.clone();
     let sidebar = build_sidebar("eam_functional_locations", display_name, &initials, &installed, user.is_admin());
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><title>{code} - Functional Location</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/><script src="https://cdn.tailwindcss.com"></script></head>
-<body class="min-h-screen bg-base-200"><div class="flex">{sidebar}
-<main class="flex-1 p-6">
+<body class="min-h-screen bg-base-200">
+<div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a></div>
+<div id="sidebar-overlay" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
+<div class="flex">{sidebar}
+<main class="flex-1 p-4 lg:p-6 min-w-0">
 <div class="flex justify-between items-center mb-6"><div><div class="breadcrumbs text-sm"><ul><li><a href="/eam">Asset Management</a></li><li><a href="/eam/functional-locations">Functional Locations</a></li><li>{code}</li></ul></div>
 <h1 class="text-2xl font-bold">{name}</h1>
 <p class="text-base-content/60 font-mono">{code}</p></div>
@@ -9238,7 +9582,7 @@ async fn eam_functional_location_detail(
 <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
 <div class="card bg-base-100 shadow"><div class="card-body">
 <h3 class="font-semibold text-lg mb-4">Details</h3>
-<div class="grid grid-cols-2 gap-y-3">
+<div class="grid grid-cols-1 sm:grid-cols-2 gap-y-3">
 <div><span class="text-base-content/50 text-sm">Status</span><div class="mt-1">{status_badge}</div></div>
 <div><span class="text-base-content/50 text-sm">Unit Type</span><div class="mt-1"><span class="badge badge-outline">{unit_code}</span> {unit_type}</div></div>
 <div><span class="text-base-content/50 text-sm">Site</span><div class="mt-1 font-medium">{site_name}</div></div>
@@ -9251,7 +9595,7 @@ async fn eam_functional_location_detail(
 
 <div class="card bg-base-100 shadow"><div class="card-body">
 <h3 class="font-semibold text-lg mb-4">References</h3>
-<div class="grid grid-cols-2 gap-y-3">
+<div class="grid grid-cols-1 sm:grid-cols-2 gap-y-3">
 <div><span class="text-base-content/50 text-sm">SLD Reference</span><div class="mt-1 font-mono">{sld_ref}</div></div>
 <div><span class="text-base-content/50 text-sm">SCADA Point Group</span><div class="mt-1 font-mono">{scada}</div></div>
 <div><span class="text-base-content/50 text-sm">Created</span><div class="mt-1">{}</div></div>
@@ -9408,9 +9752,13 @@ async fn eam_functional_location_edit(
     let installed = db_ctx.installed_modules.clone();
     let sidebar = build_sidebar("eam_functional_locations", display_name, &initials, &installed, user.is_admin());
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><title>Edit {cur_code} - Functional Location</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/><script src="https://cdn.tailwindcss.com"></script></head>
-<body class="min-h-screen bg-base-200"><div class="flex">{sidebar}
-<main class="flex-1 p-6">
+<body class="min-h-screen bg-base-200">
+<div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a></div>
+<div id="sidebar-overlay" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
+<div class="flex">{sidebar}
+<main class="flex-1 p-4 lg:p-6 min-w-0">
 <div class="flex justify-between items-center mb-6"><div><div class="breadcrumbs text-sm"><ul><li><a href="/eam">Asset Management</a></li><li><a href="/eam/functional-locations">Functional Locations</a></li><li><a href="/eam/functional-locations/{id}">{cur_code}</a></li><li>Edit</li></ul></div>
 <h1 class="text-2xl font-bold">Edit Functional Location</h1></div>
 <a href="/eam/functional-locations/{id}" class="btn btn-ghost"><svg class="w-5 h-5 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 19l-7-7m0 0l7-7m-7 7h18"/></svg>Back</a></div>
@@ -9480,9 +9828,13 @@ async fn eam_sld(
     let sidebar = build_sidebar("eam_sld", display_name, &initials, &installed, user.is_admin());
 
     let header = format!(r#"<!DOCTYPE html><html data-theme="dark"><head><title>Single Line Diagram - Asset Management</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/><script src="https://cdn.tailwindcss.com"></script></head>
-<body class="min-h-screen bg-base-200"><div class="flex h-screen">{sidebar}
-<main class="flex-1 flex flex-col overflow-hidden">
+<body class="min-h-screen bg-base-200">
+<div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a></div>
+<div id="sidebar-overlay" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
+<div class="flex h-screen">{sidebar}
+<main class="flex-1 flex flex-col overflow-hidden min-w-0">
 <div class="p-4 pb-0"><div class="breadcrumbs text-sm"><ul><li><a href="/eam">Asset Management</a></li><li>Single Line Diagram</li></ul></div></div>
 <div id="sld-root" class="flex-1 m-4 mt-2 card bg-base-100 shadow overflow-hidden"></div>
 </main></div>"#);
@@ -10058,9 +10410,13 @@ async fn eam_condition_monitoring(
     let installed = db_ctx.installed_modules.clone();
     let sidebar = build_sidebar("eam_condition", display_name, &initials, &installed, user.is_admin());
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><title>Condition Monitoring - Asset Management</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/><script src="https://cdn.tailwindcss.com"></script></head>
-<body class="min-h-screen bg-base-200"><div class="flex">{sidebar}
-<main class="flex-1 p-6">
+<body class="min-h-screen bg-base-200">
+<div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a></div>
+<div id="sidebar-overlay" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
+<div class="flex">{sidebar}
+<main class="flex-1 p-4 lg:p-6 min-w-0">
 <div class="flex justify-between items-center mb-6"><div><div class="breadcrumbs text-sm"><ul><li><a href="/eam">Asset Management</a></li><li>Condition Monitoring</li></ul></div>
 <h1 class="text-2xl font-bold">Condition Monitoring</h1><p class="text-base-content/60">Equipment health and diagnostic tests</p></div>
 <div class="dropdown dropdown-end"><label tabindex="0" class="btn btn-primary"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/></svg>New Test</label>
@@ -10071,7 +10427,7 @@ async fn eam_condition_monitoring(
 <li><a href="/eam/condition/pd/new">Partial Discharge</a></li>
 <li><a href="/eam/condition/ir/new">Insulation Resistance</a></li>
 </ul></div></div>
-<div class="grid grid-cols-6 gap-4 mb-6">
+<div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-4 mb-6">
 <div class="stat bg-base-100 rounded-lg shadow p-4"><div class="stat-title text-xs">DGA Tests</div><div class="stat-value text-2xl">{dga_tests}</div></div>
 <div class="stat bg-base-100 rounded-lg shadow p-4"><div class="stat-title text-xs">Oil Quality</div><div class="stat-value text-2xl">{oil_tests}</div></div>
 <div class="stat bg-base-100 rounded-lg shadow p-4"><div class="stat-title text-xs">Thermal Scans</div><div class="stat-value text-2xl">{thermal}</div></div>
@@ -10139,9 +10495,13 @@ async fn eam_manufacturers(
     let installed = db_ctx.installed_modules.clone();
     let sidebar = build_sidebar("eam_manufacturers", display_name, &initials, &installed, user.is_admin());
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><title>Manufacturers - Asset Management</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/><script src="https://cdn.tailwindcss.com"></script></head>
-<body class="min-h-screen bg-base-200"><div class="flex">{sidebar}
-<main class="flex-1 p-6">
+<body class="min-h-screen bg-base-200">
+<div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a></div>
+<div id="sidebar-overlay" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
+<div class="flex">{sidebar}
+<main class="flex-1 p-4 lg:p-6 min-w-0">
 <div class="flex justify-between items-center mb-6"><div><div class="breadcrumbs text-sm"><ul><li><a href="/eam">Asset Management</a></li><li>Manufacturers</li></ul></div>
 <h1 class="text-2xl font-bold">Manufacturers</h1><p class="text-base-content/60">Equipment manufacturers and suppliers</p></div>
 <a href="/eam/manufacturers/new" class="btn btn-primary"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/></svg>New Manufacturer</a></div>
@@ -10258,10 +10618,14 @@ async fn eam_site_detail(
     } else { "-".to_string() };
 
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><title>{name} - Site Details</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/>
 <script src="https://cdn.tailwindcss.com"></script></head>
-<body class="min-h-screen bg-base-200"><div class="flex">{sidebar}
-<main class="flex-1 p-6">
+<body class="min-h-screen bg-base-200">
+<div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a></div>
+<div id="sidebar-overlay" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
+<div class="flex">{sidebar}
+<main class="flex-1 p-4 lg:p-6 min-w-0">
 <div class="mb-6"><div class="breadcrumbs text-sm"><ul><li><a href="/eam">Asset Management</a></li><li><a href="/eam/sites">Sites</a></li><li>{code}</li></ul></div>
 <div class="flex justify-between items-start">
 <div><h1 class="text-2xl font-bold">{name}</h1><p class="text-base-content/60">{}</p></div>
@@ -10273,7 +10637,7 @@ async fn eam_site_detail(
 <div class="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-6">
 <div class="card bg-base-100 shadow lg:col-span-2"><div class="card-body">
 <h2 class="card-title">Site Information</h2>
-<div class="grid grid-cols-2 gap-4 mt-4">
+<div class="grid grid-cols-1 sm:grid-cols-2 gap-4 mt-4">
 <div><span class="text-base-content/60 text-sm">Code</span><p class="font-mono font-semibold">{code}</p></div>
 <div><span class="text-base-content/60 text-sm">Type</span><p>{}</p></div>
 <div><span class="text-base-content/60 text-sm">Location</span><p>{location}</p></div>
@@ -10415,11 +10779,15 @@ async fn eam_asset_detail(
     };
 
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><title>{name} - Asset Details</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/>
 <script src="https://cdn.tailwindcss.com"></script>
 <script src="https://unpkg.com/htmx.org@1.9.10"></script></head>
-<body class="min-h-screen bg-base-200"><div class="flex">{sidebar}
-<main class="flex-1 p-6">
+<body class="min-h-screen bg-base-200">
+<div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a></div>
+<div id="sidebar-overlay" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
+<div class="flex">{sidebar}
+<main class="flex-1 p-4 lg:p-6 min-w-0">
 <div class="mb-6"><div class="breadcrumbs text-sm"><ul><li><a href="/eam">Asset Management</a></li><li><a href="/eam/assets">Assets</a></li><li>{asset_code}</li></ul></div>
 <div class="flex justify-between items-start">
 <div><h1 class="text-2xl font-bold">{name}</h1><p class="text-base-content/60">{} - {}</p></div>
@@ -10431,7 +10799,7 @@ async fn eam_asset_detail(
 <div class="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-6">
 <div class="card bg-base-100 shadow lg:col-span-2"><div class="card-body">
 <h2 class="card-title">Asset Information</h2>
-<div class="grid grid-cols-2 gap-4 mt-4">
+<div class="grid grid-cols-1 sm:grid-cols-2 gap-4 mt-4">
 <div><span class="text-base-content/60 text-sm">Asset Code</span><p class="font-mono font-semibold">{asset_code}</p></div>
 <div><span class="text-base-content/60 text-sm">Tag Number</span><p class="font-mono">{}</p></div>
 <div><span class="text-base-content/60 text-sm">Category</span><p>{}</p></div>
@@ -10450,7 +10818,7 @@ async fn eam_asset_detail(
 
 <div class="card bg-base-100 shadow mb-6"><div class="card-body">
 <h2 class="card-title">Manufacturer Details</h2>
-<div class="grid grid-cols-3 gap-4 mt-4">
+<div class="grid grid-cols-1 sm:grid-cols-3 gap-4 mt-4">
 <div><span class="text-base-content/60 text-sm">Manufacturer</span><p class="font-semibold">{}</p></div>
 <div><span class="text-base-content/60 text-sm">Model</span><p>{}</p></div>
 <div><span class="text-base-content/60 text-sm">Serial Number</span><p class="font-mono">{}</p></div>
@@ -10503,10 +10871,14 @@ async fn eam_site_form(
     let sidebar = build_sidebar("eam_sites", display_name, &initials, &installed, user.is_admin());
 
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><title>New Site - Asset Management</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/>
 <script src="https://cdn.tailwindcss.com"></script></head>
-<body class="min-h-screen bg-base-200"><div class="flex">{sidebar}
-<main class="flex-1 p-6">
+<body class="min-h-screen bg-base-200">
+<div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a></div>
+<div id="sidebar-overlay" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
+<div class="flex">{sidebar}
+<main class="flex-1 p-4 lg:p-6 min-w-0">
 <div class="mb-6"><div class="breadcrumbs text-sm"><ul><li><a href="/eam">Asset Management</a></li><li><a href="/eam/sites">Sites</a></li><li>New</li></ul></div>
 <h1 class="text-2xl font-bold">Create New Site</h1></div>
 <form method="POST" action="/eam/sites" class="card bg-base-100 shadow"><div class="card-body">
@@ -10613,10 +10985,14 @@ async fn eam_site_edit(
     let sidebar = build_sidebar("eam_sites", display_name, &initials, &installed, user.is_admin());
 
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><title>Edit {name} - Asset Management</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/>
 <script src="https://cdn.tailwindcss.com"></script></head>
-<body class="min-h-screen bg-base-200"><div class="flex">{sidebar}
-<main class="flex-1 p-6">
+<body class="min-h-screen bg-base-200">
+<div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a></div>
+<div id="sidebar-overlay" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
+<div class="flex">{sidebar}
+<main class="flex-1 p-4 lg:p-6 min-w-0">
 <div class="mb-6"><div class="breadcrumbs text-sm"><ul><li><a href="/eam">Asset Management</a></li><li><a href="/eam/sites">Sites</a></li><li><a href="/eam/sites/{id}">{code}</a></li><li>Edit</li></ul></div>
 <h1 class="text-2xl font-bold">Edit Site</h1></div>
 <form method="POST" action="/eam/sites/{id}" class="card bg-base-100 shadow"><div class="card-body">
@@ -10740,10 +11116,14 @@ async fn eam_asset_form(
     let sidebar = build_sidebar("eam_assets", display_name, &initials, &installed, user.is_admin());
 
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><title>New Asset - Asset Management</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/>
 <script src="https://cdn.tailwindcss.com"></script></head>
-<body class="min-h-screen bg-base-200"><div class="flex">{sidebar}
-<main class="flex-1 p-6">
+<body class="min-h-screen bg-base-200">
+<div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a></div>
+<div id="sidebar-overlay" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
+<div class="flex">{sidebar}
+<main class="flex-1 p-4 lg:p-6 min-w-0">
 <div class="mb-6"><div class="breadcrumbs text-sm"><ul><li><a href="/eam">Asset Management</a></li><li><a href="/eam/assets">Assets</a></li><li>New</li></ul></div>
 <h1 class="text-2xl font-bold">Create New Asset</h1></div>
 <form method="POST" action="/eam/assets" class="card bg-base-100 shadow"><div class="card-body">
@@ -10879,10 +11259,14 @@ async fn eam_asset_edit(
     let sidebar = build_sidebar("eam_assets", display_name, &initials, &installed, user.is_admin());
 
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><title>Edit {name} - Asset Management</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/>
 <script src="https://cdn.tailwindcss.com"></script></head>
-<body class="min-h-screen bg-base-200"><div class="flex">{sidebar}
-<main class="flex-1 p-6">
+<body class="min-h-screen bg-base-200">
+<div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a></div>
+<div id="sidebar-overlay" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
+<div class="flex">{sidebar}
+<main class="flex-1 p-4 lg:p-6 min-w-0">
 <div class="mb-6"><div class="breadcrumbs text-sm"><ul><li><a href="/eam">Asset Management</a></li><li><a href="/eam/assets">Assets</a></li><li><a href="/eam/assets/{id}">{asset_code}</a></li><li>Edit</li></ul></div>
 <h1 class="text-2xl font-bold">Edit Asset</h1></div>
 <form method="POST" action="/eam/assets/{id}" class="card bg-base-100 shadow"><div class="card-body">
@@ -12171,7 +12555,7 @@ async fn activity_types_list(
                     <label class="label"><span class="label-text">Name</span></label>
                     <input type="text" name="name" class="input input-bordered" placeholder="e.g., Follow Up" required/>
                 </div>
-                <div class="grid grid-cols-2 gap-4">
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
                     <div class="form-control mb-3">
                         <label class="label"><span class="label-text">Icon</span></label>
                         <input type="text" name="icon" class="input input-bordered" value="clock" placeholder="clock"/>
@@ -12189,7 +12573,7 @@ async fn activity_types_list(
                         </select>
                     </div>
                 </div>
-                <div class="grid grid-cols-2 gap-4">
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
                     <div class="form-control mb-3">
                         <label class="label"><span class="label-text">Default Days</span></label>
                         <input type="number" name="default_days" class="input input-bordered" value="1" min="1"/>
@@ -12307,7 +12691,7 @@ async fn activity_type_edit(
                         <label class="label"><span class="label-text">Name</span></label>
                         <input type="text" name="name" class="input input-bordered" value="{}" required/>
                     </div>
-                    <div class="grid grid-cols-2 gap-4">
+                    <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
                         <div class="form-control mb-3">
                             <label class="label"><span class="label-text">Icon</span></label>
                             <input type="text" name="icon" class="input input-bordered" value="{}"/>
@@ -12317,7 +12701,7 @@ async fn activity_type_edit(
                             <select name="color" class="select select-bordered">{}</select>
                         </div>
                     </div>
-                    <div class="grid grid-cols-2 gap-4">
+                    <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
                         <div class="form-control mb-3">
                             <label class="label"><span class="label-text">Default Days</span></label>
                             <input type="number" name="default_days" class="input input-bordered" value="{}" min="1"/>
@@ -12496,7 +12880,7 @@ async fn sequences_list(
                     <input type="text" name="code" class="input input-bordered" placeholder="e.g., work.order" required/>
                     <label class="label"><span class="label-text-alt">Unique identifier used in API</span></label>
                 </div>
-                <div class="grid grid-cols-2 gap-4">
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
                     <div class="form-control mb-3">
                         <label class="label"><span class="label-text">Prefix</span></label>
                         <input type="text" name="prefix" class="input input-bordered" placeholder="e.g., WO-"/>
@@ -12506,7 +12890,7 @@ async fn sequences_list(
                         <input type="text" name="suffix" class="input input-bordered" placeholder="e.g., -A"/>
                     </div>
                 </div>
-                <div class="grid grid-cols-2 gap-4">
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
                     <div class="form-control mb-3">
                         <label class="label"><span class="label-text">Padding</span></label>
                         <input type="number" name="padding" class="input input-bordered" value="5" min="1" max="10"/>
@@ -12667,7 +13051,7 @@ async fn sequence_edit(
                         <label class="label"><span class="label-text">Name</span></label>
                         <input type="text" name="name" class="input input-bordered" value="{}" required/>
                     </div>
-                    <div class="grid grid-cols-2 gap-4">
+                    <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
                         <div class="form-control mb-3">
                             <label class="label"><span class="label-text">Prefix</span></label>
                             <input type="text" name="prefix" class="input input-bordered" value="{}"/>
@@ -12677,7 +13061,7 @@ async fn sequence_edit(
                             <input type="text" name="suffix" class="input input-bordered" value="{}"/>
                         </div>
                     </div>
-                    <div class="grid grid-cols-2 gap-4">
+                    <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
                         <div class="form-control mb-3">
                             <label class="label"><span class="label-text">Padding</span></label>
                             <input type="number" name="padding" class="input input-bordered" value="{}" min="1" max="10"/>
@@ -12888,7 +13272,7 @@ async fn cron_list(
                     <label class="label"><span class="label-text">Function</span></label>
                     <input type="text" name="function_name" class="input input-bordered" placeholder="e.g., send_daily_report" required/>
                 </div>
-                <div class="grid grid-cols-2 gap-4">
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
                     <div class="form-control mb-3">
                         <label class="label"><span class="label-text">Every</span></label>
                         <input type="number" name="interval_number" class="input input-bordered" value="1" min="1"/>
@@ -13081,7 +13465,7 @@ async fn cron_edit(
                             <label class="label"><span class="label-text">Function</span></label>
                             <input type="text" name="function_name" class="input input-bordered" value="{}" required/>
                         </div>
-                        <div class="grid grid-cols-2 gap-4">
+                        <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
                             <div class="form-control mb-3">
                                 <label class="label"><span class="label-text">Every</span></label>
                                 <input type="number" name="interval_number" class="input input-bordered" value="{}" min="1"/>
@@ -13583,7 +13967,7 @@ async fn reports_list(
                     <label class="label"><span class="label-text">Model</span></label>
                     <input type="text" name="model_name" class="input input-bordered" placeholder="e.g., contacts" required/>
                 </div>
-                <div class="grid grid-cols-2 gap-4">
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
                     <div class="form-control mb-3">
                         <label class="label"><span class="label-text">Paper Size</span></label>
                         <select name="paper_size" class="select select-bordered">
@@ -13717,7 +14101,7 @@ async fn report_edit(
                         <label class="label"><span class="label-text">Model</span></label>
                         <input type="text" name="model_name" class="input input-bordered" value="{}" required/>
                     </div>
-                    <div class="grid grid-cols-2 gap-4">
+                    <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
                         <div class="form-control mb-3">
                             <label class="label"><span class="label-text">Paper Size</span></label>
                             <select name="paper_size" class="select select-bordered">{}</select>
@@ -14010,12 +14394,14 @@ async fn render_dynamic_form(
     <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="min-h-screen bg-base-200">
+<div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar-inline').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay-inline').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a></div>
+<div id="sidebar-overlay-inline" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar-inline').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
 <div class="flex">
-    <aside class="w-64 bg-base-100 shadow-lg min-h-screen p-4">
+    <aside id="sidebar-inline" class="w-64 bg-base-100 shadow-lg min-h-screen p-4 fixed lg:static top-0 left-0 z-40 h-full -translate-x-full lg:translate-x-0 transition-transform duration-200">
         <div class="text-xl font-bold mb-6"><span class="text-success">re</span><span class="opacity-60">micle</span></div>
         <ul class="menu">{}</ul>
     </aside>
-    <main class="flex-1 p-6">
+    <main class="flex-1 p-4 lg:p-6 min-w-0">
         <div class="mb-6">
             <a href="/list/{}" class="btn btn-ghost btn-sm">← Back to List</a>
         </div>
