@@ -1,0 +1,5 @@
+[migration]
+module = "base"
+description = "Add announcements and user shortcuts tables for the home screen"
+reversible = true
+dependencies = ["001_initial_schema", "020_chatter_core"]

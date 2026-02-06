@@ -11,8 +11,10 @@ use axum::{
 };
 use sqlx::{postgres::PgPoolOptions, Column, PgPool, Row};
 use chrono::Datelike;
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 use tower_http::services::ServeDir;
 use tracing::{error, info, warn};
 use vortex_orm::ConnectionPool;
@@ -29,6 +31,7 @@ pub struct AppState {
     pub db_filter: Option<String>,
     pub multi_db: bool,
     pub default_db: String,
+    pub installed_modules: Arc<RwLock<HashSet<String>>>,
 }
 
 /// Database context injected by auth middleware for request-scoped DB routing.
@@ -36,6 +39,7 @@ pub struct AppState {
 pub struct DatabaseContext {
     pub db_name: String,
     pub pool: Arc<ConnectionPool>,
+    pub installed_modules: HashSet<String>,
 }
 
 /// Extractor that provides a PgPool from the request-scoped DatabaseContext.
@@ -204,13 +208,24 @@ async fn auth_middleware(
             };
             request.extensions_mut().insert(auth_user);
 
+            // Query installed modules for this specific database
+            let db_installed_modules: HashSet<String> = sqlx::query_scalar(
+                "SELECT technical_name FROM installed_modules WHERE state = 'installed'"
+            )
+            .fetch_all(db)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+
             // Inject Arc<ConnectionPool> for EAM handlers (Extension-based extraction)
             request.extensions_mut().insert(pool.clone());
 
-            // Inject DatabaseContext for downstream extractors (Db extractor)
+            // Inject DatabaseContext for downstream extractors (Db, InstalledModules)
             request.extensions_mut().insert(DatabaseContext {
                 db_name,
                 pool,
+                installed_modules: db_installed_modules,
             });
 
             next.run(request).await
@@ -246,6 +261,76 @@ fn redirect_to_login_with_message(_message: &str) -> Response {
         "session=; Path=/; HttpOnly; Max-Age=0".parse().unwrap(),
     );
     (headers, Redirect::to("/login")).into_response()
+}
+
+/// Module guard middleware for the "contacts" module.
+async fn contacts_module_guard(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    module_guard_check("contacts", &state, request, next).await
+}
+
+/// Module guard middleware for the "asset_management" module.
+async fn asset_management_module_guard(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    module_guard_check("asset_management", &state, request, next).await
+}
+
+async fn module_guard_check(
+    module_name: &str,
+    _state: &AppState,
+    request: Request,
+    next: Next,
+) -> Response {
+    let is_installed = request
+        .extensions()
+        .get::<DatabaseContext>()
+        .map(|ctx| ctx.installed_modules.contains(module_name))
+        .unwrap_or(false);
+    if is_installed {
+        next.run(request).await
+    } else {
+        let path = request.uri().path().to_string();
+        if path.starts_with("/api/") {
+            axum::Json(serde_json::json!({
+                "error": "module_not_installed",
+                "module": module_name,
+                "message": format!("The '{}' module is not installed", module_name)
+            })).into_response()
+        } else {
+            Html(module_not_installed_page(module_name)).into_response()
+        }
+    }
+}
+
+fn module_not_installed_page(module_name: &str) -> String {
+    let display_name = match module_name {
+        "contacts" => "Contacts",
+        "asset_management" => "Asset Management",
+        _ => module_name,
+    };
+    format!(r#"<!DOCTYPE html><html data-theme="dark"><head><title>Module Not Installed</title>
+<link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/>
+<script src="https://cdn.tailwindcss.com"></script></head>
+<body class="min-h-screen bg-base-200 flex items-center justify-center">
+<div class="card bg-base-100 shadow-xl max-w-md w-full">
+<div class="card-body items-center text-center">
+<div class="w-20 h-20 rounded-full bg-warning/10 flex items-center justify-center mb-4">
+<svg class="w-10 h-10 text-warning" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4.5c-.77-.833-2.694-.833-3.464 0L3.34 16.5c-.77.833.192 2.5 1.732 2.5z"/>
+</svg></div>
+<h2 class="card-title text-xl">Module Not Installed</h2>
+<p class="text-base-content/60 mt-2">The <strong>{display_name}</strong> module is not currently installed.</p>
+<p class="text-base-content/60 text-sm mt-1">Please ask your system administrator to install it from the Modules page.</p>
+<div class="card-actions mt-6 gap-3">
+<a href="/modules" class="btn btn-primary">Go to Modules</a>
+<a href="/home" class="btn btn-ghost">Back to Home</a>
+</div></div></div></body></html>"#)
 }
 
 /// Parse the [database_manager] section from vortex.toml (if present).
@@ -418,6 +503,15 @@ pub async fn run(host: String, port: u16, _workers: Option<usize>) -> Result<()>
         None
     };
 
+    // Load installed modules cache
+    let installed: Vec<String> = sqlx::query_scalar(
+        "SELECT technical_name FROM installed_modules WHERE state = 'installed'"
+    )
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default();
+    let installed_modules = Arc::new(RwLock::new(installed.into_iter().collect::<HashSet<String>>()));
+
     // Create app state
     let state = Arc::new(AppState {
         db,
@@ -428,6 +522,7 @@ pub async fn run(host: String, port: u16, _workers: Option<usize>) -> Result<()>
         db_filter: if db_filter.is_empty() { None } else { Some(db_filter) },
         multi_db: multi_db_enabled,
         default_db,
+        installed_modules,
     });
 
     // Start background pool eviction task if multi-db
@@ -473,13 +568,92 @@ pub async fn run(host: String, port: u16, _workers: Option<usize>) -> Result<()>
 
 /// Build the application router
 fn build_router(state: Arc<AppState>) -> Router {
-    // Protected routes - require authentication
+    // --- Contacts routes (gated by "contacts" module) ---
+    let contacts_routes = Router::new()
+        .route("/contacts", get(contacts_list))
+        .route("/contacts/new", get(contacts_new))
+        .route("/contacts", post(contacts_create))
+        .route("/contacts/{id}", get(contacts_edit))
+        .route("/contacts/{id}", post(contacts_update))
+        .route("/contacts/{id}/delete", post(contacts_delete))
+        .route("/contacts/{id}/approve", post(contacts_approve))
+        .route("/contacts/{id}/set-draft", post(contacts_set_draft))
+        .route_layer(middleware::from_fn_with_state(state.clone(), contacts_module_guard));
+
+    // --- EAM HTML routes (gated by "asset_management" module) ---
+    let eam_html_routes = Router::new()
+        .route("/eam", get(eam_dashboard))
+        .route("/eam/sites", get(eam_sites))
+        .route("/eam/sites/new", get(eam_site_form))
+        .route("/eam/sites", post(eam_site_create))
+        .route("/eam/sites/{id}", get(eam_site_detail))
+        .route("/eam/sites/{id}/edit", get(eam_site_edit))
+        .route("/eam/sites/{id}", post(eam_site_update))
+        .route("/eam/assets", get(eam_assets))
+        .route("/eam/assets/new", get(eam_asset_form))
+        .route("/eam/assets", post(eam_asset_create))
+        .route("/eam/assets/{id}", get(eam_asset_detail))
+        .route("/eam/assets/{id}/edit", get(eam_asset_edit))
+        .route("/eam/assets/{id}", post(eam_asset_update))
+        .route("/eam/configuration", get(eam_configuration))
+        .route("/eam/work-orders", get(eam_work_orders))
+        .route("/eam/work-orders/new", get(eam_work_order_new))
+        .route("/eam/work-orders/new", post(eam_work_order_create))
+        .route("/eam/work-orders/{id}", get(eam_work_order_detail))
+        .route("/eam/work-orders/{id}/edit", get(eam_work_order_edit))
+        .route("/eam/work-orders/{id}/edit", post(eam_work_order_save))
+        .route("/api/eam/work-orders/{id}/transition", post(eam_work_order_transition))
+        .route("/eam/functional-locations", get(eam_functional_locations))
+        .route("/eam/functional-locations/new", get(eam_functional_location_new))
+        .route("/eam/functional-locations/new", post(eam_functional_location_create))
+        .route("/eam/functional-locations/{id}", get(eam_functional_location_detail))
+        .route("/eam/functional-locations/{id}/edit", get(eam_functional_location_edit))
+        .route("/eam/functional-locations/{id}/edit", post(eam_functional_location_save))
+        .route("/eam/equipment", get(eam_equipment))
+        .route("/eam/inspections", get(eam_inspections))
+        .route("/eam/inspections/new", get(eam_inspection_new))
+        .route("/eam/inspections/new", post(eam_inspection_create))
+        .route("/eam/checklists", get(eam_checklists))
+        .route("/eam/checklists/new", get(eam_checklist_new))
+        .route("/eam/checklists/new", post(eam_checklist_create))
+        .route("/eam/plans", get(eam_plans))
+        .route("/eam/plans/new", get(eam_plan_new))
+        .route("/eam/plans/new", post(eam_plan_create))
+        .route("/eam/sld", get(eam_sld))
+        .route("/api/eam/sld/substations", get(eam_sld_substations_api))
+        .route("/api/eam/sld/substations/{id}", get(eam_sld_data_api))
+        .route("/eam/condition", get(eam_condition_monitoring))
+        .route("/eam/manufacturers", get(eam_manufacturers))
+        .route_layer(middleware::from_fn_with_state(state.clone(), asset_management_module_guard));
+
+    // --- EAM REST API routes (gated by "asset_management" module) ---
+    let eam_api_routes = Router::new()
+        .nest_service("/api/eam", vortex_eam::handlers::eam_api_routes())
+        .route_layer(middleware::from_fn_with_state(state.clone(), asset_management_module_guard));
+
+    // --- Core routes (always available) ---
     let protected_routes = Router::new()
         .route("/home", get(home_page))
         .route("/dashboard", get(dashboard_page))
         .route("/auth/logout", post(logout))
         .route("/partials/recent-activity", get(recent_activity))
         .route("/partials/system-status", get(system_status))
+        // Home partials
+        .route("/partials/home/announcements", get(home_announcements_partial))
+        .route("/partials/home/shortcuts", get(home_shortcuts_partial))
+        .route("/partials/home/activities", get(home_activities_partial))
+        // Announcements CRUD (admin)
+        .route("/announcements", get(announcements_list))
+        .route("/announcements/new", get(announcement_new))
+        .route("/announcements", post(announcement_create))
+        .route("/announcements/{id}/edit", get(announcement_edit))
+        .route("/announcements/{id}", post(announcement_update))
+        .route("/announcements/{id}/delete", post(announcement_delete))
+        // Shortcuts API
+        .route("/api/home/shortcuts/available", get(shortcuts_available))
+        .route("/api/home/shortcuts", post(shortcut_add))
+        .route("/api/home/shortcuts/{id}/delete", post(shortcut_remove))
+        .route("/api/home/shortcuts/reorder", post(shortcuts_reorder))
         // User management
         .route("/users", get(users_list))
         .route("/users/new", get(users_new_form))
@@ -524,59 +698,6 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/attachments/{model}/{id}", post(upload_attachment))
         .route("/attachments/{id}", get(download_attachment))
         .route("/attachments/{id}", delete(delete_attachment))
-        // Contacts management (redirects to generic)
-        .route("/contacts", get(contacts_list))
-        .route("/contacts/new", get(contacts_new))
-        .route("/contacts", post(contacts_create))
-        .route("/contacts/{id}", get(contacts_edit))
-        .route("/contacts/{id}", post(contacts_update))
-        .route("/contacts/{id}/delete", post(contacts_delete))
-        .route("/contacts/{id}/approve", post(contacts_approve))
-        .route("/contacts/{id}/set-draft", post(contacts_set_draft))
-        // EAM - Asset Management
-        .route("/eam", get(eam_dashboard))
-        .route("/eam/sites", get(eam_sites))
-        .route("/eam/sites/new", get(eam_site_form))
-        .route("/eam/sites", post(eam_site_create))
-        .route("/eam/sites/{id}", get(eam_site_detail))
-        .route("/eam/sites/{id}/edit", get(eam_site_edit))
-        .route("/eam/sites/{id}", post(eam_site_update))
-        .route("/eam/assets", get(eam_assets))
-        .route("/eam/assets/new", get(eam_asset_form))
-        .route("/eam/assets", post(eam_asset_create))
-        .route("/eam/assets/{id}", get(eam_asset_detail))
-        .route("/eam/assets/{id}/edit", get(eam_asset_edit))
-        .route("/eam/assets/{id}", post(eam_asset_update))
-        .route("/eam/configuration", get(eam_configuration))
-        // EAM - New SESB features
-        .route("/eam/work-orders", get(eam_work_orders))
-        .route("/eam/work-orders/new", get(eam_work_order_new))
-        .route("/eam/work-orders/new", post(eam_work_order_create))
-        .route("/eam/work-orders/{id}", get(eam_work_order_detail))
-        .route("/eam/work-orders/{id}/edit", get(eam_work_order_edit))
-        .route("/eam/work-orders/{id}/edit", post(eam_work_order_save))
-        .route("/api/eam/work-orders/{id}/transition", post(eam_work_order_transition))
-        .route("/eam/functional-locations", get(eam_functional_locations))
-        .route("/eam/functional-locations/new", get(eam_functional_location_new))
-        .route("/eam/functional-locations/new", post(eam_functional_location_create))
-        .route("/eam/functional-locations/{id}", get(eam_functional_location_detail))
-        .route("/eam/functional-locations/{id}/edit", get(eam_functional_location_edit))
-        .route("/eam/functional-locations/{id}/edit", post(eam_functional_location_save))
-        .route("/eam/equipment", get(eam_equipment))
-        .route("/eam/inspections", get(eam_inspections))
-        .route("/eam/inspections/new", get(eam_inspection_new))
-        .route("/eam/inspections/new", post(eam_inspection_create))
-        .route("/eam/checklists", get(eam_checklists))
-        .route("/eam/checklists/new", get(eam_checklist_new))
-        .route("/eam/checklists/new", post(eam_checklist_create))
-        .route("/eam/plans", get(eam_plans))
-        .route("/eam/plans/new", get(eam_plan_new))
-        .route("/eam/plans/new", post(eam_plan_create))
-        .route("/eam/sld", get(eam_sld))
-        .route("/api/eam/sld/substations", get(eam_sld_substations_api))
-        .route("/api/eam/sld/substations/{id}", get(eam_sld_data_api))
-        .route("/eam/condition", get(eam_condition_monitoring))
-        .route("/eam/manufacturers", get(eam_manufacturers))
         // Chatter partials
         .route("/partials/chatter/{model}/{record_id}", get(chatter_partial))
         .route("/api/chatter/{model}/{record_id}/messages", post(chatter_post_message))
@@ -623,8 +744,11 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/notifications", get(api_notifications))
         .route("/api/countries", get(api_countries))
         .route("/api/states/{country_id}", get(api_states))
-        // EAM REST API (from vortex-eam crate) — uses DatabaseContext extension from auth middleware
-        .nest_service("/api/eam", vortex_eam::handlers::eam_api_routes())
+        // Merge module-gated route groups
+        .merge(contacts_routes)
+        .merge(eam_html_routes)
+        .merge(eam_api_routes)
+        // Auth middleware wraps everything
         .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
 
     // Public routes - no authentication required
@@ -1030,118 +1154,179 @@ async fn logout(
 }
 
 async fn home_page(
-    State(state): State<Arc<AppState>>,
+    State(_state): State<Arc<AppState>>,
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
 ) -> Html<String> {
-    // Get user's role
-    let role_name: Option<String> = sqlx::query_scalar(
-        r#"
-        SELECT r.name FROM roles r
-        JOIN user_roles ur ON r.id = ur.role_id
-        WHERE ur.user_id = $1
-        LIMIT 1
-        "#
-    )
-    .bind(&user.id)
-    .fetch_optional(&db)
-    .await
-    .ok()
-    .flatten();
-
-    let is_system_admin = role_name.as_deref() == Some("System Administrator");
-    let is_admin = is_system_admin || role_name.as_deref() == Some("Administrator");
-
-    // Get the template
-    let template = include_str!("../../templates/home_standalone.html");
-
     let display_name = user.full_name.as_deref().unwrap_or(&user.username);
     let initials = get_initials(display_name);
+    let installed = db_ctx.installed_modules.clone();
+    let sidebar = build_sidebar("home", display_name, &initials, &installed, user.is_admin());
 
-    // Build admin-only module cards
-    let admin_modules = if is_admin {
-        let mut modules = String::new();
-
-        // User Management (admin only)
-        modules.push_str(r#"
-            <a href="/users" class="card bg-base-100 shadow-lg module-card cursor-pointer">
-                <div class="card-body items-center text-center">
-                    <div class="w-16 h-16 rounded-full bg-info/10 flex items-center justify-center mb-4">
-                        <svg class="w-8 h-8 text-info" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197m9 5.197v-1"/>
-                        </svg>
-                    </div>
-                    <h2 class="card-title text-lg">
-                        User Management
-                        <span class="badge badge-info badge-sm">Admin</span>
-                    </h2>
-                    <p class="text-base-content/60 text-sm">Create, edit, and manage user accounts</p>
-                    <div class="mt-4 text-info arrow-icon">
-                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 7l5 5m0 0l-5 5m5-5H6"/>
-                        </svg>
-                    </div>
-                </div>
-            </a>
-        "#);
-
-        if is_system_admin {
-            // Access Control (system admin only)
-            modules.push_str(r#"
-                <a href="/admin/access" class="card bg-base-100 shadow-lg module-card cursor-pointer">
-                    <div class="card-body items-center text-center">
-                        <div class="w-16 h-16 rounded-full bg-warning/10 flex items-center justify-center mb-4">
-                            <svg class="w-8 h-8 text-warning" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"/>
-                            </svg>
-                        </div>
-                        <h2 class="card-title text-lg">
-                            Access Control
-                            <span class="badge badge-warning badge-sm">System</span>
-                        </h2>
-                        <p class="text-base-content/60 text-sm">Configure roles, permissions, and security</p>
-                        <div class="mt-4 text-warning arrow-icon">
-                            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 7l5 5m0 0l-5 5m5-5H6"/>
-                            </svg>
-                        </div>
-                    </div>
-                </a>
-            "#);
-
-            // Audit Log (system admin only)
-            modules.push_str(r#"
-                <a href="/audit" class="card bg-base-100 shadow-lg module-card cursor-pointer">
-                    <div class="card-body items-center text-center">
-                        <div class="w-16 h-16 rounded-full bg-error/10 flex items-center justify-center mb-4">
-                            <svg class="w-8 h-8 text-error" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01"/>
-                            </svg>
-                        </div>
-                        <h2 class="card-title text-lg">
-                            Audit Log
-                            <span class="badge badge-error badge-sm">System</span>
-                        </h2>
-                        <p class="text-base-content/60 text-sm">View system audit trail and compliance</p>
-                        <div class="mt-4 text-error arrow-icon">
-                            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 7l5 5m0 0l-5 5m5-5H6"/>
-                            </svg>
-                        </div>
-                    </div>
-                </a>
-            "#);
-        }
-
-        modules
+    // Get company_id for chatter feed
+    let company_id: Option<uuid::Uuid> = sqlx::query_scalar("SELECT company_id FROM users WHERE id = $1")
+        .bind(user.id).fetch_optional(&db).await.ok().flatten();
+    let chatter_url = company_id
+        .map(|c| format!("/partials/chatter/home.feed/{}", c))
+        .unwrap_or_default();
+    let chatter_attr = if company_id.is_some() {
+        format!(r#"hx-get="{}" hx-trigger="load" hx-swap="innerHTML""#, chatter_url)
     } else {
         String::new()
     };
 
-    let html = template
-        .replace("{{user_name}}", display_name)
-        .replace("{{user_initials}}", &initials)
-        .replace("{{admin_modules}}", &admin_modules);
+    // Build condensed module links for the "Modules" section
+    let mut module_links = String::new();
+    if installed.contains("contacts") {
+        module_links.push_str(r#"<a href="/contacts" class="btn btn-ghost btn-sm justify-start gap-2"><svg class="w-4 h-4 text-success" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0z"/></svg>Contacts</a>"#);
+    }
+    if installed.contains("asset_management") {
+        module_links.push_str(r#"<a href="/eam" class="btn btn-ghost btn-sm justify-start gap-2"><svg class="w-4 h-4 text-warning" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5M9 7h1m-1 4h1m4-4h1m-1 4h1m-5 10v-5a1 1 0 011-1h2a1 1 0 011 1v5m-4 0h4"/></svg>Asset Management</a>"#);
+        module_links.push_str(r#"<a href="/eam/work-orders" class="btn btn-ghost btn-sm justify-start gap-2 pl-8"><svg class="w-4 h-4 text-warning/60" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4"/></svg>Work Orders</a>"#);
+        module_links.push_str(r#"<a href="/eam/inspections" class="btn btn-ghost btn-sm justify-start gap-2 pl-8"><svg class="w-4 h-4 text-success/60" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4"/></svg>Inspections</a>"#);
+        module_links.push_str(r#"<a href="/eam/sld" class="btn btn-ghost btn-sm justify-start gap-2 pl-8"><svg class="w-4 h-4 text-secondary/60" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h7"/><circle cx="17" cy="18" r="3" stroke-width="2" fill="none"/></svg>Single Line Diagram</a>"#);
+    }
+    if user.is_admin() {
+        module_links.push_str(r#"<a href="/users" class="btn btn-ghost btn-sm justify-start gap-2"><svg class="w-4 h-4 text-info" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197m9 5.197v-1"/></svg>User Management</a>"#);
+        module_links.push_str(r#"<a href="/settings" class="btn btn-ghost btn-sm justify-start gap-2"><svg class="w-4 h-4 text-neutral" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/></svg>Settings</a>"#);
+        module_links.push_str(r#"<a href="/modules" class="btn btn-ghost btn-sm justify-start gap-2"><svg class="w-4 h-4 text-accent" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4"/></svg>Modules</a>"#);
+    }
+
+    // Build the shortcuts modal HTML
+    let shortcuts_modal = r#"<dialog id="shortcuts-modal" class="modal">
+<div class="modal-box max-w-lg">
+<h3 class="font-bold text-lg mb-4">Edit Shortcuts</h3>
+<div role="tablist" class="tabs tabs-boxed mb-4">
+<a role="tab" class="tab tab-active" onclick="showShortcutTab('menu')">From Menu</a>
+<a role="tab" class="tab" onclick="showShortcutTab('custom')">Custom Link</a>
+</div>
+<div id="tab-menu">
+<div id="available-shortcuts" class="space-y-1">Loading...</div>
+</div>
+<div id="tab-custom" style="display:none">
+<div class="form-control mb-2"><label class="label label-text">Label</label><input id="custom-label" class="input input-bordered input-sm" placeholder="My Link"/></div>
+<div class="form-control mb-3"><label class="label label-text">URL</label><input id="custom-url" class="input input-bordered input-sm" placeholder="/some/page"/></div>
+<button class="btn btn-primary btn-sm" onclick="addCustomShortcut()">Add</button>
+</div>
+<div class="modal-action"><form method="dialog"><button class="btn btn-sm">Close</button></form></div>
+</div>
+</dialog>"#;
+
+    // JavaScript for shortcuts modal - use string concatenation to avoid brace escaping issues
+    let shortcuts_js = String::new()
+        + "<script>"
+        + "function showShortcutTab(tab){"
+        + "document.getElementById('tab-menu').style.display=tab==='menu'?'':'none';"
+        + "document.getElementById('tab-custom').style.display=tab==='custom'?'':'none';"
+        + "document.querySelectorAll('.tabs .tab').forEach(function(t,i){"
+        + "t.classList.toggle('tab-active',i===(tab==='menu'?0:1));"
+        + "});"
+        + "}"
+        + "function loadAvailableShortcuts(){"
+        + "fetch('/api/home/shortcuts/available').then(function(r){return r.json()}).then(function(d){"
+        + "var html='';"
+        + "d.items.forEach(function(item){"
+        + "html+='<button class=\"btn btn-ghost btn-sm justify-start w-full\" '"
+        + "+'onclick=\"addMenuShortcut(\\''+item.label+'\\',\\''+item.url+'\\',\\''+item.icon+'\\',\\''+item.color+'\\')\">'"
+        + "+item.label+'</button>';"
+        + "});"
+        + "document.getElementById('available-shortcuts').innerHTML=html;"
+        + "});"
+        + "}"
+        + "function addMenuShortcut(label,url,icon,color){"
+        + "var form=new FormData();"
+        + "form.append('label',label);form.append('url',url);form.append('icon',icon);form.append('color',color);"
+        + "fetch('/api/home/shortcuts',{method:'POST',body:new URLSearchParams(form)}).then(function(r){return r.text()}).then(function(h){"
+        + "document.getElementById('shortcuts-panel').innerHTML=h;"
+        + "});"
+        + "}"
+        + "function addCustomShortcut(){"
+        + "var label=document.getElementById('custom-label').value;"
+        + "var url=document.getElementById('custom-url').value;"
+        + "if(!label||!url)return;"
+        + "var form=new FormData();"
+        + "form.append('label',label);form.append('url',url);form.append('icon','link');form.append('color','primary');form.append('is_custom','true');"
+        + "fetch('/api/home/shortcuts',{method:'POST',body:new URLSearchParams(form)}).then(function(r){return r.text()}).then(function(h){"
+        + "document.getElementById('shortcuts-panel').innerHTML=h;"
+        + "document.getElementById('custom-label').value='';"
+        + "document.getElementById('custom-url').value='';"
+        + "});"
+        + "}"
+        + "document.getElementById('shortcuts-modal').addEventListener('close',function(){});"
+        + "document.getElementById('shortcuts-modal').addEventListener('show',loadAvailableShortcuts);"
+        + "var origShow=HTMLDialogElement.prototype.showModal;"
+        + "var modal=document.getElementById('shortcuts-modal');"
+        + "var origFn=modal.showModal.bind(modal);"
+        + "modal.showModal=function(){loadAvailableShortcuts();origFn();};"
+        + "</script>";
+
+    let html = format!(
+        r#"<!DOCTYPE html><html data-theme="dark"><head><title>Home - Remicle</title>
+<link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://unpkg.com/htmx.org@1.9.10"></script>
+</head>
+<body class="min-h-screen bg-base-200"><div class="flex">{sidebar}
+<main class="flex-1 p-6">
+<div class="mb-6"><h1 class="text-2xl font-bold">Welcome, {display_name}</h1><p class="text-base-content/60">Here's what's happening today</p></div>
+
+<!-- Announcements (full width) -->
+<div class="card bg-base-100 shadow mb-6">
+<div class="card-body">
+<h2 class="card-title text-lg"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5.882V19.24a1.76 1.76 0 01-3.417.592l-2.147-6.15M18 13a3 3 0 100-6M5.436 13.683A4.001 4.001 0 017 6h1.832c4.1 0 7.625-1.234 9.168-3v14c-1.543-1.766-5.067-3-9.168-3H7a3.988 3.988 0 01-1.564-.317z"/></svg>Announcements</h2>
+<div id="announcements-panel" hx-get="/partials/home/announcements" hx-trigger="load" hx-swap="innerHTML"><span class="loading loading-spinner loading-sm"></span></div>
+</div></div>
+
+<div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+<!-- Left column: Shortcuts + Discussion -->
+<div class="lg:col-span-2 space-y-6">
+
+<!-- My Shortcuts -->
+<div class="card bg-base-100 shadow">
+<div class="card-body">
+<h2 class="card-title text-lg"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1"/></svg>My Shortcuts</h2>
+<div id="shortcuts-panel" hx-get="/partials/home/shortcuts" hx-trigger="load" hx-swap="innerHTML"><span class="loading loading-spinner loading-sm"></span></div>
+</div></div>
+
+<!-- Discussion Feed -->
+<div class="card bg-base-100 shadow">
+<div class="card-body">
+<h2 class="card-title text-lg"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"/></svg>Discussion</h2>
+<div id="discussion-panel" {chatter_attr}><span class="loading loading-spinner loading-sm"></span></div>
+</div></div>
+
+</div>
+
+<!-- Right column: Activities + Modules -->
+<div class="space-y-6">
+
+<!-- My Activities -->
+<div class="card bg-base-100 shadow">
+<div class="card-body">
+<h2 class="card-title text-lg"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>My Activities</h2>
+<div id="activities-panel" hx-get="/partials/home/activities" hx-trigger="load" hx-swap="innerHTML"><span class="loading loading-spinner loading-sm"></span></div>
+</div></div>
+
+<!-- Modules -->
+<div class="card bg-base-100 shadow">
+<div class="card-body">
+<h2 class="card-title text-lg"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4"/></svg>Modules</h2>
+<div class="flex flex-col gap-1">{module_links}</div>
+</div></div>
+
+</div></div>
+{shortcuts_modal}
+</main></div>
+{shortcuts_js}
+</body></html>"#,
+        sidebar = sidebar,
+        display_name = html_escape(display_name),
+        chatter_attr = chatter_attr,
+        module_links = module_links,
+        shortcuts_modal = shortcuts_modal,
+        shortcuts_js = shortcuts_js,
+    );
 
     Html(html)
 }
@@ -1227,38 +1412,52 @@ fn get_initials(name: &str) -> String {
         .to_uppercase()
 }
 
-fn build_sidebar(active_page: &str, user_name: &str, initials: &str) -> String {
-    let nav_items = vec![
-        ("dashboard", "/dashboard", "Dashboard", r#"<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6"/>"#),
-        ("contacts", "/contacts", "Contacts", r#"<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"/>"#),
-    ];
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+}
 
-    let eam_items = vec![
-        ("eam_dashboard", "/eam", "Overview", r#"<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5M9 7h1m-1 4h1m4-4h1m-1 4h1m-5 10v-5a1 1 0 011-1h2a1 1 0 011 1v5m-4 0h4"/>"#),
-        ("eam_sites", "/eam/sites", "Sites", r#"<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 11a3 3 0 11-6 0 3 3 0 016 0z"/>"#),
-        ("eam_assets", "/eam/assets", "Assets", r#"<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"/>"#),
-        ("eam_functional_locations", "/eam/functional-locations", "Functional Locations", r#"<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3.055 11H5a2 2 0 012 2v1a2 2 0 002 2 2 2 0 012 2v2.945M8 3.935V5.5A2.5 2.5 0 0010.5 8h.5a2 2 0 012 2 2 2 0 104 0 2 2 0 012-2h1.064M15 20.488V18a2 2 0 012-2h3.064M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>"#),
-        ("eam_equipment", "/eam/equipment", "Equipment", r#"<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19.428 15.428a2 2 0 00-1.022-.547l-2.387-.477a6 6 0 00-3.86.517l-.318.158a6 6 0 01-3.86.517L6.05 15.21a2 2 0 00-1.806.547M8 4h8l-1 1v5.172a2 2 0 00.586 1.414l5 5c1.26 1.26.367 3.414-1.415 3.414H4.828c-1.782 0-2.674-2.154-1.414-3.414l5-5A2 2 0 009 10.172V5L8 4z"/>"#),
-        ("eam_work_orders", "/eam/work-orders", "Work Orders", r#"<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4"/>"#),
-        ("eam_inspections", "/eam/inspections", "Inspections", r#"<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4"/>"#),
-        ("eam_checklists", "/eam/checklists", "Checklists", r#"<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/>"#),
-        ("eam_plans", "/eam/plans", "Maintenance Plans", r#"<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"/>"#),
-        ("eam_sld", "/eam/sld", "Single Line Diagram", r#"<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h7"/><circle cx="17" cy="18" r="3" stroke-width="2" fill="none"/>"#),
-        ("eam_condition", "/eam/condition", "Condition Monitoring", r#"<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/>"#),
-        ("eam_manufacturers", "/eam/manufacturers", "Manufacturers", r#"<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5M9 7h1m-1 4h1m4-4h1m-1 4h1m-5 10v-5a1 1 0 011-1h2a1 1 0 011 1v5m-4 0h4"/>"#),
-        ("eam_configuration", "/eam/configuration", "Configuration", r#"<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/>"#),
-    ];
-
+fn build_sidebar(active_page: &str, user_name: &str, initials: &str, installed: &HashSet<String>, is_admin: bool) -> String {
     let mut nav_html = String::new();
-    for (id, href, label, icon) in &nav_items {
-        let active = if *id == active_page { " active" } else { "" };
-        nav_html.push_str(&format!(r#"<li><a href="{}" class="{}"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">{}</svg>{}</a></li>"#, href, active, icon, label));
+
+    // Home — always shown
+    let active = if active_page == "home" { " active" } else { "" };
+    nav_html.push_str(&format!(r#"<li><a href="/home" class="{}"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6"/></svg>Home</a></li>"#, active));
+
+    // Dashboard — admin only
+    if is_admin {
+        let active = if active_page == "dashboard" { " active" } else { "" };
+        nav_html.push_str(&format!(r#"<li><a href="/dashboard" class="{}"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/></svg>Dashboard</a></li>"#, active));
     }
 
-    nav_html.push_str(r#"<li class="menu-title mt-4"><span>Asset Management</span></li>"#);
-    for (id, href, label, icon) in &eam_items {
-        let active = if *id == active_page { " active" } else { "" };
-        nav_html.push_str(&format!(r#"<li><a href="{}" class="{}"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">{}</svg>{}</a></li>"#, href, active, icon, label));
+    // Contacts — only if module installed
+    if installed.contains("contacts") {
+        let active = if active_page == "contacts" { " active" } else { "" };
+        nav_html.push_str(&format!(r#"<li><a href="/contacts" class="{}"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"/></svg>Contacts</a></li>"#, active));
+    }
+
+    // EAM section — only if module installed
+    if installed.contains("asset_management") {
+        let eam_items: Vec<(&str, &str, &str, &str)> = vec![
+            ("eam_dashboard", "/eam", "Overview", r#"<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5M9 7h1m-1 4h1m4-4h1m-1 4h1m-5 10v-5a1 1 0 011-1h2a1 1 0 011 1v5m-4 0h4"/>"#),
+            ("eam_sites", "/eam/sites", "Sites", r#"<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 11a3 3 0 11-6 0 3 3 0 016 0z"/>"#),
+            ("eam_assets", "/eam/assets", "Assets", r#"<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"/>"#),
+            ("eam_functional_locations", "/eam/functional-locations", "Functional Locations", r#"<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3.055 11H5a2 2 0 012 2v1a2 2 0 002 2 2 2 0 012 2v2.945M8 3.935V5.5A2.5 2.5 0 0010.5 8h.5a2 2 0 012 2 2 2 0 104 0 2 2 0 012-2h1.064M15 20.488V18a2 2 0 012-2h3.064M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>"#),
+            ("eam_equipment", "/eam/equipment", "Equipment", r#"<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19.428 15.428a2 2 0 00-1.022-.547l-2.387-.477a6 6 0 00-3.86.517l-.318.158a6 6 0 01-3.86.517L6.05 15.21a2 2 0 00-1.806.547M8 4h8l-1 1v5.172a2 2 0 00.586 1.414l5 5c1.26 1.26.367 3.414-1.415 3.414H4.828c-1.782 0-2.674-2.154-1.414-3.414l5-5A2 2 0 009 10.172V5L8 4z"/>"#),
+            ("eam_work_orders", "/eam/work-orders", "Work Orders", r#"<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4"/>"#),
+            ("eam_inspections", "/eam/inspections", "Inspections", r#"<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4"/>"#),
+            ("eam_checklists", "/eam/checklists", "Checklists", r#"<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/>"#),
+            ("eam_plans", "/eam/plans", "Maintenance Plans", r#"<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"/>"#),
+            ("eam_sld", "/eam/sld", "Single Line Diagram", r#"<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h7"/><circle cx="17" cy="18" r="3" stroke-width="2" fill="none"/>"#),
+            ("eam_condition", "/eam/condition", "Condition Monitoring", r#"<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/>"#),
+            ("eam_manufacturers", "/eam/manufacturers", "Manufacturers", r#"<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5M9 7h1m-1 4h1m4-4h1m-1 4h1m-5 10v-5a1 1 0 011-1h2a1 1 0 011 1v5m-4 0h4"/>"#),
+            ("eam_configuration", "/eam/configuration", "Configuration", r#"<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/>"#),
+        ];
+
+        nav_html.push_str(r#"<li class="menu-title mt-4"><span>Asset Management</span></li>"#);
+        for (id, href, label, icon) in &eam_items {
+            let active = if *id == active_page { " active" } else { "" };
+            nav_html.push_str(&format!(r#"<li><a href="{}" class="{}"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">{}</svg>{}</a></li>"#, href, active, icon, label));
+        }
     }
 
     format!(r#"<aside class="w-64 bg-base-100 shadow-lg min-h-screen flex flex-col">
@@ -1381,6 +1580,635 @@ async fn system_status(State(state): State<Arc<AppState>>, Db(db): Db) -> Html<S
         </div>"#,
         user_count, session_count
     ))
+}
+
+// =============================================================================
+// HOME SCREEN: Partials, Announcements CRUD, Shortcuts
+// =============================================================================
+
+/// Map a chatter res_model to a URL for linking activities back to their source record.
+fn model_to_url(res_model: &str, res_id: &uuid::Uuid) -> Option<String> {
+    match res_model {
+        "eam_work_orders" => Some(format!("/eam/work-orders/{}", res_id)),
+        "eam_inspections" | "eam_inspection" => Some(format!("/eam/inspections")),
+        "contacts" => Some(format!("/contacts/{}", res_id)),
+        "eam_equipment" => Some(format!("/eam/equipment")),
+        "eam_sites" => Some(format!("/eam/sites/{}", res_id)),
+        "eam_assets" => Some(format!("/eam/assets/{}", res_id)),
+        "eam_functional_locations" => Some(format!("/eam/functional-locations/{}", res_id)),
+        _ => None,
+    }
+}
+
+/// HTMX partial: announcements panel for the home screen
+async fn home_announcements_partial(
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+) -> Html<String> {
+    let company_id: Option<uuid::Uuid> = sqlx::query_scalar(
+        "SELECT company_id FROM users WHERE id = $1"
+    )
+    .bind(user.id)
+    .fetch_optional(&db)
+    .await
+    .ok()
+    .flatten();
+
+    let company_id = match company_id {
+        Some(c) => c,
+        None => return Html(r#"<div class="text-base-content/50 text-sm">No company assigned.</div>"#.to_string()),
+    };
+
+    let rows = sqlx::query(
+        "SELECT a.id, a.title, a.body, a.severity, a.is_pinned, a.created_at,
+                u.full_name as author_name
+         FROM announcements a
+         LEFT JOIN users u ON a.created_by = u.id
+         WHERE a.company_id = $1 AND a.active = true
+           AND (a.publish_at IS NULL OR a.publish_at <= NOW())
+           AND (a.expire_at IS NULL OR a.expire_at > NOW())
+         ORDER BY a.is_pinned DESC, a.created_at DESC LIMIT 5"
+    )
+    .bind(company_id)
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default();
+
+    if rows.is_empty() {
+        let admin_link = if user.is_admin() {
+            r#" <a href="/announcements/new" class="link link-primary text-sm">Create one</a>"#
+        } else {
+            ""
+        };
+        return Html(format!(
+            r#"<div class="text-base-content/50 text-sm py-4">No announcements yet.{}</div>"#,
+            admin_link
+        ));
+    }
+
+    let mut html = String::new();
+    for row in &rows {
+        let title: String = row.get("title");
+        let body: String = row.get("body");
+        let severity: String = row.get("severity");
+        let is_pinned: bool = row.get("is_pinned");
+        let author: Option<String> = row.get("author_name");
+        let created: chrono::DateTime<chrono::Utc> = row.get("created_at");
+
+        let alert_class = match severity.as_str() {
+            "success" => "alert-success",
+            "warning" => "alert-warning",
+            "error" => "alert-error",
+            _ => "alert-info",
+        };
+        let pin_icon = if is_pinned {
+            r#"<svg class="w-4 h-4 inline mr-1" fill="currentColor" viewBox="0 0 20 20"><path d="M5 5a2 2 0 012-2h6a2 2 0 012 2v2h2a1 1 0 01.8 1.6L15 12v3a1 1 0 01-1 1h-3v3a1 1 0 11-2 0v-3H6a1 1 0 01-1-1v-3L2.2 8.6A1 1 0 013 7h2V5z"/></svg>"#
+        } else {
+            ""
+        };
+
+        html.push_str(&format!(
+            r#"<div class="alert {} shadow-sm mb-2"><div><div class="font-semibold">{}{}</div><div class="text-sm opacity-80">{}</div><div class="text-xs opacity-50 mt-1">by {} &middot; {}</div></div></div>"#,
+            alert_class,
+            pin_icon,
+            html_escape(&title),
+            html_escape(&body),
+            html_escape(&author.unwrap_or_else(|| "System".into())),
+            format_time_ago(created),
+        ));
+    }
+
+    if user.is_admin() {
+        html.push_str(r#"<div class="mt-2"><a href="/announcements" class="link link-primary text-sm">Manage Announcements</a></div>"#);
+    }
+
+    Html(html)
+}
+
+/// HTMX partial: user shortcuts panel for the home screen
+async fn home_shortcuts_partial(
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+) -> Html<String> {
+    let rows = sqlx::query(
+        "SELECT id, label, url, icon, color, is_custom
+         FROM user_shortcuts
+         WHERE user_id = $1 AND active = true
+         ORDER BY sequence ASC LIMIT 12"
+    )
+    .bind(user.id)
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default();
+
+    if rows.is_empty() {
+        return Html(r#"<div class="text-center py-6"><p class="text-base-content/50 text-sm mb-3">Add shortcuts to quickly access your most-used pages.</p><button class="btn btn-sm btn-outline btn-primary" onclick="document.getElementById('shortcuts-modal').showModal()">+ Add Shortcut</button></div>"#.to_string());
+    }
+
+    let mut html = String::from(r#"<div class="grid grid-cols-2 sm:grid-cols-3 gap-2">"#);
+    for row in &rows {
+        let label: String = row.get("label");
+        let url: String = row.get("url");
+        let icon: Option<String> = row.get("icon");
+        let color: Option<String> = row.get("color");
+        let _icon_name = icon.as_deref().unwrap_or("link");
+        let color_name = color.as_deref().unwrap_or("primary");
+
+        html.push_str(&format!(
+            r#"<a href="{}" class="btn btn-ghost btn-sm justify-start gap-2 border border-base-300 hover:border-{}"><svg class="w-4 h-4 text-{}" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1"/></svg><span class="truncate">{}</span></a>"#,
+            html_escape(&url),
+            color_name,
+            color_name,
+            html_escape(&label),
+        ));
+    }
+    html.push_str("</div>");
+    html.push_str(r#"<div class="mt-2 text-right"><button class="btn btn-xs btn-ghost" onclick="document.getElementById('shortcuts-modal').showModal()">Edit Shortcuts</button></div>"#);
+
+    Html(html)
+}
+
+/// HTMX partial: activities panel for the home screen
+async fn home_activities_partial(
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+) -> Html<String> {
+    let rows = sqlx::query(
+        "SELECT a.id, a.summary, a.due_date, a.state, a.res_model, a.res_id,
+                t.name as type_name, t.icon, t.color
+         FROM chatter_activities a
+         LEFT JOIN chatter_activity_types t ON a.activity_type_id = t.id
+         WHERE a.assigned_to_id = $1 AND a.state IN ('pending','overdue') AND a.active = true
+         ORDER BY CASE WHEN a.state='overdue' THEN 0 ELSE 1 END, a.due_date ASC
+         LIMIT 20"
+    )
+    .bind(user.id)
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default();
+
+    if rows.is_empty() {
+        return Html(r#"<div class="text-center py-6 text-base-content/50 text-sm">No pending activities. You're all caught up!</div>"#.to_string());
+    }
+
+    let mut html = String::from(r#"<div class="space-y-2">"#);
+    for row in &rows {
+        let activity_id: uuid::Uuid = row.get("id");
+        let summary: Option<String> = row.get("summary");
+        let due_date: chrono::NaiveDate = row.get("due_date");
+        let state: String = row.get("state");
+        let res_model: String = row.get("res_model");
+        let res_id: uuid::Uuid = row.get("res_id");
+        let type_name: Option<String> = row.get("type_name");
+        let color: Option<String> = row.get("color");
+
+        let badge_class = if state == "overdue" { "badge-error" } else { "badge-warning" };
+        let badge_text = if state == "overdue" { "Overdue" } else { "Pending" };
+        let color_val = color.as_deref().unwrap_or("primary");
+
+        let link = model_to_url(&res_model, &res_id);
+        let summary_text = summary.as_deref().unwrap_or("(no summary)");
+        let type_label = type_name.as_deref().unwrap_or("Activity");
+
+        let summary_html = if let Some(ref href) = link {
+            format!(r#"<a href="{}" class="link link-hover font-medium">{}</a>"#, href, html_escape(summary_text))
+        } else {
+            format!(r#"<span class="font-medium">{}</span>"#, html_escape(summary_text))
+        };
+
+        let complete_url = format!("/api/chatter/{}/{}/activities/{}/complete", html_escape(&res_model), res_id, activity_id);
+        html.push_str("<div class=\"flex items-center gap-3 p-2 rounded-lg hover:bg-base-200\">");
+        html.push_str(&format!("<div class=\"badge badge-sm badge-outline text-{}\">{}</div>", color_val, html_escape(type_label)));
+        html.push_str(&format!("<div class=\"flex-1 min-w-0\">{}<div class=\"text-xs text-base-content/50\">Due: {} <span class=\"badge {} badge-xs\">{}</span></div></div>", summary_html, due_date, badge_class, badge_text));
+        html.push_str("<button class=\"btn btn-xs btn-success\" hx-post=\"");
+        html.push_str(&complete_url);
+        html.push_str("\" hx-target=\"#activities-panel\" hx-swap=\"innerHTML\" hx-get=\"/partials/home/activities\" hx-trigger=\"click\" title=\"Mark Done\">Done</button>");
+        html.push_str("</div>");
+    }
+    html.push_str("</div>");
+
+    Html(html)
+}
+
+// -- Announcement CRUD (admin-only) -------------------------------------------
+
+#[derive(serde::Deserialize)]
+struct AnnouncementForm {
+    title: String,
+    body: String,
+    severity: Option<String>,
+    is_pinned: Option<String>,
+    publish_at: Option<String>,
+    expire_at: Option<String>,
+}
+
+async fn announcements_list(
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Announcements"))).into_response();
+    }
+
+    let display_name = user.full_name.as_deref().unwrap_or(&user.username);
+    let initials = get_initials(display_name);
+    let installed = db_ctx.installed_modules.clone();
+    let sidebar = build_sidebar("home", display_name, &initials, &installed, user.is_admin());
+
+    let rows = sqlx::query(
+        "SELECT a.id, a.title, a.severity, a.is_pinned, a.active, a.created_at,
+                u.full_name as author_name
+         FROM announcements a
+         LEFT JOIN users u ON a.created_by = u.id
+         ORDER BY a.created_at DESC LIMIT 50"
+    )
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default();
+
+    let mut table_rows = String::new();
+    for row in &rows {
+        let id: uuid::Uuid = row.get("id");
+        let title: String = row.get("title");
+        let severity: String = row.get("severity");
+        let is_pinned: bool = row.get("is_pinned");
+        let active: bool = row.get("active");
+        let created: chrono::DateTime<chrono::Utc> = row.get("created_at");
+        let author: Option<String> = row.get("author_name");
+
+        let sev_badge = match severity.as_str() {
+            "success" => r#"<span class="badge badge-success badge-sm">Success</span>"#,
+            "warning" => r#"<span class="badge badge-warning badge-sm">Warning</span>"#,
+            "error" => r#"<span class="badge badge-error badge-sm">Error</span>"#,
+            _ => r#"<span class="badge badge-info badge-sm">Info</span>"#,
+        };
+        let pin_text = if is_pinned { "📌" } else { "" };
+        let status = if active {
+            r#"<span class="badge badge-success badge-sm">Active</span>"#
+        } else {
+            r#"<span class="badge badge-ghost badge-sm">Archived</span>"#
+        };
+
+        table_rows.push_str(&format!(
+            r#"<tr class="hover"><td>{pin}{title}</td><td>{sev}</td><td>{status}</td><td>{author}</td><td>{created}</td><td><a href="/announcements/{id}/edit" class="btn btn-xs btn-ghost">Edit</a><form method="POST" action="/announcements/{id}/delete" class="inline"><button class="btn btn-xs btn-ghost text-error">Delete</button></form></td></tr>"#,
+            pin = pin_text,
+            title = html_escape(&title),
+            sev = sev_badge,
+            status = status,
+            author = html_escape(&author.unwrap_or_default()),
+            created = format_time_ago(created),
+            id = id,
+        ));
+    }
+
+    Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><title>Announcements - Remicle</title>
+<link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/>
+<script src="https://cdn.tailwindcss.com"></script></head>
+<body class="min-h-screen bg-base-200"><div class="flex">{sidebar}
+<main class="flex-1 p-6">
+<div class="flex justify-between items-center mb-6">
+<div><h1 class="text-2xl font-bold">Announcements</h1><p class="text-base-content/60">Manage company announcements shown on the home screen</p></div>
+<a href="/announcements/new" class="btn btn-primary">+ New Announcement</a>
+</div>
+<div class="card bg-base-100 shadow"><div class="overflow-x-auto">
+<table class="table table-sm"><thead><tr><th>Title</th><th>Severity</th><th>Status</th><th>Author</th><th>Created</th><th>Actions</th></tr></thead>
+<tbody>{table_rows}</tbody></table></div></div>
+</main></div></body></html>"#)).into_response()
+}
+
+async fn announcement_new(
+    Db(_db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Announcements"))).into_response();
+    }
+
+    let display_name = user.full_name.as_deref().unwrap_or(&user.username);
+    let initials = get_initials(display_name);
+    let installed = db_ctx.installed_modules.clone();
+    let sidebar = build_sidebar("home", display_name, &initials, &installed, user.is_admin());
+
+    Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><title>New Announcement - Remicle</title>
+<link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/>
+<script src="https://cdn.tailwindcss.com"></script></head>
+<body class="min-h-screen bg-base-200"><div class="flex">{sidebar}
+<main class="flex-1 p-6"><h1 class="text-2xl font-bold mb-6">New Announcement</h1>
+<form action="/announcements" method="POST" class="card bg-base-100 shadow p-6 max-w-2xl">
+<div class="form-control mb-4"><label class="label"><span class="label-text">Title *</span></label><input name="title" class="input input-bordered" required/></div>
+<div class="form-control mb-4"><label class="label"><span class="label-text">Body *</span></label><textarea name="body" class="textarea textarea-bordered h-32" required></textarea></div>
+<div class="grid grid-cols-2 gap-4 mb-4">
+<div class="form-control"><label class="label"><span class="label-text">Severity</span></label><select name="severity" class="select select-bordered"><option value="info">Info</option><option value="success">Success</option><option value="warning">Warning</option><option value="error">Error</option></select></div>
+<div class="form-control"><label class="label cursor-pointer justify-start gap-2"><span class="label-text">Pinned</span><input type="checkbox" name="is_pinned" value="on" class="checkbox checkbox-primary"/></label></div>
+</div>
+<div class="grid grid-cols-2 gap-4 mb-4">
+<div class="form-control"><label class="label"><span class="label-text">Publish At (leave empty for immediate)</span></label><input name="publish_at" type="datetime-local" class="input input-bordered"/></div>
+<div class="form-control"><label class="label"><span class="label-text">Expire At (leave empty for never)</span></label><input name="expire_at" type="datetime-local" class="input input-bordered"/></div>
+</div>
+<div class="flex gap-2 mt-4"><a href="/announcements" class="btn btn-ghost">Cancel</a><button class="btn btn-primary">Create Announcement</button></div>
+</form></main></div></body></html>"#)).into_response()
+}
+
+async fn announcement_create(
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Form(form): Form<AnnouncementForm>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Announcements"))).into_response();
+    }
+
+    let company_id: Option<uuid::Uuid> = sqlx::query_scalar("SELECT company_id FROM users WHERE id = $1")
+        .bind(user.id).fetch_optional(&db).await.ok().flatten();
+    let company_id = match company_id {
+        Some(c) => c,
+        None => return (StatusCode::BAD_REQUEST, "No company assigned").into_response(),
+    };
+
+    let severity = form.severity.as_deref().unwrap_or("info");
+    let is_pinned = form.is_pinned.as_deref() == Some("on");
+    let publish_at: Option<chrono::DateTime<chrono::Utc>> = form.publish_at.as_deref()
+        .filter(|s| !s.is_empty())
+        .and_then(|s| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M").ok())
+        .map(|dt| dt.and_utc());
+    let expire_at: Option<chrono::DateTime<chrono::Utc>> = form.expire_at.as_deref()
+        .filter(|s| !s.is_empty())
+        .and_then(|s| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M").ok())
+        .map(|dt| dt.and_utc());
+
+    let result = sqlx::query(
+        "INSERT INTO announcements (title, body, severity, is_pinned, publish_at, expire_at, company_id, created_by) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)"
+    )
+    .bind(&form.title)
+    .bind(&form.body)
+    .bind(severity)
+    .bind(is_pinned)
+    .bind(publish_at)
+    .bind(expire_at)
+    .bind(company_id)
+    .bind(user.id)
+    .execute(&db)
+    .await;
+
+    match result {
+        Ok(_) => Redirect::to("/announcements").into_response(),
+        Err(e) => {
+            error!("Failed to create announcement: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("Error: {}", e)).into_response()
+        }
+    }
+}
+
+async fn announcement_edit(
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<uuid::Uuid>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Announcements"))).into_response();
+    }
+
+    let row = sqlx::query("SELECT id, title, body, severity, is_pinned, publish_at, expire_at FROM announcements WHERE id = $1")
+        .bind(id).fetch_optional(&db).await.ok().flatten();
+    let row = match row {
+        Some(r) => r,
+        None => return (StatusCode::NOT_FOUND, "Announcement not found").into_response(),
+    };
+
+    let title: String = row.get("title");
+    let body: String = row.get("body");
+    let severity: String = row.get("severity");
+    let is_pinned: bool = row.get("is_pinned");
+    let publish_at: Option<chrono::DateTime<chrono::Utc>> = row.get("publish_at");
+    let expire_at: Option<chrono::DateTime<chrono::Utc>> = row.get("expire_at");
+
+    let pinned_checked = if is_pinned { "checked" } else { "" };
+    let publish_val = publish_at.map(|d| d.format("%Y-%m-%dT%H:%M").to_string()).unwrap_or_default();
+    let expire_val = expire_at.map(|d| d.format("%Y-%m-%dT%H:%M").to_string()).unwrap_or_default();
+
+    let sev_options = ["info", "success", "warning", "error"].iter().map(|s| {
+        let selected = if *s == severity.as_str() { "selected" } else { "" };
+        format!(r#"<option value="{}" {}>{}</option>"#, s, selected, s.to_uppercase().chars().next().unwrap().to_string() + &s[1..])
+    }).collect::<String>();
+
+    let display_name = user.full_name.as_deref().unwrap_or(&user.username);
+    let initials = get_initials(display_name);
+    let installed = db_ctx.installed_modules.clone();
+    let sidebar = build_sidebar("home", display_name, &initials, &installed, user.is_admin());
+
+    Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><title>Edit Announcement - Remicle</title>
+<link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/>
+<script src="https://cdn.tailwindcss.com"></script></head>
+<body class="min-h-screen bg-base-200"><div class="flex">{sidebar}
+<main class="flex-1 p-6"><h1 class="text-2xl font-bold mb-6">Edit Announcement</h1>
+<form action="/announcements/{id}" method="POST" class="card bg-base-100 shadow p-6 max-w-2xl">
+<div class="form-control mb-4"><label class="label"><span class="label-text">Title *</span></label><input name="title" class="input input-bordered" value="{title}" required/></div>
+<div class="form-control mb-4"><label class="label"><span class="label-text">Body *</span></label><textarea name="body" class="textarea textarea-bordered h-32" required>{body}</textarea></div>
+<div class="grid grid-cols-2 gap-4 mb-4">
+<div class="form-control"><label class="label"><span class="label-text">Severity</span></label><select name="severity" class="select select-bordered">{sev_options}</select></div>
+<div class="form-control"><label class="label cursor-pointer justify-start gap-2"><span class="label-text">Pinned</span><input type="checkbox" name="is_pinned" value="on" class="checkbox checkbox-primary" {pinned_checked}/></label></div>
+</div>
+<div class="grid grid-cols-2 gap-4 mb-4">
+<div class="form-control"><label class="label"><span class="label-text">Publish At</span></label><input name="publish_at" type="datetime-local" class="input input-bordered" value="{publish_val}"/></div>
+<div class="form-control"><label class="label"><span class="label-text">Expire At</span></label><input name="expire_at" type="datetime-local" class="input input-bordered" value="{expire_val}"/></div>
+</div>
+<div class="flex gap-2 mt-4"><a href="/announcements" class="btn btn-ghost">Cancel</a><button class="btn btn-primary">Save Changes</button></div>
+</form></main></div></body></html>"#,
+        id = id,
+        title = html_escape(&title),
+        body = html_escape(&body),
+        sev_options = sev_options,
+        pinned_checked = pinned_checked,
+        publish_val = publish_val,
+        expire_val = expire_val,
+    )).into_response()
+}
+
+async fn announcement_update(
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Path(id): Path<uuid::Uuid>,
+    Form(form): Form<AnnouncementForm>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Announcements"))).into_response();
+    }
+
+    let severity = form.severity.as_deref().unwrap_or("info");
+    let is_pinned = form.is_pinned.as_deref() == Some("on");
+    let publish_at: Option<chrono::DateTime<chrono::Utc>> = form.publish_at.as_deref()
+        .filter(|s| !s.is_empty())
+        .and_then(|s| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M").ok())
+        .map(|dt| dt.and_utc());
+    let expire_at: Option<chrono::DateTime<chrono::Utc>> = form.expire_at.as_deref()
+        .filter(|s| !s.is_empty())
+        .and_then(|s| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M").ok())
+        .map(|dt| dt.and_utc());
+
+    let result = sqlx::query(
+        "UPDATE announcements SET title=$1, body=$2, severity=$3, is_pinned=$4, publish_at=$5, expire_at=$6, updated_by=$7, updated_at=NOW() WHERE id=$8"
+    )
+    .bind(&form.title)
+    .bind(&form.body)
+    .bind(severity)
+    .bind(is_pinned)
+    .bind(publish_at)
+    .bind(expire_at)
+    .bind(user.id)
+    .bind(id)
+    .execute(&db)
+    .await;
+
+    match result {
+        Ok(_) => Redirect::to("/announcements").into_response(),
+        Err(e) => {
+            error!("Failed to update announcement: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("Error: {}", e)).into_response()
+        }
+    }
+}
+
+async fn announcement_delete(
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Path(id): Path<uuid::Uuid>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Announcements"))).into_response();
+    }
+
+    let _ = sqlx::query("UPDATE announcements SET active = false, updated_by = $1, updated_at = NOW() WHERE id = $2")
+        .bind(user.id).bind(id).execute(&db).await;
+
+    Redirect::to("/announcements").into_response()
+}
+
+// -- Shortcut management handlers ---------------------------------------------
+
+#[derive(serde::Deserialize)]
+struct ShortcutAddForm {
+    label: String,
+    url: String,
+    icon: Option<String>,
+    color: Option<String>,
+    is_custom: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct ShortcutReorderForm {
+    ids: String, // comma-separated UUIDs
+}
+
+async fn shortcuts_available(
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+) -> Json<serde_json::Value> {
+    let installed = &db_ctx.installed_modules;
+    let mut items = vec![];
+
+    // Always available
+    items.push(serde_json::json!({"label": "Users", "url": "/users", "icon": "users", "color": "info"}));
+    items.push(serde_json::json!({"label": "Settings", "url": "/settings", "icon": "settings", "color": "neutral"}));
+    items.push(serde_json::json!({"label": "Modules", "url": "/modules", "icon": "package", "color": "accent"}));
+
+    if installed.contains("contacts") {
+        items.push(serde_json::json!({"label": "Contacts", "url": "/contacts", "icon": "contact", "color": "primary"}));
+    }
+    if installed.contains("asset_management") {
+        items.push(serde_json::json!({"label": "EAM Overview", "url": "/eam", "icon": "building", "color": "warning"}));
+        items.push(serde_json::json!({"label": "Work Orders", "url": "/eam/work-orders", "icon": "clipboard", "color": "warning"}));
+        items.push(serde_json::json!({"label": "Sites", "url": "/eam/sites", "icon": "map-pin", "color": "warning"}));
+        items.push(serde_json::json!({"label": "Assets", "url": "/eam/assets", "icon": "zap", "color": "warning"}));
+        items.push(serde_json::json!({"label": "Equipment", "url": "/eam/equipment", "icon": "tool", "color": "warning"}));
+        items.push(serde_json::json!({"label": "Inspections", "url": "/eam/inspections", "icon": "search", "color": "success"}));
+        items.push(serde_json::json!({"label": "SLD", "url": "/eam/sld", "icon": "git-branch", "color": "secondary"}));
+    }
+
+    Json(serde_json::json!({"items": items}))
+}
+
+async fn shortcut_add(
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Form(form): Form<ShortcutAddForm>,
+) -> Response {
+    let company_id: Option<uuid::Uuid> = sqlx::query_scalar("SELECT company_id FROM users WHERE id = $1")
+        .bind(user.id).fetch_optional(&db).await.ok().flatten();
+    let company_id = match company_id {
+        Some(c) => c,
+        None => return (StatusCode::BAD_REQUEST, "No company assigned").into_response(),
+    };
+
+    // Get next sequence
+    let max_seq: Option<i32> = sqlx::query_scalar(
+        "SELECT MAX(sequence) FROM user_shortcuts WHERE user_id = $1 AND active = true"
+    )
+    .bind(user.id)
+    .fetch_optional(&db)
+    .await
+    .ok()
+    .flatten();
+    let next_seq = max_seq.unwrap_or(0) + 10;
+
+    let is_custom = form.is_custom.as_deref() == Some("true");
+
+    let _ = sqlx::query(
+        "INSERT INTO user_shortcuts (user_id, label, url, icon, color, sequence, is_custom, company_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)"
+    )
+    .bind(user.id)
+    .bind(&form.label)
+    .bind(&form.url)
+    .bind(form.icon.as_deref().unwrap_or("link"))
+    .bind(form.color.as_deref().unwrap_or("primary"))
+    .bind(next_seq)
+    .bind(is_custom)
+    .bind(company_id)
+    .execute(&db)
+    .await;
+
+    // Return the updated shortcuts panel via HTMX
+    home_shortcuts_partial(Db(db), Extension(user)).await.into_response()
+}
+
+async fn shortcut_remove(
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Path(id): Path<uuid::Uuid>,
+) -> Response {
+    let _ = sqlx::query(
+        "UPDATE user_shortcuts SET active = false WHERE id = $1 AND user_id = $2"
+    )
+    .bind(id)
+    .bind(user.id)
+    .execute(&db)
+    .await;
+
+    home_shortcuts_partial(Db(db), Extension(user)).await.into_response()
+}
+
+async fn shortcuts_reorder(
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Form(form): Form<ShortcutReorderForm>,
+) -> Response {
+    let ids: Vec<&str> = form.ids.split(',').collect();
+    for (i, id_str) in ids.iter().enumerate() {
+        if let Ok(id) = uuid::Uuid::parse_str(id_str.trim()) {
+            let _ = sqlx::query(
+                "UPDATE user_shortcuts SET sequence = $1 WHERE id = $2 AND user_id = $3"
+            )
+            .bind((i as i32 + 1) * 10)
+            .bind(id)
+            .bind(user.id)
+            .execute(&db)
+            .await;
+        }
+    }
+
+    home_shortcuts_partial(Db(db), Extension(user)).await.into_response()
 }
 
 // =============================================================================
@@ -2850,11 +3678,21 @@ async fn module_install(
     .await;
 
     match result {
-        Ok(_) => axum::Json(ModuleOperationResponse {
-            success: true,
-            message: format!("Module '{}' installed successfully", name),
-            error: None,
-        }).into_response(),
+        Ok(_) => {
+            // Refresh installed modules cache
+            let new_installed: Vec<String> = sqlx::query_scalar(
+                "SELECT technical_name FROM installed_modules WHERE state = 'installed'"
+            ).fetch_all(&db).await.unwrap_or_default();
+            let mut cache = state.installed_modules.write().await;
+            *cache = new_installed.into_iter().collect();
+            drop(cache);
+
+            axum::Json(ModuleOperationResponse {
+                success: true,
+                message: format!("Module '{}' installed successfully", name),
+                error: None,
+            }).into_response()
+        }
         Err(e) => axum::Json(ModuleOperationResponse {
             success: false,
             message: "Installation failed".to_string(),
@@ -2946,11 +3784,21 @@ async fn module_uninstall(
     .await;
 
     match result {
-        Ok(_) => axum::Json(ModuleOperationResponse {
-            success: true,
-            message: format!("Module '{}' uninstalled successfully", name),
-            error: None,
-        }).into_response(),
+        Ok(_) => {
+            // Refresh installed modules cache
+            let new_installed: Vec<String> = sqlx::query_scalar(
+                "SELECT technical_name FROM installed_modules WHERE state = 'installed'"
+            ).fetch_all(&db).await.unwrap_or_default();
+            let mut cache = state.installed_modules.write().await;
+            *cache = new_installed.into_iter().collect();
+            drop(cache);
+
+            axum::Json(ModuleOperationResponse {
+                success: true,
+                message: format!("Module '{}' uninstalled successfully", name),
+                error: None,
+            }).into_response()
+        }
         Err(e) => axum::Json(ModuleOperationResponse {
             success: false,
             message: "Uninstallation failed".to_string(),
@@ -5169,9 +6017,77 @@ async fn delete_attachment(
 // Contacts Management Handlers
 // ============================================================================
 
-/// Redirect /contacts to the generic list view
-async fn contacts_list() -> Response {
-    Redirect::to("/list/contacts").into_response()
+/// List all contacts with a proper table view
+async fn contacts_list(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+) -> Response {
+    let display_name = user.full_name.as_deref().unwrap_or(&user.username);
+    let initials = get_initials(display_name);
+    let installed = db_ctx.installed_modules.clone();
+    let sidebar = build_sidebar("contacts", display_name, &initials, &installed, user.is_admin());
+
+    let contacts = sqlx::query(
+        "SELECT id, name, display_name, contact_type, email, phone, city, active FROM contacts ORDER BY name LIMIT 200"
+    )
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default();
+
+    let mut rows = String::new();
+    for c in &contacts {
+        let id: uuid::Uuid = c.get("id");
+        let name: String = c.get("name");
+        let display: Option<String> = c.get("display_name");
+        let ctype: String = c.get("contact_type");
+        let email: Option<String> = c.get("email");
+        let phone: Option<String> = c.get("phone");
+        let city: Option<String> = c.get("city");
+        let active: bool = c.get("active");
+        let status_badge = if active {
+            r#"<span class="badge badge-success badge-sm">Active</span>"#
+        } else {
+            r#"<span class="badge badge-warning badge-sm">Archived</span>"#
+        };
+        let type_badge = match ctype.as_str() {
+            "customer" => r#"<span class="badge badge-info badge-sm">Customer</span>"#,
+            "supplier" => r#"<span class="badge badge-secondary badge-sm">Supplier</span>"#,
+            "both" => r#"<span class="badge badge-accent badge-sm">Both</span>"#,
+            _ => r#"<span class="badge badge-ghost badge-sm">Other</span>"#,
+        };
+        rows.push_str(&format!(
+            r#"<tr class="hover cursor-pointer" onclick="window.location='/contacts/{id}'">
+            <td>{name}</td><td>{display}</td><td>{type_badge}</td>
+            <td>{email}</td><td>{phone}</td><td>{city}</td><td>{status_badge}</td></tr>"#,
+            id = id,
+            name = html_escape(&name),
+            display = html_escape(&display.unwrap_or_default()),
+            type_badge = type_badge,
+            email = html_escape(&email.unwrap_or_default()),
+            phone = html_escape(&phone.unwrap_or_default()),
+            city = html_escape(&city.unwrap_or_default()),
+            status_badge = status_badge,
+        ));
+    }
+
+    Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><title>Contacts - Remicle</title>
+<link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/>
+<script src="https://cdn.tailwindcss.com"></script></head>
+<body class="min-h-screen bg-base-200"><div class="flex">{sidebar}
+<main class="flex-1 p-6">
+<div class="flex justify-between items-center mb-6">
+<div><h1 class="text-2xl font-bold">Contacts</h1><p class="text-base-content/60">Manage customers, suppliers, and stakeholders</p></div>
+<a href="/contacts/new" class="btn btn-primary">+ New Contact</a>
+</div>
+<div class="card bg-base-100 shadow">
+<div class="overflow-x-auto">
+<table class="table table-sm">
+<thead><tr><th>Name</th><th>Display Name</th><th>Type</th><th>Email</th><th>Phone</th><th>City</th><th>Status</th></tr></thead>
+<tbody>{rows}</tbody>
+</table></div></div>
+</main></div></body></html>"#)).into_response()
 }
 
 async fn contacts_new(State(state): State<Arc<AppState>>, Db(db): Db, Extension(_user): Extension<AuthUser>) -> Response {
@@ -5937,6 +6853,7 @@ async fn eam_dashboard(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
 ) -> Response {
     let display_name = user.full_name.as_deref().unwrap_or(&user.username);
     let initials = get_initials(display_name);
@@ -5962,7 +6879,8 @@ async fn eam_dashboard(
         "SELECT COUNT(*) FROM eam_assets a JOIN eam_asset_statuses s ON a.status_id = s.id WHERE a.company_id = $1 AND a.is_active = true AND s.code = 'FAULTY'"
     ).bind(company_id).fetch_one(&db).await.unwrap_or(0);
 
-    let sidebar = build_sidebar("eam_dashboard", display_name, &initials);
+    let installed = db_ctx.installed_modules.clone();
+    let sidebar = build_sidebar("eam_dashboard", display_name, &initials, &installed, user.is_admin());
 
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><title>Asset Management - Remicle</title>
 <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/>
@@ -5995,6 +6913,7 @@ async fn eam_sites(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     let display_name = user.full_name.as_deref().unwrap_or(&user.username);
@@ -6119,7 +7038,8 @@ async fn eam_sites(
         }
     };
 
-    let sidebar = build_sidebar("eam_sites", display_name, &initials);
+    let installed = db_ctx.installed_modules.clone();
+    let sidebar = build_sidebar("eam_sites", display_name, &initials, &installed, user.is_admin());
     let view_btns = format!(r#"<div class="btn-group">
         <a href="?view=list&search={search}&type={type_filter}&status={status_filter}" class="btn btn-sm {}" title="List View">
             <svg class="w-4 h-4 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 10h16M4 14h16M4 18h16"/></svg>List</a>
@@ -6181,6 +7101,7 @@ async fn eam_assets(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     let display_name = user.full_name.as_deref().unwrap_or(&user.username);
@@ -6320,7 +7241,8 @@ async fn eam_assets(
     let status_options: String = statuses.iter().map(|(id, name)| format!(r#"<option value="{}" {}>{}</option>"#, id, if status_filter == id { "selected" } else { "" }, name)).collect();
     let site_options: String = sites_list.iter().map(|(id, name)| format!(r#"<option value="{}" {}>{}</option>"#, id, if site_filter == id { "selected" } else { "" }, name)).collect();
 
-    let sidebar = build_sidebar("eam_assets", display_name, &initials);
+    let installed = db_ctx.installed_modules.clone();
+    let sidebar = build_sidebar("eam_assets", display_name, &initials, &installed, user.is_admin());
     let view_btns = format!(r#"<div class="btn-group">
         <a href="?view=list&search={search}&category={category_filter}&status={status_filter}&site={site_filter}" class="btn btn-sm {}" title="List View">
             <svg class="w-4 h-4 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 10h16M4 14h16M4 18h16"/></svg>List</a>
@@ -6365,6 +7287,7 @@ async fn eam_configuration(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
 ) -> Response {
     let display_name = user.full_name.as_deref().unwrap_or(&user.username);
     let initials = get_initials(display_name);
@@ -6382,7 +7305,8 @@ async fn eam_configuration(
     let status_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM eam_asset_statuses WHERE company_id = $1 AND is_active = true")
         .bind(company_id).fetch_one(&db).await.unwrap_or(0);
 
-    let sidebar = build_sidebar("eam_configuration", display_name, &initials);
+    let installed = db_ctx.installed_modules.clone();
+    let sidebar = build_sidebar("eam_configuration", display_name, &initials, &installed, user.is_admin());
 
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><title>Configuration - Asset Management</title>
 <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/>
@@ -6422,6 +7346,7 @@ async fn eam_work_orders(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
 ) -> Response {
     let display_name = user.full_name.as_deref().unwrap_or(&user.username);
     let initials = get_initials(display_name);
@@ -6492,7 +7417,8 @@ async fn eam_work_orders(
         format!(r#"<div class="overflow-x-auto"><table class="table table-zebra"><thead><tr><th>WO Number</th><th>Title</th><th>Asset</th><th>Type</th><th>Priority</th><th>State</th><th>Scheduled</th><th>Assigned</th><th>Actions</th></tr></thead><tbody>{table_rows}</tbody></table></div>"#)
     };
 
-    let sidebar = build_sidebar("eam_work_orders", display_name, &initials);
+    let installed = db_ctx.installed_modules.clone();
+    let sidebar = build_sidebar("eam_work_orders", display_name, &initials, &installed, user.is_admin());
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><title>Work Orders - Asset Management</title>
 <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/><script src="https://cdn.tailwindcss.com"></script></head>
 <body class="min-h-screen bg-base-200"><div class="flex">{sidebar}
@@ -6516,6 +7442,7 @@ async fn eam_work_order_new(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
 ) -> Response {
     let display_name = user.full_name.as_deref().unwrap_or(&user.username);
     let initials = get_initials(display_name);
@@ -6603,7 +7530,8 @@ async fn eam_work_order_new(
 </div>
 </div></div></form>"##);
 
-    let sidebar = build_sidebar("eam_work_orders", display_name, &initials);
+    let installed = db_ctx.installed_modules.clone();
+    let sidebar = build_sidebar("eam_work_orders", display_name, &initials, &installed, user.is_admin());
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><title>New Work Order - Asset Management</title>
 <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/><script src="https://cdn.tailwindcss.com"></script></head>
 <body class="min-h-screen bg-base-200"><div class="flex">{sidebar}
@@ -6670,6 +7598,7 @@ async fn eam_work_order_detail(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
     Path(id): Path<uuid::Uuid>,
 ) -> Response {
     let display_name = user.full_name.as_deref().unwrap_or(&user.username);
@@ -6919,7 +7848,8 @@ async fn eam_work_order_detail(
         r#"<div class="text-center py-12"><h3 class="text-lg font-semibold">Work Order Not Found</h3><a href="/eam/work-orders" class="btn btn-primary mt-4">Back to Work Orders</a></div>"#.to_string()
     };
 
-    let sidebar = build_sidebar("eam_work_orders", display_name, &initials);
+    let installed = db_ctx.installed_modules.clone();
+    let sidebar = build_sidebar("eam_work_orders", display_name, &initials, &installed, user.is_admin());
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><title>Work Order Detail - Asset Management</title>
 <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/><script src="https://cdn.tailwindcss.com"></script></head>
 <body class="min-h-screen bg-base-200"><div class="flex">{sidebar}
@@ -6935,6 +7865,7 @@ async fn eam_work_order_edit(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
     Path(id): Path<uuid::Uuid>,
 ) -> Response {
     let display_name = user.full_name.as_deref().unwrap_or(&user.username);
@@ -7076,7 +8007,8 @@ async fn eam_work_order_edit(
         r#"<div class="text-center py-12"><h3 class="text-lg font-semibold">Work Order Not Found</h3></div>"#.to_string()
     };
 
-    let sidebar = build_sidebar("eam_work_orders", display_name, &initials);
+    let installed = db_ctx.installed_modules.clone();
+    let sidebar = build_sidebar("eam_work_orders", display_name, &initials, &installed, user.is_admin());
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><title>Edit Work Order - Asset Management</title>
 <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/><script src="https://cdn.tailwindcss.com"></script></head>
 <body class="min-h-screen bg-base-200"><div class="flex">{sidebar}
@@ -7199,6 +8131,7 @@ async fn eam_equipment(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     let display_name = user.full_name.as_deref().unwrap_or(&user.username);
@@ -7280,7 +8213,8 @@ async fn eam_equipment(
         if filter == "ct_vt" { "tab-active" } else { "" },
     );
 
-    let sidebar = build_sidebar("eam_equipment", display_name, &initials);
+    let installed = db_ctx.installed_modules.clone();
+    let sidebar = build_sidebar("eam_equipment", display_name, &initials, &installed, user.is_admin());
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><title>Equipment - Asset Management</title>
 <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/><script src="https://cdn.tailwindcss.com"></script></head>
 <body class="min-h-screen bg-base-200"><div class="flex">{sidebar}
@@ -7297,6 +8231,7 @@ async fn eam_inspections(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
 ) -> Response {
     let display_name = user.full_name.as_deref().unwrap_or(&user.username);
     let initials = get_initials(display_name);
@@ -7348,7 +8283,8 @@ async fn eam_inspections(
         format!(r#"<div class="overflow-x-auto"><table class="table table-zebra"><thead><tr><th>Code</th><th>Asset</th><th>Type</th><th>Date</th><th>Inspector</th><th>Condition</th><th>State</th><th>Actions</th></tr></thead><tbody>{table_rows}</tbody></table></div>"#)
     };
 
-    let sidebar = build_sidebar("eam_inspections", display_name, &initials);
+    let installed = db_ctx.installed_modules.clone();
+    let sidebar = build_sidebar("eam_inspections", display_name, &initials, &installed, user.is_admin());
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><title>Inspections - Asset Management</title>
 <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/><script src="https://cdn.tailwindcss.com"></script></head>
 <body class="min-h-screen bg-base-200"><div class="flex">{sidebar}
@@ -7364,6 +8300,7 @@ async fn eam_checklists(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
 ) -> Response {
     let display_name = user.full_name.as_deref().unwrap_or(&user.username);
     let initials = get_initials(display_name);
@@ -7409,7 +8346,8 @@ async fn eam_checklists(
         format!(r#"<div class="overflow-x-auto"><table class="table table-zebra"><thead><tr><th>Name</th><th>Equipment Category</th><th>Maintenance Type</th><th>Version</th><th>Items</th><th>Status</th><th>Actions</th></tr></thead><tbody>{table_rows}</tbody></table></div>"#)
     };
 
-    let sidebar = build_sidebar("eam_checklists", display_name, &initials);
+    let installed = db_ctx.installed_modules.clone();
+    let sidebar = build_sidebar("eam_checklists", display_name, &initials, &installed, user.is_admin());
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><title>Checklist Templates - Asset Management</title>
 <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/><script src="https://cdn.tailwindcss.com"></script></head>
 <body class="min-h-screen bg-base-200"><div class="flex">{sidebar}
@@ -7425,6 +8363,7 @@ async fn eam_plans(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
 ) -> Response {
     let display_name = user.full_name.as_deref().unwrap_or(&user.username);
     let initials = get_initials(display_name);
@@ -7476,7 +8415,8 @@ async fn eam_plans(
         format!(r#"<div class="overflow-x-auto"><table class="table table-zebra"><thead><tr><th>Plan Code</th><th>Asset</th><th>Type</th><th>Frequency</th><th>Next Due</th><th>State</th><th>Actions</th></tr></thead><tbody>{table_rows}</tbody></table></div>"#)
     };
 
-    let sidebar = build_sidebar("eam_plans", display_name, &initials);
+    let installed = db_ctx.installed_modules.clone();
+    let sidebar = build_sidebar("eam_plans", display_name, &initials, &installed, user.is_admin());
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><title>Maintenance Plans - Asset Management</title>
 <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/><script src="https://cdn.tailwindcss.com"></script></head>
 <body class="min-h-screen bg-base-200"><div class="flex">{sidebar}
@@ -7492,6 +8432,7 @@ async fn eam_inspection_new(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
 ) -> Response {
     let display_name = user.full_name.as_deref().unwrap_or(&user.username);
     let initials = get_initials(display_name);
@@ -7576,7 +8517,8 @@ async fn eam_inspection_new(
 </div>
 </div></div></form>"##);
 
-    let sidebar = build_sidebar("eam_inspections", display_name, &initials);
+    let installed = db_ctx.installed_modules.clone();
+    let sidebar = build_sidebar("eam_inspections", display_name, &initials, &installed, user.is_admin());
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><title>New Inspection - Asset Management</title>
 <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/><script src="https://cdn.tailwindcss.com"></script></head>
 <body class="min-h-screen bg-base-200"><div class="flex">{sidebar}
@@ -7647,6 +8589,7 @@ async fn eam_inspection_create(
 async fn eam_checklist_new(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
 ) -> Response {
     let display_name = user.full_name.as_deref().unwrap_or(&user.username);
     let initials = get_initials(display_name);
@@ -7694,7 +8637,8 @@ async fn eam_checklist_new(
 </div>
 </div></div></form>"##;
 
-    let sidebar = build_sidebar("eam_checklists", display_name, &initials);
+    let installed = db_ctx.installed_modules.clone();
+    let sidebar = build_sidebar("eam_checklists", display_name, &initials, &installed, user.is_admin());
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><title>New Checklist Template - Asset Management</title>
 <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/><script src="https://cdn.tailwindcss.com"></script></head>
 <body class="min-h-screen bg-base-200"><div class="flex">{sidebar}
@@ -7742,6 +8686,7 @@ async fn eam_plan_new(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
 ) -> Response {
     let display_name = user.full_name.as_deref().unwrap_or(&user.username);
     let initials = get_initials(display_name);
@@ -7856,7 +8801,8 @@ async fn eam_plan_new(
 </div>
 </div></div></form>"##);
 
-    let sidebar = build_sidebar("eam_plans", display_name, &initials);
+    let installed = db_ctx.installed_modules.clone();
+    let sidebar = build_sidebar("eam_plans", display_name, &initials, &installed, user.is_admin());
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><title>New Maintenance Plan - Asset Management</title>
 <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/><script src="https://cdn.tailwindcss.com"></script></head>
 <body class="min-h-screen bg-base-200"><div class="flex">{sidebar}
@@ -7928,6 +8874,7 @@ async fn eam_functional_locations(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
 ) -> Response {
     let display_name = user.full_name.as_deref().unwrap_or(&user.username);
     let initials = get_initials(display_name);
@@ -7983,7 +8930,8 @@ async fn eam_functional_locations(
         format!(r#"<div class="overflow-x-auto"><table class="table table-zebra"><thead><tr><th>Code</th><th>Name</th><th>Unit Type</th><th>Site</th><th>Voltage</th><th>Parent</th><th>Status</th><th>Actions</th></tr></thead><tbody>{table_rows}</tbody></table></div>"#)
     };
 
-    let sidebar = build_sidebar("eam_functional_locations", display_name, &initials);
+    let installed = db_ctx.installed_modules.clone();
+    let sidebar = build_sidebar("eam_functional_locations", display_name, &initials, &installed, user.is_admin());
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><title>Functional Locations - Asset Management</title>
 <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/><script src="https://cdn.tailwindcss.com"></script></head>
 <body class="min-h-screen bg-base-200"><div class="flex">{sidebar}
@@ -7999,6 +8947,7 @@ async fn eam_functional_location_new(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
 ) -> Response {
     let display_name = user.full_name.as_deref().unwrap_or(&user.username);
     let initials = get_initials(display_name);
@@ -8101,7 +9050,8 @@ async fn eam_functional_location_new(
 </div>
 </div></div></form>"##);
 
-    let sidebar = build_sidebar("eam_functional_locations", display_name, &initials);
+    let installed = db_ctx.installed_modules.clone();
+    let sidebar = build_sidebar("eam_functional_locations", display_name, &initials, &installed, user.is_admin());
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><title>New Functional Location - Asset Management</title>
 <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/><script src="https://cdn.tailwindcss.com"></script></head>
 <body class="min-h-screen bg-base-200"><div class="flex">{sidebar}
@@ -8159,6 +9109,7 @@ async fn eam_functional_location_detail(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
     axum::extract::Path(id): axum::extract::Path<uuid::Uuid>,
 ) -> Response {
     let display_name = user.full_name.as_deref().unwrap_or(&user.username);
@@ -8270,7 +9221,8 @@ async fn eam_functional_location_detail(
         format!(r#"<div class="overflow-x-auto"><table class="table table-sm"><thead><tr><th>Code</th><th>Name</th><th>Status</th></tr></thead><tbody>{assets_html}</tbody></table></div>"#)
     };
 
-    let sidebar = build_sidebar("eam_functional_locations", display_name, &initials);
+    let installed = db_ctx.installed_modules.clone();
+    let sidebar = build_sidebar("eam_functional_locations", display_name, &initials, &installed, user.is_admin());
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><title>{code} - Functional Location</title>
 <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/><script src="https://cdn.tailwindcss.com"></script></head>
 <body class="min-h-screen bg-base-200"><div class="flex">{sidebar}
@@ -8325,6 +9277,7 @@ async fn eam_functional_location_edit(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
     axum::extract::Path(id): axum::extract::Path<uuid::Uuid>,
 ) -> Response {
     let display_name = user.full_name.as_deref().unwrap_or(&user.username);
@@ -8452,7 +9405,8 @@ async fn eam_functional_location_edit(
 </div>
 </div></div></form>"##);
 
-    let sidebar = build_sidebar("eam_functional_locations", display_name, &initials);
+    let installed = db_ctx.installed_modules.clone();
+    let sidebar = build_sidebar("eam_functional_locations", display_name, &initials, &installed, user.is_admin());
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><title>Edit {cur_code} - Functional Location</title>
 <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/><script src="https://cdn.tailwindcss.com"></script></head>
 <body class="min-h-screen bg-base-200"><div class="flex">{sidebar}
@@ -8518,10 +9472,12 @@ async fn eam_functional_location_save(
 async fn eam_sld(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
 ) -> Response {
     let display_name = user.full_name.as_deref().unwrap_or(&user.username);
     let initials = get_initials(display_name);
-    let sidebar = build_sidebar("eam_sld", display_name, &initials);
+    let installed = db_ctx.installed_modules.clone();
+    let sidebar = build_sidebar("eam_sld", display_name, &initials, &installed, user.is_admin());
 
     let header = format!(r#"<!DOCTYPE html><html data-theme="dark"><head><title>Single Line Diagram - Asset Management</title>
 <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/><script src="https://cdn.tailwindcss.com"></script></head>
@@ -9078,6 +10034,7 @@ async fn eam_condition_monitoring(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
 ) -> Response {
     let display_name = user.full_name.as_deref().unwrap_or(&user.username);
     let initials = get_initials(display_name);
@@ -9098,7 +10055,8 @@ async fn eam_condition_monitoring(
     let critical_class = if critical > 0 { "bg-error/10" } else { "" };
     let critical_text = if critical > 0 { "text-error" } else { "" };
 
-    let sidebar = build_sidebar("eam_condition", display_name, &initials);
+    let installed = db_ctx.installed_modules.clone();
+    let sidebar = build_sidebar("eam_condition", display_name, &initials, &installed, user.is_admin());
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><title>Condition Monitoring - Asset Management</title>
 <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/><script src="https://cdn.tailwindcss.com"></script></head>
 <body class="min-h-screen bg-base-200"><div class="flex">{sidebar}
@@ -9135,6 +10093,7 @@ async fn eam_manufacturers(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
 ) -> Response {
     let display_name = user.full_name.as_deref().unwrap_or(&user.username);
     let initials = get_initials(display_name);
@@ -9177,7 +10136,8 @@ async fn eam_manufacturers(
         format!(r#"<div class="overflow-x-auto"><table class="table table-zebra"><thead><tr><th>Code</th><th>Name</th><th>Country</th><th>Website</th><th>Status</th><th>Actions</th></tr></thead><tbody>{table_rows}</tbody></table></div>"#)
     };
 
-    let sidebar = build_sidebar("eam_manufacturers", display_name, &initials);
+    let installed = db_ctx.installed_modules.clone();
+    let sidebar = build_sidebar("eam_manufacturers", display_name, &initials, &installed, user.is_admin());
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><title>Manufacturers - Asset Management</title>
 <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/><script src="https://cdn.tailwindcss.com"></script></head>
 <body class="min-h-screen bg-base-200"><div class="flex">{sidebar}
@@ -9193,6 +10153,7 @@ async fn eam_site_detail(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
     Path(id): Path<uuid::Uuid>,
 ) -> Response {
     let display_name = user.full_name.as_deref().unwrap_or(&user.username);
@@ -9289,7 +10250,8 @@ async fn eam_site_detail(
         }
     }
 
-    let sidebar = build_sidebar("eam_sites", display_name, &initials);
+    let installed = db_ctx.installed_modules.clone();
+    let sidebar = build_sidebar("eam_sites", display_name, &initials, &installed, user.is_admin());
     let location = format!("{}, {}", city.as_deref().unwrap_or("-"), state_name.as_deref().unwrap_or("-"));
     let gps = if let (Some(lat), Some(lon)) = (gps_lat, gps_lon) {
         format!("{:.4}, {:.4}", lat, lon)
@@ -9367,6 +10329,7 @@ async fn eam_asset_detail(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
     Path(id): Path<uuid::Uuid>,
 ) -> Response {
     let display_name = user.full_name.as_deref().unwrap_or(&user.username);
@@ -9440,7 +10403,8 @@ async fn eam_asset_detail(
     let site_id: Option<uuid::Uuid> = asset.get("site_id");
     let voltage: Option<String> = asset.get("voltage_level");
 
-    let sidebar = build_sidebar("eam_assets", display_name, &initials);
+    let installed = db_ctx.installed_modules.clone();
+    let sidebar = build_sidebar("eam_assets", display_name, &initials, &installed, user.is_admin());
     let criticality_badge = match criticality {
         Some(5) => r#"<span class="badge badge-error">Critical (5)</span>"#,
         Some(4) => r#"<span class="badge badge-warning">High (4)</span>"#,
@@ -9531,10 +10495,12 @@ async fn eam_asset_detail(
 async fn eam_site_form(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
 ) -> Response {
     let display_name = user.full_name.as_deref().unwrap_or(&user.username);
     let initials = get_initials(display_name);
-    let sidebar = build_sidebar("eam_sites", display_name, &initials);
+    let installed = db_ctx.installed_modules.clone();
+    let sidebar = build_sidebar("eam_sites", display_name, &initials, &installed, user.is_admin());
 
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><title>New Site - Asset Management</title>
 <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/>
@@ -9614,6 +10580,7 @@ async fn eam_site_edit(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
     Path(id): Path<uuid::Uuid>,
 ) -> Response {
     let display_name = user.full_name.as_deref().unwrap_or(&user.username);
@@ -9642,7 +10609,8 @@ async fn eam_site_edit(
     let feeder_count: Option<i32> = site.get("feeder_count");
     let description: Option<String> = site.get("description");
 
-    let sidebar = build_sidebar("eam_sites", display_name, &initials);
+    let installed = db_ctx.installed_modules.clone();
+    let sidebar = build_sidebar("eam_sites", display_name, &initials, &installed, user.is_admin());
 
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><title>Edit {name} - Asset Management</title>
 <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/>
@@ -9737,6 +10705,7 @@ async fn eam_asset_form(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
 ) -> Response {
     let display_name = user.full_name.as_deref().unwrap_or(&user.username);
     let initials = get_initials(display_name);
@@ -9767,7 +10736,8 @@ async fn eam_asset_form(
     let loc_opts: String = locations.iter().map(|(id, name, site)| format!(r#"<option value="{}">{} - {}</option>"#, id, site, name)).collect();
     let volt_opts: String = voltages.iter().map(|(id, name)| format!(r#"<option value="{}">{}</option>"#, id, name)).collect();
 
-    let sidebar = build_sidebar("eam_assets", display_name, &initials);
+    let installed = db_ctx.installed_modules.clone();
+    let sidebar = build_sidebar("eam_assets", display_name, &initials, &installed, user.is_admin());
 
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><title>New Asset - Asset Management</title>
 <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/>
@@ -9848,6 +10818,7 @@ async fn eam_asset_edit(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
     Path(id): Path<uuid::Uuid>,
 ) -> Response {
     let display_name = user.full_name.as_deref().unwrap_or(&user.username);
@@ -9904,7 +10875,8 @@ async fn eam_asset_edit(
     let volt_opts: String = voltages.iter().map(|(vid, vname)|
         format!(r#"<option value="{}" {}>{}</option>"#, vid, if voltage_id == Some(*vid) { "selected" } else { "" }, vname)).collect();
 
-    let sidebar = build_sidebar("eam_assets", display_name, &initials);
+    let installed = db_ctx.installed_modules.clone();
+    let sidebar = build_sidebar("eam_assets", display_name, &initials, &installed, user.is_admin());
 
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><title>Edit {name} - Asset Management</title>
 <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/>
