@@ -90,23 +90,26 @@ impl RateLimiter {
     }
 }
 
-/// Rate limiting middleware
+/// Rate limiting middleware — checks the RateLimiter from request extensions.
 pub async fn rate_limit_middleware(
     request: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    // Get rate limiter from extensions (should be added by layer)
-    // For now, this is a placeholder implementation
-
-    // Get client identifier
     let client_id = request
         .headers()
         .get("x-forwarded-for")
         .or_else(|| request.headers().get("x-real-ip"))
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("unknown");
+        .unwrap_or("unknown")
+        .to_string();
 
-    // In a real implementation, check against the rate limiter
-    // For now, always allow
+    let limiter = request.extensions().get::<RateLimiter>().cloned();
+
+    if let Some(limiter) = limiter {
+        if !limiter.check(&client_id).await {
+            return Err(StatusCode::TOO_MANY_REQUESTS);
+        }
+    }
+
     Ok(next.run(request).await)
 }
