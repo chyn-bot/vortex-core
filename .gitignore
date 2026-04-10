@@ -40,3 +40,6 @@ logs/
 
 # Documentation
 /docs/build/
+
+# User-uploaded runtime content (chatter attachments, etc.)
+/uploads/
