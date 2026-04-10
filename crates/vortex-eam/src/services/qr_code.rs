@@ -27,6 +27,10 @@ pub enum EntityType {
     WorkOrder,
     /// Inspection
     Inspection,
+    /// Transmission Line
+    TransmissionLine,
+    /// Transmission Tower
+    TransmissionTower,
 }
 
 impl EntityType {
@@ -40,6 +44,8 @@ impl EntityType {
             EntityType::Site => "STE",
             EntityType::WorkOrder => "WO",
             EntityType::Inspection => "INS",
+            EntityType::TransmissionLine => "TL",
+            EntityType::TransmissionTower => "TWR",
         }
     }
 
@@ -53,6 +59,8 @@ impl EntityType {
             "STE" => Some(EntityType::Site),
             "WO" => Some(EntityType::WorkOrder),
             "INS" => Some(EntityType::Inspection),
+            "TL" => Some(EntityType::TransmissionLine),
+            "TWR" => Some(EntityType::TransmissionTower),
             _ => None,
         }
     }

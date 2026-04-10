@@ -198,8 +198,10 @@ pub struct Asset {
     pub id: Uuid,
     #[vortex(required, indexed)]
     pub company_id: Uuid,
-    /// Bay reference (L3) - new field for SESB hierarchy
+    /// Bay reference (L3) - for distribution equipment
     pub bay_id: Option<Uuid>,
+    /// Tower reference - for transmission equipment (alternative to bay_id)
+    pub tower_id: Option<Uuid>,
     /// Legacy functional location reference (deprecated, for migration compatibility)
     pub functional_location_id: Option<Uuid>,
     #[vortex(required)]
@@ -219,17 +221,32 @@ pub struct Asset {
     pub model: Option<String>,
     pub serial_number: Option<String>,
     pub year_manufactured: Option<i32>,
+    /// Full manufacture date (supplements year_manufactured)
+    pub manufacture_date: Option<String>,
+    /// Date equipment was installed at site
+    pub installation_date: Option<String>,
     pub commissioning_date: Option<String>,
     pub warranty_expiry: Option<String>,
     pub expected_life_years: Option<i32>,
     pub purchase_cost: Option<f64>,
     pub replacement_cost: Option<f64>,
+    /// Rated voltage in kV (base equipment level)
+    pub rated_voltage_kv: Option<f64>,
+    /// Rated current in Amperes (base equipment level)
+    pub rated_current_a: Option<f64>,
+    /// Rated power in kVA (base equipment level)
+    pub rated_power_kva: Option<f64>,
     pub criticality_rating: Option<i32>,
     pub operational_status: Option<String>,
+    /// Condition assessment: good, fair, poor, critical, unknown
+    pub condition_status: Option<String>,
     pub condition_score: Option<f64>,
+    /// Computed health index (0-100 scale)
+    pub health_index: Option<f64>,
     pub last_inspection_date: Option<String>,
     pub last_maintenance_date: Option<String>,
     pub next_maintenance_date: Option<String>,
+    pub notes: Option<String>,
     pub qr_code: Option<String>,
     pub qr_code_generated_at: Option<DateTime<Utc>>,
     pub display_order: Option<i32>,

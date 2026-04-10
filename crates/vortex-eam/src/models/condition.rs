@@ -93,6 +93,13 @@ pub struct DgaAnalysis {
     pub status: Option<String>,
     /// Assessment method: duval_triangle, rogers_ratio, ieee_c57_104
     pub assessment_method: Option<String>,
+    // Metadata
+    pub test_report_number: Option<String>,
+    pub result_summary: Option<String>,
+    pub tested_by: Option<Uuid>,
+    /// Workflow state: draft, submitted, reviewed
+    pub workflow_state: Option<String>,
+    pub recommendations: Option<String>,
     pub notes: Option<String>,
     pub created_at: Option<DateTime<Utc>>,
     pub created_by: Option<Uuid>,
@@ -135,6 +142,12 @@ pub struct OilQualityTest {
     pub furan_2fal_ppb: Option<f64>,
     /// Overall status: good, acceptable, marginal, poor
     pub status: Option<String>,
+    // Metadata
+    pub test_report_number: Option<String>,
+    pub result_summary: Option<String>,
+    pub tested_by: Option<Uuid>,
+    pub workflow_state: Option<String>,
+    pub recommendations: Option<String>,
     pub notes: Option<String>,
     pub created_at: Option<DateTime<Utc>>,
     pub created_by: Option<Uuid>,
@@ -175,6 +188,11 @@ pub struct ThermalImaging {
     /// Visual image file reference
     pub visual_image_id: Option<Uuid>,
     pub recommended_action: Option<String>,
+    // Metadata (no separate recommendations — uses recommended_action above)
+    pub test_report_number: Option<String>,
+    pub result_summary: Option<String>,
+    pub tested_by: Option<Uuid>,
+    pub workflow_state: Option<String>,
     pub notes: Option<String>,
     pub created_at: Option<DateTime<Utc>>,
     pub created_by: Option<Uuid>,
@@ -212,6 +230,12 @@ pub struct PartialDischarge {
     pub background_noise_pc: Option<f64>,
     /// Status: pass, fail, marginal
     pub status: Option<String>,
+    // Metadata
+    pub test_report_number: Option<String>,
+    pub result_summary: Option<String>,
+    pub tested_by: Option<Uuid>,
+    pub workflow_state: Option<String>,
+    pub recommendations: Option<String>,
     pub notes: Option<String>,
     pub created_at: Option<DateTime<Utc>>,
     pub created_by: Option<Uuid>,
@@ -252,6 +276,12 @@ pub struct InsulationResistance {
     pub minimum_ir_mohm: Option<f64>,
     /// Status: pass, fail, marginal
     pub status: Option<String>,
+    // Metadata
+    pub test_report_number: Option<String>,
+    pub result_summary: Option<String>,
+    pub tested_by: Option<Uuid>,
+    pub workflow_state: Option<String>,
+    pub recommendations: Option<String>,
     pub notes: Option<String>,
     pub created_at: Option<DateTime<Utc>>,
     pub created_by: Option<Uuid>,
@@ -280,6 +310,12 @@ pub struct Sf6Analysis {
     pub sf6_dew_point_c: Option<f64>,
     /// Status: normal, caution, warning, critical
     pub status: Option<String>,
+    // Metadata
+    pub test_report_number: Option<String>,
+    pub result_summary: Option<String>,
+    pub tested_by: Option<Uuid>,
+    pub workflow_state: Option<String>,
+    pub recommendations: Option<String>,
     pub notes: Option<String>,
     pub created_at: Option<DateTime<Utc>>,
     pub created_by: Option<Uuid>,
@@ -310,6 +346,12 @@ pub struct ContactTimingTest {
     pub simultaneity_ms: Option<f64>,
     /// Status: pass, fail, marginal
     pub status: Option<String>,
+    // Metadata
+    pub test_report_number: Option<String>,
+    pub result_summary: Option<String>,
+    pub tested_by: Option<Uuid>,
+    pub workflow_state: Option<String>,
+    pub recommendations: Option<String>,
     pub notes: Option<String>,
     pub created_at: Option<DateTime<Utc>>,
     pub created_by: Option<Uuid>,
@@ -342,6 +384,12 @@ pub struct BatteryDischargeTest {
     pub electrolyte_temp_c: Option<f64>,
     /// Status: pass, fail, marginal
     pub status: Option<String>,
+    // Metadata
+    pub test_report_number: Option<String>,
+    pub result_summary: Option<String>,
+    pub tested_by: Option<Uuid>,
+    pub workflow_state: Option<String>,
+    pub recommendations: Option<String>,
     pub notes: Option<String>,
     pub created_at: Option<DateTime<Utc>>,
     pub created_by: Option<Uuid>,

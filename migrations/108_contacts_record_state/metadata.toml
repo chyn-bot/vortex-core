@@ -1,0 +1,5 @@
+[migration]
+module = "contacts"
+description = "Add record_state column to contacts table for workflow state tracking"
+reversible = true
+dependencies = ["010_contacts"]

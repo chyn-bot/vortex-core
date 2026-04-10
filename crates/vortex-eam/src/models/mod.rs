@@ -18,6 +18,10 @@
 //! - Original: Transformer, SwitchGear, RingMainUnit, FeederPillar, ProtectionSystem, ScadaSystem, Battery
 //! - New: CurrentVoltageTransformer, SurgeArrester, Cable, Busbar, Isolator, EarthingSystem
 //!
+//! ## Transmission
+//! - TransmissionLine: Overhead power lines connecting substations
+//! - TransmissionTower: Structures along a line with GPS coordinates
+//!
 //! ## Condition Monitoring
 //! - Generic: ConditionMonitoringRecord, AssetHealthIndex
 //! - Specialized: DgaAnalysis, OilQualityTest, ThermalImaging, PartialDischarge, InsulationResistance
@@ -38,6 +42,7 @@ pub mod equipment;
 pub mod maintenance;
 pub mod condition;
 pub mod checklist;
+pub mod transmission;
 
 pub use configuration::*;
 pub use hierarchy::*;
@@ -45,3 +50,4 @@ pub use equipment::*;
 pub use maintenance::*;
 pub use condition::*;
 pub use checklist::*;
+pub use transmission::*;

@@ -1,0 +1,5 @@
+[migration]
+module = "asset_management"
+description = "Add missing fields to eam_assets, eam_work_orders, eam_inspection_results for SESB parity"
+reversible = true
+dependencies = ["111_eam_security"]

@@ -20,6 +20,14 @@ pub enum SequenceType {
     Maintenance,
     /// Inspection codes: INS/2026/00001 (includes year)
     Inspection,
+    /// Maintenance Plan codes: MP/00001
+    MaintenancePlan,
+    /// Transmission Line codes: TL/00001
+    TransmissionLine,
+    /// Transmission Tower codes: TWR/000001
+    TransmissionTower,
+    /// Condition Monitoring codes: CM/2026/00001 (includes year)
+    ConditionMonitoring,
 }
 
 impl SequenceType {
@@ -31,6 +39,10 @@ impl SequenceType {
             SequenceType::Part => "part",
             SequenceType::Maintenance => "maintenance",
             SequenceType::Inspection => "inspection",
+            SequenceType::MaintenancePlan => "maintenance_plan",
+            SequenceType::TransmissionLine => "transmission_line",
+            SequenceType::TransmissionTower => "transmission_tower",
+            SequenceType::ConditionMonitoring => "condition_monitoring",
         }
     }
 
@@ -42,19 +54,26 @@ impl SequenceType {
             SequenceType::Part => "PRT",
             SequenceType::Maintenance => "MNT",
             SequenceType::Inspection => "INS",
+            SequenceType::MaintenancePlan => "MP",
+            SequenceType::TransmissionLine => "TL",
+            SequenceType::TransmissionTower => "TWR",
+            SequenceType::ConditionMonitoring => "CM",
         }
     }
 
     /// Whether this sequence includes year in the format
     fn includes_year(&self) -> bool {
-        matches!(self, SequenceType::Maintenance | SequenceType::Inspection)
+        matches!(self, SequenceType::Maintenance | SequenceType::Inspection | SequenceType::ConditionMonitoring)
     }
 
     /// Number of digits for the sequence number
     fn digits(&self) -> usize {
         match self {
-            SequenceType::Equipment | SequenceType::Component | SequenceType::Part => 6,
-            SequenceType::Maintenance | SequenceType::Inspection => 5,
+            SequenceType::Equipment | SequenceType::Component | SequenceType::Part
+            | SequenceType::TransmissionTower => 6,
+            SequenceType::Maintenance | SequenceType::Inspection
+            | SequenceType::MaintenancePlan | SequenceType::TransmissionLine
+            | SequenceType::ConditionMonitoring => 5,
         }
     }
 }
@@ -137,6 +156,26 @@ pub async fn next_maintenance_code(pool: &ConnectionPool) -> VortexResult<String
 /// Generates next inspection code: INS/2026/00001
 pub async fn next_inspection_code(pool: &ConnectionPool) -> VortexResult<String> {
     next_code(pool, SequenceType::Inspection).await
+}
+
+/// Generates next maintenance plan code: MP/00001
+pub async fn next_maintenance_plan_code(pool: &ConnectionPool) -> VortexResult<String> {
+    next_code(pool, SequenceType::MaintenancePlan).await
+}
+
+/// Generates next transmission line code: TL/00001
+pub async fn next_transmission_line_code(pool: &ConnectionPool) -> VortexResult<String> {
+    next_code(pool, SequenceType::TransmissionLine).await
+}
+
+/// Generates next transmission tower code: TWR/000001
+pub async fn next_transmission_tower_code(pool: &ConnectionPool) -> VortexResult<String> {
+    next_code(pool, SequenceType::TransmissionTower).await
+}
+
+/// Generates next condition monitoring code: CM/2026/00001
+pub async fn next_condition_monitoring_code(pool: &ConnectionPool) -> VortexResult<String> {
+    next_code(pool, SequenceType::ConditionMonitoring).await
 }
 
 /// Peeks at the next sequence value without incrementing
