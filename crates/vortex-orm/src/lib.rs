@@ -33,6 +33,7 @@ pub mod dialect;
 pub mod field;
 pub mod migration;
 pub mod model;
+pub mod model_impl;
 pub mod pool_manager;
 pub mod query;
 pub mod registry;
@@ -45,7 +46,8 @@ pub mod prelude {
     pub use crate::dialect::MssqlDialect;
     pub use crate::dialect::PostgresDialect;
     pub use crate::field::{Field, FieldDef, FieldType};
-    pub use crate::model::{Model, ModelMeta, AccessControl, AccessibleFields, SecureModelExt, NoAccessControl};
+    pub use crate::model::{Model, ModelExt, ModelMeta, AccessControl, AccessibleFields, SecureModelExt, NoAccessControl};
+    pub use crate::model_impl::{browse, count, execute_query};
     pub use crate::pool_manager::{DatabasePoolManager, PoolManagerConfig};
     pub use crate::query::{Query, QueryBuilder, Filter, OrderBy, SecureQueryBuilder, SecureQuery};
     pub use crate::registry::ModelRegistry;
