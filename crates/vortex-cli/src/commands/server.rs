@@ -18,6 +18,9 @@ use tokio::sync::RwLock;
 use tower_http::services::ServeDir;
 use tracing::{error, info, warn};
 use vortex_orm::ConnectionPool;
+use vortex_security::audit::PgAuditStorage;
+use vortex_security::signing::{Ed25519Key, SigningKey, SigningMode};
+use vortex_security::{AuditAction, AuditEntry, AuditLog, AuditSeverity};
 use vortex_server::middleware::rate_limit::{RateLimiter, RateLimitConfig};
 use vortex_orm::pool_manager::{DatabasePoolManager, PoolManagerConfig};
 
@@ -33,6 +36,10 @@ pub struct AppState {
     pub multi_db: bool,
     pub default_db: String,
     pub installed_modules: Arc<RwLock<HashSet<String>>>,
+    /// WORM audit ledger (Phase 0.1). All state-changing handlers must
+    /// emit audit events through this service — never via raw SQL inserts
+    /// into `audit_log`, which would bypass the hash chain.
+    pub audit: Arc<AuditLog>,
 }
 
 /// Database context injected by auth middleware for request-scoped DB routing.
@@ -419,6 +426,63 @@ pub async fn run(host: String, port: u16, _workers: Option<usize>) -> Result<()>
     // Create connection pool wrapper for EAM handlers
     let pool = Arc::new(ConnectionPool::from_pg_pool(db.clone(), &database_url));
 
+    // ─── WORM Audit Ledger (Phase 0.1) ─────────────────────────────────
+    // Load the Ed25519 signing key from VORTEX_AUDIT_SIGNING_KEY (base64
+    // PKCS#8). Signing can be disabled for local dev via
+    // VORTEX_AUDIT_SIGNING_MODE=disabled — the hash chain still provides
+    // tamper evidence, but the ledger can no longer attribute entries.
+    let signing_mode = SigningMode::from_env();
+    let signer: Option<Arc<dyn SigningKey>> = match signing_mode {
+        SigningMode::Enabled => match Ed25519Key::from_env() {
+            Ok(key) => {
+                info!(
+                    "Audit ledger signing ENABLED (key_id={})",
+                    key.key_id()
+                );
+                // Register the public half so `vortex audit verify` can
+                // validate historical entries even after the key rotates.
+                let key_id_owned = key.key_id().to_string();
+                let public_key = key.public_key();
+                let algorithm = key.algorithm().to_string();
+                let storage_for_register = PgAuditStorage::new(pool.clone(), None);
+                if let Err(e) = storage_for_register
+                    .register_signing_key(
+                        &key_id_owned,
+                        &public_key,
+                        &algorithm,
+                        chrono::Utc::now(),
+                    )
+                    .await
+                {
+                    warn!("audit_signing_keys upsert failed: {e}");
+                }
+                Some(Arc::new(key))
+            }
+            Err(e) => {
+                warn!(
+                    "VORTEX_AUDIT_SIGNING_KEY not usable ({e}); falling \
+                     back to unsigned chain. Set VORTEX_AUDIT_SIGNING_MODE=disabled \
+                     to silence this warning in dev."
+                );
+                None
+            }
+        },
+        SigningMode::Disabled => {
+            warn!("Audit ledger signing DISABLED via VORTEX_AUDIT_SIGNING_MODE — dev only");
+            None
+        }
+    };
+
+    let audit_storage = Arc::new(PgAuditStorage::new(pool.clone(), signer));
+    let audit = Arc::new(AuditLog::new(audit_storage).with_alert_handler(|entry| {
+        error!(
+            action = ?entry.action,
+            user_id = ?entry.user_id,
+            source_ip = ?entry.source_ip,
+            "CRITICAL security event"
+        );
+    }));
+
     // Create pool manager
     let pool_manager = if multi_db_enabled {
         let config = PoolManagerConfig {
@@ -530,6 +594,7 @@ pub async fn run(host: String, port: u16, _workers: Option<usize>) -> Result<()>
         multi_db: multi_db_enabled,
         default_db,
         installed_modules,
+        audit,
     });
 
     // Start background pool eviction task if multi-db
@@ -976,17 +1041,27 @@ async fn login_submit(
                 .execute(&db)
                 .await;
 
-                // Log successful login
-                let _ = sqlx::query(
-                    r#"
-                    INSERT INTO audit_log (user_id, username, action, resource_type, details, cip_requirement)
-                    VALUES ($1, $2, 'LOGIN', 'session', '{"success": true}', 'CIP-007-R5')
-                    "#
+                // Log successful login through the WORM ledger.
+                //
+                // Multi-DB note: `state.audit` is bound to the primary
+                // database's pool. In multi-DB deployments, login events
+                // for non-primary tenants currently land in the primary
+                // audit_log. Per-tenant audit ledgers are a Phase 0.2
+                // follow-up — see /root/.claude/plans/shiny-fluttering-reef.md.
+                let audit_entry = AuditEntry::new(
+                    AuditAction::LoginSuccess,
+                    AuditSeverity::Info,
                 )
-                .bind(&user.id)
-                .bind(&user.username)
-                .execute(&db)
-                .await;
+                .with_user(vortex_common::UserId(user.id))
+                .with_username(&user.username)
+                .with_resource("session", user.id.to_string())
+                .with_details(serde_json::json!({
+                    "database": db_name,
+                    "session_id": token_hash,
+                }));
+                if let Err(e) = state.audit.log(audit_entry).await {
+                    error!("WORM audit write failed for LoginSuccess: {}", e);
+                }
 
                 // Return success with session cookie (db_name|token format for multi-db)
                 let mut headers = HeaderMap::new();
@@ -1010,32 +1085,42 @@ async fn login_submit(
                 .execute(&db)
                 .await;
 
-                // Log failed login
-                let _ = sqlx::query(
-                    r#"
-                    INSERT INTO audit_log (user_id, username, action, resource_type, details, success, cip_requirement)
-                    VALUES ($1, $2, 'LOGIN_FAILED', 'session', '{"reason": "invalid_password"}', false, 'CIP-007-R5')
-                    "#
+                // Log failed login — WORM ledger.
+                let audit_entry = AuditEntry::new(
+                    AuditAction::LoginFailure,
+                    AuditSeverity::Warning,
                 )
-                .bind(&user.id)
-                .bind(&user.username)
-                .execute(&db)
-                .await;
+                .with_user(vortex_common::UserId(user.id))
+                .with_username(&user.username)
+                .with_resource("session", user.id.to_string())
+                .with_error("invalid_password")
+                .with_details(serde_json::json!({
+                    "reason": "invalid_password",
+                    "database": db_name,
+                }));
+                if let Err(e) = state.audit.log(audit_entry).await {
+                    error!("WORM audit write failed for LoginFailure: {}", e);
+                }
 
                 error_response("Invalid username or password")
             }
         }
         Ok(None) => {
-            // Log failed login attempt for unknown user
-            let _ = sqlx::query(
-                r#"
-                INSERT INTO audit_log (username, action, resource_type, details, success, cip_requirement)
-                VALUES ($1, 'LOGIN_FAILED', 'session', '{"reason": "user_not_found"}', false, 'CIP-007-R5')
-                "#
+            // Log failed login attempt for unknown user — WORM ledger.
+            let audit_entry = AuditEntry::new(
+                AuditAction::LoginFailure,
+                AuditSeverity::Warning,
             )
-            .bind(&form.username)
-            .execute(&db)
-            .await;
+            .with_username(&form.username)
+            .with_resource("session", "unknown")
+            .with_error("user_not_found")
+            .with_details(serde_json::json!({
+                "reason": "user_not_found",
+                "database": db_name,
+            }));
+            if let Err(e) = state.audit.log(audit_entry).await {
+                error!("WORM audit write failed for unknown-user LoginFailure: {}", e);
+            }
 
             error_response("Invalid username or password")
         }
@@ -1185,17 +1270,18 @@ async fn logout(
     .execute(&db)
     .await;
 
-    // Log the logout
-    let _ = sqlx::query(
-        r#"
-        INSERT INTO audit_log (user_id, username, action, resource_type, details, cip_requirement)
-        VALUES ($1, $2, 'LOGOUT', 'session', '{"reason": "user_initiated"}', 'CIP-007-R5')
-        "#
-    )
-    .bind(&user.id)
-    .bind(&user.username)
-    .execute(&db)
-    .await;
+    // Log the logout through the WORM ledger.
+    let audit_entry = AuditEntry::new(AuditAction::Logout, AuditSeverity::Info)
+        .with_user(vortex_common::UserId(user.id))
+        .with_username(&user.username)
+        .with_session(user.session_id)
+        .with_resource("session", user.session_id.to_string())
+        .with_details(serde_json::json!({
+            "reason": "user_initiated",
+        }));
+    if let Err(e) = state.audit.log(audit_entry).await {
+        error!("WORM audit write failed for Logout: {}", e);
+    }
 
     info!("User {} logged out", user.username);
 
@@ -1518,8 +1604,11 @@ fn build_sidebar(active_page: &str, user_name: &str, initials: &str, installed: 
 }
 
 async fn recent_activity(State(state): State<Arc<AppState>>, Db(db): Db) -> Html<String> {
-    // Fetch real audit log entries
-    let entries = sqlx::query_as::<_, AuditEntry>(
+    // Fetch recent audit log entries for the UI. This is a read-only view
+    // over the WORM ledger and is intentionally decoupled from the
+    // `vortex_security::AuditEntry` struct — it only needs a few columns
+    // for rendering, and stays compatible with pre-chain legacy rows.
+    let entries = sqlx::query_as::<_, AuditActivityRow>(
         r#"
         SELECT
             timestamp,
@@ -1540,10 +1629,18 @@ async fn recent_activity(State(state): State<Arc<AppState>>, Db(db): Db) -> Html
         .map(|e| {
             let time_ago = format_time_ago(e.timestamp);
             let badge_class = match e.action.as_str() {
+                // New chained-ledger codes
+                "login_success" => "badge-info",
+                "login_failure" => "badge-error",
+                "logout" => "badge-warning",
+                "user_created" | "user_updated" | "user_unlocked" => "badge-info",
+                "chain_verification_passed" => "badge-success",
+                "chain_verification_failed" | "trigger_disabled" => "badge-error",
+                // Legacy pre-chain rows
                 "LOGIN" => "badge-info",
                 "LOGIN_FAILED" => "badge-error",
                 "LOGOUT" => "badge-warning",
-                "SYSTEM_INITIALIZED" => "badge-success",
+                "SYSTEM_INITIALIZED" | "AUDIT_WORM_ENABLED" => "badge-success",
                 _ => "badge-neutral",
             };
             format!(
@@ -1568,7 +1665,7 @@ async fn recent_activity(State(state): State<Arc<AppState>>, Db(db): Db) -> Html
 }
 
 #[derive(sqlx::FromRow)]
-struct AuditEntry {
+struct AuditActivityRow {
     timestamp: chrono::DateTime<chrono::Utc>,
     username: String,
     action: String,
@@ -2699,18 +2796,19 @@ async fn users_create(
                 .execute(&db)
                 .await;
 
-            // Log the action
-            let _ = sqlx::query(
-                r#"
-                INSERT INTO audit_log (user_id, username, action, resource_type, resource_name, cip_requirement)
-                VALUES ($1, $2, 'USER_CREATED', 'user', $3, 'CIP-004-R4')
-                "#
-            )
-            .bind(&auth_user.id)
-            .bind(&auth_user.username)
-            .bind(&form.username)
-            .execute(&db)
-            .await;
+            // Log the action through the WORM ledger.
+            let audit_entry = AuditEntry::new(AuditAction::UserCreated, AuditSeverity::Info)
+                .with_user(vortex_common::UserId(auth_user.id))
+                .with_username(&auth_user.username)
+                .with_resource("user", user_id.to_string())
+                .with_resource_name(&form.username)
+                .with_details(serde_json::json!({
+                    "new_username": form.username,
+                    "role_id": form.role.to_string(),
+                }));
+            if let Err(e) = state.audit.log(audit_entry).await {
+                error!("WORM audit write failed for UserCreated: {}", e);
+            }
 
             // Redirect to users list (works for both HTMX and regular form)
             Redirect::to("/users").into_response()
@@ -2835,6 +2933,7 @@ async fn users_update(
     }
 
     let active = form.active.is_some();
+    let password_changed = form.password.as_deref().map_or(false, |p| !p.is_empty());
 
     // Update user
     let result = if let Some(password) = form.password.filter(|p| !p.is_empty()) {
@@ -2889,18 +2988,21 @@ async fn users_update(
                 .execute(&db)
                 .await;
 
-            // Log the action
-            let _ = sqlx::query(
-                r#"
-                INSERT INTO audit_log (user_id, username, action, resource_type, resource_id, cip_requirement)
-                VALUES ($1, $2, 'USER_UPDATED', 'user', $3, 'CIP-004-R4')
-                "#
-            )
-            .bind(&auth_user.id)
-            .bind(&auth_user.username)
-            .bind(&user_id)
-            .execute(&db)
-            .await;
+            // Log the action through the WORM ledger.
+            let audit_entry = AuditEntry::new(AuditAction::UserUpdated, AuditSeverity::Info)
+                .with_user(vortex_common::UserId(auth_user.id))
+                .with_username(&auth_user.username)
+                .with_resource("user", user_id.to_string())
+                .with_details(serde_json::json!({
+                    "target_user_id": user_id.to_string(),
+                    "new_email": form.email,
+                    "active": active,
+                    "role_id": form.role.to_string(),
+                    "password_changed": password_changed,
+                }));
+            if let Err(e) = state.audit.log(audit_entry).await {
+                error!("WORM audit write failed for UserUpdated: {}", e);
+            }
 
             // Redirect to users list (works for both HTMX and regular form)
             Redirect::to("/users").into_response()
@@ -2970,18 +3072,17 @@ async fn users_unlock(
 
     match result {
         Ok(_) => {
-            // Log the action
-            let _ = sqlx::query(
-                r#"
-                INSERT INTO audit_log (user_id, username, action, resource_type, resource_id, cip_requirement)
-                VALUES ($1, $2, 'USER_UNLOCKED', 'user', $3, 'CIP-004-R4')
-                "#
-            )
-            .bind(&auth_user.id)
-            .bind(&auth_user.username)
-            .bind(&user_id)
-            .execute(&db)
-            .await;
+            // Log the action through the WORM ledger.
+            let audit_entry = AuditEntry::new(AuditAction::UserUnlocked, AuditSeverity::Info)
+                .with_user(vortex_common::UserId(auth_user.id))
+                .with_username(&auth_user.username)
+                .with_resource("user", user_id.to_string())
+                .with_details(serde_json::json!({
+                    "target_user_id": user_id.to_string(),
+                }));
+            if let Err(e) = state.audit.log(audit_entry).await {
+                error!("WORM audit write failed for UserUnlocked: {}", e);
+            }
 
             let mut headers = HeaderMap::new();
             headers.insert("HX-Redirect", format!("/users/{}", user_id).parse().unwrap());

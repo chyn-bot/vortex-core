@@ -23,11 +23,20 @@ csv = "1.3"
 # Regex for domain expression evaluation
 regex = "1.10"
 
+# Database — required for PgAuditStorage (WORM ledger backend)
+sqlx = { workspace = true }
+
+# Concurrency primitives for per-tenant audit writer tasks
+dashmap = "6.1"
+
 # Security & Crypto
 argon2 = { workspace = true }
 ring = { workspace = true }
 jsonwebtoken = { workspace = true }
 uuid = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+base64 = "0.22"
 
 # Time
 chrono = { workspace = true }
@@ -37,3 +46,6 @@ thiserror = { workspace = true }
 
 # Logging
 tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util", "macros"] }

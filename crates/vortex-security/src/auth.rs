@@ -210,7 +210,9 @@ impl AuthService {
         }
 
         // Log success
-        self.audit_log.log_login_success(user_auth.user_id, source_ip).await?;
+        self.audit_log
+            .log_login_success(user_auth.user_id, &credentials.username, Some(source_ip))
+            .await?;
         info!("Authentication successful: {}", credentials.username);
 
         Ok(AuthResult {
@@ -281,7 +283,11 @@ impl AuthService {
 
     /// Log authentication failure
     async fn log_failure(&self, username: &str, source_ip: &str, reason: &str) {
-        if let Err(e) = self.audit_log.log_login_failure(username, source_ip, reason).await {
+        if let Err(e) = self
+            .audit_log
+            .log_login_failure(username, Some(source_ip), reason)
+            .await
+        {
             warn!("Failed to log authentication failure: {}", e);
         }
     }

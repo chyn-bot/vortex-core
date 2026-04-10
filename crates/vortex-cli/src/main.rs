@@ -9,7 +9,7 @@ use tracing_subscriber::FmtSubscriber;
 
 mod commands;
 
-/// Vortex - NERC CIP Compliant Business Platform
+/// Vortex - Zero-Trust Enterprise Core
 #[derive(Parser)]
 #[command(name = "vortex")]
 #[command(author, version, about, long_about = None)]
@@ -59,6 +59,12 @@ enum Commands {
     User {
         #[command(subcommand)]
         command: UserCommands,
+    },
+
+    /// WORM audit ledger verification and inspection
+    Audit {
+        #[command(subcommand)]
+        command: commands::audit::AuditCommands,
     },
 
     /// Generate shell completions
@@ -272,6 +278,9 @@ async fn main() -> Result<()> {
         }
         Commands::User { command } => {
             commands::user::run(command).await
+        }
+        Commands::Audit { command } => {
+            commands::audit::run(command).await
         }
         Commands::Completions { shell } => {
             commands::completions::run(shell)

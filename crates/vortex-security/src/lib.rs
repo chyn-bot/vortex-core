@@ -44,6 +44,7 @@ pub mod domain;
 pub mod password;
 pub mod rbac;
 pub mod session;
+pub mod signing;
 
 pub mod prelude {
     // Legacy access control (still useful for simple cases)
@@ -58,11 +59,15 @@ pub mod prelude {
     pub use crate::csv_loader::{CsvLoader, MemoryRoleResolver, RoleResolver};
 
     // Core security
-    pub use crate::audit::{AuditAction, AuditEntry, AuditLog};
+    pub use crate::audit::{
+        AuditAction, AuditEntry, AuditFilter, AuditLog, AuditSeverity, AuditStorage,
+        MemoryAuditStorage, PgAuditStorage,
+    };
     pub use crate::auth::{AuthService, Credentials};
     pub use crate::password::{PasswordHasher, PasswordPolicy};
     pub use crate::rbac::{Permission, Role, RoleManager};
     pub use crate::session::{Session, SessionManager};
+    pub use crate::signing::{Ed25519Key, SigningKey, SigningMode};
 }
 
 pub use prelude::*;
