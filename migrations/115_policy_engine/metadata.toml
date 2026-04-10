@@ -1,0 +1,5 @@
+[migration]
+module = "core"
+description = "Policy engine: policy_rules table + seed policies for the Cedar-based ABAC service. Layers on top of RBAC for fine-grained permissions the existing model/record/field rules cannot express."
+reversible = true
+dependencies = ["114_audit_worm"]

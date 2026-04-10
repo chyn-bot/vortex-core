@@ -13,6 +13,7 @@ path = "src/main.rs"
 vortex-common = { workspace = true }
 vortex-orm = { workspace = true }
 vortex-security = { workspace = true }
+vortex-policy = { workspace = true }
 vortex-module = { workspace = true }
 vortex-server = { workspace = true }
 vortex-eam = { workspace = true }

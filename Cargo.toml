@@ -5,6 +5,7 @@ members = [
     "crates/vortex-macros",
     "crates/vortex-orm",
     "crates/vortex-security",
+    "crates/vortex-policy",
     "crates/vortex-module",
     "crates/vortex-chatter",
     "crates/vortex-server",
@@ -49,7 +50,10 @@ sha2 = "0.10"
 hex = "0.4"
 rand = "0.8"
 
-# Logging & Tracing (NERC CIP audit compliance)
+# Policy engine (Phase 0.2: ABAC via Cedar)
+cedar-policy = "4.9"
+
+# Logging & Tracing (Zero-Trust audit compliance)
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
@@ -75,6 +79,7 @@ vortex-common = { path = "crates/vortex-common" }
 vortex-macros = { path = "crates/vortex-macros" }
 vortex-orm = { path = "crates/vortex-orm" }
 vortex-security = { path = "crates/vortex-security" }
+vortex-policy = { path = "crates/vortex-policy" }
 vortex-module = { path = "crates/vortex-module" }
 vortex-chatter = { path = "crates/vortex-chatter" }
 vortex-server = { path = "crates/vortex-server" }

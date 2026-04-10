@@ -67,6 +67,12 @@ enum Commands {
         command: commands::audit::AuditCommands,
     },
 
+    /// Cedar policy engine inspection and dry-run
+    Policy {
+        #[command(subcommand)]
+        command: commands::policy::PolicyCommands,
+    },
+
     /// Generate shell completions
     Completions {
         /// Shell to generate completions for
@@ -281,6 +287,9 @@ async fn main() -> Result<()> {
         }
         Commands::Audit { command } => {
             commands::audit::run(command).await
+        }
+        Commands::Policy { command } => {
+            commands::policy::run(command).await
         }
         Commands::Completions { shell } => {
             commands::completions::run(shell)
