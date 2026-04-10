@@ -1,0 +1,5 @@
+[migration]
+module = "asset_management"
+description = "Add transmission line and tower models for overhead line asset management"
+reversible = true
+dependencies = ["106_eam_checklist_plans"]
