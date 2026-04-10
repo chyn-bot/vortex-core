@@ -40,7 +40,8 @@
             <div class="card-body py-3">
                 <div class="flex items-center gap-4">
                     <label class="label"><span class="label-text font-medium">Master Password</span></label>
-                    <input type="password" id="master-password" class="input input-bordered input-sm flex-1" placeholder="Enter master password">
+                    <input type="password" id="master-password" name="master_password" class="input input-bordered input-sm flex-1" placeholder="Enter master password">
+                    <button id="unlock-btn" type="button" class="btn btn-primary btn-sm">Unlock</button>
                 </div>
             </div>
         </div>
@@ -54,10 +55,10 @@
                 <h2 class="card-title text-lg mb-4">Databases</h2>
                 <div id="db-list"
                      hx-post="/web/database/manager/list"
-                     hx-trigger="load"
-                     hx-vals='js:{master_password: document.getElementById("master-password").value}'
+                     hx-trigger="reloadList from:body"
+                     hx-include="#master-password"
                      hx-swap="innerHTML">
-                    <div class="text-center py-4 text-base-content/50">Loading...</div>
+                    <div class="text-center py-4 text-base-content/50">Enter master password and click Unlock to view databases</div>
                 </div>
             </div>
         </div>
@@ -69,7 +70,7 @@
                 <form hx-post="/web/database/manager/create"
                       hx-target="#db-messages"
                       hx-swap="innerHTML"
-                      hx-on::after-request="if(event.detail.successful) { htmx.trigger('#db-list', 'load') }">
+                      hx-on::after-request="if(event.detail.successful) { htmx.trigger(document.body, 'reloadList') }">
                     <div class="flex flex-wrap gap-4 items-end">
                         <div class="form-control flex-1 min-w-[200px]">
                             <label class="label"><span class="label-text">Database Name</span></label>
@@ -98,7 +99,7 @@
                 <form hx-post="/web/database/manager/duplicate"
                       hx-target="#db-messages"
                       hx-swap="innerHTML"
-                      hx-on::after-request="if(event.detail.successful) { htmx.trigger('#db-list', 'load') }">
+                      hx-on::after-request="if(event.detail.successful) { htmx.trigger(document.body, 'reloadList') }">
                     <div class="flex flex-wrap gap-4 items-end">
                         <div class="form-control flex-1 min-w-[150px]">
                             <label class="label"><span class="label-text">Source Database</span></label>
@@ -126,7 +127,7 @@
                       hx-target="#db-messages"
                       hx-swap="innerHTML"
                       hx-encoding="multipart/form-data"
-                      hx-on::after-request="if(event.detail.successful) { htmx.trigger('#db-list', 'load') }">
+                      hx-on::after-request="if(event.detail.successful) { htmx.trigger(document.body, 'reloadList') }">
                     <div class="flex flex-wrap gap-4 items-end">
                         <div class="form-control flex-1 min-w-[150px]">
                             <label class="label"><span class="label-text">Database Name</span></label>
@@ -179,6 +180,25 @@
             const mpInput = document.getElementById('master-password');
             if (mpInput && !evt.detail.parameters.master_password) {
                 evt.detail.parameters.master_password = mpInput.value;
+            }
+        });
+        // Unlock button triggers the list reload
+        function unlockDbList() {
+            const mp = document.getElementById('master-password').value;
+            if (!mp) {
+                document.getElementById('db-messages').innerHTML =
+                    '<div class="alert alert-warning mb-2"><span>Please enter master password</span></div>';
+                return;
+            }
+            document.querySelectorAll('.mp-field').forEach(el => el.value = mp);
+            htmx.trigger(document.body, 'reloadList');
+        }
+        document.getElementById('unlock-btn').addEventListener('click', unlockDbList);
+        // Enter key in password field also triggers unlock
+        document.getElementById('master-password').addEventListener('keydown', function(e) {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                unlockDbList();
             }
         });
     </script>

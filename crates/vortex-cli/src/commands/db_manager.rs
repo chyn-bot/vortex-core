@@ -149,10 +149,9 @@ async fn db_manager_list(
                 html.push_str(r#"<input type="hidden" name="master_password" class="mp-field">"#);
                 html.push_str(r#"<button class="btn btn-xs btn-ghost">Backup</button></form>"#);
                 // Delete button
-                html.push_str(r#"<form hx-post="/web/database/manager/delete" hx-target="#);
-                html.push_str(r#"#db-messages" hx-swap="innerHTML" "#);
+                html.push_str(r##"<form hx-post="/web/database/manager/delete" hx-target="#db-messages" hx-swap="innerHTML" "##);
                 html.push_str(&format!(r#"hx-confirm="Delete database {name}? This cannot be undone!" class="inline" "#));
-                html.push_str(r#"hx-on::after-request="if(event.detail.successful){htmx.trigger(document.getElementById('db-list'),'load')}">"#);
+                html.push_str(r#"hx-on::after-request="if(event.detail.successful){htmx.trigger(document.body,'reloadList')}">"#);
                 html.push_str(&format!(r#"<input type="hidden" name="name" value="{name}">"#));
                 html.push_str(r#"<input type="hidden" name="master_password" class="mp-field">"#);
                 html.push_str(r#"<button class="btn btn-xs btn-error btn-ghost">Delete</button></form>"#);

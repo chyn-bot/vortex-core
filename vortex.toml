@@ -16,12 +16,12 @@ ssl_mode = "prefer"
 jwt_secret = "change-me-in-production"
 jwt_expiry_hours = 24
 
-# Session settings (NERC CIP-007 compliant)
+# Session settings (zero-trust defaults)
 session_idle_timeout_minutes = 30
 session_absolute_timeout_hours = 24
 max_concurrent_sessions = 3
 
-# Password policy (NERC CIP-007 compliant)
+# Password policy (zero-trust defaults)
 password_min_length = 8
 password_require_uppercase = true
 password_require_lowercase = true
@@ -33,7 +33,7 @@ max_failed_attempts = 5
 lockout_duration_minutes = 30
 
 [audit]
-# Audit log settings (NERC CIP-007 compliant)
+# Audit log settings (immutable, append-only)
 enabled = true
 log_security_events = true
 log_data_changes = true
@@ -45,10 +45,10 @@ auto_install_core = true
 
 [database_manager]
 # Multi-database management (Odoo-style). Set enabled = true to activate.
-enabled = false
+enabled = true
 master_database = "vortex_master"
 # Master password (Argon2 hash). Set via CLI or database manager UI.
-master_password = ""
+master_password = "VortexMaster@2026"
 # Database filter pattern. "" = show all, "^%h$" = match subdomain to db name
 db_filter = ""
 # Enforced naming prefix for new databases
