@@ -108,6 +108,9 @@ impl Module for EamModule {
                     // Condition monitoring (generic)
                     "ConditionMonitoringRecord".to_string(),
                     "AssetHealthIndex".to_string(),
+                    // Transmission
+                    "TransmissionLine".to_string(),
+                    "TransmissionTower".to_string(),
                     // Condition monitoring (specialized)
                     "DgaAnalysis".to_string(),
                     "OilQualityTest".to_string(),
@@ -126,6 +129,10 @@ impl Module for EamModule {
                     "104_eam_condition_monitoring".to_string(),
                     "105_eam_maintenance_workflows".to_string(),
                     "106_eam_checklist_plans".to_string(),
+                    "110_eam_transmission".to_string(),
+                    "111_eam_security".to_string(),
+                    "112_eam_field_alignment".to_string(),
+                    "113_eam_condition_metadata".to_string(),
                 ],
             }
         })
