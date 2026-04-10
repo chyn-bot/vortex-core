@@ -1,0 +1,5 @@
+[migration]
+module = "asset_management"
+description = "Add EAM security groups (User/Officer/Manager/Admin) and model access rules"
+reversible = true
+dependencies = ["002_access_control", "110_eam_transmission"]
