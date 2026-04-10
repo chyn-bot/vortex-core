@@ -271,7 +271,7 @@ fn redirect_to_login_with_message(_message: &str) -> Response {
     let mut headers = HeaderMap::new();
     headers.insert(
         header::SET_COOKIE,
-        "session=; Path=/; HttpOnly; SameSite=Strict; Secure; Max-Age=0".parse().unwrap(),
+        "session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0".parse().unwrap(),
     );
     (headers, Redirect::to("/login")).into_response()
 }
@@ -620,7 +620,7 @@ pub async fn run(host: String, port: u16, _workers: Option<usize>) -> Result<()>
     println!("╔════════════════════════════════════════════════════════════╗");
     println!("║                                                            ║");
     println!("║   \x1b[32mre\x1b[90mmicle\x1b[0m                                               ║");
-    println!("║   NERC CIP Compliant Platform                              ║");
+    println!("║   Zero-Trust Enterprise Core                               ║");
     println!("║                                                            ║");
     println!("║   URL: http://{}:{:<24}       ║", host, port);
     println!("║   Database: Connected                                      ║");
@@ -691,6 +691,12 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/eam/plans", get(eam_plans))
         .route("/eam/plans/new", get(eam_plan_new))
         .route("/eam/plans/new", post(eam_plan_create))
+        .route("/eam/transmission", get(eam_transmission))
+        .route("/eam/transmission/lines/new", get(eam_transmission_line_form))
+        .route("/eam/transmission/lines/new", post(eam_transmission_line_create))
+        .route("/eam/transmission/{id}", get(eam_transmission_line_detail))
+        .route("/eam/transmission/towers/new", get(eam_transmission_tower_form))
+        .route("/eam/transmission/towers/new", post(eam_transmission_tower_create))
         .route("/eam/sld", get(eam_sld))
         .route("/api/eam/sld/substations", get(eam_sld_substations_api))
         .route("/api/eam/sld/substations/{id}", get(eam_sld_data_api))
@@ -1068,7 +1074,7 @@ async fn login_submit(
                 headers.insert(
                     header::SET_COOKIE,
                     format!(
-                        "session={}|{}; Path=/; HttpOnly; SameSite=Strict; Secure; Max-Age=1800",
+                        "session={}|{}; Path=/; HttpOnly; SameSite=Strict; Max-Age=1800",
                         db_name, session_token
                     )
                     .parse()
@@ -1211,6 +1217,98 @@ fn html_escape(s: &str) -> String {
      .replace('\'', "&#x27;")
 }
 
+/// Formats an integer with comma separators (e.g. 50064 → "50,064").
+fn format_number(n: i64) -> String {
+    let s = n.to_string();
+    let bytes = s.as_bytes();
+    let mut result = String::with_capacity(s.len() + s.len() / 3);
+    for (i, &b) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i) % 3 == 0 {
+            result.push(',');
+        }
+        result.push(b as char);
+    }
+    result
+}
+
+/// Builds DaisyUI-styled pagination controls.
+/// `page` is 1-based, `per_page` is items per page, `total` is total item count.
+/// `base_url` should be the path + query string WITHOUT `page` param (e.g. "/list/contacts?search=foo&per_page=80").
+fn build_pagination_html(page: i64, per_page: i64, total: i64, base_url: &str) -> String {
+    if total == 0 {
+        return String::new();
+    }
+    let last_page = (total + per_page - 1) / per_page;
+    let page = page.max(1).min(last_page);
+    let start = (page - 1) * per_page + 1;
+    let end = (page * per_page).min(total);
+
+    let sep = if base_url.contains('?') { "&" } else { "?" };
+
+    let mut html = String::with_capacity(2048);
+    html.push_str(r#"<div class="flex flex-col sm:flex-row items-center justify-between mt-4 gap-2">"#);
+    html.push_str(&format!(
+        r#"<span class="text-sm text-base-content/60">Showing {}-{} of {}</span>"#,
+        format_number(start), format_number(end), format_number(total)
+    ));
+
+    html.push_str(r#"<div class="join">"#);
+
+    // Prev button
+    if page > 1 {
+        html.push_str(&format!(
+            r#"<a href="{}{}page={}" class="join-item btn btn-sm">&laquo; Prev</a>"#,
+            base_url, sep, page - 1
+        ));
+    } else {
+        html.push_str(r#"<button class="join-item btn btn-sm btn-disabled">&laquo; Prev</button>"#);
+    }
+
+    // Page buttons: first, ..., window ±2 around current, ..., last
+    let mut pages_to_show: Vec<i64> = Vec::new();
+    pages_to_show.push(1);
+    for p in (page - 2)..=(page + 2) {
+        if p > 1 && p < last_page {
+            pages_to_show.push(p);
+        }
+    }
+    if last_page > 1 {
+        pages_to_show.push(last_page);
+    }
+    pages_to_show.dedup();
+
+    let mut prev_p: i64 = 0;
+    for &p in &pages_to_show {
+        if p > prev_p + 1 {
+            html.push_str(r#"<button class="join-item btn btn-sm btn-disabled">...</button>"#);
+        }
+        if p == page {
+            html.push_str(&format!(
+                r#"<button class="join-item btn btn-sm btn-active">{}</button>"#, p
+            ));
+        } else {
+            html.push_str(&format!(
+                r#"<a href="{}{}page={}" class="join-item btn btn-sm">{}</a>"#,
+                base_url, sep, p, p
+            ));
+        }
+        prev_p = p;
+    }
+
+    // Next button
+    if page < last_page {
+        html.push_str(&format!(
+            r#"<a href="{}{}page={}" class="join-item btn btn-sm">Next &raquo;</a>"#,
+            base_url, sep, page + 1
+        ));
+    } else {
+        html.push_str(r#"<button class="join-item btn btn-sm btn-disabled">Next &raquo;</button>"#);
+    }
+
+    html.push_str("</div></div>");
+    html
+}
+
 /// Middleware that adds OWASP-recommended security headers to all responses.
 async fn security_headers_middleware(
     request: Request,
@@ -1225,7 +1323,7 @@ async fn security_headers_middleware(
     headers.insert("Permissions-Policy", "camera=(), microphone=(), geolocation=()".parse().unwrap());
     headers.insert(
         "Content-Security-Policy",
-        "default-src 'self'; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; script-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' https://cdn.jsdelivr.net".parse().unwrap(),
+        "default-src 'self'; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; script-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com https://cdn.jsdelivr.net https://unpkg.com; connect-src 'self' https://cdn.jsdelivr.net; img-src 'self' data:; font-src 'self' https://cdn.jsdelivr.net".parse().unwrap(),
     );
     response
 }
@@ -1289,7 +1387,7 @@ async fn logout(
     let mut headers = HeaderMap::new();
     headers.insert(
         header::SET_COOKIE,
-        "session=; Path=/; HttpOnly; SameSite=Strict; Secure; Max-Age=0".parse().unwrap(),
+        "session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0".parse().unwrap(),
     );
     headers.insert("HX-Redirect", "/login".parse().unwrap());
     (StatusCode::OK, headers).into_response()
@@ -1578,6 +1676,7 @@ fn build_sidebar(active_page: &str, user_name: &str, initials: &str, installed: 
             ("eam_inspections", "/eam/inspections", "Inspections", r#"<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4"/>"#),
             ("eam_checklists", "/eam/checklists", "Checklists", r#"<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/>"#),
             ("eam_plans", "/eam/plans", "Maintenance Plans", r#"<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"/>"#),
+            ("eam_transmission", "/eam/transmission", "Transmission", r#"<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M3 21h18"/>"#),
             ("eam_sld", "/eam/sld", "Single Line Diagram", r#"<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h7"/><circle cx="17" cy="18" r="3" stroke-width="2" fill="none"/>"#),
             ("eam_condition", "/eam/condition", "Condition Monitoring", r#"<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/>"#),
             ("eam_manufacturers", "/eam/manufacturers", "Manufacturers", r#"<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5M9 7h1m-1 4h1m4-4h1m-1 4h1m-5 10v-5a1 1 0 011-1h2a1 1 0 011 1v5m-4 0h4"/>"#),
@@ -1718,8 +1817,8 @@ async fn system_status(State(state): State<Arc<AppState>>, Db(db): Db) -> Html<S
                 <span class="badge badge-info">{}</span>
             </div>
             <div class="flex items-center justify-between">
-                <span>CIP Compliance</span>
-                <span class="badge badge-success">Active</span>
+                <span>Audit Ledger</span>
+                <span class="badge badge-success">Sealed</span>
             </div>
         </div>"#,
         user_count, session_count
@@ -4384,6 +4483,8 @@ async fn build_sidebar_menu(db: &PgPool, user_roles: &[String], current_model: &
 struct GenericListQuery {
     search: Option<String>,
     group_by: Option<String>,
+    page: Option<i64>,
+    per_page: Option<i64>,
     #[serde(flatten)]
     filters: std::collections::HashMap<String, String>,
 }
@@ -4524,10 +4625,27 @@ async fn generic_list_view(
         }
     }
 
+    // Pagination params
+    let page = params.page.unwrap_or(1).max(1);
+    let per_page = params.per_page.unwrap_or(80).max(10).min(500);
+    let where_clause = conditions.join(" AND ");
+
+    // Count total matching records
+    let count_query = format!(
+        "SELECT COUNT(*) FROM {}{} WHERE {}",
+        table_name, joins, where_clause
+    );
+    let total: i64 = sqlx::query_scalar(&count_query)
+        .fetch_one(&db)
+        .await
+        .unwrap_or(0);
+
+    let offset = (page - 1) * per_page;
+
     // Build and execute query
     let query = format!(
-        "SELECT {} FROM {}{} WHERE {} ORDER BY {} LIMIT 200",
-        select_cols, table_name, joins, conditions.join(" AND "), order_by
+        "SELECT {} FROM {}{} WHERE {} ORDER BY {} LIMIT {} OFFSET {}",
+        select_cols, table_name, joins, where_clause, order_by, per_page, offset
     );
 
     let records = sqlx::query(&query)
@@ -4826,6 +4944,7 @@ body {{ background: oklch(var(--b2)); color: oklch(var(--bc)); }}
 <thead><tr>{}</tr></thead>
 <tbody>{}</tbody>
 </table>
+{}
 </div>
 </main>
 </div>
@@ -4835,7 +4954,36 @@ body {{ background: oklch(var(--b2)); color: oklch(var(--bc)); }}
         sidebar_menu,
         model_display_name, model_display_name.to_lowercase(),
         model_name, model_name, model_name, model_name, model_name, model_name,
-        saved_filters_options, filter_controls, model_name, headers, rows
+        saved_filters_options, filter_controls, model_name, headers, rows,
+        {
+            // Build base_url for pagination links, preserving search/filter/group_by/per_page params
+            let mut base_parts = vec![format!("/list/{}", model_name)];
+            let mut qp = Vec::new();
+            if let Some(ref s) = params.search {
+                if !s.is_empty() {
+                    qp.push(format!("search={}", html_escape(s)));
+                }
+            }
+            if let Some(ref g) = params.group_by {
+                if !g.is_empty() {
+                    qp.push(format!("group_by={}", html_escape(g)));
+                }
+            }
+            for (k, v) in &params.filters {
+                if !v.is_empty() {
+                    qp.push(format!("{}={}", html_escape(k), html_escape(v)));
+                }
+            }
+            if per_page != 80 {
+                qp.push(format!("per_page={}", per_page));
+            }
+            let base_url = if qp.is_empty() {
+                base_parts.remove(0)
+            } else {
+                format!("{}?{}", base_parts[0], qp.join("&"))
+            };
+            build_pagination_html(page, per_page, total, &base_url)
+        }
     )).into_response()
 }
 
@@ -8595,6 +8743,9 @@ async fn eam_equipment(
     let display_name = user.full_name.as_deref().unwrap_or(&user.username);
     let initials = get_initials(display_name);
     let filter = params.get("type").cloned().unwrap_or_else(|| "all".to_string());
+    let eq_page: i64 = params.get("page").and_then(|s| s.parse().ok()).unwrap_or(1).max(1);
+    let eq_per_page: i64 = params.get("per_page").and_then(|s| s.parse().ok()).unwrap_or(80).max(10).min(500);
+    let eq_offset = (eq_page - 1) * eq_per_page;
 
     let company_id: uuid::Uuid = sqlx::query_scalar("SELECT company_id FROM users WHERE id = $1")
         .bind(user.id).fetch_one(&db).await.unwrap_or_default();
@@ -8608,23 +8759,33 @@ async fn eam_equipment(
 
     let total = transformers + switchgear + rmu + batteries + ct_vt;
 
-    // Build equipment table based on filter
-    let equipment_query = match filter.as_str() {
-        "transformer" => r#"SELECT a.id, a.asset_code, a.name, a.manufacturer, a.model, a.operational_status, 'Transformer' as eq_type, t.mva_rating as rating
-            FROM eam_assets a JOIN eam_transformers t ON t.asset_id = a.id WHERE a.company_id = $1 AND a.is_active = true ORDER BY a.name"#,
-        "switchgear" => r#"SELECT a.id, a.asset_code, a.name, a.manufacturer, a.model, a.operational_status, 'Switchgear' as eq_type, s.rated_voltage as rating
-            FROM eam_assets a JOIN eam_switch_gears s ON s.asset_id = a.id WHERE a.company_id = $1 AND a.is_active = true ORDER BY a.name"#,
-        "battery" => r#"SELECT a.id, a.asset_code, a.name, a.manufacturer, a.model, a.operational_status, 'Battery' as eq_type, b.nominal_voltage as rating
-            FROM eam_assets a JOIN eam_batteries b ON b.asset_id = a.id WHERE a.company_id = $1 AND a.is_active = true ORDER BY a.name"#,
-        "ct_vt" => r#"SELECT a.id, a.asset_code, a.name, a.manufacturer, a.model, a.operational_status, 'CT/VT' as eq_type, c.rated_voltage_kv as rating
-            FROM eam_assets a JOIN eam_current_voltage_transformers c ON c.asset_id = a.id WHERE a.company_id = $1 AND a.is_active = true ORDER BY a.name"#,
-        "rmu" => r#"SELECT a.id, a.asset_code, a.name, a.manufacturer, a.model, a.operational_status, 'RMU' as eq_type, r.rated_voltage_kv as rating
-            FROM eam_assets a JOIN eam_ring_main_units r ON r.asset_id = a.id WHERE a.company_id = $1 AND a.is_active = true ORDER BY a.name"#,
-        _ => r#"SELECT a.id, a.asset_code, a.name, a.manufacturer, a.model, a.operational_status, c.name as eq_type, NULL::float8 as rating
-            FROM eam_assets a LEFT JOIN eam_asset_categories c ON a.category_id = c.id WHERE a.company_id = $1 AND a.is_active = true ORDER BY a.name LIMIT 50"#,
+    // Determine the count for the current filter tab (used for pagination)
+    let filtered_total = match filter.as_str() {
+        "transformer" => transformers,
+        "switchgear" => switchgear,
+        "rmu" => rmu,
+        "battery" => batteries,
+        "ct_vt" => ct_vt,
+        _ => total,
     };
 
-    let eq_rows = sqlx::query(equipment_query).bind(company_id).fetch_all(&db).await.unwrap_or_default();
+    // Build equipment table based on filter — all use parameterized LIMIT/OFFSET ($2/$3)
+    let equipment_query = match filter.as_str() {
+        "transformer" => r#"SELECT a.id, a.asset_code, a.name, a.manufacturer, a.model, a.operational_status, 'Transformer' as eq_type, t.mva_rating as rating
+            FROM eam_assets a JOIN eam_transformers t ON t.asset_id = a.id WHERE a.company_id = $1 AND a.is_active = true ORDER BY a.name LIMIT $2 OFFSET $3"#,
+        "switchgear" => r#"SELECT a.id, a.asset_code, a.name, a.manufacturer, a.model, a.operational_status, 'Switchgear' as eq_type, s.rated_voltage as rating
+            FROM eam_assets a JOIN eam_switch_gears s ON s.asset_id = a.id WHERE a.company_id = $1 AND a.is_active = true ORDER BY a.name LIMIT $2 OFFSET $3"#,
+        "battery" => r#"SELECT a.id, a.asset_code, a.name, a.manufacturer, a.model, a.operational_status, 'Battery' as eq_type, b.nominal_voltage as rating
+            FROM eam_assets a JOIN eam_batteries b ON b.asset_id = a.id WHERE a.company_id = $1 AND a.is_active = true ORDER BY a.name LIMIT $2 OFFSET $3"#,
+        "ct_vt" => r#"SELECT a.id, a.asset_code, a.name, a.manufacturer, a.model, a.operational_status, 'CT/VT' as eq_type, c.rated_voltage_kv as rating
+            FROM eam_assets a JOIN eam_current_voltage_transformers c ON c.asset_id = a.id WHERE a.company_id = $1 AND a.is_active = true ORDER BY a.name LIMIT $2 OFFSET $3"#,
+        "rmu" => r#"SELECT a.id, a.asset_code, a.name, a.manufacturer, a.model, a.operational_status, 'RMU' as eq_type, r.rated_voltage_kv as rating
+            FROM eam_assets a JOIN eam_ring_main_units r ON r.asset_id = a.id WHERE a.company_id = $1 AND a.is_active = true ORDER BY a.name LIMIT $2 OFFSET $3"#,
+        _ => r#"SELECT a.id, a.asset_code, a.name, a.manufacturer, a.model, a.operational_status, c.name as eq_type, NULL::float8 as rating
+            FROM eam_assets a LEFT JOIN eam_asset_categories c ON a.category_id = c.id WHERE a.company_id = $1 AND a.is_active = true ORDER BY a.name LIMIT $2 OFFSET $3"#,
+    };
+
+    let eq_rows = sqlx::query(equipment_query).bind(company_id).bind(eq_per_page).bind(eq_offset).fetch_all(&db).await.unwrap_or_default();
 
     let mut table_rows = String::new();
     for row in &eq_rows {
@@ -8685,8 +8846,24 @@ async fn eam_equipment(
 <h1 class="text-2xl font-bold">Equipment</h1><p class="text-base-content/60">All equipment types across the system</p></div>
 <a href="/eam/equipment/new" class="btn btn-primary"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/></svg>New Equipment</a></div>
 {filter_tabs}
-<div class="card bg-base-100 shadow"><div class="card-body">{content}</div></div>
-</main></div></body></html>"#)).into_response()
+<div class="card bg-base-100 shadow"><div class="card-body">{content}{eq_pagination}</div></div>
+</main></div></body></html>"#,
+        eq_pagination = {
+            let mut base_url = String::from("/eam/equipment");
+            let mut qp = Vec::new();
+            if filter != "all" {
+                qp.push(format!("type={}", filter));
+            }
+            if eq_per_page != 80 {
+                qp.push(format!("per_page={}", eq_per_page));
+            }
+            if !qp.is_empty() {
+                base_url.push('?');
+                base_url.push_str(&qp.join("&"));
+            }
+            build_pagination_html(eq_page, eq_per_page, filtered_total, &base_url)
+        }
+    )).into_response()
 }
 
 async fn eam_inspections(
@@ -10534,6 +10711,573 @@ async fn eam_sld_data_api(
         "bays": bay_json,
         "equipment": eq_json
     })).into_response()
+}
+
+async fn eam_transmission(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+) -> Response {
+    let display_name = user.full_name.as_deref().unwrap_or(&user.username);
+    let initials = get_initials(display_name);
+
+    let company_id: uuid::Uuid = sqlx::query_scalar("SELECT company_id FROM users WHERE id = $1")
+        .bind(user.id).fetch_one(&db).await.unwrap_or_default();
+
+    // Counts
+    let total_lines: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM eam_transmission_lines WHERE company_id = $1 AND (is_deleted IS NULL OR is_deleted = FALSE)")
+        .bind(company_id).fetch_one(&db).await.unwrap_or(0);
+    let total_towers: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM eam_transmission_towers WHERE company_id = $1 AND (is_deleted IS NULL OR is_deleted = FALSE)")
+        .bind(company_id).fetch_one(&db).await.unwrap_or(0);
+    let operational_lines: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM eam_transmission_lines WHERE company_id = $1 AND (is_deleted IS NULL OR is_deleted = FALSE) AND state = 'operational'")
+        .bind(company_id).fetch_one(&db).await.unwrap_or(0);
+    let critical_towers: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM eam_transmission_towers WHERE company_id = $1 AND (is_deleted IS NULL OR is_deleted = FALSE) AND condition_status = 'critical'")
+        .bind(company_id).fetch_one(&db).await.unwrap_or(0);
+
+    // Fetch lines with tower counts
+    let line_rows = sqlx::query(
+        r#"SELECT l.id, l.code, l.name, l.line_length_km, l.voltage_level_id, l.conductor_type, l.state, l.ownership,
+                  COALESCE(fs.name, '') as from_sub_name, COALESCE(ts.name, '') as to_sub_name,
+                  (SELECT COUNT(*) FROM eam_transmission_towers t WHERE t.transmission_line_id = l.id AND (t.is_deleted IS NULL OR t.is_deleted = FALSE)) as tower_count
+           FROM eam_transmission_lines l
+           LEFT JOIN eam_substations fs ON l.from_substation_id = fs.id
+           LEFT JOIN eam_substations ts ON l.to_substation_id = ts.id
+           WHERE l.company_id = $1 AND (l.is_deleted IS NULL OR l.is_deleted = FALSE)
+           ORDER BY l.code"#
+    ).bind(company_id).fetch_all(&db).await.unwrap_or_default();
+
+    let mut line_table = String::new();
+    for row in &line_rows {
+        let id: uuid::Uuid = row.get("id");
+        let code: String = row.get("code");
+        let name: String = row.get("name");
+        let length: Option<f64> = row.get("line_length_km");
+        let conductor: Option<String> = row.get("conductor_type");
+        let state_val: Option<String> = row.get("state");
+        let from_sub: String = row.get("from_sub_name");
+        let to_sub: String = row.get("to_sub_name");
+        let tower_count: i64 = row.get("tower_count");
+
+        let length_str = length.map(|l| format!("{:.1} km", l)).unwrap_or_else(|| "-".into());
+        let conductor_str = conductor.unwrap_or_else(|| "-".into());
+        let state_badge = match state_val.as_deref() {
+            Some("operational") => r#"<span class="badge badge-success badge-sm">Operational</span>"#,
+            Some("construction") => r#"<span class="badge badge-warning badge-sm">Construction</span>"#,
+            Some("planning") => r#"<span class="badge badge-info badge-sm">Planning</span>"#,
+            Some("maintenance") => r#"<span class="badge badge-warning badge-sm">Maintenance</span>"#,
+            Some("decommissioned") => r#"<span class="badge badge-ghost badge-sm">Decommissioned</span>"#,
+            _ => r#"<span class="badge badge-ghost badge-sm">-</span>"#,
+        };
+        let route_str = if !from_sub.is_empty() && !to_sub.is_empty() {
+            format!("{} → {}", html_escape(&from_sub), html_escape(&to_sub))
+        } else if !from_sub.is_empty() {
+            html_escape(&from_sub)
+        } else {
+            "-".into()
+        };
+
+        line_table.push_str(&format!(
+            r#"<tr class="hover"><td class="font-mono font-semibold">{}</td><td>{}</td><td class="text-sm">{}</td><td>{}</td><td class="uppercase text-xs">{}</td><td class="text-center">{}</td><td>{}</td>
+            <td><a href="/eam/transmission/{}" class="btn btn-ghost btn-xs">View</a></td></tr>"#,
+            html_escape(&code), html_escape(&name), route_str, length_str, conductor_str, tower_count, state_badge, id
+        ));
+    }
+
+    let lines_content = if line_rows.is_empty() {
+        r#"<div class="text-center py-12"><svg class="w-16 h-16 mx-auto text-base-content/30 mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"/></svg><h3 class="text-lg font-semibold mb-2">No Transmission Lines Yet</h3><p class="text-base-content/60">Create transmission lines and towers to manage overhead line assets</p></div>"#.to_string()
+    } else {
+        format!(r#"<div class="overflow-x-auto"><table class="table table-zebra"><thead><tr><th>Code</th><th>Name</th><th>Route</th><th>Length</th><th>Conductor</th><th>Towers</th><th>Status</th><th>Actions</th></tr></thead><tbody>{line_table}</tbody></table></div>"#)
+    };
+
+    let critical_class = if critical_towers > 0 { "bg-error/10" } else { "" };
+    let critical_text = if critical_towers > 0 { "text-error" } else { "" };
+
+    let installed = db_ctx.installed_modules.clone();
+    let sidebar = build_sidebar("eam_transmission", display_name, &initials, &installed, user.is_admin());
+    Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style><title>Transmission - Asset Management</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/><script src="https://cdn.tailwindcss.com"></script></head>
+<body class="min-h-screen bg-base-200">
+<div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a><button onclick="(function(){{var h=document.documentElement,c=h.getAttribute('data-theme')==='dark'?'corporate':'dark';h.setAttribute('data-theme',c);localStorage.setItem('theme',c);document.querySelectorAll('.theme-icon-sun,.theme-icon-moon').forEach(function(e){{e.classList.toggle('hidden')}})}})();" class="btn btn-ghost btn-sm btn-square ml-auto"><svg class="theme-icon-sun w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5" stroke-width="2"/><path stroke-linecap="round" stroke-width="2" d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg><svg class="theme-icon-moon w-5 h-5 hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg></button></div>
+<div id="sidebar-overlay" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
+<div class="flex">{sidebar}
+<main class="flex-1 p-4 lg:p-6 min-w-0">
+<div class="flex justify-between items-center mb-6"><div><div class="breadcrumbs text-sm"><ul><li><a href="/eam">Asset Management</a></li><li>Transmission</li></ul></div>
+<h1 class="text-2xl font-bold">Transmission Network</h1><p class="text-base-content/60">Overhead transmission lines and towers</p></div>
+<div class="dropdown dropdown-end"><label tabindex="0" class="btn btn-primary"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/></svg>New</label>
+<ul tabindex="0" class="dropdown-content z-[1] menu p-2 shadow bg-base-100 rounded-box w-52">
+<li><a href="/eam/transmission/lines/new">Transmission Line</a></li>
+<li><a href="/eam/transmission/towers/new">Transmission Tower</a></li>
+</ul></div></div>
+<div class="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-6">
+<div class="stat bg-base-100 rounded-lg shadow p-4"><div class="stat-title text-xs">Lines</div><div class="stat-value text-2xl">{total_lines}</div></div>
+<div class="stat bg-base-100 rounded-lg shadow p-4"><div class="stat-title text-xs">Towers</div><div class="stat-value text-2xl">{total_towers}</div></div>
+<div class="stat bg-base-100 rounded-lg shadow p-4"><div class="stat-title text-xs">Operational</div><div class="stat-value text-2xl">{operational_lines}</div></div>
+<div class="stat bg-base-100 rounded-lg shadow p-4 {critical_class}"><div class="stat-title text-xs">Critical Towers</div><div class="stat-value text-2xl {critical_text}">{critical_towers}</div></div>
+</div>
+<div class="card bg-base-100 shadow"><div class="card-header p-4 border-b border-base-300"><h2 class="card-title text-lg">Transmission Lines</h2><p class="text-sm text-base-content/60">Overhead power lines with associated towers</p></div><div class="card-body">{lines_content}</div></div>
+</main></div></body></html>"#)).into_response()
+}
+
+async fn eam_transmission_line_form(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+) -> Response {
+    let display_name = user.full_name.as_deref().unwrap_or(&user.username);
+    let initials = get_initials(display_name);
+
+    let company_id: uuid::Uuid = sqlx::query_scalar("SELECT company_id FROM users WHERE id = $1")
+        .bind(user.id).fetch_one(&db).await.unwrap_or_default();
+
+    // Get regions for dropdown
+    let regions = sqlx::query("SELECT id, name FROM eam_regions WHERE company_id = $1 AND is_active = true ORDER BY name")
+        .bind(company_id).fetch_all(&db).await.unwrap_or_default();
+    let mut region_opts = String::new();
+    for r in &regions {
+        let rid: uuid::Uuid = r.get("id");
+        let rname: String = r.get("name");
+        region_opts.push_str(&format!(r#"<option value="{rid}">{}</option>"#, html_escape(&rname)));
+    }
+
+    // Get substations for from/to dropdowns
+    let subs = sqlx::query("SELECT id, name FROM eam_substations WHERE company_id = $1 AND is_active = true ORDER BY name")
+        .bind(company_id).fetch_all(&db).await.unwrap_or_default();
+    let mut sub_opts = String::new();
+    for s in &subs {
+        let sid: uuid::Uuid = s.get("id");
+        let sname: String = s.get("name");
+        sub_opts.push_str(&format!(r#"<option value="{sid}">{}</option>"#, html_escape(&sname)));
+    }
+
+    let installed = db_ctx.installed_modules.clone();
+    let sidebar = build_sidebar("eam_transmission", display_name, &initials, &installed, user.is_admin());
+    Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style><title>New Transmission Line - Asset Management</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/><script src="https://cdn.tailwindcss.com"></script></head>
+<body class="min-h-screen bg-base-200">
+<div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a></div>
+<div id="sidebar-overlay" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
+<div class="flex">{sidebar}
+<main class="flex-1 p-4 lg:p-6 min-w-0">
+<div class="mb-6"><div class="breadcrumbs text-sm"><ul><li><a href="/eam">Asset Management</a></li><li><a href="/eam/transmission">Transmission</a></li><li>New Line</li></ul></div>
+<h1 class="text-2xl font-bold">Create Transmission Line</h1></div>
+<form method="POST" action="/eam/transmission/lines/new" class="card bg-base-100 shadow"><div class="card-body">
+<div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+<div class="form-control"><label class="label"><span class="label-text">Code *</span></label><input type="text" name="code" required class="input input-bordered" placeholder="TL-132-001"/></div>
+<div class="form-control"><label class="label"><span class="label-text">Name *</span></label><input type="text" name="name" required class="input input-bordered" placeholder="132kV Ampang - Gombak Line"/></div>
+<div class="form-control"><label class="label"><span class="label-text">Region *</span></label><select name="region_id" required class="select select-bordered"><option value="">Select Region</option>{region_opts}</select></div>
+<div class="form-control"><label class="label"><span class="label-text">State</span></label><select name="state" class="select select-bordered"><option value="">Select</option><option value="planning">Planning</option><option value="construction">Construction</option><option value="operational" selected>Operational</option><option value="maintenance">Maintenance</option><option value="decommissioned">Decommissioned</option></select></div>
+<div class="form-control"><label class="label"><span class="label-text">From Substation</span></label><select name="from_substation_id" class="select select-bordered"><option value="">Select</option>{sub_opts}</select></div>
+<div class="form-control"><label class="label"><span class="label-text">To Substation</span></label><select name="to_substation_id" class="select select-bordered"><option value="">Select</option>{sub_opts}</select></div>
+<div class="form-control"><label class="label"><span class="label-text">Line Length (km)</span></label><input type="number" step="0.01" name="line_length_km" class="input input-bordered" placeholder="12.5"/></div>
+<div class="form-control"><label class="label"><span class="label-text">Conductor Type</span></label><select name="conductor_type" class="select select-bordered"><option value="">Select</option><option value="acsr">ACSR</option><option value="acar">ACAR</option><option value="aaac">AAAC</option><option value="aac">AAC</option><option value="accc">ACCC</option><option value="htls">HTLS</option><option value="opgw">OPGW</option></select></div>
+<div class="form-control"><label class="label"><span class="label-text">Conductor Size (mm²)</span></label><input type="number" step="0.01" name="conductor_size_mm2" class="input input-bordered" placeholder="300"/></div>
+<div class="form-control"><label class="label"><span class="label-text">Number of Circuits</span></label><input type="number" name="number_of_circuits" class="input input-bordered" placeholder="2"/></div>
+<div class="form-control"><label class="label"><span class="label-text">Rated Current (A)</span></label><input type="number" step="0.01" name="rated_current_a" class="input input-bordered"/></div>
+<div class="form-control"><label class="label"><span class="label-text">Earth Wire Type</span></label><input type="text" name="earth_wire_type" class="input input-bordered" placeholder="OPGW / Galvanized Steel"/></div>
+<div class="form-control"><label class="label"><span class="label-text">Ownership</span></label><select name="ownership" class="select select-bordered"><option value="">Select</option><option value="sesb">SESB</option><option value="ipp">IPP</option><option value="shared">Shared</option></select></div>
+<div class="form-control"><label class="label"><span class="label-text">Commissioning Date</span></label><input type="date" name="commissioning_date" class="input input-bordered"/></div>
+<div class="form-control"><label class="label"><span class="label-text">Design Life (years)</span></label><input type="number" name="design_life_years" class="input input-bordered" placeholder="40"/></div>
+<div class="form-control"><label class="label"><span class="label-text">Max Sag (m)</span></label><input type="number" step="0.01" name="max_sag_m" class="input input-bordered"/></div>
+<div class="form-control md:col-span-2"><label class="label"><span class="label-text">Notes</span></label><textarea name="notes" class="textarea textarea-bordered" rows="3"></textarea></div>
+</div>
+<div class="card-actions justify-end mt-6"><a href="/eam/transmission" class="btn btn-ghost">Cancel</a><button type="submit" class="btn btn-primary">Create Transmission Line</button></div>
+</div></form>
+</main></div></body></html>"#)).into_response()
+}
+
+async fn eam_transmission_line_create(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    axum::extract::Form(form): axum::extract::Form<std::collections::HashMap<String, String>>,
+) -> Response {
+    let company_id: uuid::Uuid = sqlx::query_scalar("SELECT company_id FROM users WHERE id = $1")
+        .bind(user.id).fetch_one(&db).await.unwrap_or_default();
+
+    let code = form.get("code").map(|s| s.as_str()).unwrap_or("");
+    let name = form.get("name").map(|s| s.as_str()).unwrap_or("");
+    let region_id: Option<uuid::Uuid> = form.get("region_id").and_then(|s| s.parse().ok());
+    let state_val = form.get("state").map(|s| s.as_str()).filter(|s| !s.is_empty());
+    let from_sub: Option<uuid::Uuid> = form.get("from_substation_id").and_then(|s| s.parse().ok());
+    let to_sub: Option<uuid::Uuid> = form.get("to_substation_id").and_then(|s| s.parse().ok());
+    let length: Option<f64> = form.get("line_length_km").and_then(|s| s.parse().ok());
+    let conductor = form.get("conductor_type").map(|s| s.as_str()).filter(|s| !s.is_empty());
+    let conductor_size: Option<f64> = form.get("conductor_size_mm2").and_then(|s| s.parse().ok());
+    let circuits: Option<i32> = form.get("number_of_circuits").and_then(|s| s.parse().ok());
+    let rated_current: Option<f64> = form.get("rated_current_a").and_then(|s| s.parse().ok());
+    let earth_wire = form.get("earth_wire_type").map(|s| s.as_str()).filter(|s| !s.is_empty());
+    let ownership = form.get("ownership").map(|s| s.as_str()).filter(|s| !s.is_empty());
+    let commissioning = form.get("commissioning_date").map(|s| s.as_str()).filter(|s| !s.is_empty());
+    let design_life: Option<i32> = form.get("design_life_years").and_then(|s| s.parse().ok());
+    let max_sag: Option<f64> = form.get("max_sag_m").and_then(|s| s.parse().ok());
+    let notes = form.get("notes").map(|s| s.as_str()).filter(|s| !s.is_empty());
+
+    let result = sqlx::query_scalar::<_, uuid::Uuid>(
+        r#"INSERT INTO eam_transmission_lines (company_id, code, name, region_id, state,
+           from_substation_id, to_substation_id, line_length_km, conductor_type, conductor_size_mm2,
+           number_of_circuits, rated_current_a, earth_wire_type, ownership, commissioning_date,
+           design_life_years, max_sag_m, notes, is_active, created_by)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,true,$19)
+           RETURNING id"#
+    )
+    .bind(company_id).bind(code).bind(name).bind(region_id).bind(state_val)
+    .bind(from_sub).bind(to_sub).bind(length).bind(conductor).bind(conductor_size)
+    .bind(circuits).bind(rated_current).bind(earth_wire).bind(ownership).bind(commissioning)
+    .bind(design_life).bind(max_sag).bind(notes).bind(user.id)
+    .fetch_one(&db).await;
+
+    match result {
+        Ok(id) => axum::response::Redirect::to(&format!("/eam/transmission/{}", id)).into_response(),
+        Err(e) => {
+            let msg = format!("{}", e);
+            let user_msg = if msg.contains("duplicate key") {
+                "A transmission line with this code already exists.".to_string()
+            } else {
+                format!("Error creating transmission line: {}", html_escape(&msg))
+            };
+            (axum::http::StatusCode::BAD_REQUEST, Html(format!(
+                r#"<!DOCTYPE html><html><head><title>Error</title><link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/><script src="https://cdn.tailwindcss.com"></script></head><body class="min-h-screen bg-base-200 flex items-center justify-center"><div class="card bg-base-100 shadow-xl p-8 max-w-md"><div class="text-error text-lg font-bold mb-2">Error</div><p>{user_msg}</p><a href="/eam/transmission/lines/new" class="btn btn-primary mt-4">Go Back</a></div></body></html>"#
+            ))).into_response()
+        }
+    }
+}
+
+async fn eam_transmission_line_detail(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<uuid::Uuid>,
+) -> Response {
+    let display_name = user.full_name.as_deref().unwrap_or(&user.username);
+    let initials = get_initials(display_name);
+
+    let company_id: uuid::Uuid = sqlx::query_scalar("SELECT company_id FROM users WHERE id = $1")
+        .bind(user.id).fetch_one(&db).await.unwrap_or_default();
+
+    let line = sqlx::query(
+        r#"SELECT l.*, COALESCE(r.name, '') as region_name,
+                  COALESCE(fs.name, '') as from_sub_name, COALESCE(ts.name, '') as to_sub_name
+           FROM eam_transmission_lines l
+           LEFT JOIN eam_regions r ON l.region_id = r.id
+           LEFT JOIN eam_substations fs ON l.from_substation_id = fs.id
+           LEFT JOIN eam_substations ts ON l.to_substation_id = ts.id
+           WHERE l.id = $1 AND l.company_id = $2 AND (l.is_deleted IS NULL OR l.is_deleted = FALSE)"#
+    ).bind(id).bind(company_id).fetch_optional(&db).await.ok().flatten();
+
+    let Some(line) = line else {
+        return (axum::http::StatusCode::NOT_FOUND, Html("Transmission line not found")).into_response();
+    };
+
+    let code: String = line.get("code");
+    let name: String = line.get("name");
+    let region_name: String = line.get("region_name");
+    let from_sub: String = line.get("from_sub_name");
+    let to_sub: String = line.get("to_sub_name");
+    let length: Option<f64> = line.get("line_length_km");
+    let conductor: Option<String> = line.get("conductor_type");
+    let conductor_size: Option<f64> = line.get("conductor_size_mm2");
+    let circuits: Option<i32> = line.get("number_of_circuits");
+    let rated_current: Option<f64> = line.get("rated_current_a");
+    let earth_wire: Option<String> = line.get("earth_wire_type");
+    let state_val: Option<String> = line.get("state");
+    let ownership: Option<String> = line.get("ownership");
+    let commissioning: Option<String> = line.get("commissioning_date");
+    let design_life: Option<i32> = line.get("design_life_years");
+    let max_sag: Option<f64> = line.get("max_sag_m");
+    let notes: Option<String> = line.get("notes");
+
+    let state_badge = match state_val.as_deref() {
+        Some("operational") => r#"<span class="badge badge-success">Operational</span>"#,
+        Some("construction") => r#"<span class="badge badge-warning">Construction</span>"#,
+        Some("planning") => r#"<span class="badge badge-info">Planning</span>"#,
+        Some("maintenance") => r#"<span class="badge badge-warning">Maintenance</span>"#,
+        Some("decommissioned") => r#"<span class="badge badge-ghost">Decommissioned</span>"#,
+        _ => r#"<span class="badge badge-ghost">-</span>"#,
+    };
+
+    let length_str = length.map(|l| format!("{:.1} km", l)).unwrap_or_else(|| "-".into());
+    let conductor_str = conductor.as_deref().map(|c| c.to_uppercase()).unwrap_or_else(|| "-".into());
+    let conductor_size_str = conductor_size.map(|s| format!("{:.0} mm²", s)).unwrap_or_else(|| "-".into());
+    let circuits_str = circuits.map(|c| c.to_string()).unwrap_or_else(|| "-".into());
+    let rated_current_str = rated_current.map(|c| format!("{:.0} A", c)).unwrap_or_else(|| "-".into());
+    let earth_wire_str = earth_wire.unwrap_or_else(|| "-".into());
+    let ownership_str = ownership.as_deref().map(|o| o.to_uppercase()).unwrap_or_else(|| "-".into());
+    let commissioning_str = commissioning.unwrap_or_else(|| "-".into());
+    let design_life_str = design_life.map(|y| format!("{} years", y)).unwrap_or_else(|| "-".into());
+    let max_sag_str = max_sag.map(|s| format!("{:.1} m", s)).unwrap_or_else(|| "-".into());
+    let notes_str = notes.map(|n| html_escape(&n)).unwrap_or_else(|| "-".into());
+    let route_str = if !from_sub.is_empty() && !to_sub.is_empty() {
+        format!("{} → {}", html_escape(&from_sub), html_escape(&to_sub))
+    } else { "-".into() };
+
+    // Fetch towers for this line
+    let towers = sqlx::query(
+        r#"SELECT id, code, name, tower_number, tower_type, tower_function, height_m,
+                  gps_latitude, gps_longitude, operational_status, condition_status, health_index
+           FROM eam_transmission_towers
+           WHERE transmission_line_id = $1 AND (is_deleted IS NULL OR is_deleted = FALSE)
+           ORDER BY tower_number, code"#
+    ).bind(id).fetch_all(&db).await.unwrap_or_default();
+
+    let mut tower_rows = String::new();
+    for t in &towers {
+        let tid: uuid::Uuid = t.get("id");
+        let tcode: String = t.get("code");
+        let tname: String = t.get("name");
+        let tnum: Option<i32> = t.get("tower_number");
+        let ttype: Option<String> = t.get("tower_type");
+        let tfunc: Option<String> = t.get("tower_function");
+        let theight: Option<f64> = t.get("height_m");
+        let tlat: Option<f64> = t.get("gps_latitude");
+        let tlon: Option<f64> = t.get("gps_longitude");
+        let tstatus: Option<String> = t.get("operational_status");
+        let tcond: Option<String> = t.get("condition_status");
+        let thi: Option<f64> = t.get("health_index");
+
+        let num_str = tnum.map(|n| n.to_string()).unwrap_or_else(|| "-".into());
+        let type_str = ttype.unwrap_or_else(|| "-".into());
+        let height_str = theight.map(|h| format!("{:.1}m", h)).unwrap_or_else(|| "-".into());
+        let gps_str = match (tlat, tlon) {
+            (Some(lat), Some(lon)) => format!("{:.4}, {:.4}", lat, lon),
+            _ => "-".into(),
+        };
+        let status_badge = match tstatus.as_deref() {
+            Some("operational") => r#"<span class="badge badge-success badge-sm">Operational</span>"#,
+            Some("out_of_service") => r#"<span class="badge badge-error badge-sm">Out of Service</span>"#,
+            Some("under_repair") => r#"<span class="badge badge-warning badge-sm">Under Repair</span>"#,
+            _ => r#"<span class="badge badge-ghost badge-sm">-</span>"#,
+        };
+        let cond_badge = match tcond.as_deref() {
+            Some("excellent") => r#"<span class="badge badge-success badge-sm">Excellent</span>"#,
+            Some("good") => r#"<span class="badge badge-success badge-sm">Good</span>"#,
+            Some("fair") => r#"<span class="badge badge-warning badge-sm">Fair</span>"#,
+            Some("poor") => r#"<span class="badge badge-error badge-sm">Poor</span>"#,
+            Some("critical") => r#"<span class="badge badge-error badge-sm">Critical</span>"#,
+            _ => r#"<span class="badge badge-ghost badge-sm">-</span>"#,
+        };
+
+        tower_rows.push_str(&format!(
+            r#"<tr class="hover"><td>{num_str}</td><td class="font-mono">{}</td><td>{}</td><td class="capitalize">{type_str}</td><td>{height_str}</td><td class="text-xs">{gps_str}</td><td>{status_badge}</td><td>{cond_badge}</td></tr>"#,
+            html_escape(&tcode), html_escape(&tname)
+        ));
+    }
+
+    let tower_content = if towers.is_empty() {
+        r#"<div class="text-center py-8"><p class="text-base-content/60">No towers registered for this line</p><a href="/eam/transmission/towers/new" class="btn btn-sm btn-primary mt-2">Add Tower</a></div>"#.to_string()
+    } else {
+        format!(r#"<div class="overflow-x-auto"><table class="table table-zebra table-sm"><thead><tr><th>#</th><th>Code</th><th>Name</th><th>Type</th><th>Height</th><th>GPS</th><th>Status</th><th>Condition</th></tr></thead><tbody>{tower_rows}</tbody></table></div>"#)
+    };
+
+    let installed = db_ctx.installed_modules.clone();
+    let sidebar = build_sidebar("eam_transmission", display_name, &initials, &installed, user.is_admin());
+    Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style><title>{} - Transmission Line</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/><script src="https://cdn.tailwindcss.com"></script></head>
+<body class="min-h-screen bg-base-200">
+<div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a></div>
+<div id="sidebar-overlay" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
+<div class="flex">{sidebar}
+<main class="flex-1 p-4 lg:p-6 min-w-0">
+<div class="flex justify-between items-center mb-6"><div><div class="breadcrumbs text-sm"><ul><li><a href="/eam">Asset Management</a></li><li><a href="/eam/transmission">Transmission</a></li><li>{}</li></ul></div>
+<h1 class="text-2xl font-bold">{}</h1><p class="text-base-content/60">{}</p></div>
+<div>{state_badge}</div></div>
+<div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
+<div class="card bg-base-100 shadow"><div class="card-header p-4 border-b border-base-300"><h2 class="card-title text-lg">Line Details</h2></div><div class="card-body">
+<table class="table table-sm"><tbody>
+<tr><td class="font-semibold w-40">Code</td><td class="font-mono">{}</td></tr>
+<tr><td class="font-semibold">Region</td><td>{}</td></tr>
+<tr><td class="font-semibold">Route</td><td>{route_str}</td></tr>
+<tr><td class="font-semibold">Length</td><td>{length_str}</td></tr>
+<tr><td class="font-semibold">Ownership</td><td>{ownership_str}</td></tr>
+<tr><td class="font-semibold">Commissioning</td><td>{commissioning_str}</td></tr>
+<tr><td class="font-semibold">Design Life</td><td>{design_life_str}</td></tr>
+</tbody></table></div></div>
+<div class="card bg-base-100 shadow"><div class="card-header p-4 border-b border-base-300"><h2 class="card-title text-lg">Conductor Specifications</h2></div><div class="card-body">
+<table class="table table-sm"><tbody>
+<tr><td class="font-semibold w-40">Type</td><td>{conductor_str}</td></tr>
+<tr><td class="font-semibold">Size</td><td>{conductor_size_str}</td></tr>
+<tr><td class="font-semibold">Circuits</td><td>{circuits_str}</td></tr>
+<tr><td class="font-semibold">Rated Current</td><td>{rated_current_str}</td></tr>
+<tr><td class="font-semibold">Earth Wire</td><td>{earth_wire_str}</td></tr>
+<tr><td class="font-semibold">Max Sag</td><td>{max_sag_str}</td></tr>
+</tbody></table></div></div>
+</div>
+<div class="card bg-base-100 shadow mb-6"><div class="card-header p-4 border-b border-base-300 flex justify-between items-center"><div><h2 class="card-title text-lg">Towers ({tower_count})</h2></div><a href="/eam/transmission/towers/new" class="btn btn-sm btn-primary">Add Tower</a></div><div class="card-body">{tower_content}</div></div>
+<div class="card bg-base-100 shadow"><div class="card-header p-4 border-b border-base-300"><h2 class="card-title text-lg">Notes</h2></div><div class="card-body"><p>{notes_str}</p></div></div>
+</main></div></body></html>"#,
+        html_escape(&name), html_escape(&code), html_escape(&name), html_escape(&code),
+        html_escape(&code), html_escape(&region_name), tower_count = towers.len()
+    )).into_response()
+}
+
+async fn eam_transmission_tower_form(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+) -> Response {
+    let display_name = user.full_name.as_deref().unwrap_or(&user.username);
+    let initials = get_initials(display_name);
+
+    let company_id: uuid::Uuid = sqlx::query_scalar("SELECT company_id FROM users WHERE id = $1")
+        .bind(user.id).fetch_one(&db).await.unwrap_or_default();
+
+    // Get transmission lines for dropdown
+    let lines = sqlx::query("SELECT id, code, name FROM eam_transmission_lines WHERE company_id = $1 AND (is_deleted IS NULL OR is_deleted = FALSE) ORDER BY code")
+        .bind(company_id).fetch_all(&db).await.unwrap_or_default();
+    let mut line_opts = String::new();
+    for l in &lines {
+        let lid: uuid::Uuid = l.get("id");
+        let lcode: String = l.get("code");
+        let lname: String = l.get("name");
+        line_opts.push_str(&format!(r#"<option value="{lid}">{} - {}</option>"#, html_escape(&lcode), html_escape(&lname)));
+    }
+
+    let installed = db_ctx.installed_modules.clone();
+    let sidebar = build_sidebar("eam_transmission", display_name, &initials, &installed, user.is_admin());
+    Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style><title>New Tower - Asset Management</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/><script src="https://cdn.tailwindcss.com"></script></head>
+<body class="min-h-screen bg-base-200">
+<div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a></div>
+<div id="sidebar-overlay" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
+<div class="flex">{sidebar}
+<main class="flex-1 p-4 lg:p-6 min-w-0">
+<div class="mb-6"><div class="breadcrumbs text-sm"><ul><li><a href="/eam">Asset Management</a></li><li><a href="/eam/transmission">Transmission</a></li><li>New Tower</li></ul></div>
+<h1 class="text-2xl font-bold">Create Transmission Tower</h1></div>
+<form method="POST" action="/eam/transmission/towers/new" class="card bg-base-100 shadow"><div class="card-body">
+<div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+<div class="form-control"><label class="label"><span class="label-text">Code *</span></label><input type="text" name="code" required class="input input-bordered" placeholder="TWR-001"/></div>
+<div class="form-control"><label class="label"><span class="label-text">Name *</span></label><input type="text" name="name" required class="input input-bordered" placeholder="Tower 1 - Ampang Line"/></div>
+<div class="form-control"><label class="label"><span class="label-text">Transmission Line *</span></label><select name="transmission_line_id" required class="select select-bordered"><option value="">Select Line</option>{line_opts}</select></div>
+<div class="form-control"><label class="label"><span class="label-text">Tower Number</span></label><input type="number" name="tower_number" class="input input-bordered" placeholder="1"/></div>
+<div class="form-control"><label class="label"><span class="label-text">Tower Type</span></label><select name="tower_type" class="select select-bordered"><option value="">Select</option><option value="lattice_steel">Lattice Steel</option><option value="tubular_steel">Tubular Steel</option><option value="wood_pole">Wood Pole</option><option value="concrete_pole">Concrete Pole</option><option value="monopole">Monopole</option><option value="h_frame">H-Frame</option><option value="guyed_v">Guyed V</option><option value="self_supporting">Self Supporting</option></select></div>
+<div class="form-control"><label class="label"><span class="label-text">Tower Function</span></label><select name="tower_function" class="select select-bordered"><option value="">Select</option><option value="suspension">Suspension</option><option value="tension">Tension</option><option value="angle">Angle</option><option value="dead_end">Dead End</option><option value="transposition">Transposition</option><option value="junction">Junction</option></select></div>
+</div>
+<div class="divider">Physical Dimensions</div>
+<div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+<div class="form-control"><label class="label"><span class="label-text">Height (m)</span></label><input type="number" step="0.1" name="height_m" class="input input-bordered" placeholder="35"/></div>
+<div class="form-control"><label class="label"><span class="label-text">Base Width (m)</span></label><input type="number" step="0.1" name="base_width_m" class="input input-bordered"/></div>
+<div class="form-control"><label class="label"><span class="label-text">Weight (kg)</span></label><input type="number" step="0.1" name="weight_kg" class="input input-bordered"/></div>
+<div class="form-control"><label class="label"><span class="label-text">Foundation Type</span></label><input type="text" name="foundation_type" class="input input-bordered" placeholder="Pad / Pile / Grillage"/></div>
+<div class="form-control"><label class="label"><span class="label-text">Span to Next (m)</span></label><input type="number" step="0.1" name="span_to_next_m" class="input input-bordered"/></div>
+<div class="form-control"><label class="label"><span class="label-text">Span to Previous (m)</span></label><input type="number" step="0.1" name="span_to_previous_m" class="input input-bordered"/></div>
+</div>
+<div class="divider">GPS Location</div>
+<div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+<div class="form-control"><label class="label"><span class="label-text">Latitude</span></label><input type="number" step="0.000001" name="gps_latitude" class="input input-bordered" placeholder="5.9788"/></div>
+<div class="form-control"><label class="label"><span class="label-text">Longitude</span></label><input type="number" step="0.000001" name="gps_longitude" class="input input-bordered" placeholder="116.0735"/></div>
+<div class="form-control"><label class="label"><span class="label-text">Elevation (m)</span></label><input type="number" step="0.1" name="elevation_m" class="input input-bordered"/></div>
+<div class="form-control"><label class="label"><span class="label-text">Ground Clearance (m)</span></label><input type="number" step="0.1" name="ground_clearance_m" class="input input-bordered"/></div>
+<div class="form-control"><label class="label"><span class="label-text">Right of Way (m)</span></label><input type="number" step="0.1" name="right_of_way_m" class="input input-bordered"/></div>
+</div>
+<div class="divider">Electrical</div>
+<div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+<div class="form-control"><label class="label"><span class="label-text">Phase Configuration</span></label><input type="text" name="phase_configuration" class="input input-bordered" placeholder="Vertical / Horizontal / Delta"/></div>
+<div class="form-control"><label class="label"><span class="label-text">Insulator Type</span></label><select name="insulator_type" class="select select-bordered"><option value="">Select</option><option value="glass">Glass</option><option value="porcelain">Porcelain</option><option value="composite">Composite</option></select></div>
+<div class="form-control"><label class="label"><span class="label-text">Insulator Count</span></label><input type="number" name="insulator_count" class="input input-bordered"/></div>
+<div class="form-control"><label class="label flex cursor-pointer gap-2"><span class="label-text">Earth Wire Attached</span><input type="checkbox" name="earth_wire_attached" value="true" class="checkbox checkbox-sm"/></label></div>
+<div class="form-control"><label class="label flex cursor-pointer gap-2"><span class="label-text">Aviation Marking</span><input type="checkbox" name="aviation_marking" value="true" class="checkbox checkbox-sm"/></label></div>
+</div>
+<div class="divider">Status</div>
+<div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+<div class="form-control"><label class="label"><span class="label-text">Operational Status</span></label><select name="operational_status" class="select select-bordered"><option value="operational">Operational</option><option value="standby">Standby</option><option value="out_of_service">Out of Service</option><option value="under_repair">Under Repair</option><option value="decommissioned">Decommissioned</option></select></div>
+<div class="form-control"><label class="label"><span class="label-text">Condition</span></label><select name="condition_status" class="select select-bordered"><option value="">Select</option><option value="excellent">Excellent</option><option value="good">Good</option><option value="fair">Fair</option><option value="poor">Poor</option><option value="critical">Critical</option></select></div>
+<div class="form-control"><label class="label"><span class="label-text">Health Index (0-100)</span></label><input type="number" step="0.1" min="0" max="100" name="health_index" class="input input-bordered"/></div>
+</div>
+<div class="grid grid-cols-1 md:grid-cols-2 gap-4 mt-4">
+<div class="form-control"><label class="label"><span class="label-text">Last Inspection Date</span></label><input type="date" name="last_inspection_date" class="input input-bordered"/></div>
+<div class="form-control"><label class="label"><span class="label-text">Next Inspection Date</span></label><input type="date" name="next_inspection_date" class="input input-bordered"/></div>
+<div class="form-control md:col-span-2"><label class="label"><span class="label-text">Notes</span></label><textarea name="notes" class="textarea textarea-bordered" rows="3"></textarea></div>
+</div>
+<div class="card-actions justify-end mt-6"><a href="/eam/transmission" class="btn btn-ghost">Cancel</a><button type="submit" class="btn btn-primary">Create Tower</button></div>
+</div></form>
+</main></div></body></html>"#)).into_response()
+}
+
+async fn eam_transmission_tower_create(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    axum::extract::Form(form): axum::extract::Form<std::collections::HashMap<String, String>>,
+) -> Response {
+    let company_id: uuid::Uuid = sqlx::query_scalar("SELECT company_id FROM users WHERE id = $1")
+        .bind(user.id).fetch_one(&db).await.unwrap_or_default();
+
+    let code = form.get("code").map(|s| s.as_str()).unwrap_or("");
+    let name = form.get("name").map(|s| s.as_str()).unwrap_or("");
+    let line_id: Option<uuid::Uuid> = form.get("transmission_line_id").and_then(|s| s.parse().ok());
+    let tower_number: Option<i32> = form.get("tower_number").and_then(|s| s.parse().ok());
+    let tower_type = form.get("tower_type").map(|s| s.as_str()).filter(|s| !s.is_empty());
+    let tower_function = form.get("tower_function").map(|s| s.as_str()).filter(|s| !s.is_empty());
+    let height: Option<f64> = form.get("height_m").and_then(|s| s.parse().ok());
+    let base_width: Option<f64> = form.get("base_width_m").and_then(|s| s.parse().ok());
+    let weight: Option<f64> = form.get("weight_kg").and_then(|s| s.parse().ok());
+    let foundation = form.get("foundation_type").map(|s| s.as_str()).filter(|s| !s.is_empty());
+    let span_next: Option<f64> = form.get("span_to_next_m").and_then(|s| s.parse().ok());
+    let span_prev: Option<f64> = form.get("span_to_previous_m").and_then(|s| s.parse().ok());
+    let lat: Option<f64> = form.get("gps_latitude").and_then(|s| s.parse().ok());
+    let lon: Option<f64> = form.get("gps_longitude").and_then(|s| s.parse().ok());
+    let elevation: Option<f64> = form.get("elevation_m").and_then(|s| s.parse().ok());
+    let clearance: Option<f64> = form.get("ground_clearance_m").and_then(|s| s.parse().ok());
+    let row_m: Option<f64> = form.get("right_of_way_m").and_then(|s| s.parse().ok());
+    let phase_config = form.get("phase_configuration").map(|s| s.as_str()).filter(|s| !s.is_empty());
+    let insulator_type = form.get("insulator_type").map(|s| s.as_str()).filter(|s| !s.is_empty());
+    let insulator_count: Option<i32> = form.get("insulator_count").and_then(|s| s.parse().ok());
+    let earth_wire = form.contains_key("earth_wire_attached");
+    let aviation = form.contains_key("aviation_marking");
+    let op_status = form.get("operational_status").map(|s| s.as_str()).filter(|s| !s.is_empty());
+    let cond_status = form.get("condition_status").map(|s| s.as_str()).filter(|s| !s.is_empty());
+    let health: Option<f64> = form.get("health_index").and_then(|s| s.parse().ok());
+    let last_insp = form.get("last_inspection_date").map(|s| s.as_str()).filter(|s| !s.is_empty());
+    let next_insp = form.get("next_inspection_date").map(|s| s.as_str()).filter(|s| !s.is_empty());
+    let notes = form.get("notes").map(|s| s.as_str()).filter(|s| !s.is_empty());
+
+    let result = sqlx::query_scalar::<_, uuid::Uuid>(
+        r#"INSERT INTO eam_transmission_towers (company_id, code, name, transmission_line_id, tower_number,
+           tower_type, tower_function, height_m, base_width_m, weight_kg, foundation_type,
+           span_to_next_m, span_to_previous_m, gps_latitude, gps_longitude, elevation_m,
+           ground_clearance_m, right_of_way_m, phase_configuration, insulator_type, insulator_count,
+           earth_wire_attached, aviation_marking, operational_status, condition_status, health_index,
+           last_inspection_date, next_inspection_date, notes, is_active, created_by)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,true,$30)
+           RETURNING id"#
+    )
+    .bind(company_id).bind(code).bind(name).bind(line_id).bind(tower_number)
+    .bind(tower_type).bind(tower_function).bind(height).bind(base_width).bind(weight).bind(foundation)
+    .bind(span_next).bind(span_prev).bind(lat).bind(lon).bind(elevation)
+    .bind(clearance).bind(row_m).bind(phase_config).bind(insulator_type).bind(insulator_count)
+    .bind(earth_wire).bind(aviation).bind(op_status).bind(cond_status).bind(health)
+    .bind(last_insp).bind(next_insp).bind(notes).bind(user.id)
+    .fetch_one(&db).await;
+
+    match result {
+        Ok(_id) => {
+            // Redirect to the parent line's detail page if we have the line_id
+            let redirect_url = if let Some(lid) = line_id {
+                format!("/eam/transmission/{}", lid)
+            } else {
+                "/eam/transmission".to_string()
+            };
+            axum::response::Redirect::to(&redirect_url).into_response()
+        }
+        Err(e) => {
+            let msg = format!("{}", e);
+            let user_msg = if msg.contains("duplicate key") {
+                "A tower with this code already exists.".to_string()
+            } else {
+                format!("Error creating tower: {}", html_escape(&msg))
+            };
+            (axum::http::StatusCode::BAD_REQUEST, Html(format!(
+                r#"<!DOCTYPE html><html><head><title>Error</title><link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/><script src="https://cdn.tailwindcss.com"></script></head><body class="min-h-screen bg-base-200 flex items-center justify-center"><div class="card bg-base-100 shadow-xl p-8 max-w-md"><div class="text-error text-lg font-bold mb-2">Error</div><p>{user_msg}</p><a href="/eam/transmission/towers/new" class="btn btn-primary mt-4">Go Back</a></div></body></html>"#
+            ))).into_response()
+        }
+    }
 }
 
 async fn eam_condition_monitoring(
