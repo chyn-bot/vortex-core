@@ -612,6 +612,14 @@ pub async fn run(host: String, port: u16, _workers: Option<usize>) -> Result<()>
     let workflow = Arc::new(workflow_engine);
     let plugin_registry = Arc::new(plugin_registry);
 
+    // ─── Auto-register compiled-in plugins (Phase 0.6b) ───────────────
+    // Walk the plugin registry and upsert each plugin's metadata into
+    // `installed_modules`. Newly-added plugin crates become visible to
+    // `vortex module list` immediately — no SQL migration required to
+    // bootstrap a new plugin. Idempotent; preserves existing install
+    // state so a plugin that was already marked `installed` stays so.
+    crate::commands::module_sync::sync_plugins_best_effort(&db, &plugin_registry).await;
+
     // Create app state
     let state = Arc::new(AppState {
         db,
