@@ -15,8 +15,12 @@ vortex-orm = { workspace = true }
 vortex-security = { workspace = true }
 vortex-policy = { workspace = true }
 vortex-module = { workspace = true }
+vortex-framework = { workspace = true }
 vortex-server = { workspace = true }
-vortex-eam = { workspace = true }
+# vortex-eam is gated behind the `eam` feature so `cargo build
+# --no-default-features` produces a core-only binary without the EAM
+# plugin's API routes.
+vortex-eam = { workspace = true, optional = true }
 
 # Async
 tokio = { workspace = true }
@@ -56,3 +60,9 @@ argon2 = "0.5"
 sha2 = "0.10"
 rand = { workspace = true }
 md5 = "0.7"
+
+[features]
+default = ["eam"]
+# Pulls in the EAM plugin and registers its routes/menu entries.
+# Omit to build a core-only `vortex` binary.
+eam = ["dep:vortex-eam"]

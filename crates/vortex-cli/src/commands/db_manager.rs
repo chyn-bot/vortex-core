@@ -16,7 +16,7 @@ use serde::Deserialize;
 use sqlx::{PgPool, Row};
 use tracing::{error, info, warn};
 
-use super::server::AppState;
+use vortex_framework::AppState;
 
 /// Build the database manager routes (public, master-password protected).
 pub fn db_manager_routes() -> Router<Arc<AppState>> {

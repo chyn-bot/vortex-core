@@ -77,6 +77,11 @@ pub fn build_router(state: AppState) -> Router {
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
 
     // Protected API routes (return 401 if not authenticated)
+    // Note: this Router is part of the legacy vortex-server path and is
+    // NOT the one the CLI binary uses — the CLI composes its own router
+    // in commands/server.rs with plugins merged in via PluginRegistry.
+    // Plugin routes (EAM, CR, etc.) are contributed by plugin crates at
+    // the binary level, not here. This router stays core-only.
     let protected_api_routes = Router::new()
         .nest("/api/auth", api_auth_routes())
         .nest("/api/v1", api_model_routes())
@@ -84,7 +89,6 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/api/admin", api_admin_routes())
         .nest("/api/access", access::access_routes())
         .nest("/api/chatter", chatter::chatter_routes())
-        .nest_service("/api/eam", vortex_eam::handlers::eam_api_routes())
         // Apply auth context middleware
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
 
