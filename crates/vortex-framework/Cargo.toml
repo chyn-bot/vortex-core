@@ -1,0 +1,38 @@
+[package]
+name = "vortex-framework"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+# The framework crate is the binding layer between the module system
+# (`vortex-module`) and the runtime binary (`vortex-cli`, `vortex-server`).
+# It provides:
+#
+#   - `AppState` — the shared state every HTTP handler receives, moved out
+#     of vortex-cli so plugins can depend on it without a circular dep.
+#   - `Plugin` trait — what a plugin implements to contribute routes and
+#     sidebar menu entries to the host binary.
+#   - `MenuEntry` / `PluginRegistry` — the aggregation points the host
+#     walks at startup to assemble the full router and sidebar.
+#
+# Modules (vortex-eam, the future vortex-change, etc.) depend on this
+# crate to plug in. The host binary depends on this crate to consume
+# installed plugins.
+
+[dependencies]
+vortex-common = { workspace = true }
+vortex-orm = { workspace = true }
+vortex-security = { workspace = true }
+vortex-policy = { workspace = true }
+vortex-module = { workspace = true }
+
+tokio = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+sqlx = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
