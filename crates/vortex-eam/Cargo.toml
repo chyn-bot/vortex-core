@@ -13,6 +13,7 @@ vortex-macros = { path = "../vortex-macros" }
 vortex-orm.workspace = true
 vortex-module.workspace = true
 vortex-security.workspace = true
+vortex-framework.workspace = true
 
 # Async runtime
 tokio.workspace = true

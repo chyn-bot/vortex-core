@@ -44,12 +44,15 @@
 //! - Audit trail for state transitions (per CLAUDE.md compliance)
 //! - Electronic signature support for critical assets
 
+pub mod handlers;
 pub mod models;
 pub mod module;
-pub mod handlers;
+pub mod plugin;
 pub mod services;
+pub mod ui;
 
 pub use module::EamModule;
+pub use plugin::EamPlugin;
 
 // Re-export configuration models
 pub use models::configuration::{Manufacturer, VoltageLevel, UnitType, AssetCategory, AssetStatus};
