@@ -40,9 +40,54 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use axum::Router;
 use vortex_common::VortexResult;
+use vortex_workflow::StateMachine;
 
 use crate::menu::MenuEntry;
 use crate::state::AppState;
+
+/// A database migration contributed by a plugin.
+///
+/// Plugins embed their migration SQL directly in the crate binary
+/// via `include_str!` so the plugin is self-contained — installing a
+/// plugin means adding a crate dep and nothing else; no files to
+/// copy into the host's `migrations/` directory.
+///
+/// ## Naming and uniqueness
+///
+/// `name` is **plugin-local** — each plugin starts its own number
+/// space at `001`. The migration runner records applied plugin
+/// migrations under a composite key `<module>:<name>` (e.g.
+/// `change_request:001_change_requests`) so two plugins can both
+/// have a `001_initial` without colliding with each other or with
+/// the core's `001_initial_schema`.
+///
+/// ## What core migrations this plugin depends on
+///
+/// Plugins that reference core tables (`users`, `companies`,
+/// `workflow_instances`, `audit_log`, `policy_rules`) should set
+/// `requires_core_migration` to the last core migration that shipped
+/// the table they need. The runner fails fast with a clear error if
+/// the core is older than that, instead of producing a confusing
+/// `relation "foo" does not exist` deep in the SQL.
+#[derive(Debug, Clone)]
+pub struct PluginMigration {
+    /// Plugin-local migration name. Must start with a zero-padded
+    /// sequence number for deterministic ordering (e.g.
+    /// `001_change_requests`).
+    pub name: &'static str,
+    /// Postgres SQL to run when applying this migration. Typically
+    /// embedded via `include_str!("migrations/001_foo/postgres.sql")`.
+    pub up_sql: &'static str,
+    /// Optional rollback SQL. `None` means the migration is
+    /// irreversible (matches the Phase 0.1 audit WORM pattern).
+    pub down_sql: Option<&'static str>,
+    /// The last core migration this plugin's schema depends on. If
+    /// the migration runner finds the target database is missing
+    /// this core migration, it aborts with a clear error instead of
+    /// trying to run the plugin SQL against a half-built core.
+    /// `None` means "this plugin has no core dependencies" — rare.
+    pub requires_core_migration: Option<&'static str>,
+}
 
 /// A plugin contributes routes and menu entries to the host binary.
 ///
@@ -102,6 +147,35 @@ pub trait Plugin: Send + Sync {
     /// Default: no entries — the plugin is "headless" (exposes routes
     /// only, no UI navigation).
     fn menu_entries(&self) -> Vec<MenuEntry> {
+        Vec::new()
+    }
+
+    /// Return the workflow state machines this plugin contributes.
+    /// The host builds one shared [`vortex_workflow::WorkflowEngine`]
+    /// during startup and registers every plugin's machines into it
+    /// before creating `AppState`, so handlers can call
+    /// `state.workflow.transition(...)` without knowing which plugin
+    /// owns which machine.
+    ///
+    /// Plugins that use workflows should return their machines here;
+    /// plugins that don't use workflows leave the default empty impl.
+    fn state_machines(&self) -> Vec<StateMachine> {
+        Vec::new()
+    }
+
+    /// Return the database migrations this plugin ships with. The
+    /// migration runner (`vortex db migrate`) applies these **after**
+    /// all core migrations, scoped under the plugin's technical name,
+    /// so two plugins can safely have migrations with the same local
+    /// name.
+    ///
+    /// Plugins embed their SQL with `include_str!` so the crate is
+    /// self-contained and the host binary does not need to ship a
+    /// filesystem `migrations/` directory for the plugin.
+    ///
+    /// Default: no migrations — the plugin is stateless or reuses
+    /// existing core tables only.
+    fn migrations(&self) -> Vec<PluginMigration> {
         Vec::new()
     }
 

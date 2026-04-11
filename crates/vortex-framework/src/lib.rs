@@ -42,7 +42,7 @@ pub mod ui;
 
 pub use auth::{AuthUser, Db};
 pub use menu::{MenuEntry, MenuGroup};
-pub use plugin::Plugin;
+pub use plugin::{Plugin, PluginMigration};
 pub use registry::PluginRegistry;
 pub use sidebar::build_sidebar;
 pub use state::{AppState, DatabaseContext};

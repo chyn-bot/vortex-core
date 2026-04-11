@@ -13,6 +13,7 @@ members = [
     "crates/vortex-server",
     "crates/vortex-cli",
     "crates/vortex-eam",
+    "crates/vortex-change",
 ]
 
 [workspace.package]
@@ -88,6 +89,7 @@ vortex-framework = { path = "crates/vortex-framework" }
 vortex-chatter = { path = "crates/vortex-chatter" }
 vortex-server = { path = "crates/vortex-server" }
 vortex-eam = { path = "crates/vortex-eam" }
+vortex-change = { path = "crates/vortex-change" }
 
 [profile.release]
 lto = true

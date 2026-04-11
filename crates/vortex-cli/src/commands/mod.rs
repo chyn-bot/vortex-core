@@ -1,6 +1,7 @@
 //! CLI command implementations
 
 pub mod audit;
+pub mod builtins;
 pub mod completions;
 pub mod db;
 pub mod db_manager;

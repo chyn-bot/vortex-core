@@ -2,10 +2,40 @@
 
 use anyhow::{Context, Result};
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
-use tracing::info;
 use std::path::Path;
+use std::sync::Arc;
+use tracing::info;
+use vortex_framework::{Plugin, PluginRegistry};
 
 use crate::DbCommands;
+
+/// Build a bare `PluginRegistry` suitable for migration-time work.
+///
+/// This is a lightweight version of the registry construction in
+/// `commands/server.rs` — it registers every compiled-in plugin but
+/// does NOT wire up the workflow engine, audit ledger, policy
+/// service, or `AppState`. Migration commands only need the list
+/// of plugins and their `migrations()` output, so the cheaper
+/// registry is enough.
+fn build_migration_registry() -> PluginRegistry {
+    let mut registry = PluginRegistry::new();
+    #[cfg(feature = "eam")]
+    registry.register(Arc::new(vortex_eam::EamPlugin::new()));
+    #[cfg(feature = "cr")]
+    registry.register(Arc::new(vortex_change::ChangeRequestPlugin::new()));
+    registry
+}
+
+/// Composite identifier stored in `vortex_migrations.name` for
+/// plugin migrations. Core migrations keep their raw directory name
+/// (e.g. `116_workflow_engine`) for backwards compatibility; plugin
+/// migrations are stored as `<module>:<name>` (e.g.
+/// `change_request:001_change_requests`) so two plugins can ship
+/// a migration with the same local name without colliding on the
+/// `name UNIQUE` constraint.
+fn plugin_migration_key(module: &str, name: &str) -> String {
+    format!("{}:{}", module, name)
+}
 
 /// Get database connection
 async fn get_db_pool() -> Result<PgPool> {
@@ -117,6 +147,13 @@ pub async fn run(command: DbCommands) -> Result<()> {
                         Ok(pool) => {
                             init_migrations_table(&pool).await?;
                             run_all_migrations(&pool).await?;
+                            let (pa, ps) = run_plugin_migrations(&pool).await?;
+                            if pa > 0 || ps > 0 {
+                                println!(
+                                    "  Plugin migrations: {} applied, {} skipped",
+                                    pa, ps
+                                );
+                            }
                         }
                         Err(e) => {
                             println!("  Warning: Could not connect to '{}': {}", db_name, e);
@@ -148,8 +185,8 @@ pub async fn run(command: DbCommands) -> Result<()> {
                 .collect();
             entries.sort_by_key(|e| e.file_name());
 
-            let mut applied_count = 0;
-            let mut skipped_count = 0;
+            let mut applied_count: usize = 0;
+            let mut skipped_count: usize = 0;
 
             for entry in entries {
                 let path = entry.path();
@@ -215,6 +252,16 @@ pub async fn run(command: DbCommands) -> Result<()> {
                     }
                 }
             }
+
+            // ─── Plugin-declared migrations (Phase 0.6) ───────────
+            // Walk every compiled-in plugin and apply any migrations
+            // it embeds in its own crate. These live under
+            // `crates/<plugin>/migrations/` and are registered via
+            // `Plugin::migrations()` — no files in the host
+            // `migrations/` directory.
+            let (plugin_applied, plugin_skipped) = run_plugin_migrations(&pool).await?;
+            applied_count += plugin_applied;
+            skipped_count += plugin_skipped;
 
             if applied_count > 0 {
                 println!("\nApplied {} migration(s), skipped {} (already applied)", applied_count, skipped_count);
@@ -615,6 +662,93 @@ dependencies = []
 }
 
 /// Run all pending migrations from the migrations/ directory.
+/// Apply every plugin-declared migration that has not yet been
+/// recorded. Runs **after** the core filesystem migrations so that
+/// a plugin's `requires_core_migration` dependency is guaranteed
+/// to be present.
+///
+/// Uses the composite `<module>:<name>` key in `vortex_migrations`
+/// so plugin migrations never collide with core or with each other.
+/// Falls back to the "object already exists → record as applied"
+/// path that the core filesystem runner uses, which is how a dev DB
+/// that was populated by the old filesystem layout transitions to
+/// the plugin-declared layout cleanly.
+async fn run_plugin_migrations(pool: &PgPool) -> Result<(usize, usize)> {
+    let registry = build_migration_registry();
+    let mut applied = 0usize;
+    let mut skipped = 0usize;
+
+    for plugin in registry.plugins_iter() {
+        let module = plugin.technical_name();
+        let migrations = plugin.migrations();
+        if migrations.is_empty() {
+            continue;
+        }
+
+        // Verify each required core migration is present before we
+        // run any of this plugin's SQL. Fail fast with a clear error
+        // — otherwise we'd get a confusing `relation "..." does not
+        // exist` deep inside the plugin's SQL.
+        for mig in &migrations {
+            if let Some(required) = mig.requires_core_migration {
+                let ok: bool =
+                    sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM vortex_migrations WHERE name = $1)")
+                        .bind(required)
+                        .fetch_one(pool)
+                        .await?;
+                if !ok {
+                    anyhow::bail!(
+                        "plugin '{}' migration '{}' requires core migration '{}' which has not been applied. Run `vortex db migrate` to apply core migrations first.",
+                        module,
+                        mig.name,
+                        required
+                    );
+                }
+            }
+        }
+
+        for mig in migrations {
+            let key = plugin_migration_key(module, mig.name);
+
+            if is_migration_applied(pool, &key).await? {
+                skipped += 1;
+                continue;
+            }
+
+            println!("  Applying plugin migration '{}'...", key);
+            let start = std::time::Instant::now();
+            match sqlx::raw_sql(mig.up_sql).execute(pool).await {
+                Ok(_) => {
+                    let elapsed = start.elapsed().as_millis() as i32;
+                    record_migration(pool, &key, module, elapsed).await?;
+                    println!("  Applied '{}' ({}ms)", key, elapsed);
+                    applied += 1;
+                }
+                Err(e) => {
+                    let err_msg = e.to_string();
+                    if err_msg.contains("already exists") {
+                        // Dev-DB transition path: the old filesystem
+                        // migration created the tables, so we just
+                        // record the new key as applied.
+                        println!(
+                            "  Plugin migration '{}' objects already exist, marking as applied",
+                            key
+                        );
+                        record_migration(pool, &key, module, 0).await?;
+                        skipped += 1;
+                    } else {
+                        return Err(e).with_context(|| {
+                            format!("Failed to apply plugin migration '{}'", key)
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    Ok((applied, skipped))
+}
+
 async fn run_all_migrations(pool: &PgPool) -> Result<()> {
     let migrations_dir = Path::new("migrations");
     if !migrations_dir.exists() {
@@ -673,5 +807,9 @@ async fn run_all_migrations(pool: &PgPool) -> Result<()> {
             }
         }
     }
+
+    // Apply plugin-declared migrations after the core filesystem
+    // ones. Same pattern as the single-DB path above.
+    let _ = run_plugin_migrations(pool).await?;
     Ok(())
 }

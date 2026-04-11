@@ -1,0 +1,29 @@
+[package]
+name = "vortex-change"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Change Request plugin — state-machine-driven approval workflow for NERC CIP-010 change management. First real plugin built on top of the vortex-framework + vortex-workflow substrate."
+
+[dependencies]
+vortex-common = { workspace = true }
+vortex-framework = { workspace = true }
+vortex-workflow = { workspace = true }
+vortex-security = { workspace = true }
+vortex-policy = { workspace = true }
+
+tokio = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+sqlx = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "macros", "test-util"] }
+vortex-orm = { workspace = true }

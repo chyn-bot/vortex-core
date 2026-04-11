@@ -572,13 +572,44 @@ pub async fn run(host: String, port: u16, _workers: Option<usize>) -> Result<()>
     // plugin crates — the only place a plugin is mentioned at all is
     // right here in the composition binary.
     let mut plugin_registry = PluginRegistry::new();
+    // Synthetic built-in plugins — these feed the sidebar for
+    // modules whose handlers still live in this host binary (today,
+    // only Contacts). They are unconditional because the handlers
+    // themselves are unconditional; they carry no dep weight.
+    plugin_registry.register(Arc::new(crate::commands::builtins::ContactsBuiltinPlugin));
     #[cfg(feature = "eam")]
     plugin_registry.register(Arc::new(vortex_eam::EamPlugin::new()));
+    #[cfg(feature = "cr")]
+    plugin_registry.register(Arc::new(vortex_change::ChangeRequestPlugin::new()));
     info!(
         plugin_count = plugin_registry.len() as i64,
         plugins = ?plugin_registry.technical_names(),
         "plugin registry built"
     );
+
+    // ─── Workflow engine (Phase 0.4) ──────────────────────────────────
+    // Build the engine with audit + policy wired in, then walk every
+    // registered plugin and pull in the state machines it contributes.
+    // Plugins don't need to know about each other; the engine's
+    // registry is the one place where every workflow lives.
+    let workflow_store: Arc<dyn vortex_workflow::WorkflowStore> =
+        Arc::new(vortex_workflow::PgWorkflowStore::new(db.clone()));
+    let mut workflow_engine = vortex_workflow::WorkflowEngine::new(
+        workflow_store,
+        audit.clone(),
+        policy.clone(),
+    );
+    for plugin in plugin_registry.plugins_iter() {
+        for sm in plugin.state_machines() {
+            info!(
+                plugin = plugin.technical_name(),
+                workflow_type = sm.workflow_type().as_str(),
+                "registering state machine from plugin"
+            );
+            workflow_engine.register_machine(sm);
+        }
+    }
+    let workflow = Arc::new(workflow_engine);
     let plugin_registry = Arc::new(plugin_registry);
 
     // Create app state
@@ -594,6 +625,7 @@ pub async fn run(host: String, port: u16, _workers: Option<usize>) -> Result<()>
         installed_modules,
         audit,
         policy,
+        workflow,
         plugin_registry: plugin_registry.clone(),
     });
 

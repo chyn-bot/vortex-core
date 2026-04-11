@@ -20,6 +20,7 @@ use vortex_orm::pool_manager::DatabasePoolManager;
 use vortex_orm::ConnectionPool;
 use vortex_policy::PolicyService;
 use vortex_security::AuditLog;
+use vortex_workflow::WorkflowEngine;
 
 use crate::registry::PluginRegistry;
 
@@ -68,6 +69,12 @@ pub struct AppState {
     /// this specific action on this specific resource under these
     /// conditions?"
     pub policy: Arc<PolicyService>,
+    /// Workflow engine (Phase 0.4). Plugins call
+    /// `state.workflow.transition(...)` to advance state machines
+    /// they have registered. Every transition is audit-logged to the
+    /// WORM ledger and Cedar-gated, so this one field is how a
+    /// plugin wires all three core primitives together.
+    pub workflow: Arc<WorkflowEngine>,
     /// Plugin registry (Phase 0.3). Holds every `Plugin` the host has
     /// registered. The host walks this at route construction time
     /// (merging plugin routers) and at sidebar render time (collecting
