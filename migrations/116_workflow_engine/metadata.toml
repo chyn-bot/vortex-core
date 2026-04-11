@@ -1,0 +1,5 @@
+[migration]
+module = "core"
+description = "Workflow engine: workflow_instances (mutable runtime state) + workflow_transitions (append-only history with WORM triggers matching audit_log treatment). Required by vortex-workflow crate and every plugin that uses state-machine lifecycles (CR, PO, incidents, access requests)."
+reversible = true
+dependencies = ["115_policy_engine"]

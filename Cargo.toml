@@ -6,6 +6,7 @@ members = [
     "crates/vortex-orm",
     "crates/vortex-security",
     "crates/vortex-policy",
+    "crates/vortex-workflow",
     "crates/vortex-module",
     "crates/vortex-framework",
     "crates/vortex-chatter",
@@ -81,6 +82,7 @@ vortex-macros = { path = "crates/vortex-macros" }
 vortex-orm = { path = "crates/vortex-orm" }
 vortex-security = { path = "crates/vortex-security" }
 vortex-policy = { path = "crates/vortex-policy" }
+vortex-workflow = { path = "crates/vortex-workflow" }
 vortex-module = { path = "crates/vortex-module" }
 vortex-framework = { path = "crates/vortex-framework" }
 vortex-chatter = { path = "crates/vortex-chatter" }

@@ -82,6 +82,11 @@ pub enum AuditAction {
     KeyRotated,
     TriggerDisabled,
 
+    // Workflow state machine events (CIP-007-6 R5 — tracks every
+    // approval, rejection, and lifecycle transition on workflow
+    // instances. Written by vortex-workflow::WorkflowEngine).
+    WorkflowTransition,
+
     // Custom action
     Custom(String),
 }
@@ -130,6 +135,7 @@ impl AuditAction {
             AuditAction::ChainVerificationFailed => "chain_verification_failed".into(),
             AuditAction::KeyRotated => "key_rotated".into(),
             AuditAction::TriggerDisabled => "trigger_disabled".into(),
+            AuditAction::WorkflowTransition => "workflow_transition".into(),
             AuditAction::Custom(s) => format!("custom:{s}"),
         }
     }
@@ -168,6 +174,8 @@ impl AuditAction {
             | AuditAction::ChainVerificationFailed
             | AuditAction::KeyRotated
             | AuditAction::TriggerDisabled => "CIP-007-6 R5.5",
+
+            AuditAction::WorkflowTransition => "CIP-007-6 R5",
 
             _ => "CIP-007-6",
         }

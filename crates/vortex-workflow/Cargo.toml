@@ -1,0 +1,31 @@
+[package]
+name = "vortex-workflow"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+# Generic workflow engine — state machines with Cedar-gated transitions
+# and WORM audit tie-in. Every plugin that needs approval/lifecycle
+# flows (Change Request, Purchase Order, Incident, Access Request,
+# etc.) builds on top of this crate rather than reinventing state
+# machines per module.
+
+[dependencies]
+vortex-common = { workspace = true }
+vortex-security = { workspace = true }
+vortex-policy = { workspace = true }
+
+tokio = { workspace = true }
+async-trait = { workspace = true }
+sqlx = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "macros", "test-util"] }
+vortex-orm = { workspace = true }

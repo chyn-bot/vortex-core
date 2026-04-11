@@ -603,6 +603,7 @@ fn action_code_to_action(code: &str) -> AuditAction {
         "chain_verification_failed" => AuditAction::ChainVerificationFailed,
         "key_rotated" => AuditAction::KeyRotated,
         "trigger_disabled" => AuditAction::TriggerDisabled,
+        "workflow_transition" => AuditAction::WorkflowTransition,
         other => {
             if let Some(rest) = other.strip_prefix("custom:") {
                 AuditAction::Custom(rest.to_string())
