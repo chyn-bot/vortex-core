@@ -73,6 +73,12 @@ enum Commands {
         command: commands::policy::PolicyCommands,
     },
 
+    /// Workflow engine inspection — list instances, show state, walk history
+    Workflow {
+        #[command(subcommand)]
+        command: commands::workflow::WorkflowCommands,
+    },
+
     /// Generate shell completions
     Completions {
         /// Shell to generate completions for
@@ -290,6 +296,9 @@ async fn main() -> Result<()> {
         }
         Commands::Policy { command } => {
             commands::policy::run(command).await
+        }
+        Commands::Workflow { command } => {
+            commands::workflow::run(command).await
         }
         Commands::Completions { shell } => {
             commands::completions::run(shell)

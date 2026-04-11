@@ -9,3 +9,4 @@ pub mod module;
 pub mod policy;
 pub mod server;
 pub mod user;
+pub mod workflow;
