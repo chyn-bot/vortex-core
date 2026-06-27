@@ -167,7 +167,7 @@ INSERT INTO policy_rules (name, description, policy_text, priority) VALUES
 -- ============================================================================
 INSERT INTO audit_log (
     user_id, username, action, resource_type, details,
-    cip_requirement, security_level, success
+    compliance_category, security_level, success
 ) VALUES (
     NULL,
     'system',
@@ -179,7 +179,7 @@ INSERT INTO audit_log (
         'states', jsonb_build_array('draft','submitted','under_review','approved','rejected','withdrawn','closed'),
         'policies_seeded', 4
     ),
-    'CIP-010 R1',
+    'configuration',
     'HIGH',
     true
 );
