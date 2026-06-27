@@ -81,14 +81,14 @@ GO
 -- System attestation audit entry.
 INSERT INTO audit_log (
     user_id, username, action, resource_type, details,
-    cip_requirement, security_level, success
+    compliance_category, security_level, success
 ) VALUES (
     NULL,
     'system',
     'POLICY_ENGINE_ENABLED',
     'policy_rules',
     '{"migration":"115_policy_engine","engine":"cedar-policy","seed_policies":4}',
-    'CIP-004-7 R4',
+    'authorization',
     'HIGH',
     1
 );

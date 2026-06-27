@@ -226,7 +226,7 @@ pub async fn system_status() -> impl IntoResponse {
                 <span class="badge badge-info">1</span>
             </div>
             <div class="flex items-center justify-between">
-                <span>CIP Compliance</span>
+                <span>Compliance</span>
                 <span class="badge badge-success">Active</span>
             </div>
             <div class="flex items-center justify-between">

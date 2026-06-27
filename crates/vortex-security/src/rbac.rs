@@ -91,8 +91,9 @@ pub struct Role {
     pub inherits_from: Option<Uuid>,
     /// Whether this is a system role (cannot be deleted)
     pub is_system: bool,
-    /// CIP requirement this role helps satisfy
-    pub cip_reference: Option<String>,
+    /// Optional compliance reference this role helps satisfy. Free-form;
+    /// a vertical compliance profile can map it to a specific control.
+    pub compliance_reference: Option<String>,
 }
 
 impl Role {
@@ -106,7 +107,7 @@ impl Role {
             permissions: HashSet::new(),
             inherits_from: None,
             is_system: false,
-            cip_reference: None,
+            compliance_reference: None,
         }
     }
 
@@ -141,9 +142,9 @@ impl Role {
         self
     }
 
-    /// Add CIP reference
-    pub fn with_cip_reference(mut self, reference: impl Into<String>) -> Self {
-        self.cip_reference = Some(reference.into());
+    /// Add a compliance reference
+    pub fn with_compliance_reference(mut self, reference: impl Into<String>) -> Self {
+        self.compliance_reference = Some(reference.into());
         self
     }
 }
@@ -170,27 +171,27 @@ impl RoleManager {
 
     /// Initialize with default system roles
     pub async fn init_system_roles(&self) {
-        // Super Admin - full access (CIP-004 emergency access)
+        // Super Admin - full access (emergency / break-glass access)
         let super_admin = Role::new("super_admin")
             .grant(Permission::new("*", "*"))
             .system()
-            .with_cip_reference("CIP-004-7 R4.1");
+            .with_compliance_reference("emergency_access");
         self.add_role(super_admin).await;
 
-        // System Operator - operational access (CIP-004)
+        // System Operator - operational access
         let operator = Role::new("system_operator")
             .grant(Permission::read("*"))
             .grant(Permission::create("audit_log"))
             .system()
-            .with_cip_reference("CIP-004-7 R4.2");
+            .with_compliance_reference("operational_access");
         self.add_role(operator).await;
 
-        // Auditor - read-only access for compliance (CIP-004)
+        // Auditor - read-only access for compliance review
         let auditor = Role::new("auditor")
             .grant(Permission::read("*"))
             .grant(Permission::read("audit_log"))
             .system()
-            .with_cip_reference("CIP-004-7 R4.3");
+            .with_compliance_reference("audit_readonly");
         self.add_role(auditor).await;
 
         // Viewer - basic read access

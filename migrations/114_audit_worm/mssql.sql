@@ -157,14 +157,14 @@ GO
 -- ============================================================================
 INSERT INTO audit_log (
     user_id, username, action, resource_type, details,
-    cip_requirement, security_level, success
+    compliance_category, security_level, success
 ) VALUES (
     NULL,
     'system',
     'AUDIT_WORM_ENABLED',
     'audit_log',
     '{"migration":"114_audit_worm","trigger_enforcement":true,"runtime_role":"vortex_runtime","chain_enabled":true,"signing_enabled":"env-driven"}',
-    'CIP-007-6 R5.5',
+    'audit_integrity',
     'HIGH',
     1
 );

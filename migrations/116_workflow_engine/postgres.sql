@@ -129,7 +129,7 @@ COMMENT ON TABLE workflow_transitions IS
 -- ============================================================================
 INSERT INTO audit_log (
     user_id, username, action, resource_type, details,
-    cip_requirement, security_level, success
+    compliance_category, security_level, success
 ) VALUES (
     NULL,
     'system',
@@ -140,7 +140,7 @@ INSERT INTO audit_log (
         'worm_enforcement', true,
         'supports', jsonb_build_array('change_requests', 'purchase_orders', 'incidents', 'access_requests')
     ),
-    'CIP-007-6 R5',
+    'authentication',
     'HIGH',
     true
 );

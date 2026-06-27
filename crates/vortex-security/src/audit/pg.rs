@@ -129,7 +129,7 @@ pub struct AuditDbRow {
     pub details: Value,
     pub previous_state: Option<Value>,
     pub new_state: Option<Value>,
-    pub cip_requirement: String,
+    pub compliance_category: String,
     pub chain_position: i64,
     pub prev_hash: Option<[u8; 32]>,
 }
@@ -166,7 +166,7 @@ impl AuditDbRow {
             "details": self.details,
             "previous_state": self.previous_state,
             "new_state": self.new_state,
-            "cip_requirement": self.cip_requirement,
+            "compliance_category": self.compliance_category,
             "chain_position": self.chain_position,
             "prev_hash": self.prev_hash.map(|h| hex::encode(h)),
         })
@@ -341,7 +341,7 @@ impl PgAuditStorage {
             details: entry.details.clone(),
             previous_state: entry.previous_state.clone(),
             new_state: entry.new_state.clone(),
-            cip_requirement: entry.cip_reference.clone(),
+            compliance_category: entry.compliance_category.clone(),
             chain_position: next_position,
             prev_hash: prev_hash_bytes,
         };
@@ -377,7 +377,7 @@ impl PgAuditStorage {
                 id, timestamp, company_id, user_id, username,
                 action, resource_type, resource_id, resource_name,
                 details, ip_address, user_agent, success, error_message,
-                cip_requirement, security_level,
+                compliance_category, security_level,
                 prev_hash, entry_hash, chain_position, signature,
                 signing_key_id, canonical_payload, db_timestamp
             ) VALUES (
@@ -404,7 +404,7 @@ impl PgAuditStorage {
         .bind(row.user_agent.as_deref())
         .bind(row.success)
         .bind(row.error_message.as_deref())
-        .bind(&row.cip_requirement)
+        .bind(&row.compliance_category)
         .bind(entry.severity.code())
         .bind(prev_hash_bytes.map(|h| h.to_vec()))
         .bind(entry_hash.to_vec())
@@ -486,7 +486,7 @@ impl AuditStorage for PgAuditStorage {
         let mut sql = String::from(
             "SELECT id, timestamp, company_id, user_id, username, action, \
              resource_type, resource_id, resource_name, details, ip_address::text, \
-             user_agent, success, error_message, cip_requirement \
+             user_agent, success, error_message, compliance_category \
              FROM audit_log WHERE 1=1",
         );
         let mut args: Vec<QueryArg> = Vec::new();
@@ -583,7 +583,7 @@ fn row_to_entry(row: PgRow) -> AuditEntry {
     let user_agent: Option<String> = row.try_get("user_agent").ok();
     let success: bool = row.try_get("success").unwrap_or(true);
     let error_message: Option<String> = row.try_get("error_message").ok();
-    let cip_requirement: String = row.try_get("cip_requirement").unwrap_or_default();
+    let compliance_category: String = row.try_get("compliance_category").unwrap_or_default();
 
     AuditEntry {
         id,
@@ -605,7 +605,7 @@ fn row_to_entry(row: PgRow) -> AuditEntry {
         details: details.unwrap_or(Value::Null),
         previous_state: None,
         new_state: None,
-        cip_reference: cip_requirement,
+        compliance_category,
         db_name: None,
     }
 }

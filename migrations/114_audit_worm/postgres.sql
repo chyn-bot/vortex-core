@@ -193,7 +193,7 @@ REVOKE DELETE, TRUNCATE ON audit_signing_keys FROM PUBLIC;
 -- row and start chain_position at 0.
 INSERT INTO audit_log (
     user_id, username, action, resource_type, details,
-    cip_requirement, security_level, success
+    compliance_category, security_level, success
 ) VALUES (
     NULL,
     'system',
@@ -206,7 +206,7 @@ INSERT INTO audit_log (
         'chain_enabled', true,
         'signing_enabled', 'env-driven'
     ),
-    'CIP-007-6 R5.5',
+    'audit_integrity',
     'HIGH',
     true
 );

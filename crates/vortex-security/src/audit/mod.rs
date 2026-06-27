@@ -32,7 +32,7 @@ pub use pg::PgAuditStorage;
 /// Audit action types for security and configuration-change events.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AuditAction {
-    // Authentication events (CIP-007-6 R5.1)
+    // Authentication events
     LoginSuccess,
     LoginFailure,
     Logout,
@@ -43,14 +43,14 @@ pub enum AuditAction {
     MfaSuccess,
     MfaFailure,
 
-    // Authorization events (CIP-004-7 R4)
+    // Authorization events
     AccessGranted,
     AccessDenied,
     PermissionChange,
     RoleAssigned,
     RoleRevoked,
 
-    // User lifecycle (CIP-004-7 R4)
+    // User lifecycle
     UserCreated,
     UserUpdated,
     UserLocked,
@@ -63,7 +63,7 @@ pub enum AuditAction {
     RecordViewed,
     BulkExport,
 
-    // Configuration events (CIP-010-4 R1)
+    // Configuration events
     ConfigChanged,
     SystemStartup,
     SystemShutdown,
@@ -76,16 +76,16 @@ pub enum AuditAction {
     RateLimitExceeded,
     InvalidToken,
 
-    // Audit self-attestation (CIP-007-6 R5.5)
+    // Audit self-attestation
     GenesisCreated,
     ChainVerificationPassed,
     ChainVerificationFailed,
     KeyRotated,
     TriggerDisabled,
 
-    // Workflow state machine events (CIP-007-6 R5 — tracks every
-    // approval, rejection, and lifecycle transition on workflow
-    // instances. Written by vortex-workflow::WorkflowEngine).
+    // Workflow state machine events — tracks every approval,
+    // rejection, and lifecycle transition on workflow instances.
+    // Written by vortex-workflow::WorkflowEngine.
     WorkflowTransition,
 
     // Custom action
@@ -141,8 +141,12 @@ impl AuditAction {
         }
     }
 
-    /// Get the CIP requirement this action relates to.
-    pub fn cip_requirement(&self) -> &'static str {
+    /// Get the generic compliance category this action relates to.
+    ///
+    /// Returns a regulator-neutral security domain. A vertical
+    /// compliance profile (e.g. a SOX or HIPAA plugin) can map
+    /// these categories to its own control references.
+    pub fn compliance_category(&self) -> &'static str {
         match self {
             AuditAction::LoginSuccess
             | AuditAction::LoginFailure
@@ -152,7 +156,7 @@ impl AuditAction {
             | AuditAction::PasswordReset
             | AuditAction::MfaChallenge
             | AuditAction::MfaSuccess
-            | AuditAction::MfaFailure => "CIP-007-6 R5",
+            | AuditAction::MfaFailure => "authentication",
 
             AuditAction::AccessGranted
             | AuditAction::AccessDenied
@@ -162,23 +166,23 @@ impl AuditAction {
             | AuditAction::UserCreated
             | AuditAction::UserUpdated
             | AuditAction::UserLocked
-            | AuditAction::UserUnlocked => "CIP-004-7 R4",
+            | AuditAction::UserUnlocked => "authorization",
 
             AuditAction::ConfigChanged
             | AuditAction::SystemStartup
             | AuditAction::SystemShutdown
             | AuditAction::ModuleLoaded
-            | AuditAction::ModuleUnloaded => "CIP-010-4 R1",
+            | AuditAction::ModuleUnloaded => "configuration",
 
             AuditAction::GenesisCreated
             | AuditAction::ChainVerificationPassed
             | AuditAction::ChainVerificationFailed
             | AuditAction::KeyRotated
-            | AuditAction::TriggerDisabled => "CIP-007-6 R5.5",
+            | AuditAction::TriggerDisabled => "audit_integrity",
 
-            AuditAction::WorkflowTransition => "CIP-007-6 R5",
+            AuditAction::WorkflowTransition => "workflow",
 
-            _ => "CIP-007-6",
+            _ => "security",
         }
     }
 
@@ -266,8 +270,8 @@ pub struct AuditEntry {
     pub previous_state: Option<serde_json::Value>,
     /// New state for change tracking.
     pub new_state: Option<serde_json::Value>,
-    /// CIP requirement reference (denormalized from `action.cip_requirement()`).
-    pub cip_reference: String,
+    /// Generic compliance category (denormalized from `action.compliance_category()`).
+    pub compliance_category: String,
     /// Target database for multi-DB deployments. When set, the
     /// `PgAuditStorage` backend resolves the tenant's pool from the
     /// `DatabasePoolManager` and writes to THAT database's
@@ -286,7 +290,7 @@ pub struct AuditEntry {
 impl AuditEntry {
     /// Create a new audit entry.
     pub fn new(action: AuditAction, severity: AuditSeverity) -> Self {
-        let cip_reference = action.cip_requirement().to_string();
+        let compliance_category = action.compliance_category().to_string();
         Self {
             id: Uuid::now_v7(),
             timestamp: Utc::now(),
@@ -307,7 +311,7 @@ impl AuditEntry {
             details: serde_json::Value::Null,
             previous_state: None,
             new_state: None,
-            cip_reference,
+            compliance_category,
             db_name: None,
         }
     }
@@ -553,8 +557,8 @@ impl AuditLog {
     /// Use this from handlers that open their own transaction to mutate
     /// business data: passing the same transaction here ensures the audit
     /// write and the business mutation commit or roll back together. This
-    /// is the only correct way to satisfy CIP-007-6 R5 for state changes
-    /// inside multi-statement handlers.
+    /// is the only correct way to keep the audit trail consistent for
+    /// state changes inside multi-statement handlers.
     pub async fn log_tx<'c>(
         &self,
         entry: AuditEntry,

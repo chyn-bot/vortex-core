@@ -161,13 +161,13 @@ INSERT INTO audit_log (
     action,
     resource_type,
     details,
-    cip_requirement,
+    compliance_category,
     security_level
 ) VALUES (
     '00000000-0000-0000-0000-000000000001',
     'ACCESS_CONTROL_INITIALIZED',
     'system',
     '{"version": "0.1.0", "migration": "002_access_control"}',
-    'CIP-004-7 R4',
+    'authorization',
     'HIGH'
 );

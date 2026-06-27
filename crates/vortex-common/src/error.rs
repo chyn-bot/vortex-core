@@ -171,15 +171,17 @@ impl VortexError {
         )
     }
 
-    /// Returns the CIP requirement this error relates to (if any)
-    pub fn cip_requirement(&self) -> Option<&'static str> {
+    /// Returns the generic compliance category this error relates to
+    /// (if any). Regulator-neutral; a vertical compliance profile can
+    /// map these categories to its own control references.
+    pub fn compliance_category(&self) -> Option<&'static str> {
         match self {
-            VortexError::AuthenticationFailed { .. } => Some("CIP-007-6 R5"),
-            VortexError::AccessDenied { .. } => Some("CIP-004-7 R4"),
-            VortexError::SessionInvalid => Some("CIP-007-6 R5"),
-            VortexError::InsufficientPermissions { .. } => Some("CIP-004-7 R4"),
-            VortexError::SecurityPolicyViolation(_) => Some("CIP-007-6"),
-            VortexError::ConfigurationError(_) => Some("CIP-010-4 R1"),
+            VortexError::AuthenticationFailed { .. } => Some("authentication"),
+            VortexError::AccessDenied { .. } => Some("authorization"),
+            VortexError::SessionInvalid => Some("authentication"),
+            VortexError::InsufficientPermissions { .. } => Some("authorization"),
+            VortexError::SecurityPolicyViolation(_) => Some("security"),
+            VortexError::ConfigurationError(_) => Some("configuration"),
             _ => None,
         }
     }

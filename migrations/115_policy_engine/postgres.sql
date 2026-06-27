@@ -109,7 +109,7 @@ permit (
 -- ============================================================================
 INSERT INTO audit_log (
     user_id, username, action, resource_type, details,
-    cip_requirement, security_level, success
+    compliance_category, security_level, success
 ) VALUES (
     NULL,
     'system',
@@ -120,7 +120,7 @@ INSERT INTO audit_log (
         'engine', 'cedar-policy',
         'seed_policies', 4
     ),
-    'CIP-004-7 R4',
+    'authorization',
     'HIGH',
     true
 );

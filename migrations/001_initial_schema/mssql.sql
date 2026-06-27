@@ -57,7 +57,7 @@ CREATE INDEX idx_users_email ON users(company_id, email);
 CREATE INDEX idx_users_active ON users(active);
 
 -- ============================================================================
--- ROLES (RBAC - CIP-004 compliant)
+-- ROLES (RBAC - compliance-ready)
 -- ============================================================================
 CREATE TABLE roles (
     id UNIQUEIDENTIFIER PRIMARY KEY DEFAULT NEWID(),
@@ -99,7 +99,7 @@ CREATE INDEX idx_user_roles_user ON user_roles(user_id);
 CREATE INDEX idx_user_roles_role ON user_roles(role_id);
 
 -- ============================================================================
--- PASSWORD HISTORY (CIP-007 compliant)
+-- PASSWORD HISTORY (compliance-ready)
 -- ============================================================================
 CREATE TABLE password_history (
     id UNIQUEIDENTIFIER PRIMARY KEY DEFAULT NEWID(),
@@ -111,7 +111,7 @@ CREATE TABLE password_history (
 CREATE INDEX idx_password_history_user ON password_history(user_id);
 
 -- ============================================================================
--- SESSIONS (CIP-007 compliant - 30 min timeout)
+-- SESSIONS (compliance-ready - 30 min timeout)
 -- ============================================================================
 CREATE TABLE sessions (
     id UNIQUEIDENTIFIER PRIMARY KEY DEFAULT NEWID(),
@@ -132,7 +132,7 @@ CREATE INDEX idx_sessions_token ON sessions(token_hash);
 CREATE INDEX idx_sessions_expires ON sessions(expires_at);
 
 -- ============================================================================
--- AUDIT LOG (CIP-007 compliant - immutable)
+-- AUDIT LOG (compliance-ready - immutable)
 -- ============================================================================
 CREATE TABLE audit_log (
     id UNIQUEIDENTIFIER PRIMARY KEY DEFAULT NEWID(),
@@ -149,8 +149,8 @@ CREATE TABLE audit_log (
     user_agent NVARCHAR(MAX),
     success BIT NOT NULL DEFAULT 1,
     error_message NVARCHAR(MAX),
-    -- CIP compliance fields
-    cip_requirement NVARCHAR(20),  -- e.g., 'CIP-007-R5'
+    -- compliance fields
+    compliance_category NVARCHAR(20),  -- generic compliance category, e.g. 'configuration'
     security_level NVARCHAR(20)    -- 'HIGH', 'MEDIUM', 'LOW'
 );
 
@@ -173,7 +173,7 @@ CREATE TABLE system_settings (
 
 -- Default settings
 INSERT INTO system_settings ([key], value, description) VALUES
-    ('session.timeout_minutes', '30', 'Session timeout in minutes (CIP-007)'),
+    ('session.timeout_minutes', '30', 'Session timeout in minutes'),
     ('password.min_length', '12', 'Minimum password length'),
     ('password.require_special', 'true', 'Require special characters'),
     ('password.max_age_days', '90', 'Password expiration in days'),
@@ -260,13 +260,13 @@ INSERT INTO audit_log (
     action,
     resource_type,
     details,
-    cip_requirement,
+    compliance_category,
     security_level
 ) VALUES (
     '00000000-0000-0000-0000-000000000001',
     'SYSTEM_INITIALIZED',
     'system',
     '{"version": "0.1.0", "migration": "001_initial_schema"}',
-    'CIP-010-R1',
+    'configuration',
     'HIGH'
 );

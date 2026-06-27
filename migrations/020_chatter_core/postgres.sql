@@ -140,7 +140,7 @@ CREATE TABLE chatter_attachments (
     file_path VARCHAR(1000) NOT NULL,
     file_size BIGINT NOT NULL,
     mime_type VARCHAR(255),
-    checksum VARCHAR(64),  -- SHA-256 for CIP compliance integrity verification
+    checksum VARCHAR(64),  -- SHA-256 for audit integrity verification
     -- Metadata
     description TEXT,
     -- Audit

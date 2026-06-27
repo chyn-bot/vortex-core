@@ -207,7 +207,7 @@ async fn export_cmd(
     let mut sql = String::from(
         "SELECT id, timestamp, company_id, user_id, username, action, \
          resource_type, resource_id, details, ip_address::text as ip_address, \
-         user_agent, success, cip_requirement, chain_position, entry_hash \
+         user_agent, success, compliance_category, chain_position, entry_hash \
          FROM audit_log WHERE 1=1",
     );
     let mut arg_idx = 0;

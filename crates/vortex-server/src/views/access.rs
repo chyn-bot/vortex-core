@@ -5,9 +5,9 @@
 //! - Record rules (domain-based filtering)
 //! - Field access (field-level permissions)
 //!
-//! # CIP Compliance
+//! # Compliance
 //!
-//! - CIP-004-7 R4: Access management and authorization
+//! - Access management and authorization
 
 use askama::Template;
 use axum::{
