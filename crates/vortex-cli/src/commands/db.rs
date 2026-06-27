@@ -55,7 +55,7 @@ async fn init_migrations_table(pool: &PgPool) -> Result<()> {
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS vortex_migrations (
-            id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
             name VARCHAR(255) NOT NULL UNIQUE,
             module VARCHAR(255) NOT NULL,
             applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -88,7 +88,7 @@ async fn record_migration(pool: &PgPool, name: &str, module: &str, execution_tim
     sqlx::query(
         r#"
         INSERT INTO vortex_migrations (id, name, module, checksum, execution_time_ms)
-        VALUES (uuid_generate_v4(), $1, $2, $3, $4)
+        VALUES (gen_random_uuid(), $1, $2, $3, $4)
         "#
     )
     .bind(name)
