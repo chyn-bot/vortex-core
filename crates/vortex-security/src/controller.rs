@@ -4,10 +4,10 @@
 //! three-tier access control model (model access, record rules, field access)
 //! with caching for performance.
 //!
-//! # CIP Compliance
+//! # Compliance
 //!
-//! - CIP-004-7 R4: Access management and authorization
-//! - CIP-007-6 R5: Audit logging of access denials
+//! - Access management and authorization
+//! - Audit logging of access denials
 
 use crate::domain::{DomainExpr, DomainValue, PostgresDialect, SqlDialect};
 use serde::{Deserialize, Serialize};

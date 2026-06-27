@@ -1,6 +1,6 @@
 //! Role-Based Access Control (RBAC)
 //!
-//! Implements NERC CIP-004 requirements for access management.
+//! Implements enterprise access-management requirements for regulated industries.
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};

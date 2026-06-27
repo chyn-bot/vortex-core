@@ -17,8 +17,8 @@
 //!   policies in the plugin migration are enforced without any
 //!   code here.
 //!
-//! The HTML is built with `format!` strings — the same convention
-//! vortex-eam uses. The CR plugin is small on purpose; a future
+//! The HTML is built with `format!` strings — the standard plugin
+//! convention. The CR plugin is small on purpose; a future
 //! phase can extract shared chrome (header/footer) into
 //! `vortex-framework::ui` when a second plugin needs it.
 
@@ -91,8 +91,8 @@ fn principal_for(user: &AuthUser, company_id: Uuid) -> PolicyPrincipal {
 
 /// Generate the next `CR/YYYY/NNNNN` number for a tenant. Uses a
 /// `SELECT MAX + 1` read followed by an INSERT; real production
-/// numbering should move to the `eam_sequences`-style atomic upsert
-/// pattern, but this is Phase 0.5 and the CR plugin is a
+/// numbering should move to the core `vortex_orm::sequence` service
+/// (atomic no-gap upsert), but this is Phase 0.5 and the CR plugin is a
 /// demonstrator. Collisions are handled by the unique constraint on
 /// `(company_id, number)` — callers retry.
 async fn generate_cr_number(db: &sqlx::PgPool, company_id: Uuid) -> Result<String, sqlx::Error> {

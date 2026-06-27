@@ -60,7 +60,7 @@ pub type ReportHandler = Arc<
 pub struct ReportDef {
     /// Globally-unique report code, conventionally
     /// `<plugin_technical_name>.<report_name>` — e.g.
-    /// `eam.work_order_summary`, `sales.invoice`.
+    /// `crm.lead_summary`, `sales.invoice`.
     pub code: &'static str,
     /// Human-readable display name, shown in UI listings.
     pub name: &'static str,
@@ -82,14 +82,14 @@ impl ReportDef {
     /// use vortex_framework::reports::{ReportDef, ReportFormat, ReportOutput};
     ///
     /// ReportDef::new(
-    ///     "eam.wo_summary",
-    ///     "Work Order Summary",
-    ///     "Printable summary of a work order for the field crew",
+    ///     "crm.lead_summary",
+    ///     "Lead Summary",
+    ///     "Printable summary of a lead for the sales team",
     ///     vec![ReportFormat::Html, ReportFormat::Csv],
     ///     |state, params| async move {
     ///         let id = params.get("id").ok_or_else(|| /* ... */)?;
     ///         // ... query, render ...
-    ///         Ok(ReportOutput::html("wo.html", body))
+    ///         Ok(ReportOutput::html("lead.html", body))
     ///     },
     /// )
     /// ```

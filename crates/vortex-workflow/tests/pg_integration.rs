@@ -175,7 +175,7 @@ async fn create_and_transition_through_happy_path() {
             &"test_cr".into(),
             SYSTEM_COMPANY_ID,
             user_id,
-            json!({ "title": "Replace transformer TX-01-MAIN" }),
+            json!({ "title": "Upgrade billing service to v2" }),
         )
         .await
         .unwrap();

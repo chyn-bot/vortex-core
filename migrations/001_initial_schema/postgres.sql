@@ -1,6 +1,6 @@
 -- Remicle Core Schema
 -- Initial migration for core tables
--- NERC CIP Compliant
+-- Regulated-industry compliant
 
 -- Enable UUID extension
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";

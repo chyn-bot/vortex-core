@@ -16,8 +16,8 @@
 //! - `Company::"<uuid>"` — tenant scope.
 //! - `Resource::"<type>:<id>"` — generic escape hatch for arbitrary
 //!   resources. Used when the demo integration targets a user resource;
-//!   future modules (work orders, POs) will add their own entity types
-//!   (`WorkOrder`, `PurchaseOrder`, etc.).
+//!   future modules (change requests, POs) will add their own entity types
+//!   (`ChangeRequest`, `PurchaseOrder`, etc.).
 //!
 //! Action entities are not built here — actions are just Cedar
 //! `Action::"update"` string literals that the PolicyService constructs
@@ -50,10 +50,10 @@ pub struct PolicyPrincipal {
 /// ABAC attributes the resource exposes (region, criticality, amount, etc.).
 #[derive(Debug, Clone)]
 pub struct PolicyResource {
-    /// Cedar entity type, e.g. `"User"`, `"WorkOrder"`, `"PurchaseOrder"`.
+    /// Cedar entity type, e.g. `"User"`, `"ChangeRequest"`, `"PurchaseOrder"`.
     pub type_name: String,
     /// Stable resource identifier. For user updates this is the target
-    /// user's UUID; for work orders, the WO UUID; etc.
+    /// user's UUID; for change requests, the CR UUID; etc.
     pub id: String,
     /// Free-form ABAC attributes serialized as JSON. Only primitive types
     /// are currently projected into Cedar (strings, numbers, bools); the

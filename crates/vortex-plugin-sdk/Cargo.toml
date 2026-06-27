@@ -14,7 +14,7 @@ description = "Vortex ERP Plugin SDK — everything a third-party vertical needs
 # across patch releases.
 #
 # If you are working inside the vortex-core workspace itself (on
-# vortex-eam, vortex-change, or a new first-party plugin), you MAY
+# vortex-change, vortex-contacts, or a new first-party plugin), you MAY
 # depend on the individual crates directly — the SDK is not mandatory
 # for in-tree development. The SDK exists for out-of-tree consumers
 # who should not need to know (or care) about the internal crate

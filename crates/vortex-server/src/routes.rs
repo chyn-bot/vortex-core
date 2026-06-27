@@ -9,7 +9,7 @@ use tower_http::services::ServeDir;
 
 use crate::middleware::auth::{auth_middleware, require_auth_html};
 use crate::state::AppState;
-use crate::views::{access, auth, chatter, contacts, dashboard, eam, home, modules, users};
+use crate::views::{access, auth, chatter, contacts, dashboard, home, modules, users};
 
 /// Build the main application router
 pub fn build_router(state: AppState) -> Router {
@@ -52,18 +52,6 @@ pub fn build_router(state: AppState) -> Router {
         .route("/modules/{id}/upgrade", post(modules::module_upgrade))
         // Access control management (HTML admin UI)
         .nest("/admin/access", access::access_html_routes())
-        // EAM routes
-        .route("/eam", get(eam::eam_dashboard))
-        .route("/eam/sites", get(eam::eam_sites))
-        .route("/eam/assets", get(eam::eam_assets))
-        .route("/eam/work-orders", get(eam::eam_work_orders))
-        .route("/eam/equipment", get(eam::eam_equipment))
-        .route("/eam/condition", get(eam::eam_condition_monitoring))
-        .route("/eam/manufacturers", get(eam::eam_manufacturers))
-        .route("/eam/configuration", get(eam::eam_configuration))
-        .route("/eam/inspections", get(eam::eam_inspections))
-        .route("/eam/checklists", get(eam::eam_checklists))
-        .route("/eam/plans", get(eam::eam_maintenance_plans))
         // Partials for HTMX
         .route("/partials/recent-activity", get(dashboard::recent_activity))
         .route("/partials/system-status", get(dashboard::system_status))
@@ -80,8 +68,8 @@ pub fn build_router(state: AppState) -> Router {
     // Note: this Router is part of the legacy vortex-server path and is
     // NOT the one the CLI binary uses — the CLI composes its own router
     // in commands/server.rs with plugins merged in via PluginRegistry.
-    // Plugin routes (EAM, CR, etc.) are contributed by plugin crates at
-    // the binary level, not here. This router stays core-only.
+    // Plugin routes (CR, Contacts, etc.) are contributed by plugin
+    // crates at the binary level, not here. This router stays core-only.
     let protected_api_routes = Router::new()
         .nest("/api/auth", api_auth_routes())
         .nest("/api/v1", api_model_routes())

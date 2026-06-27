@@ -9,7 +9,7 @@
 
 Vortex is a **horizontal ERP platform** written in Rust. It is intentionally not bound to any industry — the core provides a zero-trust kernel (identity, persistence, audit, policy, workflow, multi-tenancy, plugin loading) and every domain-specific capability ships as a **plugin crate**.
 
-The first vertical is utilities (`vortex-eam`). Change Request (`vortex-change`) is a second, cross-cutting plugin. More verticals will follow — manufacturing, retail, services, finance, public sector — each as its own crate.
+Verticals ship as plugin crates. The in-tree examples are Change Request (`vortex-change`), a cross-cutting plugin, and Contacts (`vortex-contacts`), a CRM-style reference plugin. More verticals will follow — manufacturing, retail, services, finance, public sector — each as its own crate, including third-party ones built against the plugin SDK.
 
 Vortex is closer in spirit to **Odoo** (horizontal ERP with vertical modules) than to NetSuite or SAP: open, modular, auditable, self-hostable, and designed so third parties can build verticals without touching core.
 
@@ -41,9 +41,9 @@ Anything that two different verticals would both need:
 
 Anything industry-, regulator-, or geography-specific:
 
-- Industry domain models (assets, leads, invoices, patient records, production orders)
+- Industry domain models (leads, invoices, patient records, production orders)
 - Industry-specific workflows
-- Vertical compliance profiles (NERC-CIP, SOX, HIPAA, GDPR shapes) — configured on top of core primitives
+- Vertical compliance profiles (SOX, HIPAA, PCI-DSS, GDPR shapes) — configured on top of core primitives
 - Industry vocabulary, UI, reports
 - Regulator-specific audit formats (CEF/LEEF export presets)
 
@@ -53,7 +53,7 @@ Things a horizontal ERP must have that are **not yet in core** and will gate a s
 
 | Capability | Odoo analogue | Current state | Priority |
 |---|---|---|---|
-| Universal sequence service | `ir.sequence` | Exists inside `vortex-eam` as `eam_sequences`. Needs promotion. | P0 |
+| Universal sequence service | `ir.sequence` | **Shipped** — promoted into core as the `vortex-orm` sequence service; any plugin can request sequence generation. | — |
 | Currency / exchange rates | `res.currency` | **Shipped (Phase 0.7)** — `currencies` + `currency_rates` + `companies.currency_id` (migration 119). API: `vortex_orm::commerce::{Currency, CurrencyRate, get_rate, convert_amount, round_to_currency}`. | — |
 | Taxes | `account.tax` | **Shipped (Phase 0.7)** — minimal model: percent/fixed, sale/purchase/none, inclusive/exclusive. Compound taxes and tax groups deferred. API: `vortex_orm::commerce::{Tax, TaxAmountType, TaxTypeUse, compute_tax_amount}`. | — |
 | Unit of measure | `uom.uom` | **Shipped (Phase 0.7)** — category-scoped conversion graph, 6 seed categories, ~29 seed units. API: `vortex_orm::commerce::{UomCategory, Uom, convert_uom}`. | — |
@@ -91,7 +91,7 @@ A plugin contributes:
 
 1. **Identity** — stable `technical_name` (snake_case) used to key the `installed_modules` table and namespace its migration history.
 2. **HTTP routes** — an `axum::Router` fragment `merge`d into the host router. Plugin owns its URL layout.
-3. **Nested sub-services** — routers with their own state that get `nest_service`d at a chosen prefix (used by EAM for `/api/eam/*` which uses per-request `DatabaseContext`).
+3. **Nested sub-services** — routers with their own state that get `nest_service`d at a chosen prefix (e.g. a CRM plugin mounting `/api/crm/*` with its own per-request `DatabaseContext`).
 4. **Sidebar menu entries** — host aggregates, sorts by group+priority, role-filters, and renders.
 5. **Workflow state machines** — registered into the shared `WorkflowEngine` during startup.
 6. **Migrations** — embedded via `include_str!` so the plugin crate is self-contained; the migration runner records applied migrations under a composite key `<technical_name>:<migration_name>`, so plugins can have collisions in local names without conflict.
@@ -104,7 +104,7 @@ Plugins ship SQL with `include_str!` — no copying files into the host's `migra
 - `up_sql` / `down_sql` — embedded SQL strings.
 - `requires_core_migration` — the last core migration the plugin depends on. The runner fails fast with a clear error if core is older, instead of producing a confusing `relation "foo" does not exist`.
 
-This contract was established in Phase 0.6 ("The Great Extraction"). As of Phase 0.7 both `vortex-change` and `vortex-eam` ship their migrations through it; no plugin-specific SQL lives in `vortex-core/migrations/` anymore.
+This contract was established in Phase 0.6 ("The Great Extraction"). As of Phase 0.7 every in-tree plugin (`vortex-change`, `vortex-contacts`) ships its migrations through it; no plugin-specific SQL lives in `vortex-core/migrations/` anymore.
 
 ## 4. The platform ABI: `AppState`
 
@@ -144,7 +144,7 @@ Vortex is designed for three distinct deploy shapes. Any future packaging work m
 
 - One `vortex` binary, one Postgres cluster.
 - `database_manager` provisions per-tenant databases (`vortex_acme`, `vortex_globex`, …) from the master DB.
-- Tenants pick verticals per-database: `vortex module install eam -d vortex_acme`.
+- Tenants pick verticals per-database: `vortex module install crm -d vortex_acme`.
 - Auth middleware routes each request to the tenant's pool via `DatabaseContext`.
 - Reverse proxy (nginx/Caddy) terminates TLS, maps subdomain → tenant.
 
@@ -162,7 +162,7 @@ Vortex is designed for three distinct deploy shapes. Any future packaging work m
 
 **Packaging**: native OS packages (`.deb`, `.rpm`, Windows MSI) with systemd unit / Windows service wrapper. Postgres as a declared dependency, not bundled.
 
-This is the shape utility customers (TNB, SESB) will want, and also factories, hospitals, public-sector customers — anyone who won't let software run in someone else's cloud.
+This is the shape regulated enterprise customers will want — factories, hospitals, financial institutions, public-sector customers — anyone who won't let software run in someone else's cloud.
 
 ### Shape 3 — Developer / plugin author
 
@@ -228,15 +228,15 @@ This works. What's missing before it's truly "installable elsewhere":
 - **No `.deb` / `.rpm`** packaging.
 - **No installer script** — the commands above are manual.
 - **Audit signing key** is still env-var-sourced; production needs KMS/HSM integration.
-- **`vortex-core/migrations/`** contains both core and EAM migrations; a vanilla install always applies EAM whether the customer wants it or not.
+- **No license/entitlement gating** — `vortex module install <vertical>` is unrestricted; commercial verticals will need an entitlement check.
 
 ## 7. Known gaps (as of 2026-04-11)
 
 These are architectural debt items to close before scaling to multiple verticals:
 
-1. ~~**EAM migrations still in core.**~~ **Done (Phase 0.7).** Eleven EAM migrations (formerly `100_eam_*` through `113_eam_*` in `vortex-core/migrations/`) now live in `crates/vortex-eam/migrations/` under plugin-local numbering `001_base` through `011_condition_metadata`. Applied via `EamPlugin::migrations()` using the `PluginMigration` contract; composite tracking key `asset_management:00N_*`. Core can now be installed without EAM — the plugin contributes its schema entirely from within its own crate.
-2. **`vortex-eam` sequence service should be promoted to core.** Every vertical will need sequence generation; having it hidden inside EAM forces duplication. *(Impact: blocks second vertical.)*
-3. **No scheduled-actions / cron framework.** Every vertical will need this. *(Impact: blocks second vertical.)*
+1. ~~**Plugin-specific migrations in core.**~~ **Done (Phase 0.7).** No vertical migrations live in `vortex-core/migrations/` anymore. Every plugin contributes its schema entirely from within its own crate via `Plugin::migrations()` and the `PluginMigration` contract, tracked under a composite key `<technical_name>:<migration_name>`. Core can be installed standalone with zero vertical tables.
+2. ~~**Sequence service should be promoted to core.**~~ **Done.** Sequence generation now lives in `vortex-orm` as a core service, available to every plugin; no vertical owns its own copy.
+3. **No scheduled-actions / cron framework.** Every vertical will need this. *(Impact: blocks more verticals.)*
 4. ~~**No currency / UoM / tax primitives.**~~ **Done (Phase 0.7).** Migration `119_commerce_primitives` ships `currencies` (+ ISO 4217 seeds), `currency_rates` (time-series with `rate=1` baseline for every currency), `uom_categories` + `uoms` (6 categories, ~29 units), `taxes` (minimal percent/fixed model), and adds `companies.currency_id`. Rust API lives at `vortex_orm::commerce`: pure-function conversion/rounding (`convert_uom`, `compute_tax_amount`, `round_to_currency`) plus DB-backed rate lookup (`get_rate`, `convert_amount`). 19 unit tests cover the pure logic paths. **Deferred**: compound taxes, tax groups, rate-provider integration (natural fit for a scheduled action), chart of accounts, journal entries.
 5. ~~**No report engine.**~~ **Partially done (Phase 0.7).** `vortex_framework::reports` ships a registry + `GET /reports/:code` endpoint + `ReportDef` plugin contribution with HTML, CSV, and JSON formats. Every render is audited via `AuditAction::BulkExport`. Plugins declare reports in one block via `Plugin::reports()` and get HTTP delivery for free; direct consumers (scheduled email, export scripts) call `render_report(state, code, params)` to get the same bytes without HTTP. **Still deferred**: PDF and XLSX. These belong in extension plugins (`vortex-report-pdf`, `vortex-report-xlsx`) that wrap specific backends without forcing every Vortex deployment to carry a heavyweight dependency. For internal reports today, handlers generate HTML with `@media print` stylesheets and users Ctrl+P → Save as PDF from the browser. Regulated customer-facing artifacts (legal invoices, tax returns) requiring guaranteed PDF output wait for the extension plugin.
 6. ~~**Audit signing key is env-sourced.**~~ **Done (Phase 0.7).** `vortex-security::signing` restructured from a single `signing.rs` into a `signing/` module with pluggable backends: `Ed25519Key` (env-var, dev-only) and `Pkcs11SigningKey` (PKCS#11 v3.0, works with SoftHSM2 for dev/CI, Thales Luna / Entrust nShield / YubiHSM 2 / Utimaco for production). Backend selection via `[audit.signing]` in `vortex.toml`. Private key material NEVER enters the Vortex process with the PKCS#11 backend. Extension contract documented in `signing/mod.rs` header — adding Vault / AWS KMS / Azure Key Vault is four additive steps, no existing backend code is touched. **Still deferred**: ECDSA-P256 algorithm support (for HSMs with pre-FIPS-186-5 firmware), automated key rotation ceremony, KMS-backed unseal for multi-DB deployments.
@@ -257,9 +257,9 @@ These are architectural debt items to close before scaling to multiple verticals
 | Term | Meaning |
 |---|---|
 | **Core** | The horizontal ERP kernel — every `vortex-*` crate other than a plugin. |
-| **Vertical** | An industry-specific plugin crate (`vortex-eam`, `vortex-change`, future: `vortex-crm`, `vortex-finance`, …). |
+| **Vertical** | An industry-specific plugin crate (`vortex-change`, `vortex-contacts`, future: `vortex-crm`, `vortex-finance`, …). |
 | **Plugin** | Any crate implementing `vortex_framework::Plugin`. All verticals are plugins; some cross-cutting capabilities may also be plugins. |
 | **Tenant** | A customer database in multi-DB mode. In single-tenant mode there's exactly one, named `default_db`. |
 | **Module** | Synonym for plugin in user-facing contexts — `vortex module install foo` installs the plugin with technical_name `foo` for a given tenant. |
 | **WORM** | Write-Once, Read-Many — applied to the audit ledger. DB-level triggers forbid UPDATE/DELETE on `audit_log`. |
-| **Vertical compliance profile** | A configuration of core compliance primitives (audit, eSig, policy) to match a specific regulator (NERC-CIP, SOX, HIPAA, …). |
+| **Vertical compliance profile** | A configuration of core compliance primitives (audit, eSig, policy) to match a specific regulator (SOX, HIPAA, PCI-DSS, GDPR, …). |

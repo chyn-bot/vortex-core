@@ -1,5 +1,0 @@
-[migration]
-module = "asset_management"
-description = "Enterprise Asset Management base tables - Sites, Assets, Equipment"
-reversible = true
-dependencies = ["003_module_registry"]

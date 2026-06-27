@@ -36,7 +36,7 @@ use crate::ui::html_escape;
 ///
 /// `active_page` matches either a core page key (`"home"`,
 /// `"dashboard"`, `"contacts"`) or a plugin menu-entry id
-/// (e.g. `"eam.work_orders"`). Matching entries render with the
+/// (e.g. `"crm.leads"`). Matching entries render with the
 /// `active` CSS class.
 pub fn build_sidebar(
     active_page: &str,
@@ -114,8 +114,8 @@ pub fn build_sidebar(
 </aside>"##, nav_html, initials, user_name)
 }
 
-/// Turn a technical name like `"asset_management"` into a display
-/// title like `"Asset Management"`, using the plugin registry to look
+/// Turn a technical name like `"field_service"` into a display
+/// title like `"Field Service"`, using the plugin registry to look
 /// up the plugin's preferred display name if one is registered.
 fn pretty_section_title(plugin_key: &str, registry: &PluginRegistry) -> String {
     if registry.technical_names().contains(&plugin_key) {
@@ -171,10 +171,10 @@ mod tests {
     #[async_trait::async_trait]
     impl Plugin for Dummy {
         fn technical_name(&self) -> &'static str {
-            "asset_management"
+            "field_service"
         }
         fn display_name(&self) -> &'static str {
-            "Asset Management"
+            "Field Service"
         }
         fn version(&self) -> &'static str {
             "0.1.0"
@@ -184,9 +184,9 @@ mod tests {
         }
         fn menu_entries(&self) -> Vec<MenuEntry> {
             vec![MenuEntry::new(
-                "asset_management.work_orders",
-                "Work Orders",
-                "/eam/work-orders",
+                "field_service.leads",
+                "Leads",
+                "/crm/leads",
                 MenuGroup::Operations,
             )]
         }
@@ -196,11 +196,11 @@ mod tests {
     fn sidebar_renders_plugin_entry() {
         let mut r = PluginRegistry::new();
         r.register(Arc::new(Dummy));
-        let installed: HashSet<String> = ["asset_management".to_string()].into_iter().collect();
+        let installed: HashSet<String> = ["field_service".to_string()].into_iter().collect();
         let html = build_sidebar("home", "Alice", "AL", &installed, true, &r, &[]);
-        assert!(html.contains("Work Orders"));
-        assert!(html.contains("Asset Management"));
-        assert!(html.contains("/eam/work-orders"));
+        assert!(html.contains("Leads"));
+        assert!(html.contains("Field Service"));
+        assert!(html.contains("/crm/leads"));
     }
 
     #[test]
@@ -209,7 +209,7 @@ mod tests {
         r.register(Arc::new(Dummy));
         let installed: HashSet<String> = HashSet::new();
         let html = build_sidebar("home", "Alice", "AL", &installed, true, &r, &[]);
-        assert!(!html.contains("Work Orders"));
+        assert!(!html.contains("Leads"));
     }
 
     #[test]

@@ -16,7 +16,7 @@ license.workspace = true
 #   - `MenuEntry` / `PluginRegistry` — the aggregation points the host
 #     walks at startup to assemble the full router and sidebar.
 #
-# Modules (vortex-eam, the future vortex-change, etc.) depend on this
+# Plugin crates (vortex-change, vortex-contacts, etc.) depend on this
 # crate to plug in. The host binary depends on this crate to consume
 # installed plugins.
 

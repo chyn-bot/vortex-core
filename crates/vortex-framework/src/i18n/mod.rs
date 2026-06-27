@@ -25,7 +25,7 @@
 //! ```
 //!
 //! The "key itself is the fallback" convention means untranslated
-//! strings show as their dotted key (`menu.work_orders`) rather
+//! strings show as their dotted key (`menu.leads`) rather
 //! than crashing or showing nothing — which is ugly but
 //! immediately obvious to developers and testers.
 //!
@@ -84,7 +84,7 @@ pub use locale::{locale_from_accept_language, Locale, DEFAULT_LOCALE};
 pub struct Translation {
     /// BCP 47 locale code (`en`, `ms-MY`, `zh-CN`).
     pub locale: String,
-    /// Module / plugin that owns this string — e.g. `core`, `eam`,
+    /// Module / plugin that owns this string — e.g. `core`, `crm`,
     /// `sales`. Used for scoping and for admin-UI filtering.
     pub module: String,
     /// Dotted key — e.g. `menu.dashboard`, `btn.save`,
@@ -267,8 +267,8 @@ mod tests {
             Translation::new("ms", "core", "menu.dashboard", "Papan Pemuka"),
             Translation::new("ms", "core", "btn.save", "Simpan"),
             Translation::new("ms-MY", "core", "btn.save", "Simpan (MY)"),
-            Translation::new("en", "eam", "menu.assets", "Assets"),
-            Translation::new("ms", "eam", "menu.assets", "Aset"),
+            Translation::new("en", "crm", "menu.leads", "Leads"),
+            Translation::new("ms", "crm", "menu.leads", "Prospek"),
         ]);
         svc
     }
@@ -323,10 +323,10 @@ mod tests {
     fn t_plugin_keys_are_module_prefixed() {
         let svc = build_test_service();
         let en = Locale::parse("en");
-        // EAM's "menu.assets" is stored as "eam.menu.assets"
-        assert_eq!(svc.t("eam.menu.assets", &en), "Assets");
+        // CRM's "menu.leads" is stored as "crm.menu.leads"
+        assert_eq!(svc.t("crm.menu.leads", &en), "Leads");
         let ms = Locale::parse("ms");
-        assert_eq!(svc.t("eam.menu.assets", &ms), "Aset");
+        assert_eq!(svc.t("crm.menu.leads", &ms), "Prospek");
     }
 
     #[test]

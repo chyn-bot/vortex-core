@@ -219,27 +219,27 @@ mod tests {
     fn registry_filters_uninstalled_plugins() {
         let mut r = PluginRegistry::new();
         r.register(plugin(
-            "eam",
-            vec![MenuEntry::new("eam.main", "EAM", "/eam", MenuGroup::Operations)],
+            "crm",
+            vec![MenuEntry::new("crm.main", "CRM", "/crm", MenuGroup::Operations)],
         ));
         r.register(plugin(
             "cr",
             vec![MenuEntry::new("cr.main", "CRs", "/cr", MenuGroup::Operations)],
         ));
-        let menu = r.collect_menu(&installed(&["eam"]), &[]);
+        let menu = r.collect_menu(&installed(&["crm"]), &[]);
         assert_eq!(menu.len(), 1);
-        assert_eq!(menu[0].label, "EAM");
+        assert_eq!(menu[0].label, "CRM");
     }
 
     #[test]
     fn registry_filters_by_required_role() {
         let mut r = PluginRegistry::new();
-        let entry = MenuEntry::new("eam.admin", "Admin", "/eam/admin", MenuGroup::Administration)
+        let entry = MenuEntry::new("crm.admin", "Admin", "/crm/admin", MenuGroup::Administration)
             .require_role("admin");
-        r.register(plugin("eam", vec![entry]));
-        let user_menu = r.collect_menu(&installed(&["eam"]), &["viewer".to_string()]);
+        r.register(plugin("crm", vec![entry]));
+        let user_menu = r.collect_menu(&installed(&["crm"]), &["viewer".to_string()]);
         assert!(user_menu.is_empty());
-        let admin_menu = r.collect_menu(&installed(&["eam"]), &["admin".to_string()]);
+        let admin_menu = r.collect_menu(&installed(&["crm"]), &["admin".to_string()]);
         assert_eq!(admin_menu.len(), 1);
     }
 
@@ -247,14 +247,14 @@ mod tests {
     fn registry_orders_by_group_then_priority() {
         let mut r = PluginRegistry::new();
         r.register(plugin(
-            "eam",
+            "crm",
             vec![
-                MenuEntry::new("eam.a", "A", "/a", MenuGroup::Operations).with_priority(20),
-                MenuEntry::new("eam.b", "B", "/b", MenuGroup::Operations).with_priority(10),
-                MenuEntry::new("eam.c", "C", "/c", MenuGroup::Administration).with_priority(5),
+                MenuEntry::new("crm.a", "A", "/a", MenuGroup::Operations).with_priority(20),
+                MenuEntry::new("crm.b", "B", "/b", MenuGroup::Operations).with_priority(10),
+                MenuEntry::new("crm.c", "C", "/c", MenuGroup::Administration).with_priority(5),
             ],
         ));
-        let menu = r.collect_menu(&installed(&["eam"]), &[]);
+        let menu = r.collect_menu(&installed(&["crm"]), &[]);
         assert_eq!(menu[0].label, "B"); // lowest priority in Operations
         assert_eq!(menu[1].label, "A");
         assert_eq!(menu[2].label, "C"); // Administration comes after Operations
@@ -264,13 +264,13 @@ mod tests {
     fn collect_menu_by_group_filter() {
         let mut r = PluginRegistry::new();
         r.register(plugin(
-            "eam",
+            "crm",
             vec![
-                MenuEntry::new("eam.a", "A", "/a", MenuGroup::Operations),
-                MenuEntry::new("eam.b", "B", "/b", MenuGroup::Administration),
+                MenuEntry::new("crm.a", "A", "/a", MenuGroup::Operations),
+                MenuEntry::new("crm.b", "B", "/b", MenuGroup::Administration),
             ],
         ));
-        let ops = r.collect_menu_by_group(MenuGroup::Operations, &installed(&["eam"]), &[]);
+        let ops = r.collect_menu_by_group(MenuGroup::Operations, &installed(&["crm"]), &[]);
         assert_eq!(ops.len(), 1);
         assert_eq!(ops[0].label, "A");
     }
@@ -278,9 +278,9 @@ mod tests {
     #[test]
     fn registry_tracks_technical_names() {
         let mut r = PluginRegistry::new();
-        r.register(plugin("eam", vec![]));
+        r.register(plugin("crm", vec![]));
         r.register(plugin("cr", vec![]));
         assert_eq!(r.len(), 2);
-        assert_eq!(r.technical_names(), vec!["eam", "cr"]);
+        assert_eq!(r.technical_names(), vec!["crm", "cr"]);
     }
 }

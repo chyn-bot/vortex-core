@@ -1,4 +1,4 @@
-//! Session management - NERC CIP-007-6 R5
+//! Session management - enterprise session security
 //!
 //! Secure session handling with timeouts and tracking.
 
@@ -30,10 +30,10 @@ pub struct SessionConfig {
 }
 
 impl Default for SessionConfig {
-    /// NERC CIP-007-6 compliant defaults
+    /// Hardened enterprise defaults
     fn default() -> Self {
         Self {
-            idle_timeout_minutes: 30,       // CIP requires <= 30 minutes
+            idle_timeout_minutes: 30,       // idle sessions expire within 30 minutes
             absolute_timeout_hours: 24,
             max_concurrent_sessions: 3,
             sensitive_operation_timeout_minutes: 5,

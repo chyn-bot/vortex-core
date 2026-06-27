@@ -20,7 +20,7 @@
 --      SQL to disable / defer a job without redeploying.
 
 CREATE TABLE IF NOT EXISTS scheduled_actions (
-    -- Stable plugin-assigned code, e.g. "eam.work_order_overdue_check".
+    -- Stable plugin-assigned code, e.g. "crm.lead_score_recompute".
     -- Must be globally unique across all plugins; the plugin's technical
     -- name is the conventional prefix.
     code              VARCHAR(100) PRIMARY KEY,
@@ -72,7 +72,7 @@ CREATE INDEX IF NOT EXISTS idx_scheduled_actions_due
 COMMENT ON TABLE scheduled_actions IS
     'Platform scheduler: plugin-contributed background jobs. Definitions sourced from Plugin::scheduled_actions() in Rust code; runtime state (next_call, counters, errors, admin-toggled active) owned by this table. Distributed-safe via FOR UPDATE SKIP LOCKED.';
 COMMENT ON COLUMN scheduled_actions.code IS
-    'Globally-unique action code, conventionally prefixed with the plugin technical name, e.g. "eam.work_order_overdue_check".';
+    'Globally-unique action code, conventionally prefixed with the plugin technical name, e.g. "crm.lead_score_recompute".';
 COMMENT ON COLUMN scheduled_actions.schedule_kind IS
     'Schedule family: "every" (fixed interval — uses interval_seconds) or future "cron" (uses cron_expr).';
 COMMENT ON COLUMN scheduled_actions.active IS

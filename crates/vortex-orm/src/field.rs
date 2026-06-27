@@ -86,7 +86,7 @@ pub struct FieldDef {
     pub audit: bool,
     /// Dependencies for computed fields
     pub depends_on: Vec<String>,
-    /// Encryption requirement (NERC CIP-011)
+    /// Field-level encryption for sensitive data
     pub encrypted: bool,
     /// Field-level access groups
     pub access_groups: Vec<String>,

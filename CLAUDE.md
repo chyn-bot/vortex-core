@@ -4,7 +4,7 @@
 
 Vortex is a **horizontal ERP platform** written in Rust. It provides the kernel — persistence, identity, audit, policy, workflow, multi-tenancy, plugin loading, HTTP shell — and everything domain-specific ships as a **plugin crate**.
 
-Utilities (`vortex-eam`) is the first vertical. More will follow (manufacturing, retail, services, finance, etc.). Any feature that assumes a specific industry, regulator, or geography does **not** belong in core.
+Verticals ship as plugin crates. The in-tree examples are Change Request (`vortex-change`) and the Contacts reference plugin (`vortex-contacts`); third parties add their own (CRM, manufacturing, retail, services, finance, etc.). Any feature that assumes a specific industry, regulator, or geography does **not** belong in core.
 
 > See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full platform contract: what core guarantees, what plugins provide, the `Plugin` trait, migration ownership, and deployment shapes.
 
@@ -15,8 +15,8 @@ Utilities (`vortex-eam`) is the first vertical. More will follow (manufacturing,
 - Compliance *primitives* — WORM audit, eSig, cryptographic chaining — are core because they're reusable across regulated verticals.
 
 **In a plugin crate**:
-- Industry-specific models and workflows (assets, leads, invoices, manufacturing orders, patient records, …).
-- Vertical compliance *profiles* (NERC-CIP for utilities, SOX for finance, HIPAA for healthcare) — configured on top of the core primitives, not baked into them.
+- Industry-specific models and workflows (leads, invoices, manufacturing orders, patient records, …).
+- Vertical compliance *profiles* (SOX for finance, HIPAA for healthcare, PCI-DSS for payments) — configured on top of the core primitives, not baked into them.
 - Anything that names a specific regulator, currency, geography, or industry.
 
 **Rule of thumb**: if you can imagine two different verticals wanting the feature, it's probably core. If the feature only makes sense inside one vertical, it's a plugin.
@@ -37,10 +37,11 @@ vortex-core/
 │   ├── vortex-chatter/     # Mail / notification bus
 │   ├── vortex-server/      # HTTP shell, middleware, shared handlers
 │   ├── vortex-cli/         # Thin host binary (vortex command)
+│   ├── vortex-plugin-sdk/  # Re-export facade for third-party plugin authors
 │   │
-│   ├── vortex-eam/         # VERTICAL PLUGIN — utilities / EAM
+│   ├── vortex-change/      # VERTICAL PLUGIN — change requests
 │   │   └── migrations/     # Plugin-owned schema (applied via Plugin::migrations)
-│   └── vortex-change/      # VERTICAL PLUGIN — change requests
+│   └── vortex-contacts/    # REFERENCE PLUGIN — contacts / CRM example
 │       └── migrations/
 ├── migrations/             # Core migrations only
 └── docs/
@@ -112,7 +113,7 @@ Every user-initiated action must go through `state.policy.check(...)`. The Cedar
 ## For vertical-specific context
 
 Each plugin crate has its own `CLAUDE.md`:
-- Utilities / EAM compliance and domain context: [`crates/vortex-eam/CLAUDE.md`](crates/vortex-eam/CLAUDE.md)
 - Change requests: `crates/vortex-change/CLAUDE.md` *(TODO)*
+- Contacts / CRM reference plugin: `crates/vortex-contacts/CLAUDE.md` *(TODO)*
 
 If you are working inside a plugin crate, read that plugin's CLAUDE.md first for domain vocabulary and compliance requirements. If you are working in a core crate, this file is the source of truth.

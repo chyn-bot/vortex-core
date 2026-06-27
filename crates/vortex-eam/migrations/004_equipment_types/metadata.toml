@@ -1,5 +1,0 @@
-[migration]
-module = "asset_management"
-description = "Add new equipment types (CT/VT, Surge Arrester, Cable, Busbar, Isolator, Earthing) and enhance existing models"
-reversible = true
-dependencies = ["102_eam_master_data"]

@@ -1,4 +1,4 @@
-//! Request logging middleware for NERC CIP compliance
+//! Request logging middleware for compliance/audit
 
 use axum::{
     extract::Request,

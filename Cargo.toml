@@ -12,7 +12,6 @@ members = [
     "crates/vortex-chatter",
     "crates/vortex-server",
     "crates/vortex-cli",
-    "crates/vortex-eam",
     "crates/vortex-change",
     "crates/vortex-contacts",
     "crates/vortex-plugin-sdk",
@@ -105,7 +104,6 @@ vortex-module = { path = "crates/vortex-module" }
 vortex-framework = { path = "crates/vortex-framework" }
 vortex-chatter = { path = "crates/vortex-chatter" }
 vortex-server = { path = "crates/vortex-server" }
-vortex-eam = { path = "crates/vortex-eam" }
 vortex-change = { path = "crates/vortex-change" }
 vortex-contacts = { path = "crates/vortex-contacts" }
 vortex-plugin-sdk = { path = "crates/vortex-plugin-sdk" }

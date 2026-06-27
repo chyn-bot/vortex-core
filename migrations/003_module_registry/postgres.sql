@@ -127,20 +127,6 @@ INSERT INTO installed_modules (
 INSERT INTO module_dependencies (module_id, depends_on)
 SELECT id, 'base' FROM installed_modules WHERE technical_name = 'contacts';
 
--- Enterprise Asset Management module
-INSERT INTO installed_modules (
-    technical_name, name, version, state, category,
-    summary, description, author, is_core, application, sequence, icon
-) VALUES
-    ('asset_management', 'Enterprise Asset Management', '0.1.0', 'uninstalled', 'Operations',
-     'Distribution substation asset management with hierarchical equipment tracking',
-     'Complete EAM solution for electrical utilities. Manage sites, functional locations, and equipment (transformers, switchgear, RMUs, batteries). Supports configurable voltage levels, unit types, maintenance scheduling, and condition monitoring.',
-     'Vortex Team', false, true, 100, 'building-2');
-
--- EAM depends on base
-INSERT INTO module_dependencies (module_id, depends_on)
-SELECT id, 'base' FROM installed_modules WHERE technical_name = 'asset_management';
-
 -- ============================================================================
 -- HELPER FUNCTIONS
 -- ============================================================================

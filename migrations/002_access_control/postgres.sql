@@ -1,5 +1,5 @@
 -- Access Control System
--- NERC CIP-004 Compliant Access Management
+-- Enterprise access management
 -- Implements Odoo-style three-tier access control
 
 -- ============================================================================

@@ -18,10 +18,6 @@ vortex-workflow = { workspace = true }
 vortex-module = { workspace = true }
 vortex-framework = { workspace = true }
 vortex-server = { workspace = true }
-# vortex-eam is gated behind the `eam` feature so `cargo build
-# --no-default-features` produces a core-only binary without the EAM
-# plugin's API routes.
-vortex-eam = { workspace = true, optional = true }
 # vortex-change is gated behind the `cr` feature. The CR plugin is
 # the Phase 0.5 demonstrator of the workflow + audit + policy +
 # framework stack composed end-to-end.
@@ -70,10 +66,8 @@ rand = { workspace = true }
 md5 = "0.7"
 
 [features]
-default = ["eam", "cr"]
-# Pulls in the EAM plugin and registers its routes/menu entries.
-# Omit to build a core-only `vortex` binary.
-eam = ["dep:vortex-eam"]
+default = ["cr"]
 # Pulls in the Change Request plugin — registers its state machine
 # with the workflow engine and mounts its /change-requests/* routes.
+# Omit to build a core-only `vortex` binary.
 cr = ["dep:vortex-change"]

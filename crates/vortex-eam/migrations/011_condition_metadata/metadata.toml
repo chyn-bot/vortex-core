@@ -1,5 +1,0 @@
-[migration]
-module = "asset_management"
-description = "Add metadata fields (test_report_number, result_summary, tested_by, workflow_state, recommendations) to all condition monitoring tables"
-reversible = true
-dependencies = ["112_eam_field_alignment"]

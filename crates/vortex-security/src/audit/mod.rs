@@ -1,4 +1,4 @@
-//! Immutable Audit Logging - NERC CIP-007 / CIP-010 Compliance
+//! Immutable Audit Logging - regulated-industry compliance
 //!
 //! Provides tamper-evident, cryptographically-chained, WORM audit logging
 //! for all security-relevant events. The on-disk ledger uses a per-tenant
@@ -29,7 +29,7 @@ use vortex_common::{CompanyId, UserId, VortexResult};
 
 pub use pg::PgAuditStorage;
 
-/// Audit action types per NERC CIP-007-6 R5 and CIP-010-4 R1.
+/// Audit action types for security and configuration-change events.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AuditAction {
     // Authentication events (CIP-007-6 R5.1)

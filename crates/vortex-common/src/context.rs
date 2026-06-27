@@ -1,7 +1,7 @@
 //! Execution context for request handling
 //!
 //! The Context carries user identity, company scope, and audit information
-//! through all operations. This is critical for NERC CIP compliance.
+//! through all operations. This is critical for compliance and audit.
 
 use crate::{CompanyId, UserId, Timestamp};
 use serde::{Deserialize, Serialize};

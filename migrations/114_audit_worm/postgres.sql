@@ -1,7 +1,7 @@
 -- Migration 114: WORM Audit Ledger
 --
 -- Turns the pre-existing `audit_log` table into a cryptographically-chained,
--- append-only, per-tenant WORM ledger per NERC CIP-007-6 R5 / CIP-010-4 R1.
+-- append-only, per-tenant WORM ledger for regulated-industry audit compliance.
 --
 -- Two enforcement layers:
 --   1. BEFORE UPDATE / DELETE / TRUNCATE triggers that RAISE EXCEPTION —

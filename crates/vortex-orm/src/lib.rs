@@ -1,6 +1,6 @@
 //! Vortex ORM - Object-Relational Mapping Layer
 //!
-//! A powerful ORM designed for large-scale data management with NERC CIP compliance.
+//! A powerful ORM designed for large-scale data management with regulated-industry compliance.
 //!
 //! # Features
 //!

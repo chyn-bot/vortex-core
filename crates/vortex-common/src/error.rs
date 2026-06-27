@@ -1,6 +1,6 @@
 //! Error types for Vortex
 //!
-//! Provides a unified error type for NERC CIP compliant error handling
+//! Provides a unified error type for regulated-industry-grade error handling
 //! with proper categorization for audit logging.
 
 use thiserror::Error;
@@ -31,7 +31,7 @@ pub enum VortexError {
     MigrationFailed(String),
 
     // ─────────────────────────────────────────────────────────────────────
-    // Security Errors (NERC CIP-004, CIP-005, CIP-007)
+    // Security Errors
     // ─────────────────────────────────────────────────────────────────────
     #[error("Authentication failed for user: {username}")]
     AuthenticationFailed { username: String },
@@ -79,7 +79,7 @@ pub enum VortexError {
     RequiredFieldMissing(String),
 
     // ─────────────────────────────────────────────────────────────────────
-    // Configuration Errors (NERC CIP-010)
+    // Configuration Errors
     // ─────────────────────────────────────────────────────────────────────
     #[error("Configuration error: {0}")]
     ConfigurationError(String),
@@ -163,7 +163,7 @@ impl VortexError {
         }
     }
 
-    /// Returns whether this error should be logged for NERC CIP compliance
+    /// Returns whether this error should be logged for compliance/audit
     pub fn requires_audit_log(&self) -> bool {
         matches!(
             self.category(),

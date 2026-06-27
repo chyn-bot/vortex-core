@@ -176,7 +176,7 @@ async fn auth_middleware(
             .into_iter()
             .collect();
 
-            // Inject Arc<ConnectionPool> for EAM handlers (Extension-based extraction)
+            // Inject Arc<ConnectionPool> for plugin handlers (Extension-based extraction)
             request.extensions_mut().insert(pool.clone());
 
             // Inject DatabaseContext for downstream extractors (Db, InstalledModules)
@@ -230,9 +230,9 @@ async fn contacts_module_guard(
     module_guard_check("contacts", &state, request, next).await
 }
 
-// NOTE: asset_management_module_guard deleted in Phase 0.3b. The core
-// no longer has any knowledge of EAM-specific middleware; plugins
-// that need install-state gating should implement their own.
+// NOTE: the core no longer has any knowledge of vertical-specific
+// middleware; plugins that need install-state gating should implement
+// their own.
 
 async fn module_guard_check(
     module_name: &str,
@@ -264,7 +264,6 @@ async fn module_guard_check(
 fn module_not_installed_page(module_name: &str) -> String {
     let display_name = match module_name {
         "contacts" => "Contacts",
-        "asset_management" => "Asset Management",
         _ => module_name,
     };
     format!(r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style><title>Module Not Installed</title>
@@ -443,7 +442,7 @@ pub async fn run(host: String, port: u16, _workers: Option<usize>) -> Result<()>
     // Seed core roles if they don't exist
     seed_core_roles(&db).await;
 
-    // Create connection pool wrapper for EAM handlers
+    // Create connection pool wrapper for plugin handlers
     let pool = Arc::new(ConnectionPool::from_pg_pool(db.clone(), &database_url));
 
     // ─── WORM Audit Ledger (Phase 0.1 + Phase 0.7 KMS) ─────────────────
@@ -696,8 +695,6 @@ pub async fn run(host: String, port: u16, _workers: Option<usize>) -> Result<()>
     // routes, no menu entries — it exists purely to feed the
     // scheduler via the standard plugin contribution path.
     plugin_registry.register(Arc::new(crate::commands::builtins::SystemBuiltinPlugin));
-    #[cfg(feature = "eam")]
-    plugin_registry.register(Arc::new(vortex_eam::EamPlugin::new()));
     #[cfg(feature = "cr")]
     plugin_registry.register(Arc::new(vortex_change::ChangeRequestPlugin::new()));
     info!(
@@ -2103,8 +2100,8 @@ async fn build_home_calendar(
         });
     }
 
-    // Note: plugin-specific calendar events (work orders, inspections,
-    // etc.) are no longer hardcoded here. A future phase will add a
+    // Note: plugin-specific calendar events are no longer hardcoded
+    // here. A future phase will add a
     // `Plugin::calendar_events` hook so plugins can contribute their
     // own events to the home calendar. The core calendar shows only
     // mail.activity items from the chatter subsystem.
@@ -2215,8 +2212,8 @@ async fn build_home_calendar(
     html.push_str("<div class=\"flex flex-wrap gap-3 mt-3 text-xs text-base-content/60\">");
     html.push_str("<span class=\"flex items-center gap-1\"><span class=\"w-2 h-2 rounded-full bg-error\"></span>Overdue</span>");
     html.push_str("<span class=\"flex items-center gap-1\"><span class=\"w-2 h-2 rounded-full bg-warning\"></span>Activity</span>");
-    html.push_str("<span class=\"flex items-center gap-1\"><span class=\"w-2 h-2 rounded-full bg-info\"></span>Work Order</span>");
-    html.push_str("<span class=\"flex items-center gap-1\"><span class=\"w-2 h-2 rounded-full bg-success\"></span>Inspection</span>");
+    html.push_str("<span class=\"flex items-center gap-1\"><span class=\"w-2 h-2 rounded-full bg-info\"></span>Task</span>");
+    html.push_str("<span class=\"flex items-center gap-1\"><span class=\"w-2 h-2 rounded-full bg-success\"></span>Review</span>");
     html.push_str("</div>");
 
     Html(html)
@@ -7470,7 +7467,7 @@ async fn contacts_set_draft(
 }
 
 // =============================================================================
-// EAM - Enterprise Asset Management
+// Chatter
 // =============================================================================
 
 /// Chatter partial for any model
@@ -8379,8 +8376,8 @@ async fn notifications_page(
                         <svg class="w-5 h-5" style="color:#8BC53F" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
                     </div>
                     <div class="flex-1">
-                        <p class="font-medium">Work Order WO-2024-001 Approved</p>
-                        <p class="text-muted text-sm mt-1">Your work order has been approved by the supervisor.</p>
+                        <p class="font-medium">Change Request CR-2024-001 Approved</p>
+                        <p class="text-muted text-sm mt-1">Your change request has been approved by the supervisor.</p>
                         <p class="text-muted text-xs mt-2">2 hours ago</p>
                     </div>
                 </div>
@@ -8392,7 +8389,7 @@ async fn notifications_page(
                         <svg class="w-5 h-5 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z"/></svg>
                     </div>
                     <div class="flex-1">
-                        <p class="font-medium">New comment on Asset A-1001</p>
+                        <p class="font-medium">New comment on Contact C-1001</p>
                         <p class="text-muted text-sm mt-1">John mentioned you in a comment.</p>
                         <p class="text-muted text-xs mt-2">5 hours ago</p>
                     </div>
@@ -8405,8 +8402,8 @@ async fn notifications_page(
                         <svg class="w-5 h-5 text-yellow-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/></svg>
                     </div>
                     <div class="flex-1">
-                        <p class="font-medium">Scheduled maintenance reminder</p>
-                        <p class="text-muted text-sm mt-1">Asset A-1005 is due for preventive maintenance tomorrow.</p>
+                        <p class="font-medium">Scheduled task reminder</p>
+                        <p class="text-muted text-sm mt-1">Record R-1005 is due for review tomorrow.</p>
                         <p class="text-muted text-xs mt-2">1 day ago</p>
                     </div>
                 </div>
@@ -8419,7 +8416,7 @@ async fn notifications_page(
                     </div>
                     <div class="flex-1">
                         <p class="font-medium">Task completed</p>
-                        <p class="text-muted text-sm mt-1">Inspection task for Transformer T-101 has been completed.</p>
+                        <p class="text-muted text-sm mt-1">Review task for record R-101 has been completed.</p>
                         <p class="text-muted text-xs mt-2">2 days ago</p>
                     </div>
                 </div>
@@ -9037,7 +9034,7 @@ async fn sequences_list(
             <form method="post" action="/settings/sequences">
                 <div class="form-control mb-3">
                     <label class="label"><span class="label-text">Name</span></label>
-                    <input type="text" name="name" class="input input-bordered" placeholder="e.g., Work Order" required/>
+                    <input type="text" name="name" class="input input-bordered" placeholder="e.g., Invoice" required/>
                 </div>
                 <div class="form-control mb-3">
                     <label class="label"><span class="label-text">Code</span></label>

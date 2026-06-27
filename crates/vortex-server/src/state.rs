@@ -31,7 +31,7 @@ pub struct AppState {
     pub jwt_secret: Arc<String>,
 }
 
-/// Enable EAM handlers to extract `Arc<ConnectionPool>` from `AppState`
+/// Enable plugin handlers to extract `Arc<ConnectionPool>` from `AppState`
 impl FromRef<AppState> for Arc<ConnectionPool> {
     fn from_ref(state: &AppState) -> Self {
         state.db.clone()

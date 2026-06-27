@@ -94,9 +94,8 @@ impl Plugin for ChangeRequestPlugin {
         vec![cr_state_machine()]
     }
 
-    /// Sidebar entry. Lives under Operations next to EAM so utility
-    /// operators see "Change Requests" in the same group as their
-    /// assets and work orders.
+    /// Sidebar entry. Lives under the Operations group so operators
+    /// see "Change Requests" alongside other operational modules.
     fn menu_entries(&self) -> Vec<MenuEntry> {
         vec![MenuEntry::new(
             "change_request.list",

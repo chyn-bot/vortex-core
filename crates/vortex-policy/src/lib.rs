@@ -7,12 +7,12 @@
 //! action on this specific resource under these specific conditions?"* —
 //! the questions that ERP workflows actually ask:
 //!
-//! - *"Can Alice approve work order WO-2026-00123, given that she is the
+//! - *"Can Alice approve change request CR-2026-00123, given that she is the
 //!   requester and the org requires segregation of duties?"*  → deny
-//! - *"Can Bob (inspector) sign off equipment EQP-001234, given that its
-//!   region is Sabah and Bob's assigned region is Sabah?"*  → permit
-//! - *"Can Carol (cost-center manager) approve a PO for RM 85,000, given
-//!   that her spending limit for CC-1001 is RM 100,000?"*  → permit
+//! - *"Can Bob (reviewer) sign off record REC-001234, given that its
+//!   region is EU and Bob's assigned region is EU?"*  → permit
+//! - *"Can Carol (cost-center manager) approve a PO for 85,000, given
+//!   that her spending limit for CC-1001 is 100,000?"*  → permit
 //!
 //! None of these can be expressed as a SQL domain filter or a CRUD bit.
 //!

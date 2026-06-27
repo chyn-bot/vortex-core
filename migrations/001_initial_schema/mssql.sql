@@ -1,6 +1,6 @@
 -- Vortex Core Schema for Microsoft SQL Server
 -- Initial migration for core tables
--- NERC CIP Compliant
+-- Regulated-industry compliant
 
 -- ============================================================================
 -- COMPANIES (Multi-tenant support)

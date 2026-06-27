@@ -15,11 +15,11 @@
 //! ## Route mounting convention
 //!
 //! Plugins return a Router that already knows its own path prefix — a
-//! plugin that serves `/eam/*` routes should construct its router with
+//! plugin that serves `/crm/*` routes should construct its router with
 //! those absolute paths and the host will `merge` it into the main
 //! router. This is deliberately simpler than nesting under a
-//! plugin-controlled prefix: plugins that serve both `/api/eam/*` and
-//! `/eam/*` (API + HTML) would otherwise need two mount points, one
+//! plugin-controlled prefix: plugins that serve both `/api/crm/*` and
+//! `/crm/*` (API + HTML) would otherwise need two mount points, one
 //! per URL subtree.
 //!
 //! ## State
@@ -94,7 +94,7 @@ pub struct PluginMigration {
 
 /// A plugin contributes routes and menu entries to the host binary.
 ///
-/// Implementors live in their own crate (e.g. `vortex-eam`,
+/// Implementors live in their own crate (e.g. `vortex-crm`,
 /// `vortex-change`) and depend on `vortex-framework` but not on the
 /// host binary. The host collects every registered `Arc<dyn Plugin>`
 /// into a [`crate::PluginRegistry`] at startup and calls `routes` and
@@ -134,7 +134,7 @@ pub trait Plugin: Send + Sync {
     ///
     /// Use this for plugin subsystems that manage their own state
     /// (database pools injected via request extensions, etc.) rather
-    /// than sharing `AppState`. The EAM plugin's `/api/eam/*` REST API
+    /// than sharing `AppState`. The CRM plugin's `/api/crm/*` REST API
     /// is one such case — its handlers pull the DB pool from the
     /// request's `DatabaseContext` extension, not from shared state.
     ///
@@ -215,7 +215,7 @@ pub trait Plugin: Send + Sync {
     /// output through a different delivery channel.
     ///
     /// Namespace report codes with the plugin's technical name —
-    /// e.g. `eam.work_order_summary` — so two plugins cannot
+    /// e.g. `crm.lead_summary` — so two plugins cannot
     /// collide.
     ///
     /// Default: no reports.
@@ -236,7 +236,7 @@ pub trait Plugin: Send + Sync {
     /// them to handlers.
     ///
     /// Namespace action codes with the plugin's technical name —
-    /// e.g. `eam.work_order_overdue_check` — so two plugins cannot
+    /// e.g. `crm.lead_score_recompute` — so two plugins cannot
     /// collide.
     ///
     /// Default: no background jobs.

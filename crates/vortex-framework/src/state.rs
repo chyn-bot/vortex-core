@@ -40,7 +40,7 @@ pub struct AppState {
     /// in `vortex-server`).
     pub db: PgPool,
     /// Wrapped pool used by crates that speak `vortex-orm`'s
-    /// `ConnectionPool` API (the EAM crate and the policy engine, for
+    /// `ConnectionPool` API (the CRM crate and the policy engine, for
     /// example, accept this type rather than a raw `PgPool`).
     pub pool: Arc<ConnectionPool>,
     /// Per-database pool manager for multi-tenant deployments. In

@@ -62,16 +62,6 @@ fn get_modules(is_admin: bool, is_system_admin: bool) -> Vec<ModuleCard> {
             system_admin_only: false,
         },
         ModuleCard {
-            id: "eam",
-            name: "Asset Management",
-            description: "Manage substations, equipment, and maintenance schedules",
-            icon: r#"<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5M9 7h1m-1 4h1m4-4h1m-1 4h1m-5 10v-5a1 1 0 011-1h2a1 1 0 011 1v5m-4 0h4"/>"#,
-            href: "/eam",
-            color: "warning",
-            admin_only: false,
-            system_admin_only: false,
-        },
-        ModuleCard {
             id: "modules",
             name: "Modules",
             description: "Browse and manage installed system modules",

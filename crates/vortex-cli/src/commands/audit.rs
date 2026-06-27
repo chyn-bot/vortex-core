@@ -267,7 +267,7 @@ async fn export_cmd(
             ExportFormat::Cef => {
                 // CEF:Version|Device Vendor|Device Product|Device Version|Signature ID|Name|Severity|Extension
                 println!(
-                    "CEF:0|Vortex|vortex-eam|0.1|{}|{}|{}|suser={} src={} act={}",
+                    "CEF:0|Vortex|vortex|0.1|{}|{}|{}|suser={} src={} act={}",
                     action,
                     action,
                     if success { 3 } else { 7 },
@@ -278,7 +278,7 @@ async fn export_cmd(
             }
             ExportFormat::Leef => {
                 println!(
-                    "LEEF:2.0|Vortex|vortex-eam|0.1|{}|\t|devTime={}\tusrName={}\tsrc={}\tact={}\tsuccess={}",
+                    "LEEF:2.0|Vortex|vortex|0.1|{}|\t|devTime={}\tusrName={}\tsrc={}\tact={}\tsuccess={}",
                     action,
                     ts.to_rfc3339(),
                     username.as_deref().unwrap_or(""),

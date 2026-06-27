@@ -1,12 +1,12 @@
-//! Vortex Security - NERC CIP Compliant Security Layer
+//! Vortex Security - Enterprise Security Layer for regulated industries
 //!
 //! Provides comprehensive security features:
-//! - Role-Based Access Control (RBAC) - CIP-004
-//! - Record-level security rules - CIP-004
-//! - Field-level access control - CIP-004
-//! - Immutable audit logging - CIP-007
-//! - Session management - CIP-007
-//! - Password policies - CIP-007
+//! - Role-Based Access Control (RBAC)
+//! - Record-level security rules
+//! - Field-level access control
+//! - Immutable audit logging
+//! - Session management
+//! - Password policies
 //!
 //! # Access Control Architecture
 //!

@@ -115,7 +115,7 @@ impl ReportRegistry {
     /// the same report code — are logged as a warning and the
     /// first registration wins. Plugins should namespace their
     /// report codes with their technical name (e.g.
-    /// `eam.work_order_summary`) so collisions cannot happen in
+    /// `crm.lead_summary`) so collisions cannot happen in
     /// practice.
     pub fn new(defs: Vec<ReportDef>) -> Self {
         let mut reports: HashMap<String, ReportDef> = HashMap::new();

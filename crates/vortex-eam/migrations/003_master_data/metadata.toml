@@ -1,5 +1,0 @@
-[migration]
-module = "asset_management"
-description = "Add Manufacturer table, enhance VoltageLevel with voltage_type"
-reversible = true
-dependencies = ["101_eam_hierarchy_expansion"]

@@ -1,7 +1,7 @@
 //! Platform scheduler — background jobs, cron-style.
 //!
-//! Every Vortex vertical ends up needing background work: EAM
-//! recomputes overdue work orders, CRM rolls up lead scores,
+//! Every Vortex vertical ends up needing background work: CRM
+//! recomputes lead scores, sales rolls up pipeline totals,
 //! Finance runs end-of-month postings, the audit chain verifier
 //! does nightly integrity checks. Shipping one real implementation
 //! of "run this async closure every N minutes, persistently,
@@ -122,7 +122,7 @@ impl Scheduler {
     /// plugins contributing the same action code — are logged as a
     /// warning and the first registration wins. Plugins should
     /// namespace their action codes with their technical name (e.g.
-    /// `eam.foo`) so collisions cannot happen in practice.
+    /// `crm.foo`) so collisions cannot happen in practice.
     pub fn new(actions: Vec<ScheduledAction>) -> Self {
         let mut handlers: HashMap<String, ActionHandler> = HashMap::new();
         let mut definitions: Vec<ScheduledActionDef> = Vec::new();

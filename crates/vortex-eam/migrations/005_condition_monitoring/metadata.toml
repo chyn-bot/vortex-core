@@ -1,5 +1,0 @@
-[migration]
-module = "asset_management"
-description = "Add specialized condition monitoring tables (DGA, Oil Quality, Thermal, PD, IR)"
-reversible = true
-dependencies = ["103_eam_equipment_types"]

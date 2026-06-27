@@ -2,4 +2,4 @@
 module = "core"
 description = "WORM audit ledger: hash chain columns on audit_log, audit_chain_head, audit_signing_keys, append-only triggers, and vortex_runtime DB role with UPDATE/DELETE revoked on audit_log (CIP-007-6 R5 / CIP-010-4 R1)"
 reversible = false
-dependencies = ["113_eam_condition_metadata"]
+dependencies = ["109_home_screen"]

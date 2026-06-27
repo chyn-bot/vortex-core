@@ -61,7 +61,7 @@ impl Schedule {
 ///
 /// `code` must be globally unique across all plugins — the standard
 /// convention is `<plugin_technical_name>.<job_name>`, e.g.
-/// `eam.work_order_overdue_check` or `crm.lead_score_recompute`.
+/// `crm.lead_score_recompute` or `sales.pipeline_rollup`.
 #[derive(Debug, Clone)]
 pub struct ScheduledActionDef {
     /// Globally-unique action code. Used as the primary key in the
@@ -109,13 +109,13 @@ impl ScheduledAction {
     ///
     /// ScheduledAction::new(
     ///     ScheduledActionDef {
-    ///         code: "eam.wo_overdue_check",
-    ///         name: "EAM: mark overdue work orders",
+    ///         code: "crm.lead_score_recompute",
+    ///         name: "CRM: recompute lead scores",
     ///         schedule: Schedule::Every(Duration::from_secs(600)),
     ///         enabled_by_default: true,
     ///     },
     ///     |state| async move {
-    ///         // … sqlx::query!("UPDATE eam_work_orders SET …")
+    ///         // … sqlx::query!("UPDATE crm_leads SET …")
     ///         //     .execute(&state.db).await?;
     ///         Ok(())
     ///     },

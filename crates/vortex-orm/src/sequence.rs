@@ -59,7 +59,7 @@
 //! ## Naming convention for `code`
 //!
 //! Use a dotted namespace: `<plugin_technical_name>.<logical_name>`,
-//! e.g. `eam.equipment`, `crm.lead`, `sales.invoice`. This keeps plugin
+//! e.g. `crm.lead`, `sales.invoice`. This keeps plugin
 //! sequences from colliding and makes the `sequences` table self-
 //! documenting.
 
@@ -117,7 +117,7 @@ impl SequenceScope {
 /// at compile time.
 #[derive(Debug, Clone, Copy)]
 pub struct SequenceSpec {
-    /// Globally-unique dotted code, e.g. `"eam.equipment"`. Plugin
+    /// Globally-unique dotted code, e.g. `"crm.lead"`. Plugin
     /// names should be prefixed with the plugin's technical name so
     /// two plugins cannot collide.
     pub code: &'static str,

@@ -1,4 +1,4 @@
-//! Password hashing and policy enforcement - NERC CIP-007
+//! Password hashing and policy enforcement - enterprise password policy
 //!
 //! Implements secure password handling with configurable policies.
 
@@ -9,7 +9,7 @@ use argon2::{
 use serde::{Deserialize, Serialize};
 use vortex_common::{VortexError, VortexResult};
 
-/// Password policy configuration per NERC CIP-007-6 R5.1
+/// Password policy configuration for an enterprise password policy
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PasswordPolicy {
     /// Minimum password length
@@ -41,7 +41,7 @@ pub struct PasswordPolicy {
 }
 
 impl Default for PasswordPolicy {
-    /// NERC CIP-007-6 R5.1 compliant defaults
+    /// Hardened enterprise defaults
     fn default() -> Self {
         Self {
             min_length: 8,
@@ -52,7 +52,7 @@ impl Default for PasswordPolicy {
             require_special: true,
             min_character_classes: 3,
             history_count: 24,          // 2 years of monthly changes
-            expiry_days: 365,           // CIP requires at least annually
+            expiry_days: 365,           // rotate at least annually
             min_age_days: 1,
             max_failed_attempts: 5,
             lockout_duration_minutes: 30,

@@ -28,8 +28,8 @@
 //! 7. `INSERT INTO audit_log (...)` with all chain + signing + dual-clock
 //!    columns populated.
 //! 8. `INSERT INTO audit_chain_head (...) ON CONFLICT (company_id) DO UPDATE`
-//!    advances the head. The pattern is the atomic upsert used elsewhere
-//!    (see `crates/vortex-eam/src/services/sequence.rs`).
+//!    advances the head. The pattern is the same atomic upsert used by
+//!    the sequence service elsewhere in the workspace.
 //!
 //! When `write` is called (no caller-owned transaction), a new transaction
 //! is opened internally. When `write_tx` is called, the same steps run on
@@ -39,8 +39,8 @@
 //! # Concurrency
 //!
 //! Throughput is bounded by `FOR UPDATE` on the chain head row: for a
-//! given tenant, audit writes serialize. For the current workload (utility
-//! EAM, tens of tenants, moderate write rates) this is adequate. A
+//! given tenant, audit writes serialize. For the current workload
+//! (tens of tenants, moderate write rates) this is adequate. A
 //! follow-up will add per-tenant `tokio::mpsc` batching for tenants that
 //! exceed ~500 entries/second.
 

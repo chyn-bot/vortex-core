@@ -8,8 +8,8 @@
 //!
 //! ## Why this exists
 //!
-//! Phase 0.3 extracted EAM into `crates/vortex-eam/` and Phase 0.5
-//! created `crates/vortex-change/`. But a handful of historical
+//! Phase 0.5 created `crates/vortex-change/` as a real plugin crate.
+//! But a handful of historical
 //! modules — Contacts in particular — still have their HTTP handlers
 //! hardcoded in `crates/vortex-cli/src/commands/server.rs` because
 //! moving them is a separate project.

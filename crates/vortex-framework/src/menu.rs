@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MenuEntry {
     /// Stable identifier used to mark the "active" entry during
-    /// rendering. Format: `"<plugin>.<entry>"`, e.g. `"eam.work_orders"`.
+    /// rendering. Format: `"<plugin>.<entry>"`, e.g. `"crm.leads"`.
     pub id: String,
     /// Display label. Plugins should use locale-neutral labels; the
     /// host may translate via an i18n layer in a future phase.
@@ -111,7 +111,7 @@ impl MenuEntry {
 pub enum MenuGroup {
     /// Top-level things (home, dashboard) that predate any module.
     Main,
-    /// Operational modules (EAM, CR workflow, procurement, etc.) —
+    /// Operational modules (CRM, CR workflow, procurement, etc.) —
     /// the day-to-day user work.
     Operations,
     /// Reports, dashboards, KPIs.
@@ -152,11 +152,11 @@ mod tests {
 
     #[test]
     fn menu_entry_builder() {
-        let entry = MenuEntry::new("eam.wos", "Work Orders", "/eam/work-orders", MenuGroup::Operations)
+        let entry = MenuEntry::new("crm.leads", "Leads", "/crm/leads", MenuGroup::Operations)
             .with_icon("wrench")
             .with_priority(20)
             .require_role("technician");
-        assert_eq!(entry.id, "eam.wos");
+        assert_eq!(entry.id, "crm.leads");
         assert_eq!(entry.priority, 20);
         assert_eq!(entry.required_role.as_deref(), Some("technician"));
         assert_eq!(entry.group, MenuGroup::Operations);
