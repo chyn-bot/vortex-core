@@ -1,0 +1,1 @@
+ALTER TABLE ir_model DROP COLUMN IF EXISTS list_url;

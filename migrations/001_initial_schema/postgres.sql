@@ -225,7 +225,8 @@ INSERT INTO users (
     '00000000-0000-0000-0000-000000000001',
     'admin',
     'admin@localhost',
-    '$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$JEfz8JzjGKwY5vPrT3VMyg',
+    -- Default password: 'admin' — change immediately after first login.
+    '$argon2id$v=19$m=65536,t=3,p=4$A7WAVC/PIP3Wuv6lqEWFCw$YpHLj8lR5m6I2n5xXVySgwVDak3RitZeZdPJfmPD1uo',
     'System Administrator',
     true
 );

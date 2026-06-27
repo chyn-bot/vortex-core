@@ -28,6 +28,7 @@
 //! ```
 
 pub mod cache;
+pub mod commerce;
 pub mod connection;
 pub mod dialect;
 pub mod field;
@@ -38,6 +39,7 @@ pub mod pool_manager;
 pub mod query;
 pub mod registry;
 pub mod schema;
+pub mod sequence;
 
 pub mod prelude {
     pub use crate::connection::{ConnectionPool, DatabaseConfig};
@@ -51,6 +53,11 @@ pub mod prelude {
     pub use crate::pool_manager::{DatabasePoolManager, PoolManagerConfig};
     pub use crate::query::{Query, QueryBuilder, Filter, OrderBy, SecureQueryBuilder, SecureQuery};
     pub use crate::registry::ModelRegistry;
+    pub use crate::sequence::{SequenceScope, SequenceSpec};
+    pub use crate::commerce::{
+        Currency, CurrencyRate, Tax, TaxAmountType, TaxComputation, TaxTypeUse,
+        Uom, UomCategory, UomType,
+    };
     pub use vortex_common::{Context, VortexResult, VortexError};
 }
 

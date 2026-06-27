@@ -175,19 +175,12 @@ CREATE INDEX idx_eam_wo_history_date ON eam_work_order_state_history(changed_at)
 COMMENT ON TABLE eam_work_order_state_history IS 'Immutable audit trail of work order state changes';
 COMMENT ON COLUMN eam_work_order_state_history.signature IS 'Digital signature for critical transitions (eSig)';
 
--- ============================================================================
--- SEQUENCE GENERATOR TABLE
--- ============================================================================
-
-CREATE TABLE IF NOT EXISTS eam_sequences (
-    sequence_key VARCHAR(100) PRIMARY KEY,
-    current_value BIGINT NOT NULL DEFAULT 0,
-    updated_at TIMESTAMPTZ DEFAULT NOW()
-);
-
-CREATE INDEX IF NOT EXISTS idx_eam_sequences_key ON eam_sequences(sequence_key);
-
-COMMENT ON TABLE eam_sequences IS 'Auto-increment sequences for EAM codes (EQP, CMP, PRT, MNT, INS)';
+-- Sequence generator is provided by the core platform sequence service
+-- (see core migration 117_sequence_service and `vortex_orm::sequence`).
+-- EAM used to ship its own `eam_sequences` table here; that DDL was
+-- removed when the sequence primitive was promoted to core. Fresh
+-- installs never create the legacy table; the core 117 migration
+-- handles cleanup on upgrading dev databases that still have it.
 
 -- ============================================================================
 -- USEFUL VIEWS

@@ -1,313 +1,206 @@
-//! Auto-Sequence Generation Service
+//! EAM sequence catalog — thin wrapper over the core sequence service.
 //!
-//! Generates unique sequential codes for various EAM entities
+//! The real implementation lives in [`vortex_orm::sequence`] since
+//! sequence generation is a platform primitive every vertical needs.
+//! This module keeps the historical `SequenceType` enum and the typed
+//! `next_*_code` helpers so existing EAM call sites do not change —
+//! but all of them simply hand a [`SequenceSpec`] to the core service.
+//!
+//! When adding a new EAM sequence:
+//!
+//! 1. Add a variant to [`SequenceType`].
+//! 2. Map it to a `const` [`SequenceSpec`] in [`SequenceType::spec`].
+//!    Use the dotted namespace `eam.<thing>` so it can't collide with
+//!    sequences from other plugins.
+//! 3. Optionally add a typed `next_<thing>_code` wrapper for
+//!    ergonomics.
+//!
+//! All of this is plain const data — no DB migration needed when
+//! adding a new sequence type, because the `sequences` table is
+//! key-value and rows are lazily created on first `next()` call.
 
-use chrono::Utc;
-
-use vortex_common::{VortexResult, VortexError};
+use vortex_common::VortexResult;
+use vortex_orm::sequence::{self, SequenceSpec};
 use vortex_orm::ConnectionPool;
 
-/// Sequence types for different entities
+/// Sequence types used by the EAM plugin. Each variant resolves to a
+/// [`SequenceSpec`] via [`SequenceType::spec`] and is fulfilled by the
+/// core [`vortex_orm::sequence`] service.
 #[derive(Debug, Clone, Copy)]
 pub enum SequenceType {
-    /// Equipment/Asset codes: EQP/000001
+    /// Equipment / asset codes: `EQP/000001`
     Equipment,
-    /// Component codes: CMP/000001
+    /// Component codes: `CMP/000001`
     Component,
-    /// Part codes: PRT/000001
+    /// Part codes: `PRT/000001`
     Part,
-    /// Maintenance/Work Order codes: MNT/2026/00001 (includes year)
+    /// Maintenance / work-order codes: `MNT/2026/00001` (resets yearly)
     Maintenance,
-    /// Inspection codes: INS/2026/00001 (includes year)
+    /// Inspection codes: `INS/2026/00001` (resets yearly)
     Inspection,
-    /// Maintenance Plan codes: MP/00001
+    /// Maintenance plan codes: `MP/00001`
     MaintenancePlan,
-    /// Transmission Line codes: TL/00001
+    /// Transmission line codes: `TL/00001`
     TransmissionLine,
-    /// Transmission Tower codes: TWR/000001
+    /// Transmission tower codes: `TWR/000001`
     TransmissionTower,
-    /// Condition Monitoring codes: CM/2026/00001 (includes year)
+    /// Condition monitoring codes: `CM/2026/00001` (resets yearly)
     ConditionMonitoring,
 }
 
 impl SequenceType {
-    /// Returns the sequence key (used to identify sequence in table)
-    fn key(&self) -> &'static str {
+    /// Resolve this sequence type to its core [`SequenceSpec`].
+    ///
+    /// All specs are `const` so they compose into a compile-time
+    /// catalog with no allocations and no runtime dispatch beyond the
+    /// `match`.
+    pub const fn spec(self) -> SequenceSpec {
         match self {
-            SequenceType::Equipment => "equipment",
-            SequenceType::Component => "component",
-            SequenceType::Part => "part",
-            SequenceType::Maintenance => "maintenance",
-            SequenceType::Inspection => "inspection",
-            SequenceType::MaintenancePlan => "maintenance_plan",
-            SequenceType::TransmissionLine => "transmission_line",
-            SequenceType::TransmissionTower => "transmission_tower",
-            SequenceType::ConditionMonitoring => "condition_monitoring",
-        }
-    }
-
-    /// Returns the prefix for generated codes
-    fn prefix(&self) -> &'static str {
-        match self {
-            SequenceType::Equipment => "EQP",
-            SequenceType::Component => "CMP",
-            SequenceType::Part => "PRT",
-            SequenceType::Maintenance => "MNT",
-            SequenceType::Inspection => "INS",
-            SequenceType::MaintenancePlan => "MP",
-            SequenceType::TransmissionLine => "TL",
-            SequenceType::TransmissionTower => "TWR",
-            SequenceType::ConditionMonitoring => "CM",
-        }
-    }
-
-    /// Whether this sequence includes year in the format
-    fn includes_year(&self) -> bool {
-        matches!(self, SequenceType::Maintenance | SequenceType::Inspection | SequenceType::ConditionMonitoring)
-    }
-
-    /// Number of digits for the sequence number
-    fn digits(&self) -> usize {
-        match self {
-            SequenceType::Equipment | SequenceType::Component | SequenceType::Part
-            | SequenceType::TransmissionTower => 6,
-            SequenceType::Maintenance | SequenceType::Inspection
-            | SequenceType::MaintenancePlan | SequenceType::TransmissionLine
-            | SequenceType::ConditionMonitoring => 5,
+            SequenceType::Equipment => {
+                SequenceSpec::new("eam.equipment", "EQP").with_padding(6)
+            }
+            SequenceType::Component => {
+                SequenceSpec::new("eam.component", "CMP").with_padding(6)
+            }
+            SequenceType::Part => {
+                SequenceSpec::new("eam.part", "PRT").with_padding(6)
+            }
+            SequenceType::Maintenance => {
+                SequenceSpec::new("eam.maintenance", "MNT")
+                    .with_padding(5)
+                    .yearly()
+            }
+            SequenceType::Inspection => {
+                SequenceSpec::new("eam.inspection", "INS")
+                    .with_padding(5)
+                    .yearly()
+            }
+            SequenceType::MaintenancePlan => {
+                SequenceSpec::new("eam.maintenance_plan", "MP").with_padding(5)
+            }
+            SequenceType::TransmissionLine => {
+                SequenceSpec::new("eam.transmission_line", "TL").with_padding(5)
+            }
+            SequenceType::TransmissionTower => {
+                SequenceSpec::new("eam.transmission_tower", "TWR").with_padding(6)
+            }
+            SequenceType::ConditionMonitoring => {
+                SequenceSpec::new("eam.condition_monitoring", "CM")
+                    .with_padding(5)
+                    .yearly()
+            }
         }
     }
 }
 
-/// Gets the next sequence number and formats the code
-///
-/// # Arguments
-/// * `pool` - Database connection pool
-/// * `seq_type` - Type of sequence to generate
-///
-/// # Returns
-/// Formatted code string (e.g., "EQP/000001", "MNT/2026/00001")
+/// Consume the next code for a given EAM sequence type.
 pub async fn next_code(pool: &ConnectionPool, seq_type: SequenceType) -> VortexResult<String> {
-    let current_year = Utc::now().format("%Y").to_string();
-
-    // For year-based sequences, include year in the key
-    let key = if seq_type.includes_year() {
-        format!("{}_{}", seq_type.key(), current_year)
-    } else {
-        seq_type.key().to_string()
-    };
-
-    // Use UPSERT to atomically get next value
-    // This ensures no duplicates even under concurrent access
-    let next_val: i64 = sqlx::query_scalar(
-        r#"
-        INSERT INTO eam_sequences (sequence_key, current_value)
-        VALUES ($1, 1)
-        ON CONFLICT (sequence_key) DO UPDATE
-        SET current_value = eam_sequences.current_value + 1
-        RETURNING current_value
-        "#
-    )
-        .bind(&key)
-        .fetch_one(pool.pool())
-        .await
-        .map_err(|e| VortexError::QueryExecution(e.to_string()))?;
-
-    // Format the code
-    let formatted = if seq_type.includes_year() {
-        format!(
-            "{}/{}/{:0width$}",
-            seq_type.prefix(),
-            current_year,
-            next_val,
-            width = seq_type.digits()
-        )
-    } else {
-        format!(
-            "{}/{:0width$}",
-            seq_type.prefix(),
-            next_val,
-            width = seq_type.digits()
-        )
-    };
-
-    Ok(formatted)
+    sequence::next(pool, &seq_type.spec()).await
 }
 
-/// Generates next equipment code: EQP/000001
-pub async fn next_equipment_code(pool: &ConnectionPool) -> VortexResult<String> {
-    next_code(pool, SequenceType::Equipment).await
+/// Peek at the next code without consuming it. Only valid for preview
+/// UI — the returned code is not reserved and may be handed to another
+/// caller by the next [`next_code`] invocation.
+pub async fn peek_next_code(
+    pool: &ConnectionPool,
+    seq_type: SequenceType,
+) -> VortexResult<String> {
+    sequence::peek(pool, &seq_type.spec()).await
 }
 
-/// Generates next component code: CMP/000001
-pub async fn next_component_code(pool: &ConnectionPool) -> VortexResult<String> {
-    next_code(pool, SequenceType::Component).await
-}
-
-/// Generates next part code: PRT/000001
-pub async fn next_part_code(pool: &ConnectionPool) -> VortexResult<String> {
-    next_code(pool, SequenceType::Part).await
-}
-
-/// Generates next maintenance/work order code: MNT/2026/00001
-pub async fn next_maintenance_code(pool: &ConnectionPool) -> VortexResult<String> {
-    next_code(pool, SequenceType::Maintenance).await
-}
-
-/// Generates next inspection code: INS/2026/00001
-pub async fn next_inspection_code(pool: &ConnectionPool) -> VortexResult<String> {
-    next_code(pool, SequenceType::Inspection).await
-}
-
-/// Generates next maintenance plan code: MP/00001
-pub async fn next_maintenance_plan_code(pool: &ConnectionPool) -> VortexResult<String> {
-    next_code(pool, SequenceType::MaintenancePlan).await
-}
-
-/// Generates next transmission line code: TL/00001
-pub async fn next_transmission_line_code(pool: &ConnectionPool) -> VortexResult<String> {
-    next_code(pool, SequenceType::TransmissionLine).await
-}
-
-/// Generates next transmission tower code: TWR/000001
-pub async fn next_transmission_tower_code(pool: &ConnectionPool) -> VortexResult<String> {
-    next_code(pool, SequenceType::TransmissionTower).await
-}
-
-/// Generates next condition monitoring code: CM/2026/00001
-pub async fn next_condition_monitoring_code(pool: &ConnectionPool) -> VortexResult<String> {
-    next_code(pool, SequenceType::ConditionMonitoring).await
-}
-
-/// Peeks at the next sequence value without incrementing
-///
-/// Useful for displaying "next code will be..." without reserving it
-pub async fn peek_next_code(pool: &ConnectionPool, seq_type: SequenceType) -> VortexResult<String> {
-    let current_year = Utc::now().format("%Y").to_string();
-
-    let key = if seq_type.includes_year() {
-        format!("{}_{}", seq_type.key(), current_year)
-    } else {
-        seq_type.key().to_string()
-    };
-
-    // Get current value (or 0 if not exists)
-    let current_val: Option<i64> = sqlx::query_scalar(
-        "SELECT current_value FROM eam_sequences WHERE sequence_key = $1"
-    )
-        .bind(&key)
-        .fetch_optional(pool.pool())
-        .await
-        .map_err(|e| VortexError::QueryExecution(e.to_string()))?;
-
-    let next_val = current_val.unwrap_or(0) + 1;
-
-    let formatted = if seq_type.includes_year() {
-        format!(
-            "{}/{}/{:0width$}",
-            seq_type.prefix(),
-            current_year,
-            next_val,
-            width = seq_type.digits()
-        )
-    } else {
-        format!(
-            "{}/{:0width$}",
-            seq_type.prefix(),
-            next_val,
-            width = seq_type.digits()
-        )
-    };
-
-    Ok(formatted)
-}
-
-/// Resets a sequence to a specific value
-///
-/// WARNING: Use with caution - can cause duplicate codes if misused
+/// Administrative reset of a sequence's current-period counter. See
+/// [`vortex_orm::sequence::reset`] for the warnings.
 pub async fn reset_sequence(
     pool: &ConnectionPool,
     seq_type: SequenceType,
     value: i64,
 ) -> VortexResult<()> {
-    let current_year = Utc::now().format("%Y").to_string();
-
-    let key = if seq_type.includes_year() {
-        format!("{}_{}", seq_type.key(), current_year)
-    } else {
-        seq_type.key().to_string()
-    };
-
-    sqlx::query(
-        r#"
-        INSERT INTO eam_sequences (sequence_key, current_value)
-        VALUES ($1, $2)
-        ON CONFLICT (sequence_key) DO UPDATE
-        SET current_value = $2
-        "#
-    )
-        .bind(&key)
-        .bind(value)
-        .execute(pool.pool())
-        .await
-        .map_err(|e| VortexError::QueryExecution(e.to_string()))?;
-
-    Ok(())
+    sequence::reset(pool, &seq_type.spec(), value).await
 }
 
-/// SQL to create the sequences table (should be in migration)
-pub const CREATE_SEQUENCES_TABLE_SQL: &str = r#"
-CREATE TABLE IF NOT EXISTS eam_sequences (
-    sequence_key VARCHAR(100) PRIMARY KEY,
-    current_value BIGINT NOT NULL DEFAULT 0,
-    updated_at TIMESTAMPTZ DEFAULT NOW()
-);
+// ---------------------------------------------------------------------------
+// Typed ergonomic wrappers for each EAM sequence type. These are the
+// functions existing handlers import — keeping them unchanged means the
+// promotion from plugin-local to core service is transparent to callers.
+// ---------------------------------------------------------------------------
 
-CREATE INDEX IF NOT EXISTS idx_eam_sequences_key ON eam_sequences(sequence_key);
+/// Generates the next equipment code: `EQP/000001`.
+pub async fn next_equipment_code(pool: &ConnectionPool) -> VortexResult<String> {
+    next_code(pool, SequenceType::Equipment).await
+}
 
-COMMENT ON TABLE eam_sequences IS 'Auto-increment sequences for EAM codes';
-"#;
+/// Generates the next component code: `CMP/000001`.
+pub async fn next_component_code(pool: &ConnectionPool) -> VortexResult<String> {
+    next_code(pool, SequenceType::Component).await
+}
+
+/// Generates the next part code: `PRT/000001`.
+pub async fn next_part_code(pool: &ConnectionPool) -> VortexResult<String> {
+    next_code(pool, SequenceType::Part).await
+}
+
+/// Generates the next maintenance / work-order code: `MNT/2026/00001`.
+pub async fn next_maintenance_code(pool: &ConnectionPool) -> VortexResult<String> {
+    next_code(pool, SequenceType::Maintenance).await
+}
+
+/// Generates the next inspection code: `INS/2026/00001`.
+pub async fn next_inspection_code(pool: &ConnectionPool) -> VortexResult<String> {
+    next_code(pool, SequenceType::Inspection).await
+}
+
+/// Generates the next maintenance plan code: `MP/00001`.
+pub async fn next_maintenance_plan_code(pool: &ConnectionPool) -> VortexResult<String> {
+    next_code(pool, SequenceType::MaintenancePlan).await
+}
+
+/// Generates the next transmission line code: `TL/00001`.
+pub async fn next_transmission_line_code(pool: &ConnectionPool) -> VortexResult<String> {
+    next_code(pool, SequenceType::TransmissionLine).await
+}
+
+/// Generates the next transmission tower code: `TWR/000001`.
+pub async fn next_transmission_tower_code(pool: &ConnectionPool) -> VortexResult<String> {
+    next_code(pool, SequenceType::TransmissionTower).await
+}
+
+/// Generates the next condition monitoring code: `CM/2026/00001`.
+pub async fn next_condition_monitoring_code(pool: &ConnectionPool) -> VortexResult<String> {
+    next_code(pool, SequenceType::ConditionMonitoring).await
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_sequence_type_properties() {
-        assert_eq!(SequenceType::Equipment.prefix(), "EQP");
-        assert_eq!(SequenceType::Equipment.digits(), 6);
-        assert!(!SequenceType::Equipment.includes_year());
-
-        assert_eq!(SequenceType::Maintenance.prefix(), "MNT");
-        assert_eq!(SequenceType::Maintenance.digits(), 5);
-        assert!(SequenceType::Maintenance.includes_year());
+    fn equipment_spec_matches_legacy_format() {
+        let spec = SequenceType::Equipment.spec();
+        assert_eq!(spec.code, "eam.equipment");
+        assert_eq!(spec.prefix, "EQP");
+        assert_eq!(spec.padding, 6);
     }
 
     #[test]
-    fn test_format_equipment_code() {
-        // Manual formatting test (without DB)
-        let seq_type = SequenceType::Equipment;
-        let next_val = 42_i64;
-        let formatted = format!(
-            "{}/{:0width$}",
-            seq_type.prefix(),
-            next_val,
-            width = seq_type.digits()
-        );
-        assert_eq!(formatted, "EQP/000042");
+    fn maintenance_spec_is_yearly() {
+        let spec = SequenceType::Maintenance.spec();
+        assert_eq!(spec.code, "eam.maintenance");
+        assert_eq!(spec.prefix, "MNT");
+        assert_eq!(spec.padding, 5);
+        assert!(matches!(
+            spec.scope,
+            vortex_orm::sequence::SequenceScope::Yearly
+        ));
     }
 
     #[test]
-    fn test_format_maintenance_code() {
-        let seq_type = SequenceType::Maintenance;
-        let next_val = 123_i64;
-        let year = "2026";
-        let formatted = format!(
-            "{}/{}/{:0width$}",
-            seq_type.prefix(),
-            year,
-            next_val,
-            width = seq_type.digits()
-        );
-        assert_eq!(formatted, "MNT/2026/00123");
+    fn condition_monitoring_spec_is_yearly() {
+        let spec = SequenceType::ConditionMonitoring.spec();
+        assert_eq!(spec.code, "eam.condition_monitoring");
+        assert_eq!(spec.prefix, "CM");
+        assert!(matches!(
+            spec.scope,
+            vortex_orm::sequence::SequenceScope::Yearly
+        ));
     }
 }

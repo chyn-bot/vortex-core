@@ -38,6 +38,11 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 base64 = "0.22"
 
+# PKCS#11 v3.0 binding for HSM-backed audit signing. See
+# signing/pkcs11.rs for usage. Works with SoftHSM2 in dev/CI and
+# with real HSMs (Luna, nShield, YubiHSM 2, Utimaco) in production.
+cryptoki = { workspace = true }
+
 # Time
 chrono = { workspace = true }
 
@@ -49,3 +54,5 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util", "macros"] }
+# Temporary token directory for the SoftHSM2 integration test.
+tempfile = "3.10"

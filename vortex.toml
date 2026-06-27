@@ -39,6 +39,56 @@ log_security_events = true
 log_data_changes = true
 retention_days = 90
 
+[audit.signing]
+# Which backend produces Ed25519 signatures over audit entries.
+#
+#   "env"    — Dev default. Loads the key from
+#              $VORTEX_AUDIT_SIGNING_KEY (base64 PKCS#8). Private key
+#              lives in the Vortex process heap. Not acceptable for
+#              regulated deployments.
+#
+#   "pkcs11" — Production path. Delegates signing to an HSM via the
+#              PKCS#11 v3.0 standard API. The private key material
+#              NEVER enters the Vortex process — sign operations
+#              happen inside the HSM and only the signature bytes
+#              come back. Works with SoftHSM2 (dev/CI, not FIPS
+#              validated), YubiHSM 2, Thales Luna, Entrust nShield,
+#              Utimaco CryptoServer, and any other PKCS#11 device.
+backend = "env"
+
+# ── PKCS#11 backend configuration ──
+#
+# Uncomment and fill in when `backend = "pkcs11"`. The example values
+# below are SoftHSM2 defaults suitable for local development and CI.
+# For a real HSM, change `library_path` to the vendor's PKCS#11 shared
+# library; everything else stays shape-compatible.
+#
+# [audit.signing.pkcs11]
+# # Filesystem path to the PKCS#11 library .so/.dll.
+# # SoftHSM2 (Ubuntu):        /usr/lib/softhsm/libsofthsm2.so
+# # SoftHSM2 (RHEL/Fedora):   /usr/lib64/pkcs11/libsofthsm2.so
+# # Thales Luna:              /usr/safenet/lunaclient/lib/libCryptoki2_64.so
+# # Entrust nShield:          /opt/nfast/toolkits/pkcs11/libcknfast.so
+# # YubiHSM 2:                /usr/lib/pkcs11/yubihsm_pkcs11.so
+# library_path = "/usr/lib/softhsm/libsofthsm2.so"
+#
+# # Preferred: find the token by label (stable across reboots).
+# token_label = "vortex"
+#
+# # Fallback: numeric slot index. Used only if `token_label` is unset.
+# # Fragile — slots can renumber on USB replug / HSM restart.
+# # slot = 0
+#
+# # Label of the private-key object inside the token. Must already
+# # exist — Vortex does NOT auto-generate keys. Create the keypair
+# # via the HSM vendor's key ceremony procedure before first start.
+# key_label = "vortex-audit"
+#
+# # Environment variable holding the User PIN. Never put the PIN in
+# # vortex.toml itself — inject via systemd Environment=, docker
+# # --env-file, or a secrets manager.
+# pin_env = "VORTEX_HSM_PIN"
+
 [modules]
 # Auto-install core modules
 auto_install_core = true

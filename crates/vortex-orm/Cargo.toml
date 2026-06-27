@@ -33,6 +33,8 @@ toml = "0.8"
 # Types
 uuid = { workspace = true }
 chrono = { workspace = true }
+rust_decimal = { workspace = true }
+rust_decimal_macros = { workspace = true }
 
 # Error handling
 thiserror = { workspace = true }

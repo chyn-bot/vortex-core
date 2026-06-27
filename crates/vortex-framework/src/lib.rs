@@ -33,17 +33,38 @@
 //! `vortex-module` intact.
 
 pub mod auth;
+pub mod i18n;
+pub mod list;
 pub mod menu;
 pub mod plugin;
 pub mod registry;
+pub mod reports;
+pub mod scheduler;
 pub mod sidebar;
 pub mod state;
 pub mod ui;
 
 pub use auth::{AuthUser, Db};
+pub use i18n::{
+    format_date, locale_from_accept_language, sync_translations, Locale, Translation,
+    TranslationService, DEFAULT_LOCALE,
+};
+// Note: i18n::format_number is NOT re-exported at the crate root
+// because ui::format_number already exists. Use the full path
+// `vortex_framework::i18n::format_number` when locale-aware number
+// formatting is needed.
+pub use list::{
+    execute_list, render_list, CellRenderer, ListColumn, ListConfig, ListParams, ListResult,
+    SortDir,
+};
 pub use menu::{MenuEntry, MenuGroup};
 pub use plugin::{Plugin, PluginMigration};
 pub use registry::PluginRegistry;
+pub use reports::{
+    render_report, reports_routes, ReportDef, ReportFormat, ReportOutput, ReportParams,
+    ReportRegistry,
+};
+pub use scheduler::{Schedule, ScheduledAction, ScheduledActionDef, Scheduler};
 pub use sidebar::build_sidebar;
 pub use state::{AppState, DatabaseContext};
 pub use ui::{

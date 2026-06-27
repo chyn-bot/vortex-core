@@ -1,0 +1,16 @@
+[package]
+name = "vortex-contacts"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Contacts plugin — the first vertical built entirely against vortex-plugin-sdk"
+
+# This plugin is a DEMONSTRATOR: it exercises every core primitive
+# (migrations, sequences, translations, scheduled actions, reports,
+# audit logging, commerce) on a simple domain (business contacts)
+# to prove the platform works end-to-end. It is also genuinely
+# useful — every ERP needs a party model.
+
+[dependencies]
+vortex-plugin-sdk = { workspace = true }

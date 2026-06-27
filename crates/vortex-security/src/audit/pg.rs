@@ -54,6 +54,7 @@ use sqlx::postgres::PgRow;
 use tracing::{debug, warn};
 use uuid::Uuid;
 use vortex_common::{CompanyId, UserId, VortexError, VortexResult};
+use vortex_orm::pool_manager::DatabasePoolManager;
 use vortex_orm::ConnectionPool;
 
 use super::canonical::canonicalize;
@@ -184,11 +185,55 @@ fn fmt_ts(t: &DateTime<Utc>) -> String {
 pub struct PgAuditStorage {
     pool: Arc<ConnectionPool>,
     signer: Option<Arc<dyn SigningKey>>,
+    /// Multi-DB pool manager. When present AND an audit entry has
+    /// `db_name` set, the write uses the tenant's pool instead of
+    /// `self.pool`. This ensures each tenant's audit chain lives in
+    /// its own database, satisfying the per-tenant isolation
+    /// requirement for multi-DB deployments.
+    pool_manager: Option<Arc<DatabasePoolManager>>,
 }
 
 impl PgAuditStorage {
     pub fn new(pool: Arc<ConnectionPool>, signer: Option<Arc<dyn SigningKey>>) -> Self {
-        Self { pool, signer }
+        Self {
+            pool,
+            signer,
+            pool_manager: None,
+        }
+    }
+
+    /// Attach a pool manager for multi-DB audit scoping. When set,
+    /// entries with `db_name` will be written to the tenant's
+    /// database instead of the primary. Call during startup, after
+    /// constructing the pool manager.
+    pub fn with_pool_manager(mut self, pm: Arc<DatabasePoolManager>) -> Self {
+        self.pool_manager = Some(pm);
+        self
+    }
+
+    /// Resolve the connection pool for an audit entry. If the entry
+    /// carries a `db_name` and we have a pool manager, try the
+    /// tenant pool. Fall back to the primary on any lookup failure.
+    async fn resolve_pool(&self, entry: &AuditEntry) -> Arc<ConnectionPool> {
+        if let (Some(db_name), Some(pm)) = (&entry.db_name, &self.pool_manager) {
+            match pm.get_pool(db_name).await {
+                Ok(tenant_pool) => {
+                    debug!(
+                        db = %db_name,
+                        "routing audit entry to tenant database"
+                    );
+                    return tenant_pool;
+                }
+                Err(e) => {
+                    warn!(
+                        db = %db_name,
+                        error = %e,
+                        "tenant pool not found for audit entry — falling back to primary"
+                    );
+                }
+            }
+        }
+        self.pool.clone()
     }
 
     /// Returns the underlying connection pool, exposed for tests and the
@@ -404,8 +449,11 @@ impl PgAuditStorage {
 #[async_trait::async_trait]
 impl AuditStorage for PgAuditStorage {
     async fn write(&self, entry: AuditEntry) -> VortexResult<()> {
-        let mut tx = self
-            .pool
+        // Resolve the target pool: tenant-specific if the entry
+        // carries a db_name and we have a pool manager, primary
+        // otherwise. This is where multi-DB audit scoping happens.
+        let target_pool = self.resolve_pool(&entry).await;
+        let mut tx = target_pool
             .pool()
             .begin()
             .await
@@ -558,6 +606,7 @@ fn row_to_entry(row: PgRow) -> AuditEntry {
         previous_state: None,
         new_state: None,
         cip_reference: cip_requirement,
+        db_name: None,
     }
 }
 

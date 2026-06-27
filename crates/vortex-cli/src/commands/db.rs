@@ -19,6 +19,7 @@ use crate::DbCommands;
 /// registry is enough.
 fn build_migration_registry() -> PluginRegistry {
     let mut registry = PluginRegistry::new();
+    registry.register(Arc::new(vortex_contacts::ContactsPlugin::new()));
     #[cfg(feature = "eam")]
     registry.register(Arc::new(vortex_eam::EamPlugin::new()));
     #[cfg(feature = "cr")]

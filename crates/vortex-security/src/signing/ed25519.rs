@@ -1,82 +1,31 @@
-//! Cryptographic signing for the WORM audit ledger.
+//! Ed25519 signing backend — loads a PKCS#8 DER private key from
+//! the `VORTEX_AUDIT_SIGNING_KEY` environment variable (or a
+//! provided byte slice) and signs via the `ring` crate.
 //!
-//! Every entry in the audit chain is optionally signed by an Ed25519 key,
-//! with the key identifier recorded alongside the signature so verification
-//! can be performed later even after the key rotates. The signed payload
-//! is the JCS canonical serialization of the audit row (see
-//! [`crate::audit::canonical`]) concatenated with the entry hash; signing
-//! after hashing lets verifiers recompute the chain first and then verify
-//! signatures independently.
+//! ## When to use this backend
 //!
-//! # Key sources
+//! - Local dev: generate a throwaway key, stick it in the env,
+//!   forget about it.
+//! - CI: the same.
+//! - Small non-regulated deployments where "private key on disk"
+//!   is an acceptable trust model and the audit chain is a
+//!   nice-to-have rather than a compliance requirement.
 //!
-//! In Phase 0 the signing key is loaded from the environment variable
-//! `VORTEX_AUDIT_SIGNING_KEY`. The value is base64-encoded PKCS#8 DER —
-//! the format OpenSSL emits after stripping PEM armor:
+//! ## When NOT to use this backend
 //!
-//! ```sh
-//! openssl genpkey -algorithm ed25519 -outform DER | base64 -w0
-//! ```
-//!
-//! The key ID is read from `VORTEX_AUDIT_SIGNING_KEY_ID`; if unset, it
-//! defaults to `"default"`. Verifiers look up the public key in the
-//! `audit_signing_keys` table by this ID.
-//!
-//! A future phase will replace the env-var source with a KMS/HSM broker;
-//! the [`SigningKey`] trait is the seam for that substitution.
+//! - Anywhere a regulator or auditor will review the deployment
+//!   (banking, healthcare, critical infrastructure, public sector).
+//!   The private key lives in the Vortex process heap where an
+//!   attacker with local access or a debugger can extract it.
+//!   Use [`crate::signing::pkcs11::Pkcs11SigningKey`] instead —
+//!   it delegates every sign operation to an HSM and the private
+//!   key never enters Vortex memory.
 
 use base64::Engine;
 use ring::rand::SystemRandom;
-use ring::signature::{Ed25519KeyPair, KeyPair, UnparsedPublicKey, ED25519};
-use thiserror::Error;
+use ring::signature::{Ed25519KeyPair, KeyPair};
 
-/// Algorithm identifier stored alongside each signature. Must match the
-/// `algorithm` column in `audit_signing_keys`.
-pub const ALG_ED25519: &str = "ed25519";
-
-/// Environment variable holding the base64-encoded PKCS#8 DER key.
-pub const ENV_SIGNING_KEY: &str = "VORTEX_AUDIT_SIGNING_KEY";
-
-/// Environment variable holding the key ID (optional, defaults to "default").
-pub const ENV_SIGNING_KEY_ID: &str = "VORTEX_AUDIT_SIGNING_KEY_ID";
-
-/// Environment variable toggling signing mode. Set to `disabled` to skip
-/// signing entirely — the hash chain still guarantees tamper evidence, but
-/// the ledger cannot prove *who* signed each entry. Intended for local
-/// development only.
-pub const ENV_SIGNING_MODE: &str = "VORTEX_AUDIT_SIGNING_MODE";
-
-/// Errors produced by the signing subsystem.
-#[derive(Debug, Error)]
-pub enum SigningError {
-    #[error("environment variable {0} is not set")]
-    MissingEnvVar(&'static str),
-    #[error("failed to decode base64 key: {0}")]
-    Base64(String),
-    #[error("failed to parse PKCS#8 Ed25519 key: {0}")]
-    InvalidKey(String),
-    #[error("signature verification failed")]
-    VerificationFailed,
-}
-
-/// A signing key capable of producing detached signatures over arbitrary
-/// byte sequences. Implementations are expected to be thread-safe; the
-/// audit writer will hold a single [`std::sync::Arc<dyn SigningKey>`] for
-/// the lifetime of the server.
-pub trait SigningKey: Send + Sync {
-    /// Stable identifier for this key, used to look up the matching public
-    /// key in the `audit_signing_keys` table during verification.
-    fn key_id(&self) -> &str;
-
-    /// Algorithm code (see [`ALG_ED25519`]).
-    fn algorithm(&self) -> &'static str;
-
-    /// Produce a signature over the given bytes.
-    fn sign(&self, bytes: &[u8]) -> Vec<u8>;
-
-    /// Return the raw public key bytes (32 bytes for Ed25519).
-    fn public_key(&self) -> Vec<u8>;
-}
+use super::{SigningError, SigningKey, ALG_ED25519, ENV_SIGNING_KEY, ENV_SIGNING_KEY_ID};
 
 /// Ed25519 signing key backed by the `ring` crate.
 pub struct Ed25519Key {
@@ -96,8 +45,8 @@ impl Ed25519Key {
     }
 
     /// Load from environment: `VORTEX_AUDIT_SIGNING_KEY` (required,
-    /// base64-encoded PKCS#8) and `VORTEX_AUDIT_SIGNING_KEY_ID` (optional,
-    /// defaults to `"default"`).
+    /// base64-encoded PKCS#8) and `VORTEX_AUDIT_SIGNING_KEY_ID`
+    /// (optional, defaults to `"default"`).
     pub fn from_env() -> Result<Self, SigningError> {
         let raw = std::env::var(ENV_SIGNING_KEY)
             .map_err(|_| SigningError::MissingEnvVar(ENV_SIGNING_KEY))?;
@@ -121,9 +70,9 @@ impl Ed25519Key {
         Self::from_pkcs8(key_id, &pkcs8)
     }
 
-    /// Generate a fresh in-memory Ed25519 key. Intended for tests and
-    /// development; real deployments must load a persistent key via
-    /// [`Self::from_env`].
+    /// Generate a fresh in-memory Ed25519 key. Intended for tests
+    /// and development; real deployments must load a persistent
+    /// key via [`Self::from_env`] or use a hardware backend.
     pub fn generate(key_id: impl Into<String>) -> Result<(Self, Vec<u8>), SigningError> {
         let rng = SystemRandom::new();
         let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng)
@@ -159,40 +108,10 @@ impl SigningKey for Ed25519Key {
     }
 }
 
-/// Verify an Ed25519 signature against a known public key.
-///
-/// Returns `Ok(())` if the signature matches. Used by
-/// `vortex audit verify` to validate historical entries against the
-/// public keys recorded in `audit_signing_keys`.
-pub fn verify_ed25519(public_key: &[u8], message: &[u8], signature: &[u8]) -> Result<(), SigningError> {
-    let parsed = UnparsedPublicKey::new(&ED25519, public_key);
-    parsed
-        .verify(message, signature)
-        .map_err(|_| SigningError::VerificationFailed)
-}
-
-/// Resolved signing mode for the running process.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SigningMode {
-    /// Every audit entry is signed. This is the default and the only
-    /// mode acceptable for production.
-    Enabled,
-    /// Entries are chained but not signed. For local development only.
-    Disabled,
-}
-
-impl SigningMode {
-    pub fn from_env() -> Self {
-        match std::env::var(ENV_SIGNING_MODE).as_deref() {
-            Ok("disabled") => SigningMode::Disabled,
-            _ => SigningMode::Enabled,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::signing::verify::verify_ed25519;
 
     #[test]
     fn sign_verify_round_trip() {

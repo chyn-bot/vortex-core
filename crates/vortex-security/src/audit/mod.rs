@@ -16,6 +16,7 @@
 
 pub mod canonical;
 pub mod pg;
+pub mod verify;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -267,6 +268,19 @@ pub struct AuditEntry {
     pub new_state: Option<serde_json::Value>,
     /// CIP requirement reference (denormalized from `action.cip_requirement()`).
     pub cip_reference: String,
+    /// Target database for multi-DB deployments. When set, the
+    /// `PgAuditStorage` backend resolves the tenant's pool from the
+    /// `DatabasePoolManager` and writes to THAT database's
+    /// `audit_log` instead of the primary. `None` means "write to
+    /// the primary" — the Phase 0.1 default, and correct for system
+    /// events that are not tenant-scoped.
+    ///
+    /// Set via [`AuditEntry::with_database`]. Handlers that have a
+    /// `DatabaseContext` (multi-tenant request path) should call
+    /// `.with_database(&ctx.db_name)` so the audit entry lands in
+    /// the tenant's own chain.
+    #[serde(skip)]
+    pub db_name: Option<String>,
 }
 
 impl AuditEntry {
@@ -294,7 +308,19 @@ impl AuditEntry {
             previous_state: None,
             new_state: None,
             cip_reference,
+            db_name: None,
         }
+    }
+
+    /// Route this audit entry to a specific tenant database in
+    /// multi-DB deployments. The `PgAuditStorage` backend resolves
+    /// the pool from the `DatabasePoolManager` by this name. If
+    /// the name doesn't resolve (unknown tenant, pool evicted),
+    /// the write falls back to the primary database and logs a
+    /// warning.
+    pub fn with_database(mut self, db_name: impl Into<String>) -> Self {
+        self.db_name = Some(db_name.into());
+        self
     }
 
     pub fn with_user(mut self, user_id: UserId) -> Self {

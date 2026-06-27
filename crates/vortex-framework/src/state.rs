@@ -22,7 +22,10 @@ use vortex_policy::PolicyService;
 use vortex_security::AuditLog;
 use vortex_workflow::WorkflowEngine;
 
+use crate::i18n::TranslationService;
 use crate::registry::PluginRegistry;
+use crate::reports::ReportRegistry;
+use crate::scheduler::Scheduler;
 
 /// Shared state handed to every HTTP handler via `axum::extract::State`.
 ///
@@ -81,6 +84,26 @@ pub struct AppState {
     /// menu entries). Handlers reach it via `state.plugin_registry`
     /// when they need to know which plugins are currently active.
     pub plugin_registry: Arc<PluginRegistry>,
+    /// Platform scheduler. Built at startup from every plugin's
+    /// `scheduled_actions()` contribution and run as a single
+    /// background supervisor task. Handlers can read this to enumerate
+    /// currently-registered jobs; they cannot mutate it. See
+    /// `crate::scheduler` for the full contract and the background
+    /// supervisor loop.
+    pub scheduler: Arc<Scheduler>,
+    /// Translation service — in-memory cache of `(locale, key) →
+    /// text` triples loaded from the `translations` table. Call
+    /// `state.i18n.t(key, &locale)` from any handler to get the
+    /// translated string with automatic fallback through the
+    /// locale's chain.
+    pub i18n: Arc<TranslationService>,
+    /// Platform report registry. Built at startup from every
+    /// plugin's `reports()` contribution. The generic HTTP route
+    /// `/reports/:code` looks up reports here; direct consumers
+    /// (scheduled email, export scripts) call
+    /// `crate::reports::render_report(state, code, params)` to get
+    /// the same bytes without going through HTTP.
+    pub reports: Arc<ReportRegistry>,
 }
 
 /// Database context injected by the auth middleware for request-scoped

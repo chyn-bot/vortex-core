@@ -1,0 +1,5 @@
+[migration]
+module = "core"
+description = "Platform sequence service: generic `sequences` table with (code, scope) composite key. All Vortex verticals use this service for code generation (equipment, work orders, invoices, tickets, …) via `vortex_orm::sequence`. On upgrading dev databases, the migration transparently drains the legacy EAM-owned `eam_sequences` table (if present from the pre-Phase-0.7 layout) — splitting synthetic `<name>_<year>` keys into `(code='eam.<name>', scope='<year>')` rows and dropping the old table. Fresh installs never create `eam_sequences` at all (EAM migration 006 no longer ships its DDL)."
+reversible = true
+dependencies = ["116_workflow_engine"]

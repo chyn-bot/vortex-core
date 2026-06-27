@@ -1,0 +1,46 @@
+[package]
+name = "vortex-plugin-sdk"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Vortex ERP Plugin SDK — everything a third-party vertical needs in one dependency"
+
+# This crate is a thin re-export facade. It contains zero original
+# code — every symbol comes from one of the five core crates listed
+# below. Third-party plugin authors depend on this crate instead of
+# pulling in 5+ individual `vortex-*` crates, getting a stable,
+# documented surface that the core team commits to not breaking
+# across patch releases.
+#
+# If you are working inside the vortex-core workspace itself (on
+# vortex-eam, vortex-change, or a new first-party plugin), you MAY
+# depend on the individual crates directly — the SDK is not mandatory
+# for in-tree development. The SDK exists for out-of-tree consumers
+# who should not need to know (or care) about the internal crate
+# decomposition of the platform.
+
+[dependencies]
+# The five core crates a plugin needs. Re-exported below via
+# `pub use` so the plugin author writes `use vortex_plugin_sdk::*`.
+vortex-common    = { workspace = true }
+vortex-framework = { workspace = true }
+vortex-orm       = { workspace = true }
+vortex-security  = { workspace = true }
+vortex-workflow  = { workspace = true }
+vortex-policy    = { workspace = true }
+
+# Re-exported third-party types that plugins use directly. Listing
+# them here means the plugin author does not need to add axum, sqlx,
+# serde, etc. to their own Cargo.toml — they get the exact versions
+# the platform was compiled against.
+axum        = { workspace = true }
+async-trait = { workspace = true }
+sqlx        = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+chrono      = { workspace = true }
+uuid        = { workspace = true }
+tokio       = { workspace = true }
+tracing     = { workspace = true }
+rust_decimal = { workspace = true }

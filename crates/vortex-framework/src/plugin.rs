@@ -42,7 +42,10 @@ use axum::Router;
 use vortex_common::VortexResult;
 use vortex_workflow::StateMachine;
 
+use crate::i18n::Translation;
 use crate::menu::MenuEntry;
+use crate::reports::ReportDef;
+use crate::scheduler::ScheduledAction;
 use crate::state::AppState;
 
 /// A database migration contributed by a plugin.
@@ -176,6 +179,68 @@ pub trait Plugin: Send + Sync {
     /// Default: no migrations — the plugin is stateless or reuses
     /// existing core tables only.
     fn migrations(&self) -> Vec<PluginMigration> {
+        Vec::new()
+    }
+
+    /// Return the translations this plugin contributes. Each
+    /// entry is a `(locale, module, key, value)` tuple. The host
+    /// aggregates translations from every plugin during startup
+    /// and bulk-upserts them into the `translations` table. The
+    /// `TranslationService` on `AppState` then loads the full
+    /// table into an in-memory cache for fast `t(key, locale)`
+    /// lookups.
+    ///
+    /// Convention: `module` should match the plugin's
+    /// `technical_name()`. Keys are dot-separated hierarchy
+    /// matching the UI location: `menu.dashboard`, `btn.save`,
+    /// `field.status`. The `core` module is reserved for platform-
+    /// level strings.
+    ///
+    /// Default: no translations — the plugin uses untranslated
+    /// keys (which render as the key itself in the UI).
+    fn translations(&self) -> Vec<Translation> {
+        Vec::new()
+    }
+
+    /// Return the reports this plugin contributes. Each report is
+    /// a [`crate::reports::ReportDef`] pairing a declarative
+    /// description (code, name, supported formats) with an async
+    /// handler that renders a [`crate::reports::ReportOutput`].
+    ///
+    /// The host aggregates reports from every plugin during
+    /// startup and builds a single [`crate::reports::ReportRegistry`]
+    /// stored on [`AppState`]. The generic HTTP route `/reports/:code`
+    /// dispatches by code; plugin-custom routes can also call
+    /// [`crate::reports::render_report`] directly to get the same
+    /// output through a different delivery channel.
+    ///
+    /// Namespace report codes with the plugin's technical name —
+    /// e.g. `eam.work_order_summary` — so two plugins cannot
+    /// collide.
+    ///
+    /// Default: no reports.
+    fn reports(&self) -> Vec<ReportDef> {
+        Vec::new()
+    }
+
+    /// Return the scheduled background actions this plugin
+    /// contributes. Each action is a
+    /// [`crate::scheduler::ScheduledAction`] pairing a declarative
+    /// definition (code, name, schedule) with an async handler.
+    ///
+    /// The host aggregates actions from every plugin during startup,
+    /// upserts their definitions into the `scheduled_actions` table
+    /// (preserving runtime state like `next_call`, counters, and
+    /// admin-toggled `active` across restarts), and runs a single
+    /// supervisor task that polls for due actions and dispatches
+    /// them to handlers.
+    ///
+    /// Namespace action codes with the plugin's technical name —
+    /// e.g. `eam.work_order_overdue_check` — so two plugins cannot
+    /// collide.
+    ///
+    /// Default: no background jobs.
+    fn scheduled_actions(&self) -> Vec<ScheduledAction> {
         Vec::new()
     }
 

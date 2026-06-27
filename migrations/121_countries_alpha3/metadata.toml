@@ -1,0 +1,5 @@
+[migration]
+module = "core"
+description = "Add ISO 3166-1 alpha-3 codes to the countries table (MYS, USA, GBR, …). The existing alpha-2 `code` column is preserved for backwards compatibility; the new `alpha3` column provides the three-letter representation requested by banking and trade verticals."
+reversible = true
+dependencies = ["120_i18n"]

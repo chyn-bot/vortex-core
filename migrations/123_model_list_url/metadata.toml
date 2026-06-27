@@ -1,0 +1,5 @@
+[migration]
+module = "core"
+description = "Add ir_model.list_url — the canonical list-view URL for a model. Generic /list/{model} redirects here when set, so plugins with custom list handlers (e.g. /contacts) stay the single source of truth for their entity."
+reversible = true
+dependencies = ["122_model_registry"]

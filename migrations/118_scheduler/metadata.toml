@@ -1,0 +1,5 @@
+[migration]
+module = "core"
+description = "Platform scheduler: scheduled_actions table for plugin-contributed background jobs. Every Vortex vertical uses this same service for periodic work (overdue checks, score recomputation, end-of-period rollups, chain verification). Definitions are source-of-truth in plugin code and upserted to this table at startup; runtime state (next_call, counters, active toggle) is owned by the DB so administrators can disable or reschedule without a code change. Distributed-safe via FOR UPDATE SKIP LOCKED — any number of app instances can share a single DB."
+reversible = true
+dependencies = ["117_sequence_service"]

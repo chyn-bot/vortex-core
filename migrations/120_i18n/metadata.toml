@@ -1,0 +1,5 @@
+[migration]
+module = "core"
+description = "Platform i18n: translations table (locale, module, key, value) for translated UI strings, plus users.locale and companies.locale columns for per-user and per-tenant locale preference. Seeds ~20 core English strings (menu items, common buttons, status labels) so the out-of-box experience works without any translation data import. See vortex_framework::i18n for the Rust API."
+reversible = true
+dependencies = ["119_commerce_primitives"]

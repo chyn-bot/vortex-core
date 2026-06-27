@@ -26,6 +26,9 @@ vortex-eam = { workspace = true, optional = true }
 # the Phase 0.5 demonstrator of the workflow + audit + policy +
 # framework stack composed end-to-end.
 vortex-change = { workspace = true, optional = true }
+# Contacts plugin — always enabled; it's the platform smoke-test
+# vertical and the universal "res.partner" equivalent.
+vortex-contacts = { workspace = true }
 
 # Async
 tokio = { workspace = true }

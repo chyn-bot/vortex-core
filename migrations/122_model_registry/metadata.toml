@@ -1,0 +1,5 @@
+[migration]
+module = "core"
+description = "Model metadata registry (ir_model, ir_model_field) — the source of truth for generic list/kanban/graph/calendar/pivot views to discover a model's fields, types, and display names. Plugins register their models here via their own migrations."
+reversible = true
+dependencies = ["121_countries_alpha3"]

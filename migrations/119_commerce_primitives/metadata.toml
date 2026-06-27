@@ -1,0 +1,5 @@
+[migration]
+module = "core"
+description = "Platform commerce primitives: currencies (ISO 4217) + currency_rates time-series, uom_categories + uoms (6 categories, ~25 seed units covering Unit/Weight/Length/Volume/Time/Area), and a minimal taxes table (percent/fixed, sale/purchase, inclusive/exclusive). Adds companies.currency_id with a default pointing at the home currency. These are the tables every commerce-adjacent vertical needs (Sales, Purchasing, Inventory, Manufacturing, Finance, Services); promoting them to core stops each future plugin from reinventing the same shapes. See `vortex_orm::commerce` for the Rust API and pure-function conversion helpers."
+reversible = true
+dependencies = ["118_scheduler"]

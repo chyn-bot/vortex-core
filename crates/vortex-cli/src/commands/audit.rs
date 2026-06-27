@@ -23,15 +23,9 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::Row;
 use uuid::Uuid;
 
-use vortex_security::audit::canonical::canonicalize;
-use vortex_security::audit::pg::compute_entry_hash;
-use vortex_security::signing::verify_ed25519;
-
-/// Default clock-skew tolerance between `timestamp` (app clock) and
-/// `db_timestamp` (Postgres clock) before an entry is flagged. 5 seconds
-/// covers normal NTP drift; anything larger suggests tampering or a broken
-/// clock source.
-const DEFAULT_CLOCK_SKEW_SECONDS: i64 = 5;
+use vortex_security::audit::verify::{
+    verify_chain, VerifyOptions, DEFAULT_CLOCK_SKEW_SECONDS,
+};
 
 #[derive(Subcommand)]
 pub enum AuditCommands {
@@ -114,236 +108,54 @@ async fn verify_cmd(
     to: Option<DateTime<Utc>>,
     max_skew_seconds: i64,
 ) -> Result<()> {
-    // Discover the set of companies to verify.
-    let companies: Vec<Uuid> = if let Some(c) = company {
-        vec![c]
-    } else {
-        sqlx::query_scalar::<_, Uuid>(
-            "SELECT DISTINCT company_id FROM audit_log \
-             WHERE company_id IS NOT NULL AND chain_position IS NOT NULL \
-             ORDER BY company_id",
-        )
-        .fetch_all(pool)
-        .await
-        .context("failed to list companies from audit_log")?
-    };
+    // The actual verification logic lives in the library so the
+    // scheduled background check uses an identical code path. This
+    // CLI adapter just renders the structured report and sets the
+    // exit code.
+    let report = verify_chain(
+        pool,
+        &VerifyOptions {
+            company,
+            from,
+            to,
+            max_skew_seconds,
+        },
+    )
+    .await
+    .context("audit chain verification failed")?;
 
-    if companies.is_empty() {
+    if report.companies_checked == 0 {
         println!("No chained audit entries found — nothing to verify.");
         return Ok(());
     }
 
-    // Preload the signing-key map so we can look up public keys by key_id.
-    let key_rows = sqlx::query(
-        "SELECT key_id, public_key, algorithm, valid_from, valid_to, revoked_at \
-         FROM audit_signing_keys",
-    )
-    .fetch_all(pool)
-    .await
-    .context("failed to load audit_signing_keys")?;
+    println!(
+        "Verified {} entries across {} compan{}; {} failure{} ({}ms).",
+        report.entries_verified,
+        report.companies_checked,
+        if report.companies_checked == 1 { "y" } else { "ies" },
+        report.failure_count(),
+        if report.failure_count() == 1 { "" } else { "s" },
+        report.duration.as_millis()
+    );
 
-    let keys: std::collections::HashMap<String, KeyRecord> = key_rows
-        .into_iter()
-        .map(|r| {
-            let key_id: String = r.get("key_id");
-            let rec = KeyRecord {
-                public_key: r.get("public_key"),
-                algorithm: r.get("algorithm"),
-                valid_from: r.get("valid_from"),
-                valid_to: r.try_get("valid_to").ok(),
-                revoked_at: r.try_get("revoked_at").ok(),
-            };
-            (key_id, rec)
-        })
-        .collect();
-
-    let mut total_verified = 0usize;
-    let mut total_failures = 0usize;
-    let mut failure_details: Vec<String> = Vec::new();
-
-    for cid in companies {
-        println!("── Verifying chain for company {cid} ──");
-
-        let mut sql = String::from(
-            "SELECT id, chain_position, prev_hash, entry_hash, signature, \
-             signing_key_id, canonical_payload, timestamp, db_timestamp \
-             FROM audit_log \
-             WHERE company_id = $1 AND chain_position IS NOT NULL",
-        );
-        let mut arg_idx = 1;
-        if from.is_some() {
-            arg_idx += 1;
-            sql.push_str(&format!(" AND timestamp >= ${arg_idx}"));
-        }
-        if to.is_some() {
-            arg_idx += 1;
-            sql.push_str(&format!(" AND timestamp <= ${arg_idx}"));
-        }
-        sql.push_str(" ORDER BY chain_position ASC");
-
-        let mut q = sqlx::query(&sql).bind(cid);
-        if let Some(f) = from {
-            q = q.bind(f);
-        }
-        if let Some(t) = to {
-            q = q.bind(t);
-        }
-        let rows = q.fetch_all(pool).await.context("failed to fetch chain")?;
-
-        let mut prev_expected_hash: Option<Vec<u8>> = None;
-        for row in rows {
-            total_verified += 1;
-            let entry_id: Uuid = row.get("id");
-            let chain_position: i64 = row.get("chain_position");
-            let stored_prev: Option<Vec<u8>> = row.try_get("prev_hash").ok();
-            let stored_hash: Vec<u8> = row.get("entry_hash");
-            let canonical: String = row.get("canonical_payload");
-            let signature: Option<Vec<u8>> = row.try_get("signature").ok();
-            let key_id: Option<String> = row.try_get("signing_key_id").ok();
-            let app_ts: DateTime<Utc> = row.get("timestamp");
-            let db_ts: DateTime<Utc> = row.get("db_timestamp");
-
-            // 1. Chain linkage: the prev_hash on this row must match the
-            //    entry_hash of the previous row we just verified.
-            match (&prev_expected_hash, &stored_prev) {
-                (None, None) if chain_position == 0 => { /* valid genesis */ }
-                (Some(a), Some(b)) if a == b => { /* valid link */ }
-                (expected, actual) => {
-                    total_failures += 1;
-                    failure_details.push(format!(
-                        "  ✗ position {chain_position} (id={entry_id}): broken chain link. \
-                         expected prev_hash={:?}, stored={:?}",
-                        expected.as_ref().map(hex::encode),
-                        actual.as_ref().map(hex::encode)
-                    ));
-                    prev_expected_hash = Some(stored_hash.clone());
-                    continue;
-                }
-            }
-
-            // 2. Recompute the entry hash from canonical_payload and
-            //    compare. This is the critical tamper check.
-            let computed = compute_entry_hash(
-                stored_prev.as_deref(),
-                canonical.as_bytes(),
-            );
-            if computed.as_slice() != stored_hash.as_slice() {
-                total_failures += 1;
-                failure_details.push(format!(
-                    "  ✗ position {chain_position} (id={entry_id}): entry_hash mismatch. \
-                     canonical_payload was tampered with or the chain computation diverged. \
-                     computed={}, stored={}",
-                    hex::encode(computed),
-                    hex::encode(&stored_hash)
-                ));
-                prev_expected_hash = Some(stored_hash.clone());
-                continue;
-            }
-
-            // 3. Canonical payload must parse as valid JSON and re-canonicalize
-            //    to the same bytes. If it does not, the stored bytes are
-            //    drifted (e.g. someone round-tripped them through JSONB).
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&canonical) {
-                match canonicalize(&parsed) {
-                    Ok(re) if re == canonical => {}
-                    Ok(_) => {
-                        total_failures += 1;
-                        failure_details.push(format!(
-                            "  ✗ position {chain_position} (id={entry_id}): canonical_payload \
-                             is not stable under re-canonicalization"
-                        ));
-                    }
-                    Err(e) => {
-                        total_failures += 1;
-                        failure_details.push(format!(
-                            "  ✗ position {chain_position} (id={entry_id}): canonical re-encode \
-                             failed: {e}"
-                        ));
-                    }
-                }
-            }
-
-            // 4. Verify the Ed25519 signature if present.
-            if let (Some(sig), Some(kid)) = (signature.as_ref(), key_id.as_ref()) {
-                match keys.get(kid) {
-                    Some(key) if key.algorithm == "ed25519" => {
-                        // Check key validity window.
-                        if let Some(revoked) = key.revoked_at {
-                            if app_ts >= revoked {
-                                total_failures += 1;
-                                failure_details.push(format!(
-                                    "  ✗ position {chain_position} (id={entry_id}): entry signed \
-                                     by key '{kid}' AFTER its revocation at {revoked}"
-                                ));
-                            }
-                        }
-                        // Verify (entry_hash || canonical_bytes) — the exact
-                        // message signed by PgAuditStorage.
-                        let mut msg = Vec::with_capacity(32 + canonical.len());
-                        msg.extend_from_slice(&stored_hash);
-                        msg.extend_from_slice(canonical.as_bytes());
-                        if let Err(e) = verify_ed25519(&key.public_key, &msg, sig) {
-                            total_failures += 1;
-                            failure_details.push(format!(
-                                "  ✗ position {chain_position} (id={entry_id}): Ed25519 signature \
-                                 verification failed ({e})"
-                            ));
-                        }
-                    }
-                    Some(_) => {
-                        total_failures += 1;
-                        failure_details.push(format!(
-                            "  ✗ position {chain_position} (id={entry_id}): signing_key_id '{kid}' \
-                             uses unknown algorithm"
-                        ));
-                    }
-                    None => {
-                        total_failures += 1;
-                        failure_details.push(format!(
-                            "  ✗ position {chain_position} (id={entry_id}): signing_key_id '{kid}' \
-                             not found in audit_signing_keys (revoked and purged?)"
-                        ));
-                    }
-                }
-            }
-
-            // 5. Dual-clock skew check.
-            let skew = (app_ts - db_ts).num_seconds().abs();
-            if skew > max_skew_seconds {
-                total_failures += 1;
-                failure_details.push(format!(
-                    "  ✗ position {chain_position} (id={entry_id}): clock skew {skew}s exceeds \
-                     threshold of {max_skew_seconds}s (app={app_ts}, db={db_ts}) — possible \
-                     NTP tampering or backdating"
-                ));
-            }
-
-            prev_expected_hash = Some(stored_hash);
-        }
-    }
-
-    println!();
-    println!("Verified {total_verified} entries; {total_failures} failures.");
-    if total_failures > 0 {
+    if !report.ok() {
         println!();
         println!("Failures:");
-        for d in &failure_details {
-            println!("{d}");
+        for f in &report.failures {
+            println!(
+                "  ✗ company {} position {} (id={}) [{}]: {}",
+                f.company_id,
+                f.chain_position,
+                f.entry_id,
+                f.kind.code(),
+                f.detail
+            );
         }
         std::process::exit(1);
     }
 
     Ok(())
-}
-
-struct KeyRecord {
-    public_key: Vec<u8>,
-    algorithm: String,
-    #[allow(dead_code)]
-    valid_from: DateTime<Utc>,
-    #[allow(dead_code)]
-    valid_to: Option<DateTime<Utc>>,
-    revoked_at: Option<DateTime<Utc>>,
 }
 
 async fn head_cmd(pool: &sqlx::PgPool, company: Option<Uuid>) -> Result<()> {

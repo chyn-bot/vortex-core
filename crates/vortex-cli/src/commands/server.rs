@@ -25,7 +25,9 @@ use vortex_framework::{
 use vortex_orm::ConnectionPool;
 use vortex_policy::{Decision, PgPolicyStore, PolicyPrincipal, PolicyResource, PolicyService};
 use vortex_security::audit::PgAuditStorage;
-use vortex_security::signing::{Ed25519Key, SigningKey, SigningMode};
+use vortex_security::signing::{
+    build_signing_key, Pkcs11Config, SigningBackendConfig, SigningKey, SigningMode,
+};
 use vortex_security::{AuditAction, AuditEntry, AuditLog, AuditSeverity};
 use vortex_server::middleware::rate_limit::{RateLimiter, RateLimitConfig};
 use vortex_orm::pool_manager::{DatabasePoolManager, PoolManagerConfig};
@@ -285,6 +287,86 @@ fn module_not_installed_page(module_name: &str) -> String {
 </div></div></div></body></html>"#)
 }
 
+/// Parse the `[audit.signing]` section of `vortex.toml` and
+/// resolve it to a [`SigningBackendConfig`].
+///
+/// Default is `SigningBackendConfig::Env` (matches Phase 0.1
+/// behavior) so upgrading deployments see no change until they
+/// explicitly opt into a different backend.
+///
+/// Layout:
+///
+/// ```toml
+/// [audit.signing]
+/// backend = "env"              # or "pkcs11"
+///
+/// [audit.signing.pkcs11]
+/// library_path = "/usr/lib/softhsm/libsofthsm2.so"
+/// token_label  = "vortex"
+/// # slot        = 0             # optional, used if token_label absent
+/// key_label    = "vortex-audit"
+/// pin_env      = "VORTEX_HSM_PIN"
+/// ```
+///
+/// Follows the existing `parse_db_manager_config` convention —
+/// ad-hoc `toml::Value` access, tolerant of missing keys, no
+/// panic on malformed config. Bad config produces a default
+/// plus a warning; fatal misconfiguration is deferred to the
+/// `build_signing_key` call at startup where the operator sees
+/// a specific error.
+pub fn parse_audit_signing_config() -> SigningBackendConfig {
+    let config_str = std::fs::read_to_string("vortex.toml").unwrap_or_default();
+    let config: toml::Value = config_str
+        .parse::<toml::Value>()
+        .unwrap_or(toml::Value::Table(Default::default()));
+
+    let signing: Option<&toml::Value> =
+        config.get("audit").and_then(|a| a.get("signing"));
+    let backend = signing
+        .and_then(|s| s.get("backend"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("env");
+
+    match backend {
+        "pkcs11" => {
+            let pkcs11 = signing.and_then(|s| s.get("pkcs11"));
+            let library_path = pkcs11
+                .and_then(|p| p.get("library_path"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let token_label = pkcs11
+                .and_then(|p| p.get("token_label"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let slot = pkcs11
+                .and_then(|p| p.get("slot"))
+                .and_then(|v| v.as_integer())
+                .map(|n| n as u64);
+            let key_label = pkcs11
+                .and_then(|p| p.get("key_label"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("vortex-audit")
+                .to_string();
+            let pin_env = pkcs11
+                .and_then(|p| p.get("pin_env"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("VORTEX_HSM_PIN")
+                .to_string();
+
+            SigningBackendConfig::Pkcs11(Pkcs11Config {
+                library_path,
+                token_label,
+                slot,
+                key_label,
+                pin_env,
+            })
+        }
+        // "env" or unknown → fall back to the default Phase 0.1 path.
+        _ => SigningBackendConfig::Env,
+    }
+}
+
 /// Parse the [database_manager] section from vortex.toml (if present).
 pub fn parse_db_manager_config() -> (bool, String, String, String, String) {
     let config_str = std::fs::read_to_string("vortex.toml").unwrap_or_default();
@@ -364,54 +446,100 @@ pub async fn run(host: String, port: u16, _workers: Option<usize>) -> Result<()>
     // Create connection pool wrapper for EAM handlers
     let pool = Arc::new(ConnectionPool::from_pg_pool(db.clone(), &database_url));
 
-    // ─── WORM Audit Ledger (Phase 0.1) ─────────────────────────────────
-    // Load the Ed25519 signing key from VORTEX_AUDIT_SIGNING_KEY (base64
-    // PKCS#8). Signing can be disabled for local dev via
-    // VORTEX_AUDIT_SIGNING_MODE=disabled — the hash chain still provides
-    // tamper evidence, but the ledger can no longer attribute entries.
+    // ─── WORM Audit Ledger (Phase 0.1 + Phase 0.7 KMS) ─────────────────
+    // Phase 0.1 shipped with an env-var-backed Ed25519 signer. Phase
+    // 0.7 adds a PKCS#11 backend (SoftHSM2 for dev/CI, Thales Luna /
+    // Entrust nShield / YubiHSM 2 / Utimaco CryptoServer for prod)
+    // selected via the `[audit.signing]` section of vortex.toml.
+    //
+    // Master switch: VORTEX_AUDIT_SIGNING_MODE=disabled skips signing
+    // entirely — the hash chain still provides tamper evidence, but
+    // the ledger cannot attribute entries to a specific signer. Dev
+    // only.
     let signing_mode = SigningMode::from_env();
     let signer: Option<Arc<dyn SigningKey>> = match signing_mode {
-        SigningMode::Enabled => match Ed25519Key::from_env() {
-            Ok(key) => {
-                info!(
-                    "Audit ledger signing ENABLED (key_id={})",
-                    key.key_id()
-                );
-                // Register the public half so `vortex audit verify` can
-                // validate historical entries even after the key rotates.
-                let key_id_owned = key.key_id().to_string();
-                let public_key = key.public_key();
-                let algorithm = key.algorithm().to_string();
-                let storage_for_register = PgAuditStorage::new(pool.clone(), None);
-                if let Err(e) = storage_for_register
-                    .register_signing_key(
-                        &key_id_owned,
-                        &public_key,
-                        &algorithm,
-                        chrono::Utc::now(),
-                    )
-                    .await
-                {
-                    warn!("audit_signing_keys upsert failed: {e}");
+        SigningMode::Enabled => {
+            let backend_config = parse_audit_signing_config();
+            info!(
+                backend = backend_config.backend_name(),
+                "Audit ledger signing ENABLED — building backend"
+            );
+            match build_signing_key(&backend_config) {
+                Ok(key) => {
+                    info!(
+                        backend = backend_config.backend_name(),
+                        key_id = key.key_id(),
+                        algorithm = key.algorithm(),
+                        "Audit ledger signing key ready"
+                    );
+                    // Register the public half so `vortex audit verify`
+                    // can validate historical entries even after the
+                    // key rotates. Same upsert path for both backends —
+                    // the public key source is abstracted by the
+                    // SigningKey trait.
+                    let key_id_owned = key.key_id().to_string();
+                    let public_key = key.public_key();
+                    let algorithm = key.algorithm().to_string();
+                    let storage_for_register = PgAuditStorage::new(pool.clone(), None);
+                    if let Err(e) = storage_for_register
+                        .register_signing_key(
+                            &key_id_owned,
+                            &public_key,
+                            &algorithm,
+                            chrono::Utc::now(),
+                        )
+                        .await
+                    {
+                        warn!("audit_signing_keys upsert failed: {e}");
+                    }
+                    Some(key)
                 }
-                Some(Arc::new(key))
+                Err(e) => {
+                    warn!(
+                        backend = backend_config.backend_name(),
+                        error = %e,
+                        "Signing backend failed to open; falling back to unsigned \
+                         chain. Set VORTEX_AUDIT_SIGNING_MODE=disabled to silence \
+                         this warning in dev, or fix the backend configuration in \
+                         vortex.toml before a regulated deployment."
+                    );
+                    None
+                }
             }
-            Err(e) => {
-                warn!(
-                    "VORTEX_AUDIT_SIGNING_KEY not usable ({e}); falling \
-                     back to unsigned chain. Set VORTEX_AUDIT_SIGNING_MODE=disabled \
-                     to silence this warning in dev."
-                );
-                None
-            }
-        },
+        }
         SigningMode::Disabled => {
             warn!("Audit ledger signing DISABLED via VORTEX_AUDIT_SIGNING_MODE — dev only");
             None
         }
     };
 
-    let audit_storage = Arc::new(PgAuditStorage::new(pool.clone(), signer));
+    // ─── Pool Manager ─────────────────────────────────────────────────
+    // Constructed before the audit storage so the multi-DB pool manager
+    // can be passed to PgAuditStorage for per-tenant audit scoping.
+    let pool_manager = if multi_db_enabled {
+        let config = PoolManagerConfig {
+            base_url: base_url_from_full(&database_url),
+            ..PoolManagerConfig::default()
+        };
+        let pm = Arc::new(DatabasePoolManager::new(config));
+        // Register the default database pool
+        pm.register_pool(&default_db, pool.clone()).await;
+        pm
+    } else {
+        // Single-database mode — wrap existing pool
+        Arc::new(DatabasePoolManager::single(&default_db, pool.clone()))
+    };
+
+    // ─── WORM Audit Storage ──────────────────────────────────────────
+    // In multi-DB mode, the pool manager is attached so audit entries
+    // with `db_name` set route to the tenant's database. System events
+    // (no db_name) always go to the primary pool.
+    let mut audit_storage = PgAuditStorage::new(pool.clone(), signer);
+    if multi_db_enabled {
+        audit_storage = audit_storage.with_pool_manager(pool_manager.clone());
+        info!("Audit ledger: multi-DB scoping enabled — tenant events route to tenant databases");
+    }
+    let audit_storage = Arc::new(audit_storage);
     let audit = Arc::new(AuditLog::new(audit_storage).with_alert_handler(|entry| {
         error!(
             action = ?entry.action,
@@ -449,9 +577,6 @@ pub async fn run(host: String, port: u16, _workers: Option<usize>) -> Result<()>
         }
         Err(e) => {
             error!("Policy engine failed to load: {e}. Running in deny-all mode.");
-            // Fall back to an empty policy set — Cedar's default-deny
-            // semantics mean every check returns Deny, which is the
-            // safest failure mode for a compliance-sensitive system.
             Arc::new(
                 PolicyService::load(Arc::new(vortex_policy::store::PgPolicyStore::new(
                     db.clone(),
@@ -462,21 +587,6 @@ pub async fn run(host: String, port: u16, _workers: Option<usize>) -> Result<()>
                 ))),
             )
         }
-    };
-
-    // Create pool manager
-    let pool_manager = if multi_db_enabled {
-        let config = PoolManagerConfig {
-            base_url: base_url_from_full(&database_url),
-            ..PoolManagerConfig::default()
-        };
-        let pm = Arc::new(DatabasePoolManager::new(config));
-        // Register the default database pool
-        pm.register_pool(&default_db, pool.clone()).await;
-        pm
-    } else {
-        // Single-database mode — wrap existing pool
-        Arc::new(DatabasePoolManager::single(&default_db, pool.clone()))
     };
 
     // Set up master database if multi-db enabled
@@ -576,7 +686,16 @@ pub async fn run(host: String, port: u16, _workers: Option<usize>) -> Result<()>
     // modules whose handlers still live in this host binary (today,
     // only Contacts). They are unconditional because the handlers
     // themselves are unconditional; they carry no dep weight.
-    plugin_registry.register(Arc::new(crate::commands::builtins::ContactsBuiltinPlugin));
+    // Contacts plugin — replaces the old ContactsBuiltinPlugin with
+    // a real plugin crate that exercises every core primitive
+    // (migrations, sequences, translations, scheduled actions,
+    // reports, audit logging).
+    plugin_registry.register(Arc::new(vortex_contacts::ContactsPlugin::new()));
+    // SystemBuiltinPlugin carries host-wide scheduled actions (today:
+    // the nightly WORM chain verification self-attestation). No
+    // routes, no menu entries — it exists purely to feed the
+    // scheduler via the standard plugin contribution path.
+    plugin_registry.register(Arc::new(crate::commands::builtins::SystemBuiltinPlugin));
     #[cfg(feature = "eam")]
     plugin_registry.register(Arc::new(vortex_eam::EamPlugin::new()));
     #[cfg(feature = "cr")]
@@ -620,6 +739,78 @@ pub async fn run(host: String, port: u16, _workers: Option<usize>) -> Result<()>
     // state so a plugin that was already marked `installed` stays so.
     crate::commands::module_sync::sync_plugins_best_effort(&db, &plugin_registry).await;
 
+    // ─── Scheduler (Phase 0.7) ────────────────────────────────────────
+    // Collect every plugin's scheduled actions, build the scheduler's
+    // handler map, and upsert definitions into `scheduled_actions`. The
+    // supervisor task is spawned further down, after `state` exists,
+    // because handlers are invoked with `Arc<AppState>`.
+    let mut all_scheduled_actions = Vec::new();
+    for plugin in plugin_registry.plugins_iter() {
+        let actions = plugin.scheduled_actions();
+        if !actions.is_empty() {
+            info!(
+                plugin = plugin.technical_name(),
+                count = actions.len() as i64,
+                "registering scheduled actions from plugin"
+            );
+            all_scheduled_actions.extend(actions);
+        }
+    }
+    let scheduler = Arc::new(vortex_framework::scheduler::Scheduler::new(
+        all_scheduled_actions,
+    ));
+    if let Err(e) = scheduler.sync_definitions(&db).await {
+        warn!(error = %e, "failed to sync scheduled action definitions");
+    }
+
+    // ─── Report registry (Phase 0.7) ──────────────────────────────────
+    // Collect every plugin's report definitions into a single
+    // `ReportRegistry`. The generic HTTP route `/reports/:code` is
+    // merged into the protected router below and dispatches by code
+    // through this registry; direct consumers call
+    // `vortex_framework::reports::render_report(state, code, params)`.
+    let mut all_reports = Vec::new();
+    for plugin in plugin_registry.plugins_iter() {
+        let reports = plugin.reports();
+        if !reports.is_empty() {
+            info!(
+                plugin = plugin.technical_name(),
+                count = reports.len() as i64,
+                "registering reports from plugin"
+            );
+            all_reports.extend(reports);
+        }
+    }
+    let reports = Arc::new(vortex_framework::reports::ReportRegistry::new(all_reports));
+
+    // ─── i18n / Translations (Phase 0.7) ──────────────────────────────
+    // Collect plugin-contributed translations, sync to DB, then build
+    // the in-memory TranslationService. Plugin translations are upserted
+    // (so code-shipped defaults can be overridden by an admin via SQL),
+    // then the full table is loaded into the cache for fast t() lookups.
+    let mut all_translations = Vec::new();
+    for plugin in plugin_registry.plugins_iter() {
+        let translations = plugin.translations();
+        if !translations.is_empty() {
+            info!(
+                plugin = plugin.technical_name(),
+                count = translations.len() as i64,
+                "registering translations from plugin"
+            );
+            all_translations.extend(translations);
+        }
+    }
+    if let Err(e) = vortex_framework::i18n::sync_translations(&db, &all_translations).await {
+        warn!(error = %e, "failed to sync plugin translations to DB");
+    }
+    let i18n = match vortex_framework::i18n::TranslationService::load(&db).await {
+        Ok(svc) => Arc::new(svc),
+        Err(e) => {
+            warn!(error = %e, "failed to load translations — using empty cache");
+            Arc::new(vortex_framework::i18n::TranslationService::empty())
+        }
+    };
+
     // Create app state
     let state = Arc::new(AppState {
         db,
@@ -635,7 +826,16 @@ pub async fn run(host: String, port: u16, _workers: Option<usize>) -> Result<()>
         policy,
         workflow,
         plugin_registry: plugin_registry.clone(),
+        scheduler: scheduler.clone(),
+        reports: reports.clone(),
+        i18n,
     });
+
+    // Spawn the scheduler supervisor now that AppState exists.
+    // `start` takes `&self` and internally `tokio::spawn`s the
+    // supervisor loop, so it returns immediately. The supervisor
+    // holds its own `Arc<AppState>` and runs until process shutdown.
+    scheduler.start(state.clone());
 
     // Run each plugin's async startup hook. Failures are logged but do
     // not abort server startup — a single broken plugin should not take
@@ -687,23 +887,16 @@ pub async fn run(host: String, port: u16, _workers: Option<usize>) -> Result<()>
 
 /// Build the application router
 fn build_router(state: Arc<AppState>) -> Router {
-    // --- Contacts routes (gated by "contacts" module) ---
-    let contacts_routes = Router::new()
-        .route("/contacts", get(contacts_list))
-        .route("/contacts/new", get(contacts_new))
-        .route("/contacts", post(contacts_create))
-        .route("/contacts/{id}", get(contacts_edit))
-        .route("/contacts/{id}", post(contacts_update))
-        .route("/contacts/{id}/delete", post(contacts_delete))
-        .route("/contacts/{id}/approve", post(contacts_approve))
-        .route("/contacts/{id}/set-draft", post(contacts_set_draft))
-        .route_layer(middleware::from_fn_with_state(state.clone(), contacts_module_guard));
+    // Contacts routes are now contributed by the vortex-contacts plugin
+    // via Plugin::routes(). The old inline handlers below are kept for
+    // reference but no longer mounted. TODO: delete them once the plugin
+    // is fully verified.
 
     // --- Core routes (always available) ---
     let protected_routes = Router::new()
         .route("/home", get(home_page))
         .route("/dashboard", get(dashboard_page))
-        .route("/auth/logout", post(logout))
+        .route("/auth/logout", post(logout).get(logout))
         .route("/partials/recent-activity", get(recent_activity))
         .route("/partials/system-status", get(system_status))
         // Home partials
@@ -814,8 +1007,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/notifications", get(api_notifications))
         .route("/api/countries", get(api_countries))
         .route("/api/states/{country_id}", get(api_states))
-        // Merge legacy module-gated route groups
-        .merge(contacts_routes);
+        ;
 
     // ─── Plugin-contributed routes (Phase 0.3) ────────────────────
     // Every registered plugin contributes a Router fragment via
@@ -828,6 +1020,14 @@ fn build_router(state: Arc<AppState>) -> Router {
             protected_routes = protected_routes.nest_service(&prefix, router);
         }
     }
+    // ─── Reports endpoint (Phase 0.7) ─────────────────────────────
+    // The generic `/reports/:code` route dispatches by code through
+    // the central `ReportRegistry` and handles format negotiation,
+    // audit logging, and response assembly. Plugins do not need to
+    // register their own report routes — declaring a `ReportDef` in
+    // `Plugin::reports()` is enough.
+    let protected_routes =
+        protected_routes.merge(vortex_framework::reports::reports_routes());
     let protected_routes = protected_routes
         // Auth middleware wraps everything
         .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
@@ -1050,17 +1250,17 @@ async fn login_submit(
 
                 // Log successful login through the WORM ledger.
                 //
-                // Multi-DB note: `state.audit` is bound to the primary
-                // database's pool. In multi-DB deployments, login events
-                // for non-primary tenants currently land in the primary
-                // audit_log. Per-tenant audit ledgers are a Phase 0.2
-                // follow-up — see /root/.claude/plans/shiny-fluttering-reef.md.
+                // Multi-DB: `.with_database(&db_name)` routes the audit
+                // entry to the tenant's database so each tenant's audit
+                // chain is self-contained. In single-DB mode, db_name
+                // matches the primary and the write goes there anyway.
                 let audit_entry = AuditEntry::new(
                     AuditAction::LoginSuccess,
                     AuditSeverity::Info,
                 )
                 .with_user(vortex_common::UserId(user.id))
                 .with_username(&user.username)
+                .with_database(&db_name)
                 .with_resource("session", user.id.to_string())
                 .with_details(serde_json::json!({
                     "database": db_name,
@@ -1236,14 +1436,20 @@ async fn logout(
 
     info!("User {} logged out", user.username);
 
-    // Clear the cookie and redirect
+    // Clear the cookie and redirect to login.
+    // Use a real HTTP 302 redirect so it works both from HTMX
+    // (sidebar logout button) and from a direct browser hit
+    // (typing /auth/logout in the address bar).
     let mut headers = HeaderMap::new();
     headers.insert(
         header::SET_COOKIE,
         "session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0".parse().unwrap(),
     );
+    headers.insert(header::LOCATION, "/login".parse().unwrap());
+    // Also send HX-Redirect so HTMX callers do a full-page
+    // navigation instead of trying to swap into the current page.
     headers.insert("HX-Redirect", "/login".parse().unwrap());
-    (StatusCode::OK, headers).into_response()
+    (StatusCode::FOUND, headers).into_response()
 }
 
 async fn home_page(
@@ -1257,11 +1463,11 @@ async fn home_page(
     let installed = db_ctx.installed_modules.clone();
     let sidebar = build_sidebar("home", display_name, &initials, &installed, user.is_admin(), &state.plugin_registry, &user.roles);
 
-    // Build condensed module links for the "Modules" section
+    // Build condensed module links for the "Modules" section.
+    // Contacts is now contributed by the plugin registry (below),
+    // not hardcoded — removing the old inline link prevents the
+    // duplicate entry.
     let mut module_links = String::new();
-    if installed.contains("contacts") {
-        module_links.push_str(r#"<a href="/contacts" class="btn btn-ghost btn-sm justify-start gap-2"><svg class="w-4 h-4 text-success" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0z"/></svg>Contacts</a>"#);
-    }
     // Plugin-contributed home tiles. The registry filters by install
     // state + role and returns menu entries; we render the top-level
     // Operations-group entries as home screen quick links.
@@ -2356,9 +2562,8 @@ async fn shortcuts_available(
     items.push(serde_json::json!({"label": "Settings", "url": "/settings", "icon": "settings", "color": "neutral"}));
     items.push(serde_json::json!({"label": "Modules", "url": "/modules", "icon": "package", "color": "accent"}));
 
-    if installed.contains("contacts") {
-        items.push(serde_json::json!({"label": "Contacts", "url": "/contacts", "icon": "contact", "color": "primary"}));
-    }
+    // Contacts is now contributed by the plugin registry (below),
+    // not hardcoded — removing the old inline entry prevents duplicates.
 
     // Plugin-contributed shortcut candidates. The registry aggregates
     // Operations-group menu entries from every installed plugin and we
@@ -4319,7 +4524,7 @@ async fn generic_list_view(
 ) -> Response {
     // Fetch model metadata
     let model_row = match sqlx::query(
-        "SELECT id, display_name, table_name FROM ir_model WHERE name = $1 AND is_active = true"
+        "SELECT id, display_name, table_name, list_url FROM ir_model WHERE name = $1 AND is_active = true"
     )
     .bind(&model_name)
     .fetch_optional(&db)
@@ -4327,6 +4532,15 @@ async fn generic_list_view(
         Ok(Some(row)) => row,
         _ => return (StatusCode::NOT_FOUND, Html("Model not found")).into_response(),
     };
+
+    // If a plugin has claimed a canonical list URL for this model (e.g.
+    // the contacts plugin owns `/contacts`), defer to it. Keeps one source
+    // of truth per model instead of competing list implementations.
+    if let Ok(Some(custom_url)) = model_row.try_get::<Option<String>, _>("list_url") {
+        if !custom_url.is_empty() {
+            return Redirect::to(&custom_url).into_response();
+        }
+    }
 
     let model_id: uuid::Uuid = model_row.get("id");
     let model_display_name: String = model_row.get("display_name");
@@ -5453,7 +5667,7 @@ async fn generic_pivot_view(
 ) -> Response {
     // Fetch model metadata
     let model_row = match sqlx::query(
-        "SELECT id, display_name, table_name FROM ir_model WHERE name = $1 AND is_active = true"
+        "SELECT id, display_name, table_name, list_url FROM ir_model WHERE name = $1 AND is_active = true"
     )
     .bind(&model_name)
     .fetch_optional(&db)
@@ -5465,6 +5679,13 @@ async fn generic_pivot_view(
     let model_id: uuid::Uuid = model_row.get("id");
     let model_display_name: String = model_row.get("display_name");
     let table_name: String = model_row.get("table_name");
+    // Canonical list URL (plugin-provided when present, generic /list/{model} otherwise)
+    let list_view_url: String = model_row
+        .try_get::<Option<String>, _>("list_url")
+        .ok()
+        .flatten()
+        .filter(|u| !u.is_empty())
+        .unwrap_or_else(|| format!("/list/{}", model_name));
 
     // Fetch available fields for pivot configuration
     let fields = sqlx::query(
@@ -5488,17 +5709,25 @@ async fn generic_pivot_view(
         field_info.insert(name, (field_type, display_name, related_model));
     }
 
-    // Get selected fields from params - support multiple row/col groups (comma-separated)
-    let row_groups_str = params.get("rows").map(|s| s.as_str()).unwrap_or("record_state");
+    // Get selected fields from params - support multiple row/col groups (comma-separated).
+    // Default to empty: the pivot renders with no groups until the user picks one
+    // from the "Add Group" dropdown. Don't assume any specific column exists.
+    let row_groups_str = params.get("rows").map(|s| s.as_str()).unwrap_or("");
     let col_groups_str = params.get("cols").map(|s| s.as_str()).unwrap_or("");
     let measure_field = params.get("measure").map(|s| s.as_str()).unwrap_or("id");
     let measure_type = params.get("agg").map(|s| s.as_str()).unwrap_or("count");
     let expanded_str = params.get("expanded").map(|s| s.as_str()).unwrap_or("");
+    // `expanded=*` means "expand all" — every non-leaf row is rendered expanded.
+    let expand_all = expanded_str == "*";
 
     // Parse row and column groups
     let row_groups: Vec<&str> = row_groups_str.split(',').filter(|s| !s.is_empty()).collect();
     let col_groups: Vec<&str> = col_groups_str.split(',').filter(|s| !s.is_empty()).collect();
-    let expanded_paths: std::collections::HashSet<String> = expanded_str.split(',').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect();
+    let expanded_paths: std::collections::HashSet<String> = if expand_all {
+        std::collections::HashSet::new()
+    } else {
+        expanded_str.split(',').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect()
+    };
 
     // Build groupable field options for the add-group dropdowns
     let mut groupable_fields: Vec<(&str, &str)> = Vec::new();
@@ -5688,6 +5917,7 @@ async fn generic_pivot_view(
         row_subtotals: &std::collections::HashMap<String, std::collections::HashMap<String, f64>>,
         col_paths_sorted: &[Vec<String>],
         expanded_paths: &std::collections::HashSet<String>,
+        expand_all: bool,
         row_groups: &[&str],
         model_name: &str,
         row_groups_str: &str,
@@ -5709,7 +5939,7 @@ async fn generic_pivot_view(
         for child_path in children {
             let is_leaf = depth + 1 >= max_depth;
             let child_key = child_path.join("\x00");
-            let is_expanded = expanded_paths.contains(&child_key);
+            let is_expanded = expand_all || expanded_paths.contains(&child_key);
             let has_children = !is_leaf && all_row_paths.iter().any(|p| p.len() > depth + 1 && p[..depth + 1] == child_path[..]);
 
             // Calculate indent
@@ -5781,6 +6011,7 @@ async fn generic_pivot_view(
                     row_subtotals,
                     col_paths_sorted,
                     expanded_paths,
+                    expand_all,
                     row_groups,
                     model_name,
                     row_groups_str,
@@ -5802,6 +6033,7 @@ async fn generic_pivot_view(
         &row_subtotals,
         &col_paths_sorted,
         &expanded_paths,
+        expand_all,
         &row_groups,
         &model_name,
         row_groups_str,
@@ -5835,7 +6067,7 @@ async fn generic_pivot_view(
         let remaining: Vec<&str> = row_groups.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, g)| *g).collect();
         let remaining_str = remaining.join(",");
         row_group_tags.push_str(&format!(
-            r#"<span class="group-tag"><span class="group-name">{}</span><a href="/pivot/{}?rows={}&cols={}&measure={}&agg={}" class="group-remove" title="Remove">×</a></span>"#,
+            r#"<span class="group-chip"><span>{}</span><a href="/pivot/{}?rows={}&cols={}&measure={}&agg={}" class="group-chip-remove" title="Remove">×</a></span>"#,
             display_name, model_name, remaining_str, col_groups_str, measure_field, measure_type
         ));
     }
@@ -5846,7 +6078,7 @@ async fn generic_pivot_view(
         let remaining: Vec<&str> = col_groups.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, g)| *g).collect();
         let remaining_str = remaining.join(",");
         col_group_tags.push_str(&format!(
-            r#"<span class="group-tag"><span class="group-name">{}</span><a href="/pivot/{}?rows={}&cols={}&measure={}&agg={}" class="group-remove" title="Remove">×</a></span>"#,
+            r#"<span class="group-chip"><span>{}</span><a href="/pivot/{}?rows={}&cols={}&measure={}&agg={}" class="group-chip-remove" title="Remove">×</a></span>"#,
             display_name, model_name, row_groups_str, remaining_str, measure_field, measure_type
         ));
     }
@@ -5892,46 +6124,55 @@ async fn generic_pivot_view(
         .text-muted {{ color: oklch(var(--bc)/0.6); }}
         .user-badge {{ background: #8BC53F; color: #000; font-weight: 600; }}
 
-        /* Pivot table styles */
-        .pivot-table {{ width: 100%; border-collapse: collapse; font-size: 0.9rem; }}
-        .pivot-table th, .pivot-table td {{ padding: 0.5rem 0.75rem; text-align: right; border: 1px solid oklch(var(--b3)); white-space: nowrap; }}
-        .pivot-header {{ background: oklch(var(--b3)); color: #8BC53F; font-weight: 600; text-align: center !important; }}
-        .pivot-row-label {{ text-align: left !important; min-width: 200px; }}
-        .pivot-row-header {{ background: oklch(var(--b1)); font-weight: 500; text-align: left !important; color: oklch(var(--bc)); }}
-        .pivot-cell {{ color: oklch(var(--bc)/0.6); }}
-        .pivot-has-value {{ color: oklch(var(--bc)); background: rgba(139, 197, 63, 0.08); }}
-        .pivot-total {{ background: oklch(var(--b3)) !important; font-weight: 600; color: #8BC53F !important; }}
+        /* Pivot table — Odoo-inspired: compact, bordered, hoverable */
+        .pivot-table {{ width: auto; min-width: 100%; border-collapse: collapse; font-size: 0.85rem; }}
+        .pivot-table th, .pivot-table td {{ padding: 0.35rem 0.75rem; text-align: right; border: 1px solid oklch(var(--b3)); white-space: nowrap; }}
+        .pivot-table tbody tr:hover td {{ background-color: oklch(var(--b2)/0.5); }}
+        .pivot-header {{ background: oklch(var(--b2)); color: oklch(var(--bc)); font-weight: 500; text-align: center !important; position: relative; }}
+        .pivot-header:hover {{ background: oklch(var(--b3)); }}
+        .pivot-row-label {{ text-align: left !important; min-width: 220px; }}
+        .pivot-row-header {{ background: oklch(var(--b1)); font-weight: 400; text-align: left !important; color: oklch(var(--bc)); cursor: pointer; }}
+        .pivot-row-header:hover {{ background: oklch(var(--b2)); }}
+        .pivot-cell {{ color: oklch(var(--bc)/0.6); font-variant-numeric: tabular-nums; }}
+        .pivot-has-value {{ color: oklch(var(--bc)); }}
+        .pivot-total {{ background: oklch(var(--b2)) !important; font-weight: 600; color: oklch(var(--bc)) !important; }}
         .pivot-grand-total {{ background: oklch(var(--b3)) !important; color: oklch(var(--bc)) !important; font-weight: 700; }}
         .pivot-footer td {{ border-top: 2px solid oklch(var(--b3)); }}
 
-        /* Row hierarchy levels */
-        .pivot-row-level0 td {{ font-weight: 600; background: rgba(139, 197, 63, 0.05); }}
-        .pivot-row-level1 td {{ }}
-        .pivot-row-level2 td {{ color: oklch(var(--bc)/0.6); }}
+        /* Row hierarchy levels — subtle depth indicators */
+        .pivot-row-level0 > td.pivot-row-header {{ font-weight: 600; }}
+        .pivot-row-level1 > td.pivot-row-header {{ font-weight: 500; }}
+        .pivot-row-level2 > td.pivot-row-header {{ font-weight: 400; color: oklch(var(--bc)/0.75); }}
 
-        /* Toggle expand/collapse */
-        .pivot-toggle {{ color: #8BC53F; text-decoration: none; font-size: 0.75rem; margin-right: 4px; }}
-        .pivot-toggle:hover {{ color: #a0d050; }}
-        .pivot-toggle-spacer {{ display: inline-block; width: 16px; }}
+        /* Expand/collapse marker */
+        .pivot-toggle {{ color: oklch(var(--bc)/0.6); text-decoration: none; display: inline-block; width: 14px; }}
+        .pivot-toggle:hover {{ color: #8BC53F; }}
+        .pivot-toggle-spacer {{ display: inline-block; width: 14px; }}
 
-        /* Group configuration panel */
-        .config-panel {{ background: oklch(var(--b1)); border: 1px solid oklch(var(--b3)); border-radius: 0.5rem; padding: 1rem; }}
-        .group-section {{ margin-bottom: 0.75rem; }}
-        .group-section-label {{ font-size: 0.75rem; color: oklch(var(--bc)/0.6); margin-bottom: 0.25rem; }}
-        .group-tags {{ display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; }}
-        .group-tag {{ display: inline-flex; align-items: center; background: oklch(var(--b3)); border-radius: 4px; padding: 0.25rem 0.5rem; font-size: 0.8rem; }}
-        .group-name {{ color: oklch(var(--bc)); }}
-        .group-remove {{ color: #ff6b6b; margin-left: 0.5rem; text-decoration: none; font-weight: bold; }}
-        .group-remove:hover {{ color: #ff4444; }}
-        .add-group-btn {{ background: transparent; border: 1px dashed oklch(var(--b3)); border-radius: 4px; padding: 0.25rem 0.5rem; color: #8BC53F; font-size: 0.8rem; cursor: pointer; }}
-        .add-group-btn:hover {{ border-color: #8BC53F; background: rgba(139, 197, 63, 0.1); }}
+        /* Compact toolbar */
+        .pivot-toolbar {{ display: flex; flex-wrap: wrap; align-items: center; gap: 0.25rem; padding: 0.35rem 0.5rem; background: oklch(var(--b1)); border: 1px solid oklch(var(--b3)); border-radius: 0.5rem; margin-bottom: 1rem; }}
+        .pivot-toolbar-group {{ display: flex; gap: 0.25rem; align-items: center; padding: 0 0.5rem; }}
+        .pivot-toolbar-group + .pivot-toolbar-group {{ border-left: 1px solid oklch(var(--b3)); }}
+        .pivot-toolbar label {{ font-size: 0.75rem; color: oklch(var(--bc)/0.6); margin-right: 0.25rem; }}
+        .pivot-toolbar select {{ background: transparent; border: 1px solid oklch(var(--b3)); border-radius: 0.25rem; padding: 0.2rem 0.4rem; font-size: 0.8rem; color: oklch(var(--bc)); }}
+        .pivot-toolbar-btn {{ display: inline-flex; align-items: center; gap: 0.25rem; background: transparent; border: 1px solid oklch(var(--b3)); border-radius: 0.25rem; padding: 0.3rem 0.5rem; font-size: 0.8rem; color: oklch(var(--bc)); cursor: pointer; text-decoration: none; }}
+        .pivot-toolbar-btn:hover {{ background: oklch(var(--b2)); border-color: #8BC53F; color: #8BC53F; }}
 
-        .measure-section {{ display: flex; gap: 1rem; align-items: end; flex-wrap: wrap; }}
+        /* Active group chips + add-group trigger */
+        .pivot-groups-row {{ display: flex; flex-wrap: wrap; gap: 0.75rem; margin-bottom: 0.75rem; font-size: 0.8rem; }}
+        .pivot-groups-axis {{ display: inline-flex; align-items: center; gap: 0.25rem; flex-wrap: wrap; }}
+        .pivot-groups-axis-label {{ color: oklch(var(--bc)/0.6); font-weight: 500; margin-right: 0.25rem; }}
+        .group-chip {{ display: inline-flex; align-items: center; gap: 0.35rem; background: oklch(var(--b1)); border: 1px solid oklch(var(--b3)); border-radius: 999px; padding: 0.15rem 0.6rem; color: oklch(var(--bc)); }}
+        .group-chip-remove {{ color: oklch(var(--bc)/0.5); text-decoration: none; }}
+        .group-chip-remove:hover {{ color: #ff6b6b; }}
+        .add-group-select {{ background: transparent; border: 1px dashed oklch(var(--b3)); border-radius: 999px; padding: 0.15rem 0.5rem; color: oklch(var(--bc)/0.6); font-size: 0.75rem; cursor: pointer; }}
+        .add-group-select:hover {{ border-color: #8BC53F; color: #8BC53F; }}
 
         @media (max-width: 768px) {{
             .sidebar {{ display: none; }}
             .pivot-table {{ font-size: 0.75rem; }}
-            .pivot-table th, .pivot-table td {{ padding: 0.35rem 0.5rem; }}
+            .pivot-table th, .pivot-table td {{ padding: 0.3rem 0.45rem; }}
+            .pivot-row-label {{ min-width: 140px; }}
         }}
     </style>
 </head>
@@ -5961,7 +6202,7 @@ async fn generic_pivot_view(
             </div>
             <div class="flex gap-2 flex-wrap">
                 <div class="btn-group">
-                    <a href="/list/{}" class="btn btn-sm" title="List View">
+                    <a href="{}" class="btn btn-sm" title="List View">
                         <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 10h16M4 14h16M4 18h16"/></svg>
                     </a>
                     <a href="/kanban/{}" class="btn btn-sm" title="Kanban View">
@@ -5978,45 +6219,54 @@ async fn generic_pivot_view(
             </div>
         </div>
 
-        <!-- Pivot Configuration -->
-        <div class="config-panel mb-6">
-            <div class="group-section">
-                <div class="group-section-label">Row Groups</div>
-                <div class="group-tags">
+        <!-- Compact toolbar: Measure + Aggregation on the left, actions on the right -->
+        <div class="pivot-toolbar">
+            <div class="pivot-toolbar-group">
+                <label>Measure</label>
+                <select onchange="window.location='/pivot/{}?rows={}&cols={}&measure='+this.value+'&agg={}'">
                     {}
-                    <select class="add-group-btn" onchange="if(this.value) window.location='/pivot/{}?rows={}'+('{}'?',':'')+this.value+'&cols={}&measure={}&agg={}'">
-                        <option value="">+ Add</option>
-                        {}
-                    </select>
-                </div>
+                </select>
+                <select onchange="window.location='/pivot/{}?rows={}&cols={}&measure={}&agg='+this.value">
+                    <option value="count"{}>Count</option>
+                    <option value="sum"{}>Sum</option>
+                    <option value="avg"{}>Average</option>
+                    <option value="min"{}>Min</option>
+                    <option value="max"{}>Max</option>
+                </select>
             </div>
-            <div class="group-section">
-                <div class="group-section-label">Column Groups</div>
-                <div class="group-tags">
+            <div class="pivot-toolbar-group" style="margin-left:auto">
+                <a class="pivot-toolbar-btn" title="Flip axis (swap rows/columns)" href="/pivot/{}?rows={}&cols={}&measure={}&agg={}">
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7h12m0 0l-4-4m4 4l-4 4m0 6H4m0 0l4 4m-4-4l4-4"/></svg>
+                    Flip
+                </a>
+                <a class="pivot-toolbar-btn" title="Expand all groups" href="/pivot/{}?rows={}&cols={}&measure={}&agg={}&expanded=*">
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 8V4m0 0h4M4 4l5 5m11-5h-4m4 0v4m0-4l-5 5M4 16v4m0 0h4m-4 0l5-5m11 5l-5-5m5 5v-4m0 4h-4"/></svg>
+                    Expand all
+                </a>
+                <a class="pivot-toolbar-btn" title="Collapse all groups" href="/pivot/{}?rows={}&cols={}&measure={}&agg={}">
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 9V5m0 0H5m4 0L4 10m11-1h4m0 0V5m0 4l5-5M9 15v4m0 0H5m4 0l-5-5m11 1h4m0 0v4m0-4l5 5"/></svg>
+                    Collapse
+                </a>
+            </div>
+        </div>
+
+        <!-- Active group chips -->
+        <div class="pivot-groups-row">
+            <div class="pivot-groups-axis">
+                <span class="pivot-groups-axis-label">Rows</span>
+                {}
+                <select class="add-group-select" onchange="if(this.value) window.location='/pivot/{}?rows={}'+('{}'?',':'')+this.value+'&cols={}&measure={}&agg={}'">
+                    <option value="">+ add field</option>
                     {}
-                    <select class="add-group-btn" onchange="if(this.value) window.location='/pivot/{}?rows={}&cols={}'+('{}'?',':'')+this.value+'&measure={}&agg={}'">
-                        <option value="">+ Add</option>
-                        {}
-                    </select>
-                </div>
+                </select>
             </div>
-            <div class="measure-section mt-4">
-                <div class="form-control">
-                    <label class="label py-0"><span class="label-text text-xs text-muted">Measure</span></label>
-                    <select class="select select-bordered select-sm bg-transparent" onchange="window.location='/pivot/{}?rows={}&cols={}&measure='+this.value+'&agg={}'">
-                        {}
-                    </select>
-                </div>
-                <div class="form-control">
-                    <label class="label py-0"><span class="label-text text-xs text-muted">Aggregation</span></label>
-                    <select class="select select-bordered select-sm bg-transparent" onchange="window.location='/pivot/{}?rows={}&cols={}&measure={}&agg='+this.value">
-                        <option value="count"{}>Count</option>
-                        <option value="sum"{}>Sum</option>
-                        <option value="avg"{}>Average</option>
-                        <option value="min"{}>Min</option>
-                        <option value="max"{}>Max</option>
-                    </select>
-                </div>
+            <div class="pivot-groups-axis">
+                <span class="pivot-groups-axis-label">Columns</span>
+                {}
+                <select class="add-group-select" onchange="if(this.value) window.location='/pivot/{}?rows={}&cols={}'+('{}'?',':'')+this.value+'&measure={}&agg={}'">
+                    <option value="">+ add field</option>
+                    {}
+                </select>
             </div>
         </div>
 
@@ -6026,10 +6276,6 @@ async fn generic_pivot_view(
                 {}
             </table>
         </div>
-
-        <div class="mt-4 text-muted text-sm">
-            <p>Click ▶ to expand groups. Add multiple row/column groups for nested analysis.</p>
-        </div>
     </main>
 </div>
 </body>
@@ -6038,7 +6284,23 @@ async fn generic_pivot_view(
         user.username,
         sidebar_menu,
         model_display_name,
-        model_name, model_name, model_name, model_name, model_name,
+        &list_view_url, model_name, model_name, model_name, model_name,
+        // Toolbar — measure dropdown
+        model_name, row_groups_str, col_groups_str, measure_type,
+        measure_options,
+        // Toolbar — aggregation dropdown
+        model_name, row_groups_str, col_groups_str, measure_field,
+        if measure_type == "count" { " selected" } else { "" },
+        if measure_type == "sum" { " selected" } else { "" },
+        if measure_type == "avg" { " selected" } else { "" },
+        if measure_type == "min" { " selected" } else { "" },
+        if measure_type == "max" { " selected" } else { "" },
+        // Toolbar — Flip axis (swaps rows/cols)
+        model_name, col_groups_str, row_groups_str, measure_field, measure_type,
+        // Toolbar — Expand all
+        model_name, row_groups_str, col_groups_str, measure_field, measure_type,
+        // Toolbar — Collapse
+        model_name, row_groups_str, col_groups_str, measure_field, measure_type,
         // Row groups section
         row_group_tags,
         model_name, row_groups_str, row_groups_str, col_groups_str, measure_field, measure_type,
@@ -6047,16 +6309,6 @@ async fn generic_pivot_view(
         col_group_tags,
         model_name, row_groups_str, col_groups_str, col_groups_str, measure_field, measure_type,
         available_field_options,
-        // Measure dropdown
-        model_name, row_groups_str, col_groups_str, measure_type,
-        measure_options,
-        // Aggregation dropdown
-        model_name, row_groups_str, col_groups_str, measure_field,
-        if measure_type == "count" { " selected" } else { "" },
-        if measure_type == "sum" { " selected" } else { "" },
-        if measure_type == "avg" { " selected" } else { "" },
-        if measure_type == "min" { " selected" } else { "" },
-        if measure_type == "max" { " selected" } else { "" },
         // Table
         table_html
     )).into_response()

@@ -14,6 +14,8 @@ members = [
     "crates/vortex-cli",
     "crates/vortex-eam",
     "crates/vortex-change",
+    "crates/vortex-contacts",
+    "crates/vortex-plugin-sdk",
 ]
 
 [workspace.package]
@@ -32,8 +34,23 @@ async-trait = "0.1"
 # Database
 # Note: MSSQL support requires sqlx 0.7 or alternative like tiberius
 # The dialect abstraction layer is ready for when MSSQL is enabled
-sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono", "json"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono", "json", "rust_decimal"] }
 deadpool-postgres = "0.14"
+
+# Decimal arithmetic for currency/tax/rate computations in commerce primitives.
+# rust_decimal is the standard choice in the Rust ecosystem and has native
+# sqlx integration via the "rust_decimal" feature enabled above.
+rust_decimal = { version = "1.36", features = ["serde"] }
+rust_decimal_macros = "1.36"
+
+# PKCS#11 v3.0 binding for HSM-backed audit signing. The crate uses
+# libloading to dlopen the PKCS#11 library (.so / .dll) at runtime, so
+# there is no build-time C linking and no runtime dependency on the
+# library unless a Pkcs11SigningKey is actually constructed. Works
+# against SoftHSM2 (dev/CI, not FIPS-validated), YubiHSM 2, Thales
+# Luna, Entrust nShield, Utimaco CryptoServer, and any other PKCS#11
+# v2.40+ device.
+cryptoki = "0.10"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -90,6 +107,8 @@ vortex-chatter = { path = "crates/vortex-chatter" }
 vortex-server = { path = "crates/vortex-server" }
 vortex-eam = { path = "crates/vortex-eam" }
 vortex-change = { path = "crates/vortex-change" }
+vortex-contacts = { path = "crates/vortex-contacts" }
+vortex-plugin-sdk = { path = "crates/vortex-plugin-sdk" }
 
 [profile.release]
 lto = true
