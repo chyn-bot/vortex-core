@@ -1,0 +1,5 @@
+[migration]
+module = "core"
+description = "Generic record_stages table backing dynamic, user-managed status bars"
+reversible = true
+dependencies = []

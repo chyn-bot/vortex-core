@@ -25,6 +25,19 @@ vortex-change = { workspace = true, optional = true }
 # Contacts plugin — always enabled; it's the platform smoke-test
 # vertical and the universal "res.partner" equivalent.
 vortex-contacts = { workspace = true }
+# Inventory plugin — a generic, always-on stock primitive (products,
+# locations, double-entry moves, on-hand) that maintenance and
+# procurement verticals build on.
+vortex-inventory = { workspace = true }
+# Purchasing plugin — composes the inventory primitive (receipts post
+# stock moves). Always enabled.
+vortex-purchase = { workspace = true }
+# Maintenance / CMMS plugin — generic assets, work orders and plans;
+# composes inventory (part consumption) + scheduler. Always enabled.
+vortex-maintenance = { workspace = true }
+# SESB EAM — electrical-utility asset-management vertical. Registered
+# after inventory; owns the eam_* schema. Always enabled.
+vortex-sesb-eam = { workspace = true }
 
 # Async
 tokio = { workspace = true }
@@ -71,3 +84,6 @@ default = ["cr"]
 # with the workflow engine and mounts its /change-requests/* routes.
 # Omit to build a core-only `vortex` binary.
 cr = ["dep:vortex-change"]
+# Enables the headless-Chromium PDF backend for report export (`?format=pdf`).
+# Off by default — build with `--features pdf` and ship a Chromium binary.
+pdf = ["vortex-framework/pdf-chromium"]

@@ -1,0 +1,1 @@
+DROP TABLE IF EXISTS ir_job;

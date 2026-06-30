@@ -1,0 +1,96 @@
+/* Vortex report stylesheet — self-hosted, no CDN, no build step.
+ *
+ * Implements exactly the Tailwind/DaisyUI utility + component classes the
+ * report renderer (`user_reports::render_tabular_html` + `report_print_page`)
+ * emits, plus a curated set of common utilities for template authors. Inlined
+ * into every report/print page so PDF rendering is fully offline and
+ * deterministic (no JS JIT, no network race). Auditable and unminified by
+ * design — see UI philosophy in the root CLAUDE.md.
+ *
+ * Keep this in sync with the classes used by the report renderer. Template
+ * authors who need a utility not listed here should use inline `style="…"`.
+ */
+
+:root {
+  --base-100: #ffffff;
+  --base-200: #f2f2f5;
+  --base-300: #e3e3e8;
+  --content: #1a1a1a;
+  --muted: #6b7280;
+  --primary: #2563eb;
+  --border: #d1d5db;
+}
+
+/* ── Base ─────────────────────────────────────────────────────────── */
+* { box-sizing: border-box; }
+body {
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  color: var(--content);
+  background: var(--base-100);
+  margin: 0;
+  line-height: 1.5;
+}
+
+/* ── Layout / spacing ─────────────────────────────────────────────── */
+.p-2 { padding: .5rem; } .p-4 { padding: 1rem; } .p-8 { padding: 2rem; }
+.mt-1 { margin-top: .25rem; } .mt-2 { margin-top: .5rem; } .mt-4 { margin-top: 1rem; }
+.mb-1 { margin-bottom: .25rem; } .mb-2 { margin-bottom: .5rem; } .mb-3 { margin-bottom: .75rem; } .mb-4 { margin-bottom: 1rem; }
+.fixed { position: fixed; } .top-4 { top: 1rem; } .right-4 { right: 1rem; }
+.flex { display: flex; } .gap-2 { gap: .5rem; } .gap-4 { gap: 1rem; }
+.grid { display: grid; }
+.grid-cols-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.grid-cols-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.w-full { width: 100%; }
+.items-center { align-items: center; }
+.justify-between { justify-content: space-between; }
+
+/* ── Typography ───────────────────────────────────────────────────── */
+.text-xs { font-size: .75rem; } .text-sm { font-size: .875rem; }
+.text-lg { font-size: 1.125rem; } .text-xl { font-size: 1.25rem; } .text-2xl { font-size: 1.5rem; }
+.font-medium { font-weight: 500; } .font-semibold { font-weight: 600; } .font-bold { font-weight: 700; }
+.font-mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.italic { font-style: italic; }
+.text-left { text-align: left; } .text-center { text-align: center; } .text-right { text-align: right; }
+.uppercase { text-transform: uppercase; }
+
+/* ── Colour ───────────────────────────────────────────────────────── */
+.bg-white { background: #ffffff; } .text-black { color: #000000; }
+.bg-base-100 { background: var(--base-100); }
+.bg-base-200 { background: var(--base-200); }
+.text-gray-500 { color: var(--muted); }
+.text-base-content\/80 { color: rgba(26, 26, 26, .8); }
+.opacity-50 { opacity: .5; } .opacity-60 { opacity: .6; }
+
+/* ── Borders ──────────────────────────────────────────────────────── */
+.border { border: 1px solid var(--border); }
+.border-t { border-top: 1px solid var(--border); }
+.border-t-2 { border-top: 2px solid var(--content); }
+.rounded { border-radius: .375rem; }
+
+/* ── Table (DaisyUI .table look) ──────────────────────────────────── */
+table.table { width: 100%; border-collapse: collapse; font-size: .9rem; }
+table.table.table-sm th, table.table.table-sm td { padding: .35rem .6rem; }
+table.table th, table.table td { padding: .5rem .75rem; text-align: left; vertical-align: top; }
+table.table thead th { border-bottom: 2px solid var(--border); font-weight: 600; }
+table.table tbody tr { border-bottom: 1px solid var(--base-300); }
+table.table tfoot td { border-top: 2px solid var(--content); }
+
+/* List/code helpers for template authors */
+code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .85em; }
+ul { margin: .25rem 0; padding-left: 1.25rem; } .list-disc { list-style: disc; }
+
+/* ── Buttons (toolbar only; hidden in print) ──────────────────────── */
+.btn {
+  display: inline-flex; align-items: center; gap: .25rem;
+  padding: .35rem .8rem; border-radius: .375rem; border: 1px solid transparent;
+  font-size: .875rem; font-weight: 600; cursor: pointer; text-decoration: none; line-height: 1;
+}
+.btn-sm { padding: .25rem .6rem; font-size: .8rem; }
+.btn-primary { background: var(--primary); color: #fff; }
+.btn-outline { background: transparent; border-color: var(--border); color: var(--content); }
+
+/* ── Print ────────────────────────────────────────────────────────── */
+@media print {
+  .no-print { display: none !important; }
+  body { print-color-adjust: exact; -webkit-print-color-adjust: exact; }
+}

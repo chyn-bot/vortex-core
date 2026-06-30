@@ -39,3 +39,18 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 rust_decimal = { workspace = true }
 rust_decimal_macros = { workspace = true }
+lettre = { workspace = true }
+reqwest = { workspace = true }
+thiserror = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+
+# Optional PDF backend: headless Chromium over the DevTools Protocol. Gated by
+# the `pdf-chromium` feature so the default build pulls neither the crate nor a
+# browser dependency. Needs a Chromium/Chrome binary at runtime.
+chromiumoxide = { version = "0.7", optional = true, default-features = false, features = ["tokio-runtime"] }
+futures = { version = "0.3", optional = true }
+
+[features]
+default = []
+pdf-chromium = ["dep:chromiumoxide", "dep:futures"]

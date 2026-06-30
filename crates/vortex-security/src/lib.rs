@@ -39,6 +39,7 @@ pub mod access;
 pub mod audit;
 pub mod auth;
 pub mod controller;
+pub mod crypto;
 pub mod csv_loader;
 pub mod domain;
 pub mod password;

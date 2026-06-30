@@ -32,19 +32,37 @@
 //! would add its own binding crate alongside this one and keep
 //! `vortex-module` intact.
 
+pub mod api;
+pub mod approval;
+pub mod audit_trail;
 pub mod auth;
 pub mod i18n;
+pub mod jobs;
 pub mod list;
+pub mod mail;
 pub mod menu;
+pub mod pdf;
 pub mod plugin;
 pub mod registry;
 pub mod reports;
 pub mod scheduler;
 pub mod sidebar;
 pub mod state;
+pub mod status;
+pub mod tracking;
 pub mod ui;
+pub mod user_reports;
+pub mod webhooks;
 
+pub use api::{ResolvedToken, TokenRow};
+pub use webhooks::WebhookEndpoint;
+pub use approval::{ApprovalRequest, ApprovalStep, DecisionOutcome, NewRequest};
+pub use audit_trail::render_audit_trail;
 pub use auth::{AuthUser, Db};
+pub use jobs::{enqueue, JobContext, JobRegistry, JobWorker, NewJob};
+pub use mail::{EmailMessage, MailError, MailSecurity, MailServer};
+pub use status::{Stage, StageAction, StageActions, StageColor, StatusBar};
+pub use tracking::{FieldKind, NewValueSource, Snapshot, TrackedField, Tracker};
 pub use i18n::{
     format_date, locale_from_accept_language, sync_translations, Locale, Translation,
     TranslationService, DEFAULT_LOCALE,

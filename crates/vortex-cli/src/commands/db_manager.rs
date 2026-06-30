@@ -598,11 +598,12 @@ async fn run_migrations_on_pool(db: &PgPool) -> Result<(), String> {
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS vortex_migrations (
-            id SERIAL PRIMARY KEY,
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
             name VARCHAR(255) NOT NULL UNIQUE,
-            module VARCHAR(100),
+            module VARCHAR(255) NOT NULL DEFAULT 'core',
             applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            checksum VARCHAR(64)
+            checksum VARCHAR(64) NOT NULL DEFAULT '',
+            execution_time_ms INTEGER NOT NULL DEFAULT 0
         )
         "#
     )

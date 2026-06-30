@@ -1,0 +1,5 @@
+[migration]
+module = "core"
+description = "Generic multi-step approval workflow (rules, requests, decisions)"
+reversible = true
+dependencies = ["125_stage_actions"]

@@ -1,0 +1,5 @@
+[migration]
+module = "core"
+description = "Lockable stages + role-gated stage transition buttons (record_stage_actions)"
+reversible = true
+dependencies = ["124_record_stages"]

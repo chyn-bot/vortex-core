@@ -53,9 +53,21 @@ pub fn build_sidebar(
     let active = if active_page == "home" { " active" } else { "" };
     nav_html.push_str(&format!(r##"<li><a href="/home" class="{}"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6"/></svg>Home</a></li>"##, active));
 
+    // Approvals inbox — visible to all; the page itself shows only the
+    // requests this user may act on (empty for users who never approve).
+    let active = if active_page == "approvals" { " active" } else { "" };
+    nav_html.push_str(&format!(r##"<li><a href="/approvals" class="{}"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>Approvals</a></li>"##, active));
+
+    // Reports hub — visible to all; the page shows only reports the user may run.
+    let active = if active_page == "reports" { " active" } else { "" };
+    nav_html.push_str(&format!(r##"<li><a href="/reports" class="{}"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 17v-6h13M9 5h13M5 5h.01M5 11h.01M5 17h.01"/></svg>Reports</a></li>"##, active));
+
     if is_admin {
         let active = if active_page == "dashboard" { " active" } else { "" };
         nav_html.push_str(&format!(r##"<li><a href="/dashboard" class="{}"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/></svg>Dashboard</a></li>"##, active));
+
+        let active = if active_page == "audit" { " active" } else { "" };
+        nav_html.push_str(&format!(r##"<li><a href="/audit" class="{}"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01"/></svg>Audit Log</a></li>"##, active));
     }
 
     // NOTE: the legacy hardcoded `if installed.contains("contacts")`
@@ -85,20 +97,40 @@ pub fn build_sidebar(
             r#"<li class="menu-title mt-4"><span>{}</span></li>"#,
             html_escape(&section_title)
         ));
+
+        // A child entry (`parent` set to a sibling's id within the same
+        // section) renders nested under that parent as a collapsible
+        // sub-menu rather than as a top-level item. Index parents →
+        // children first; entries are already priority-sorted so child
+        // order is preserved.
+        let toplevel_ids: HashSet<&str> = entries
+            .iter()
+            .filter(|e| e.parent.is_none())
+            .map(|e| e.id.as_str())
+            .collect();
+        let mut children: std::collections::BTreeMap<&str, Vec<&crate::menu::MenuEntry>> =
+            std::collections::BTreeMap::new();
+        for e in entries {
+            if let Some(p) = e.parent.as_deref() {
+                if toplevel_ids.contains(p) {
+                    children.entry(p).or_default().push(e);
+                }
+            }
+        }
+
         for entry in entries {
-            let active = if entry.id == active_page { " active" } else { "" };
-            let icon_svg = entry
-                .icon
-                .as_deref()
-                .map(icon_svg_path)
-                .unwrap_or_else(|| r#"<circle cx="12" cy="12" r="9" stroke-width="2" fill="none"/>"#.to_string());
-            nav_html.push_str(&format!(
-                r#"<li><a href="{}" class="{}"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">{}</svg>{}</a></li>"#,
-                html_escape(&entry.url),
-                active,
-                icon_svg,
-                html_escape(&entry.label)
-            ));
+            // Children are emitted inside their parent's sub-menu below;
+            // skip them here. An entry whose `parent` doesn't resolve to a
+            // sibling falls through and renders as a normal top-level item.
+            if let Some(p) = entry.parent.as_deref() {
+                if toplevel_ids.contains(p) {
+                    continue;
+                }
+            }
+            match children.get(entry.id.as_str()) {
+                Some(kids) => render_submenu(&mut nav_html, entry, kids, active_page),
+                None => render_leaf(&mut nav_html, entry, active_page),
+            }
         }
     }
 
@@ -137,6 +169,57 @@ fn pretty_section_title(plugin_key: &str, registry: &PluginRegistry) -> String {
     }
 }
 
+/// Render a single navigable leaf `<li><a>` entry, marking it active
+/// when its id matches the current page.
+fn render_leaf(nav: &mut String, entry: &crate::menu::MenuEntry, active_page: &str) {
+    let active = if entry.id == active_page { " active" } else { "" };
+    nav.push_str(&format!(
+        r#"<li><a href="{}" class="{}">{}{}</a></li>"#,
+        html_escape(&entry.url),
+        active,
+        icon_svg_el(entry.icon.as_deref()),
+        html_escape(&entry.label),
+    ));
+}
+
+/// Render a parent entry that owns `kids` as a collapsible DaisyUI
+/// sub-menu (`<details><summary>…</summary><ul>…</ul></details>`). The
+/// branch opens automatically when the parent or any child is the active
+/// page, so a deep link lands with the relevant section expanded.
+fn render_submenu(
+    nav: &mut String,
+    parent: &crate::menu::MenuEntry,
+    kids: &[&crate::menu::MenuEntry],
+    active_page: &str,
+) {
+    let branch_active = parent.id == active_page || kids.iter().any(|k| k.id == active_page);
+    let open = if branch_active { " open" } else { "" };
+    let summary_active = if parent.id == active_page { " active" } else { "" };
+    nav.push_str(&format!(
+        r#"<li><details{}><summary class="{}">{}{}</summary><ul>"#,
+        open,
+        summary_active,
+        icon_svg_el(parent.icon.as_deref()),
+        html_escape(&parent.label),
+    ));
+    for k in kids {
+        render_leaf(nav, k, active_page);
+    }
+    nav.push_str("</ul></details></li>");
+}
+
+/// Wrap an optional icon name in the standard inline `<svg>` element,
+/// falling back to a neutral circle when the name is missing or unknown.
+fn icon_svg_el(icon: Option<&str>) -> String {
+    let body = icon.map(icon_svg_path).unwrap_or_else(
+        || r#"<circle cx="12" cy="12" r="9" stroke-width="2" fill="none"/>"#.to_string(),
+    );
+    format!(
+        r#"<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">{}</svg>"#,
+        body
+    )
+}
+
 /// Map a short icon name to an inline SVG `path` element body. Kept
 /// deliberately small for now; a future phase can externalize this to
 /// a data file or use a proper icon set.
@@ -154,6 +237,7 @@ fn icon_svg_path(name: &str) -> String {
         "chart" => r#"<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/>"#,
         "factory" => r#"<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5M9 7h1m-1 4h1m4-4h1m-1 4h1m-5 10v-5a1 1 0 011-1h2a1 1 0 011 1v5m-4 0h4"/>"#,
         "cog" => r#"<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/>"#,
+        "tag" => r#"<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2 7l5-5h7a2 2 0 012 2v7l-5 5-9-9z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6.5 6.5h.01"/>"#,
         _ => r#"<circle cx="12" cy="12" r="9" stroke-width="2" fill="none"/>"#,
     };
     path.to_string()
@@ -217,5 +301,63 @@ mod tests {
         let r = PluginRegistry::new();
         let html = build_sidebar("home", "Alice", "AL", &HashSet::new(), false, &r, &[]);
         assert!(html.contains(r#"href="/home""#));
+    }
+
+    struct NestedPlugin;
+    #[async_trait::async_trait]
+    impl Plugin for NestedPlugin {
+        fn technical_name(&self) -> &'static str {
+            "inventory"
+        }
+        fn display_name(&self) -> &'static str {
+            "Inventory"
+        }
+        fn version(&self) -> &'static str {
+            "0.1.0"
+        }
+        fn routes(&self) -> Router<Arc<crate::AppState>> {
+            Router::new()
+        }
+        fn menu_entries(&self) -> Vec<MenuEntry> {
+            vec![
+                MenuEntry::new("inventory.config", "Configuration", "#", MenuGroup::Operations)
+                    .with_priority(90),
+                MenuEntry::new(
+                    "inventory.categories",
+                    "Product Categories",
+                    "/inventory/categories",
+                    MenuGroup::Operations,
+                )
+                .with_priority(91)
+                .under("inventory.config"),
+            ]
+        }
+    }
+
+    #[test]
+    fn sidebar_nests_child_in_collapsible_submenu() {
+        let mut r = PluginRegistry::new();
+        r.register(Arc::new(NestedPlugin));
+        let installed: HashSet<String> = ["inventory".to_string()].into_iter().collect();
+        let html = build_sidebar("home", "Alice", "AL", &installed, true, &r, &[]);
+        // Parent rendered as a <details> submenu, child link nested inside it.
+        assert!(html.contains("<details"));
+        assert!(html.contains("<summary"));
+        let det = html.find("<details").expect("submenu present");
+        let child = html.find("/inventory/categories").expect("child link present");
+        assert!(child > det, "child must render inside the parent submenu");
+    }
+
+    #[test]
+    fn sidebar_opens_submenu_when_descendant_active() {
+        let mut r = PluginRegistry::new();
+        r.register(Arc::new(NestedPlugin));
+        let installed: HashSet<String> = ["inventory".to_string()].into_iter().collect();
+        // Collapsed when elsewhere…
+        let html = build_sidebar("home", "Alice", "AL", &installed, true, &r, &[]);
+        assert!(!html.contains("<details open"));
+        // …auto-opens when the active page is a child of the submenu.
+        let html = build_sidebar("inventory.categories", "Alice", "AL", &installed, true, &r, &[]);
+        assert!(html.contains("<details open"));
     }
 }

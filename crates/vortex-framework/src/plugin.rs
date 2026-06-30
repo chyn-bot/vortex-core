@@ -112,6 +112,46 @@ pub trait Plugin: Send + Sync {
     /// Semver version string, e.g. "0.1.0".
     fn version(&self) -> &'static str;
 
+    // ─── Catalog metadata (Apps & Modules detail page) ──────────────
+    // All default to a neutral value so existing plugins are unaffected;
+    // authors override to enrich their app's catalog entry.
+
+    /// One-line summary shown in app cards/lists. Default: empty.
+    fn summary(&self) -> &'static str {
+        ""
+    }
+
+    /// Long-form description for the app's detail page. Plain text; the
+    /// host HTML-escapes it. Default: empty.
+    fn description(&self) -> &'static str {
+        ""
+    }
+
+    /// Author / maintainer (person or org). Default: empty.
+    fn author(&self) -> &'static str {
+        ""
+    }
+
+    /// Display category, e.g. "Inventory" or "Operations".
+    /// Default: "Uncategorized".
+    fn category(&self) -> &'static str {
+        "Uncategorized"
+    }
+
+    /// Optional documentation / homepage URL. Default: empty.
+    fn website(&self) -> &'static str {
+        ""
+    }
+
+    /// Technical names of other plugins this one requires. The host uses
+    /// this to (1) order installs so a dependency installs first,
+    /// (2) render the dependency graph on the app detail page, and
+    /// (3) block uninstalling a plugin while installed dependents remain.
+    /// Default: no dependencies.
+    fn dependencies(&self) -> Vec<&'static str> {
+        Vec::new()
+    }
+
     /// Return the plugin's stateful HTTP routes as an axum `Router`
     /// fragment. Handlers in this router receive `Arc<AppState>` via
     /// `State` extraction.

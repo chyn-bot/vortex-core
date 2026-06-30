@@ -6,7 +6,7 @@ use axum::{
     http::{header, request::Parts, HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{Html, IntoResponse, Json, Redirect, Response},
-    routing::{delete, get, post},
+    routing::{delete, get, patch, post},
     Extension, Router,
 };
 use sqlx::{postgres::PgPoolOptions, Column, PgPool, Row};
@@ -25,6 +25,7 @@ use vortex_framework::{
 use vortex_orm::ConnectionPool;
 use vortex_policy::{Decision, PgPolicyStore, PolicyPrincipal, PolicyResource, PolicyService};
 use vortex_security::audit::PgAuditStorage;
+use vortex_security::audit::verify::{verify_chain, VerifyOptions, DEFAULT_CLOCK_SKEW_SECONDS};
 use vortex_security::signing::{
     build_signing_key, Pkcs11Config, SigningBackendConfig, SigningKey, SigningMode,
 };
@@ -219,6 +220,297 @@ fn redirect_to_login_with_message(_message: &str) -> Response {
         "session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0".parse().unwrap(),
     );
     (headers, Redirect::to("/login")).into_response()
+}
+
+// ─── Public REST API (/api/v1) ────────────────────────────────────────────
+// A machine-to-machine surface authenticated by bearer tokens (see
+// `vortex_framework::api`). Unlike the cookie middleware above — which serves
+// browsers and redirects to /login — this path speaks JSON and returns 401.
+// A token authenticates *as a user*, inheriting that user's roles; writes
+// additionally require the token's `write` scope. Every call is audited.
+
+/// Uniform JSON error envelope: `{"error":{"code","message"}}`.
+fn api_error(status: StatusCode, code: &str, message: &str) -> Response {
+    (status, Json(serde_json::json!({"error": {"code": code, "message": message}}))).into_response()
+}
+
+/// Write one audit entry for an API operation, scoped to the tenant database.
+/// `id` is the record UUID for single-record ops, or `None` for collection
+/// events (list views) where `resource_id` (a UUID column) must stay null.
+async fn api_audit(
+    state: &AppState,
+    db_name: &str,
+    user: &AuthUser,
+    action: AuditAction,
+    severity: AuditSeverity,
+    model: &str,
+    id: Option<&str>,
+    details: serde_json::Value,
+) {
+    let mut entry = AuditEntry::new(action, severity)
+        .with_database(db_name)
+        .with_user(vortex_common::UserId(user.id))
+        .with_username(&user.username)
+        .with_resource_name(model)
+        .with_details(details);
+    if let Some(id) = id {
+        entry = entry.with_resource(model, id);
+    }
+    if let Err(e) = state.audit.log(entry).await {
+        error!("API audit write failed: {e}");
+    }
+}
+
+/// Bearer-token auth for `/api/v1/*`. Resolves the token against the tenant
+/// database named by `X-Vortex-Database` (default DB if absent), then injects
+/// the same `AuthUser` / `DatabaseContext` the cookie path does, plus the
+/// `ResolvedToken` for scope checks. Any failure returns a JSON 401/4xx.
+async fn api_auth_middleware(
+    State(state): State<Arc<AppState>>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let secret = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "))
+        .map(|s| s.trim().to_string());
+    let Some(secret) = secret.filter(|s| !s.is_empty()) else {
+        return api_error(
+            StatusCode::UNAUTHORIZED,
+            "missing_bearer",
+            "Provide credentials as 'Authorization: Bearer <token>'.",
+        );
+    };
+
+    // Tenant selection mirrors the login cookie's db|token split.
+    let db_name = request
+        .headers()
+        .get("x-vortex-database")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| state.default_db.clone());
+    if !db_name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return api_error(StatusCode::BAD_REQUEST, "invalid_database", "Invalid X-Vortex-Database header.");
+    }
+
+    let pool = match state.pool_manager.get_pool(&db_name).await {
+        Ok(p) => p,
+        Err(_) => return api_error(StatusCode::SERVICE_UNAVAILABLE, "database_unavailable", "Database unavailable."),
+    };
+    let db = pool.pool();
+
+    let Some(tok) = vortex_framework::api::resolve_token(db, &secret).await else {
+        return api_error(StatusCode::UNAUTHORIZED, "invalid_token", "Invalid, expired, or revoked token.");
+    };
+    vortex_framework::api::touch_last_used(db, tok.token_id).await;
+
+    let installed_modules: HashSet<String> = sqlx::query_scalar(
+        "SELECT technical_name FROM installed_modules WHERE state = 'installed'",
+    )
+    .fetch_all(db)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .collect();
+
+    let auth_user = AuthUser {
+        id: tok.user_id,
+        username: tok.username.clone(),
+        full_name: tok.full_name.clone(),
+        session_id: tok.token_id, // no session row for tokens; trace by token id
+        roles: tok.roles.clone(),
+    };
+    request.extensions_mut().insert(auth_user);
+    request.extensions_mut().insert(tok); // ResolvedToken — scope checks
+    request.extensions_mut().insert(pool.clone());
+    request.extensions_mut().insert(DatabaseContext {
+        db_name,
+        pool,
+        installed_modules,
+    });
+
+    next.run(request).await
+}
+
+/// `GET /api/v1/whoami` — identity, roles, scopes, and active tenant.
+async fn api_whoami(
+    Extension(user): Extension<AuthUser>,
+    Extension(tok): Extension<vortex_framework::api::ResolvedToken>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+) -> Response {
+    Json(serde_json::json!({
+        "user": { "id": user.id, "username": user.username, "full_name": user.full_name },
+        "roles": user.roles,
+        "scopes": tok.scopes,
+        "database": db_ctx.db_name,
+        "token_id": tok.token_id,
+    }))
+    .into_response()
+}
+
+/// `GET /api/v1/models` — the registered models a client may address.
+async fn api_list_models(Db(db): Db) -> Response {
+    Json(serde_json::json!({ "models": vortex_framework::api::list_models(&db).await })).into_response()
+}
+
+/// `GET /api/v1/{model}` — list records. Reserved query keys `limit`/`offset`
+/// page the result; any other key is an equality filter on a registered field.
+async fn api_list_records(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(model): Path<String>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let limit = params.get("limit").and_then(|s| s.parse::<i64>().ok()).unwrap_or(50);
+    let offset = params.get("offset").and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+    let filters: Vec<(String, String)> = params
+        .iter()
+        .filter(|(k, _)| k.as_str() != "limit" && k.as_str() != "offset")
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+
+    match vortex_framework::api::list_records(&db, &model, &filters, limit, offset).await {
+        Ok(page) => {
+            api_audit(
+                &state, &db_ctx.db_name, &user,
+                AuditAction::RecordViewed, AuditSeverity::Info, &model, None,
+                serde_json::json!({"via": "api", "count": page.records.len(), "limit": page.limit, "offset": page.offset}),
+            ).await;
+            Json(serde_json::json!({
+                "model": model, "records": page.records,
+                "limit": page.limit, "offset": page.offset, "count": page.records.len(),
+            })).into_response()
+        }
+        Err(e) => api_error(StatusCode::BAD_REQUEST, "list_failed", &e),
+    }
+}
+
+/// `GET /api/v1/{model}/{id}` — fetch one record.
+async fn api_get_record(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path((model, id)): Path<(String, uuid::Uuid)>,
+) -> Response {
+    match vortex_framework::api::get_record(&db, &model, id).await {
+        Ok(Some(rec)) => {
+            api_audit(
+                &state, &db_ctx.db_name, &user,
+                AuditAction::RecordViewed, AuditSeverity::Info, &model, Some(&id.to_string()),
+                serde_json::json!({"via": "api"}),
+            ).await;
+            Json(rec).into_response()
+        }
+        Ok(None) => api_error(StatusCode::NOT_FOUND, "not_found", "No such record."),
+        Err(e) => api_error(StatusCode::BAD_REQUEST, "get_failed", &e),
+    }
+}
+
+/// Reject the request unless the token carries the `write` scope.
+fn require_write(tok: &vortex_framework::api::ResolvedToken) -> Option<Response> {
+    if tok.can_write() {
+        None
+    } else {
+        Some(api_error(StatusCode::FORBIDDEN, "insufficient_scope", "Token lacks the 'write' scope."))
+    }
+}
+
+/// `POST /api/v1/{model}` — create a record from a JSON body.
+async fn api_create_record(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(tok): Extension<vortex_framework::api::ResolvedToken>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(model): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    if let Some(resp) = require_write(&tok) {
+        return resp;
+    }
+    match vortex_framework::api::create_record(&db, &model, &body).await {
+        Ok(id) => {
+            api_audit(
+                &state, &db_ctx.db_name, &user,
+                AuditAction::RecordCreated, AuditSeverity::Info, &model, Some(&id.to_string()),
+                serde_json::json!({"via": "api"}),
+            ).await;
+            let rec = vortex_framework::api::get_record(&db, &model, id).await.ok().flatten();
+            vortex_framework::webhooks::emit(
+                &state.db, &db, &db_ctx.db_name, "record.created",
+                serde_json::json!({"model": model, "id": id, "record": rec}),
+            ).await;
+            (StatusCode::CREATED, Json(serde_json::json!({"id": id, "record": rec}))).into_response()
+        }
+        Err(e) => api_error(StatusCode::BAD_REQUEST, "create_failed", &e),
+    }
+}
+
+/// `PATCH /api/v1/{model}/{id}` — partial update from a JSON body.
+async fn api_update_record(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(tok): Extension<vortex_framework::api::ResolvedToken>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path((model, id)): Path<(String, uuid::Uuid)>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    if let Some(resp) = require_write(&tok) {
+        return resp;
+    }
+    match vortex_framework::api::update_record(&db, &model, id, &body).await {
+        Ok(true) => {
+            api_audit(
+                &state, &db_ctx.db_name, &user,
+                AuditAction::RecordUpdated, AuditSeverity::Info, &model, Some(&id.to_string()),
+                serde_json::json!({"via": "api"}),
+            ).await;
+            let rec = vortex_framework::api::get_record(&db, &model, id).await.ok().flatten();
+            vortex_framework::webhooks::emit(
+                &state.db, &db, &db_ctx.db_name, "record.updated",
+                serde_json::json!({"model": model, "id": id, "record": rec}),
+            ).await;
+            Json(serde_json::json!({"id": id, "record": rec})).into_response()
+        }
+        Ok(false) => api_error(StatusCode::NOT_FOUND, "not_found", "No such record."),
+        Err(e) => api_error(StatusCode::BAD_REQUEST, "update_failed", &e),
+    }
+}
+
+/// `DELETE /api/v1/{model}/{id}` — remove a record.
+async fn api_delete_record(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(tok): Extension<vortex_framework::api::ResolvedToken>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path((model, id)): Path<(String, uuid::Uuid)>,
+) -> Response {
+    if let Some(resp) = require_write(&tok) {
+        return resp;
+    }
+    match vortex_framework::api::delete_record(&db, &model, id).await {
+        Ok(true) => {
+            api_audit(
+                &state, &db_ctx.db_name, &user,
+                AuditAction::RecordDeleted, AuditSeverity::Warning, &model, Some(&id.to_string()),
+                serde_json::json!({"via": "api"}),
+            ).await;
+            vortex_framework::webhooks::emit(
+                &state.db, &db, &db_ctx.db_name, "record.deleted",
+                serde_json::json!({"model": model, "id": id}),
+            ).await;
+            (StatusCode::NO_CONTENT, ()).into_response()
+        }
+        Ok(false) => api_error(StatusCode::NOT_FOUND, "not_found", "No such record."),
+        Err(e) => api_error(StatusCode::BAD_REQUEST, "delete_failed", &e),
+    }
 }
 
 /// Module guard middleware for the "contacts" module.
@@ -690,6 +982,21 @@ pub async fn run(host: String, port: u16, _workers: Option<usize>) -> Result<()>
     // (migrations, sequences, translations, scheduled actions,
     // reports, audit logging).
     plugin_registry.register(Arc::new(vortex_contacts::ContactsPlugin::new()));
+    // Inventory — a generic, always-on stock primitive (products,
+    // locations, double-entry moves, on-hand) reused by maintenance
+    // and procurement verticals.
+    plugin_registry.register(Arc::new(vortex_inventory::InventoryPlugin::new()));
+    // Purchasing — registered AFTER inventory so its migrations (which FK
+    // into stock_product / stock_location) apply once those tables exist.
+    plugin_registry.register(Arc::new(vortex_purchase::PurchasePlugin::new()));
+    // Maintenance / CMMS — registered after inventory (its migrations FK
+    // into stock_product / stock_location and it consumes parts via
+    // vortex_inventory::post_move).
+    plugin_registry.register(Arc::new(vortex_maintenance::MaintenancePlugin::new()));
+    // SESB EAM — the electrical-utility vertical. Registered AFTER
+    // inventory (later phases consume the stock ledger for spare-part
+    // consumption); owns the eam_* schema and specializes the CMMS base.
+    plugin_registry.register(Arc::new(vortex_sesb_eam::SesbEamPlugin::new()));
     // SystemBuiltinPlugin carries host-wide scheduled actions (today:
     // the nightly WORM chain verification self-attestation). No
     // routes, no menu entries — it exists purely to feed the
@@ -834,6 +1141,15 @@ pub async fn run(host: String, port: u16, _workers: Option<usize>) -> Result<()>
     // holds its own `Arc<AppState>` and runs until process shutdown.
     scheduler.start(state.clone());
 
+    // Spawn the durable job-queue worker (mirrors the scheduler). Registers
+    // the core handlers (mail.send, …); plugins can register their own here.
+    {
+        let mut job_registry = vortex_framework::jobs::JobRegistry::new();
+        vortex_framework::jobs::register_core_handlers(&mut job_registry);
+        vortex_framework::webhooks::register_handler(&mut job_registry);
+        vortex_framework::jobs::JobWorker::new(job_registry).start(state.clone());
+    }
+
     // Run each plugin's async startup hook. Failures are logged but do
     // not abort server startup — a single broken plugin should not take
     // the core down.
@@ -938,6 +1254,8 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/admin/access/fields/{id}", post(access_field_update))
         // Module management
         .route("/modules", get(modules_list))
+        .route("/modules/refresh", post(modules_refresh))
+        .route("/modules/app/{id}", get(modules_detail))
         .route("/modules/{filter}", get(modules_list_with_filter))
         .route("/modules/{id}/install", post(module_install))
         .route("/modules/{id}/uninstall", post(module_uninstall))
@@ -970,6 +1288,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/chatter/attachments/{id}", delete(chatter_delete_attachment))
         // Activity types management
         .route("/settings", get(settings_index))
+        .route("/audit", get(audit_log_page))
         .route("/notifications", get(notifications_page))
         .route("/settings/activity-types", get(activity_types_list))
         .route("/settings/activity-types", post(activity_type_create))
@@ -995,6 +1314,65 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/settings/reports", post(report_create))
         .route("/settings/reports/{id}", get(report_edit))
         .route("/settings/reports/{id}", post(report_update))
+        .route("/settings/reports/{id}/delete", post(report_delete))
+        .route("/settings/reports/{id}/columns", post(report_column_add))
+        .route("/settings/reports/{id}/columns/{cid}/delete", post(report_column_delete))
+        .route("/settings/reports/{id}/filters", post(report_filter_add))
+        .route("/settings/reports/{id}/filters/{fid}/delete", post(report_filter_delete))
+        // User report hub + runner
+        .route("/reports", get(reports_hub))
+        .route("/reports/run/{id}", get(report_run))
+        // Localization master data (countries / states)
+        .route("/settings/countries", get(countries_list))
+        .route("/settings/countries", post(country_create))
+        .route("/settings/countries/{id}", get(country_edit))
+        .route("/settings/countries/{id}", post(country_update))
+        .route("/settings/states", get(states_list))
+        .route("/settings/states", post(state_create))
+        .route("/settings/states/{id}", get(state_edit))
+        .route("/settings/states/{id}", post(state_update))
+        // Stages (user-managed status-bar stages)
+        .route("/settings/stages", get(stages_list))
+        .route("/settings/stages", post(stage_create))
+        .route("/settings/stages/{id}", get(stage_edit))
+        .route("/settings/stages/{id}", post(stage_update))
+        .route("/settings/stages/{id}/delete", post(stage_delete))
+        // Stage buttons (role-gated transitions)
+        .route("/settings/stage-buttons", get(stage_buttons_list))
+        .route("/settings/stage-buttons", post(stage_button_create))
+        .route("/settings/stage-buttons/{id}", get(stage_button_edit))
+        .route("/settings/stage-buttons/{id}", post(stage_button_update))
+        .route("/settings/stage-buttons/{id}/delete", post(stage_button_delete))
+        // Approval rules (steps attached to stage buttons)
+        .route("/settings/approval-rules", get(approval_rules_list))
+        .route("/settings/approval-rules", post(approval_rule_create))
+        .route("/settings/approval-rules/{id}/delete", post(approval_rule_delete))
+        // Email / SMTP servers (per-tenant outbound mail)
+        .route("/settings/email", get(email_servers_list))
+        .route("/settings/email", post(email_server_create))
+        .route("/settings/email/{id}", get(email_server_edit))
+        .route("/settings/email/{id}", post(email_server_update))
+        .route("/settings/email/{id}/delete", post(email_server_delete))
+        .route("/settings/email/{id}/test", post(email_server_test))
+        // Background job queue (durable, admin)
+        .route("/settings/jobs", get(jobs_list))
+        .route("/settings/jobs/{id}/retry", post(job_retry))
+        .route("/settings/jobs/{id}/cancel", post(job_cancel))
+        // API tokens (bearer credentials for the public REST API, admin)
+        .route("/settings/api-tokens", get(api_tokens_list))
+        .route("/settings/api-tokens", post(api_token_create))
+        .route("/settings/api-tokens/{id}/revoke", post(api_token_revoke))
+        // Webhooks (outbound event subscriptions, admin)
+        .route("/settings/webhooks", get(webhooks_list))
+        .route("/settings/webhooks", post(webhook_create))
+        .route("/settings/webhooks/{id}", get(webhook_edit))
+        .route("/settings/webhooks/{id}", post(webhook_update))
+        .route("/settings/webhooks/{id}/delete", post(webhook_delete))
+        .route("/settings/webhooks/{id}/test", post(webhook_test))
+        // Approvals (generic, cross-module inbox + decisions)
+        .route("/approvals", get(approvals_inbox))
+        .route("/approvals/{id}/approve", post(approval_approve))
+        .route("/approvals/{id}/reject", post(approval_reject))
         // Dynamic Form View
         .route("/form/{model}/new", get(dynamic_form_new))
         .route("/form/{model}", post(dynamic_form_create))
@@ -1042,6 +1420,20 @@ fn build_router(state: Arc<AppState>) -> Router {
         .layer(Extension(login_limiter))
         .layer(middleware::from_fn(vortex_server::middleware::rate_limit::rate_limit_middleware));
 
+    // ─── Public REST API (Phase: developer platform) ──────────────
+    // Bearer-token authenticated, JSON in/out, separate from the cookie
+    // tree. Static segments (`whoami`, `models`) take precedence over the
+    // `{model}` parameter in the router, so they are not shadowed.
+    let api_routes = Router::new()
+        .route("/api/v1/whoami", get(api_whoami))
+        .route("/api/v1/models", get(api_list_models))
+        .route("/api/v1/{model}", get(api_list_records).post(api_create_record))
+        .route(
+            "/api/v1/{model}/{id}",
+            get(api_get_record).patch(api_update_record).delete(api_delete_record),
+        )
+        .route_layer(middleware::from_fn_with_state(state.clone(), api_auth_middleware));
+
     // Public routes - no authentication required
     Router::new()
         // Health check
@@ -1062,6 +1454,9 @@ fn build_router(state: Arc<AppState>) -> Router {
 
         // Merge protected routes
         .merge(protected_routes)
+
+        // Merge the bearer-authenticated REST API
+        .merge(api_routes)
 
         // Add state
         .with_state(state)
@@ -1373,7 +1768,7 @@ async fn security_headers_middleware(
     headers.insert("Permissions-Policy", "camera=(), microphone=(), geolocation=()".parse().unwrap());
     headers.insert(
         "Content-Security-Policy",
-        "default-src 'self'; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; script-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com https://cdn.jsdelivr.net https://unpkg.com; connect-src 'self' https://cdn.jsdelivr.net; img-src 'self' data:; font-src 'self' https://cdn.jsdelivr.net".parse().unwrap(),
+        "default-src 'self'; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; script-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com https://cdn.jsdelivr.net https://unpkg.com; connect-src 'self' https://cdn.jsdelivr.net; img-src 'self' data: https://*.tile.openstreetmap.org; font-src 'self' https://cdn.jsdelivr.net".parse().unwrap(),
     );
     response
 }
@@ -3891,6 +4286,11 @@ async fn modules_list_with_filter(
         } else {
             format!(r#"<button class="btn btn-sm btn-primary" onclick="installModule('{}', '{}')"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg>Install</button>"#, tech_name, name)
         };
+        // Prepend a "Details" link to each card's actions.
+        let action_buttons = format!(
+            r#"<a href="/modules/app/{}" class="btn btn-sm btn-ghost">Details</a>{}"#,
+            tech_name, action_buttons
+        );
 
         modules_html.push_str(&format!(r#"
         <div class="card bg-base-100 shadow-md hover:shadow-lg transition-shadow" id="module-{}">
@@ -3989,7 +4389,11 @@ async fn modules_list_with_filter(
                     <h1 class="text-2xl font-bold">Apps & Modules</h1>
                     <p class="text-base-content/60 mt-1">Install and manage application modules</p>
                 </div>
-                <div class="mt-4 md:mt-0">
+                <div class="mt-4 md:mt-0 flex items-center gap-3">
+                    <button onclick="refreshApps()" class="btn btn-outline btn-sm gap-2" title="Scan compiled-in plugins and add any new apps to this database's list">
+                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+                        Update Apps List
+                    </button>
                     <div class="stats shadow bg-base-100">
                         <div class="stat py-2 px-4">
                             <div class="stat-title text-xs">Installed</div>
@@ -4036,6 +4440,24 @@ async fn modules_list_with_filter(
     </dialog>
 
     <script>
+    async function refreshApps() {{
+        showLoading('Updating Apps List', 'Scanning available modules...');
+        try {{
+            const response = await fetch('/modules/refresh', {{ method: 'POST' }});
+            const data = await response.json();
+            hideLoading();
+            if (data.success) {{
+                showResult('Apps List Updated', data.message, 'success');
+                setTimeout(() => location.reload(), 1500);
+            }} else {{
+                showResult('Error', data.error || data.message, 'error');
+            }}
+        }} catch (error) {{
+            hideLoading();
+            showResult('Error', 'Failed to update apps list: ' + error.message, 'error');
+        }}
+    }}
+
     async function installModule(technicalName, displayName) {{
         showLoading('Installing Module', `Installing ${{displayName}}...`);
         try {{
@@ -4118,10 +4540,316 @@ struct ModuleOperationResponse {
     error: Option<String>,
 }
 
+/// Per-app detail page: rich, author-declared metadata (description,
+/// author, category, website), the dependency graph (with each related
+/// module's install state), what the app provides (migrations, menu
+/// entries), and install/uninstall actions. Metadata is read live from
+/// the plugin registry (source of truth); install state from this
+/// tenant's `installed_modules`.
+async fn modules_detail(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(_user): Extension<AuthUser>,
+    Path(id): Path<String>,
+) -> Response {
+    let row = sqlx::query(
+        "SELECT name, version, state, COALESCE(category,'Uncategorized') AS category, \
+         COALESCE(summary,'') AS summary, is_core, application, installed_at \
+         FROM installed_modules WHERE technical_name = $1",
+    )
+    .bind(&id)
+    .fetch_optional(&db)
+    .await
+    .ok()
+    .flatten();
+
+    let plugin = state
+        .plugin_registry
+        .plugins_iter()
+        .find(|p| p.technical_name() == id.as_str())
+        .cloned();
+
+    if row.is_none() && plugin.is_none() {
+        return (StatusCode::NOT_FOUND, "App not found").into_response();
+    }
+
+    // Resolve fields, preferring the live registry over the stored row.
+    let name = plugin
+        .as_ref()
+        .map(|p| p.display_name().to_string())
+        .or_else(|| row.as_ref().map(|r| r.get::<String, _>("name")))
+        .unwrap_or_else(|| id.clone());
+    let version = plugin
+        .as_ref()
+        .map(|p| p.version().to_string())
+        .or_else(|| row.as_ref().map(|r| r.get::<String, _>("version")))
+        .unwrap_or_default();
+    let state_val = row
+        .as_ref()
+        .map(|r| r.get::<String, _>("state"))
+        .unwrap_or_else(|| "uninstalled".to_string());
+    let is_core = row.as_ref().map(|r| r.get::<bool, _>("is_core")).unwrap_or(false);
+    let category = plugin
+        .as_ref()
+        .map(|p| p.category().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| row.as_ref().map(|r| r.get::<String, _>("category")))
+        .unwrap_or_else(|| "Uncategorized".into());
+    let author = plugin.as_ref().map(|p| p.author().to_string()).unwrap_or_default();
+    let website = plugin.as_ref().map(|p| p.website().to_string()).unwrap_or_default();
+    let description = plugin.as_ref().map(|p| p.description().to_string()).unwrap_or_default();
+
+    let deps: Vec<String> = plugin
+        .as_ref()
+        .map(|p| p.dependencies().iter().map(|s| s.to_string()).collect())
+        .unwrap_or_default();
+    let migrations: Vec<String> = plugin
+        .as_ref()
+        .map(|p| p.migrations().iter().map(|m| m.name.to_string()).collect())
+        .unwrap_or_default();
+    let menus: Vec<String> = plugin
+        .as_ref()
+        .map(|p| p.menu_entries().iter().map(|m| m.label.clone()).collect())
+        .unwrap_or_default();
+
+    let mut dependents: Vec<String> = state
+        .plugin_registry
+        .plugins_iter()
+        .filter(|p| p.dependencies().iter().any(|d| *d == id.as_str()))
+        .map(|p| p.technical_name().to_string())
+        .collect();
+    dependents.sort();
+
+    // Dependencies list with each related module's install state.
+    let mut deps_html = String::new();
+    if deps.is_empty() {
+        deps_html.push_str(r#"<li class="text-base-content/50">None</li>"#);
+    } else {
+        for d in &deps {
+            let st: Option<String> =
+                sqlx::query_scalar("SELECT state FROM installed_modules WHERE technical_name = $1")
+                    .bind(d)
+                    .fetch_optional(&db)
+                    .await
+                    .ok()
+                    .flatten();
+            let badge = match st.as_deref() {
+                Some("installed") => r#"<span class="badge badge-success badge-sm">installed</span>"#,
+                None => r#"<span class="badge badge-error badge-sm">not in this database</span>"#,
+                _ => r#"<span class="badge badge-ghost badge-sm">available</span>"#,
+            };
+            deps_html.push_str(&format!(
+                r#"<li class="flex items-center gap-2"><a href="/modules/app/{0}" class="link link-hover font-medium">{1}</a>{2}</li>"#,
+                html_escape(d), html_escape(d), badge
+            ));
+        }
+    }
+
+    // "Required by" (dependents).
+    let dependents_html = if dependents.is_empty() {
+        r#"<li class="text-base-content/50">Nothing depends on this app</li>"#.to_string()
+    } else {
+        dependents
+            .iter()
+            .map(|t| format!(r#"<li><a href="/modules/app/{0}" class="link link-hover">{1}</a></li>"#, html_escape(t), html_escape(t)))
+            .collect::<String>()
+    };
+
+    let list_or_none = |items: &[String]| -> String {
+        if items.is_empty() {
+            r#"<li class="text-base-content/50">None</li>"#.to_string()
+        } else {
+            items.iter().map(|i| format!("<li>{}</li>", html_escape(i))).collect()
+        }
+    };
+    let migrations_html = list_or_none(&migrations);
+    let menus_html = list_or_none(&menus);
+
+    let status_badge = match state_val.as_str() {
+        "installed" => r#"<span class="badge badge-success">Installed</span>"#,
+        _ => r#"<span class="badge badge-ghost">Not installed</span>"#,
+    };
+    let action_btn = if is_core {
+        r#"<span class="text-sm text-base-content/50">Core module — always on</span>"#.to_string()
+    } else if state_val == "installed" {
+        r#"<button class="btn btn-error btn-outline btn-sm" onclick="act('uninstall')">Uninstall</button>"#.to_string()
+    } else {
+        r#"<button class="btn btn-primary btn-sm" onclick="act('install')">Install</button>"#.to_string()
+    };
+    let dep_note = if deps.is_empty() {
+        String::new()
+    } else {
+        format!(
+            r#"<p class="text-xs text-base-content/50 mt-2">Installing this app also installs: {}</p>"#,
+            html_escape(&deps.join(", "))
+        )
+    };
+    let website_html = if website.is_empty() {
+        String::new()
+    } else {
+        format!(r#"<a href="{0}" class="link link-primary" target="_blank" rel="noopener">{0}</a>"#, html_escape(&website))
+    };
+    let desc_html = if description.is_empty() {
+        r#"<p class="text-base-content/50">No description provided.</p>"#.to_string()
+    } else {
+        format!(r#"<p class="leading-relaxed">{}</p>"#, html_escape(&description))
+    };
+
+    let mut page = format!(
+        r#"<!DOCTYPE html><html lang="en" data-theme="dark"><head>
+<script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{name} - Apps & Modules</title>
+<link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet" type="text/css"/>
+<script src="https://cdn.tailwindcss.com"></script></head>
+<body class="min-h-screen bg-base-200"><main class="max-w-4xl mx-auto p-4 lg:p-8">
+<a href="/modules" class="btn btn-ghost btn-sm mb-4 gap-2">← Back to Apps &amp; Modules</a>
+<div class="card bg-base-100 shadow-md mb-4"><div class="card-body">
+<div class="flex items-start justify-between gap-4">
+<div>
+<div class="flex items-center gap-3"><h1 class="text-3xl font-bold">{name}</h1>{status_badge}</div>
+<div class="flex flex-wrap items-center gap-2 text-sm text-base-content/60 mt-2">
+<span class="badge badge-outline">{category}</span><span>v{version}</span>
+<span class="text-base-content/30">|</span><span>{tech}</span></div>
+</div>
+<div class="flex flex-col items-end gap-1">{action_btn}{dep_note}</div>
+</div>
+<div class="divider my-2"></div>
+{desc_html}
+<div class="grid grid-cols-1 md:grid-cols-2 gap-3 mt-4 text-sm">
+<div><span class="text-base-content/50">Author:</span> {author}</div>
+<div><span class="text-base-content/50">Website:</span> {website_html}</div>
+</div>
+</div></div>
+<div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+<div class="card bg-base-100 shadow-md"><div class="card-body">
+<h2 class="card-title text-lg">Dependencies</h2>
+<ul class="menu menu-sm px-0">{deps_html}</ul>
+<h3 class="font-semibold mt-3">Required by</h3>
+<ul class="menu menu-sm px-0">{dependents_html}</ul>
+</div></div>
+<div class="card bg-base-100 shadow-md"><div class="card-body">
+<h2 class="card-title text-lg">Provides</h2>
+<h3 class="font-semibold">Menu entries</h3><ul class="list-disc pl-5">{menus_html}</ul>
+<h3 class="font-semibold mt-3">Migrations</h3><ul class="list-disc pl-5 font-mono text-xs">{migrations_html}</ul>
+</div></div>
+</div>
+</main>"#,
+        name = html_escape(&name),
+        status_badge = status_badge,
+        category = html_escape(&category),
+        version = html_escape(&version),
+        tech = html_escape(&id),
+        action_btn = action_btn,
+        dep_note = dep_note,
+        desc_html = desc_html,
+        author = if author.is_empty() { "<span class=\"text-base-content/50\">—</span>".to_string() } else { html_escape(&author) },
+        website_html = if website_html.is_empty() { "<span class=\"text-base-content/50\">—</span>".to_string() } else { website_html },
+        deps_html = deps_html,
+        dependents_html = dependents_html,
+        menus_html = menus_html,
+        migrations_html = migrations_html,
+    );
+
+    // Action script (raw block: literal braces, no format escaping).
+    page.push_str(&format!(r#"<script>const APP_ID={:?};</script>"#, id));
+    page.push_str(r#"<script>
+async function act(kind){
+  try{
+    const r = await fetch('/modules/'+APP_ID+'/'+kind, {method:'POST'});
+    const d = await r.json();
+    if(d.success){ location.href='/modules'; }
+    else { alert(d.error || d.message || 'Action failed'); }
+  }catch(e){ alert('Request failed: '+e.message); }
+}
+</script></body></html>"#);
+
+    axum::response::Html(page).into_response()
+}
+
+/// Dependency-first install order for `target`, from each plugin's
+/// declared `dependencies()`. A dependency always appears before the
+/// module that needs it; `target` is last. Cycles are broken via `seen`.
+fn resolve_install_order(registry: &PluginRegistry, target: &str) -> Vec<String> {
+    fn visit(
+        registry: &PluginRegistry,
+        name: &str,
+        ordered: &mut Vec<String>,
+        seen: &mut std::collections::HashSet<String>,
+    ) {
+        if !seen.insert(name.to_string()) {
+            return;
+        }
+        if let Some(p) = registry.plugins_iter().find(|p| p.technical_name() == name) {
+            for dep in p.dependencies() {
+                visit(registry, dep, ordered, seen);
+            }
+        }
+        ordered.push(name.to_string());
+    }
+    let mut ordered = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    visit(registry, target, &mut ordered, &mut seen);
+    ordered
+}
+
+/// "Update Apps List" — scan the compiled-in plugin registry and upsert
+/// each plugin into THIS tenant database's `installed_modules` table, so
+/// newly built/shipped modules become visible (and installable) without
+/// a server restart. Mirrors Odoo's "Update Apps List". Admin-only.
+///
+/// Background: the startup sync (`sync_plugins_best_effort`) only runs
+/// against the primary DB, so tenant DBs never see new apps until this
+/// runs against them.
+async fn modules_refresh(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+) -> Response {
+    if !user.is_system_admin() {
+        return axum::Json(ModuleOperationResponse {
+            success: false,
+            message: "Permission denied".to_string(),
+            error: Some("Only system administrators can update the apps list".to_string()),
+        }).into_response();
+    }
+
+    match crate::commands::module_sync::sync_plugins_to_installed_modules(&db, &state.plugin_registry).await {
+        Ok((inserted, updated)) => {
+            let audit = AuditEntry::new(AuditAction::ConfigChanged, AuditSeverity::Info)
+                .with_user(vortex_common::UserId(user.id))
+                .with_username(&user.username)
+                .with_database(&db_ctx.db_name)
+                .with_resource("modules", "apps_list".to_string())
+                .with_details(serde_json::json!({ "inserted": inserted, "updated": updated }));
+            if let Err(e) = state.audit.log(audit).await {
+                error!("audit log for apps-list update failed: {}", e);
+            }
+            axum::Json(ModuleOperationResponse {
+            success: true,
+            message: format!(
+                "Apps list updated — {} new app(s) added, {} refreshed. New apps appear under \"Available\".",
+                inserted, updated
+            ),
+            error: None,
+        })
+        .into_response()
+        }
+        Err(e) => axum::Json(ModuleOperationResponse {
+            success: false,
+            message: "Failed to update apps list".to_string(),
+            error: Some(e.to_string()),
+        })
+        .into_response(),
+    }
+}
+
 async fn module_install(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
     Path(module_id): Path<String>,
 ) -> Response {
     if !user.is_system_admin() {
@@ -4169,42 +4897,92 @@ async fn module_install(
         }).into_response();
     }
 
-    // Update state to installed
-    let result = sqlx::query(
-        "UPDATE installed_modules SET state = 'installed', installed_at = NOW(), updated_at = NOW() WHERE technical_name = $1"
-    )
-    .bind(&module_id)
-    .execute(&db)
-    .await;
-
-    match result {
-        Ok(_) => {
-            // Refresh installed modules cache
-            let new_installed: Vec<String> = sqlx::query_scalar(
-                "SELECT technical_name FROM installed_modules WHERE state = 'installed'"
-            ).fetch_all(&db).await.unwrap_or_default();
-            let mut cache = state.installed_modules.write().await;
-            *cache = new_installed.into_iter().collect();
-            drop(cache);
-
-            axum::Json(ModuleOperationResponse {
-                success: true,
-                message: format!("Module '{}' installed successfully", name),
-                error: None,
-            }).into_response()
+    // Install dependency-first: a plugin's declared dependencies are
+    // provisioned and activated before the plugin itself (e.g. installing
+    // "purchase" auto-pulls "inventory"). Each step provisions the
+    // module's schema in THIS tenant DB, then flips state — previously the
+    // UI only flipped the flag, leaving tenant tables uncreated.
+    let order = resolve_install_order(&state.plugin_registry, &module_id);
+    let mut also_installed: Vec<String> = Vec::new();
+    for tech in &order {
+        let st: Option<String> =
+            sqlx::query_scalar("SELECT state FROM installed_modules WHERE technical_name = $1")
+                .bind(tech)
+                .fetch_optional(&db)
+                .await
+                .ok()
+                .flatten();
+        if st.as_deref() == Some("installed") {
+            continue;
         }
-        Err(e) => axum::Json(ModuleOperationResponse {
-            success: false,
-            message: "Installation failed".to_string(),
-            error: Some(e.to_string()),
-        }).into_response(),
+
+        // Provision schema (no-op for core modules / no migrations).
+        if let Err(e) = crate::commands::db::install_plugin_schema(&db, tech).await {
+            return axum::Json(ModuleOperationResponse {
+                success: false,
+                message: "Installation failed".to_string(),
+                error: Some(format!("Could not apply '{}' schema to this database: {}", tech, e)),
+            }).into_response();
+        }
+
+        if let Err(e) = sqlx::query(
+            "UPDATE installed_modules SET state = 'installed', installed_at = NOW(), updated_at = NOW() WHERE technical_name = $1"
+        )
+        .bind(tech)
+        .execute(&db)
+        .await
+        {
+            return axum::Json(ModuleOperationResponse {
+                success: false,
+                message: "Installation failed".to_string(),
+                error: Some(e.to_string()),
+            }).into_response();
+        }
+
+        if tech != &module_id {
+            also_installed.push(tech.clone());
+        }
     }
+
+    // Refresh installed modules cache.
+    let new_installed: Vec<String> = sqlx::query_scalar(
+        "SELECT technical_name FROM installed_modules WHERE state = 'installed'"
+    ).fetch_all(&db).await.unwrap_or_default();
+    {
+        let mut cache = state.installed_modules.write().await;
+        *cache = new_installed.into_iter().collect();
+    }
+
+    // Audit the install (state-changing admin action). Routed to the
+    // tenant DB so it shows in that tenant's Recent Activity / ledger.
+    let audit = AuditEntry::new(AuditAction::ModuleLoaded, AuditSeverity::Info)
+        .with_user(vortex_common::UserId(user.id))
+        .with_username(&user.username)
+        .with_database(&db_ctx.db_name)
+        .with_resource("module", module_id.clone())
+        .with_resource_name(&name)
+        .with_details(serde_json::json!({ "dependencies_installed": also_installed }));
+    if let Err(e) = state.audit.log(audit).await {
+        error!("audit log for module install failed: {}", e);
+    }
+
+    let message = if also_installed.is_empty() {
+        format!("Module '{}' installed successfully", name)
+    } else {
+        format!(
+            "Module '{}' installed, along with its dependencies: {}",
+            name,
+            also_installed.join(", ")
+        )
+    };
+    axum::Json(ModuleOperationResponse { success: true, message, error: None }).into_response()
 }
 
 async fn module_uninstall(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
     Path(module_id): Path<String>,
 ) -> Response {
     if !user.is_system_admin() {
@@ -4292,6 +5070,16 @@ async fn module_uninstall(
             let mut cache = state.installed_modules.write().await;
             *cache = new_installed.into_iter().collect();
             drop(cache);
+
+            let audit = AuditEntry::new(AuditAction::ModuleUnloaded, AuditSeverity::Warning)
+                .with_user(vortex_common::UserId(user.id))
+                .with_username(&user.username)
+                .with_database(&db_ctx.db_name)
+                .with_resource("module", module_id.clone())
+                .with_resource_name(&name);
+            if let Err(e) = state.audit.log(audit).await {
+                error!("audit log for module uninstall failed: {}", e);
+            }
 
             axum::Json(ModuleOperationResponse {
                 success: true,
@@ -8574,6 +9362,70 @@ async fn settings_index(
             </div>
         </div>
 
+        <!-- Localization Section -->
+        <div class="mb-8">
+            <h2 class="section-title text-lg font-semibold mb-4 flex items-center gap-2">
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3.055 11H5a2 2 0 012 2v1a2 2 0 002 2 2 2 0 012 2v2.945M8 3.935V5.5A2.5 2.5 0 0010.5 8h.5a2 2 0 012 2 2 2 0 104 0 2 2 0 012-2h1.064M15 20.488V18a2 2 0 012-2h3.064M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+                Localization
+            </h2>
+            <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3 md:gap-4">
+                <a href="/settings/countries" class="card transition-all">
+                    <div class="card-body p-4">
+                        <h3 class="card-title text-base md:text-lg">Countries</h3>
+                        <p class="text-muted text-sm">Maintain the country master list</p>
+                    </div>
+                </a>
+                <a href="/settings/states" class="card transition-all">
+                    <div class="card-body p-4">
+                        <h3 class="card-title text-base md:text-lg">States / Provinces</h3>
+                        <p class="text-muted text-sm">Maintain states per country</p>
+                    </div>
+                </a>
+                <a href="/settings/stages" class="card transition-all">
+                    <div class="card-body p-4">
+                        <h3 class="card-title text-base md:text-lg">Stages</h3>
+                        <p class="text-muted text-sm">Status-bar stages per model</p>
+                    </div>
+                </a>
+                <a href="/settings/stage-buttons" class="card transition-all">
+                    <div class="card-body p-4">
+                        <h3 class="card-title text-base md:text-lg">Stage Buttons</h3>
+                        <p class="text-muted text-sm">Role-gated status transition buttons</p>
+                    </div>
+                </a>
+                <a href="/settings/approval-rules" class="card transition-all">
+                    <div class="card-body p-4">
+                        <h3 class="card-title text-base md:text-lg">Approval Rules</h3>
+                        <p class="text-muted text-sm">Multi-step sign-off for stage buttons</p>
+                    </div>
+                </a>
+                <a href="/settings/email" class="card transition-all">
+                    <div class="card-body p-4">
+                        <h3 class="card-title text-base md:text-lg">Email / SMTP</h3>
+                        <p class="text-muted text-sm">Outbound mail servers (Gmail, Office 365, …)</p>
+                    </div>
+                </a>
+                <a href="/settings/jobs" class="card transition-all">
+                    <div class="card-body p-4">
+                        <h3 class="card-title text-base md:text-lg">Background Jobs</h3>
+                        <p class="text-muted text-sm">Durable queue: retries, dead-letter, status</p>
+                    </div>
+                </a>
+                <a href="/settings/api-tokens" class="card transition-all">
+                    <div class="card-body p-4">
+                        <h3 class="card-title text-base md:text-lg">API Tokens</h3>
+                        <p class="text-muted text-sm">Bearer credentials for the public REST API</p>
+                    </div>
+                </a>
+                <a href="/settings/webhooks" class="card transition-all">
+                    <div class="card-body p-4">
+                        <h3 class="card-title text-base md:text-lg">Webhooks</h3>
+                        <p class="text-muted text-sm">Outbound event subscriptions (signed, retried)</p>
+                    </div>
+                </a>
+            </div>
+        </div>
+
         <!-- Technical Section -->
         <div class="mb-8">
             <h2 class="section-title text-lg font-semibold mb-4 flex items-center gap-2">
@@ -8613,6 +9465,347 @@ async fn settings_index(
         user.username
     );
 
+    Html(html).into_response()
+}
+
+// ============================================================================
+// Audit Log viewer — read-only window over the WORM ledger
+//
+// The audit *engine* (append-only, hash-chained, optionally signed) lives in
+// vortex-security. This page is the operator-facing view: filter by user /
+// action / resource / date, page through entries, run an on-demand chain
+// integrity check, and export the filtered set as CSV. Admin-only.
+// ============================================================================
+
+/// CSV-escape a single field (RFC 4180): wrap in quotes, double inner quotes.
+fn csv_field(s: &str) -> String {
+    format!("\"{}\"", s.replace('"', "\"\""))
+}
+
+async fn audit_log_page(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Query(query): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Audit Log"))).into_response();
+    }
+
+    // ── Read filters from the query string ──────────────────────────────
+    let f_user = query.get("user").map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let f_action = query.get("action").map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let f_resource = query.get("resource").map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let f_from = query.get("from").map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let f_to = query.get("to").map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let want_csv = query.get("format").map(|s| s.as_str()) == Some("csv");
+    let do_verify = query.get("verify").map(|s| s.as_str()) == Some("1");
+    let page: i64 = query.get("page").and_then(|s| s.parse().ok()).unwrap_or(0).max(0);
+    const PAGE_SIZE: i64 = 50;
+
+    // ── Build a parameterized WHERE from whichever filters are set ───────
+    // All binds are strings; SQL casts the date filters. Order of `binds`
+    // matches the $1,$2,… placeholders exactly.
+    let mut conds: Vec<String> = Vec::new();
+    let mut binds: Vec<String> = Vec::new();
+    if let Some(u) = &f_user {
+        conds.push(format!("username ILIKE ${}", binds.len() + 1));
+        binds.push(format!("%{}%", u));
+    }
+    if let Some(a) = &f_action {
+        conds.push(format!("action = ${}", binds.len() + 1));
+        binds.push(a.clone());
+    }
+    if let Some(r) = &f_resource {
+        conds.push(format!("resource_type = ${}", binds.len() + 1));
+        binds.push(r.clone());
+    }
+    if let Some(fr) = &f_from {
+        conds.push(format!("timestamp >= ${}::date", binds.len() + 1));
+        binds.push(fr.clone());
+    }
+    if let Some(t) = &f_to {
+        conds.push(format!("timestamp < (${}::date + INTERVAL '1 day')", binds.len() + 1));
+        binds.push(t.clone());
+    }
+    let where_clause = if conds.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", conds.join(" AND "))
+    };
+
+    // ── CSV export short-circuit (filtered set, capped) ─────────────────
+    if want_csv {
+        let sql = format!(
+            "SELECT timestamp, COALESCE(username,'System') AS username, action, \
+             COALESCE(resource_type,'') AS resource_type, COALESCE(resource_name,'') AS resource_name, \
+             success, COALESCE(host(ip_address),'') AS ip, chain_position \
+             FROM audit_log {} ORDER BY timestamp DESC LIMIT 10000",
+            where_clause
+        );
+        let mut q = sqlx::query(&sql);
+        for b in &binds {
+            q = q.bind(b);
+        }
+        let rows = q.fetch_all(&db).await.unwrap_or_default();
+        let mut csv = String::from("timestamp,username,action,resource_type,resource_name,success,ip,chain_position\n");
+        for r in &rows {
+            let ts: chrono::DateTime<chrono::Utc> = r.get("timestamp");
+            let username: String = r.get("username");
+            let action: String = r.get("action");
+            let rtype: String = r.get("resource_type");
+            let rname: String = r.get("resource_name");
+            let success: bool = r.get("success");
+            let ip: String = r.get("ip");
+            let pos: Option<i64> = r.get("chain_position");
+            csv.push_str(&format!(
+                "{},{},{},{},{},{},{},{}\n",
+                csv_field(&ts.to_rfc3339()),
+                csv_field(&username),
+                csv_field(&action),
+                csv_field(&rtype),
+                csv_field(&rname),
+                success,
+                csv_field(&ip),
+                pos.map(|p| p.to_string()).unwrap_or_default(),
+            ));
+        }
+        return (
+            [
+                (axum::http::header::CONTENT_TYPE, "text/csv; charset=utf-8"),
+                (axum::http::header::CONTENT_DISPOSITION, "attachment; filename=\"audit_log.csv\""),
+            ],
+            csv,
+        )
+            .into_response();
+    }
+
+    // ── Total count for pagination ──────────────────────────────────────
+    let count_sql = format!("SELECT COUNT(*) FROM audit_log {}", where_clause);
+    let mut cq = sqlx::query_scalar::<_, i64>(&count_sql);
+    for b in &binds {
+        cq = cq.bind(b);
+    }
+    let total: i64 = cq.fetch_one(&db).await.unwrap_or(0);
+
+    // ── Page of entries ─────────────────────────────────────────────────
+    let data_sql = format!(
+        "SELECT timestamp, COALESCE(username,'System') AS username, action, \
+         COALESCE(resource_type,'') AS resource_type, COALESCE(resource_name,'') AS resource_name, \
+         success, COALESCE(host(ip_address),'') AS ip, chain_position \
+         FROM audit_log {} ORDER BY timestamp DESC LIMIT ${} OFFSET ${}",
+        where_clause,
+        binds.len() + 1,
+        binds.len() + 2,
+    );
+    let mut dq = sqlx::query(&data_sql);
+    for b in &binds {
+        dq = dq.bind(b);
+    }
+    dq = dq.bind(PAGE_SIZE).bind(page * PAGE_SIZE);
+    let rows = dq.fetch_all(&db).await.unwrap_or_default();
+
+    // ── Distinct actions for the filter dropdown ────────────────────────
+    let actions: Vec<String> = sqlx::query_scalar("SELECT DISTINCT action FROM audit_log ORDER BY action")
+        .fetch_all(&db)
+        .await
+        .unwrap_or_default();
+
+    // ── Optional on-demand chain integrity check ────────────────────────
+    let verify_banner = if do_verify {
+        match verify_chain(
+            &db,
+            &VerifyOptions {
+                company: None,
+                from: None,
+                to: None,
+                max_skew_seconds: DEFAULT_CLOCK_SKEW_SECONDS,
+            },
+        )
+        .await
+        {
+            Ok(report) if report.companies_checked == 0 => {
+                r#"<div class="alert alert-info mb-4"><span>No chained audit entries yet — nothing to verify.</span></div>"#.to_string()
+            }
+            Ok(report) if report.ok() => format!(
+                r#"<div class="alert alert-success mb-4"><span>✓ Chain intact — verified {} entries across {} tenant(s) in {}ms.</span></div>"#,
+                report.entries_verified, report.companies_checked, report.duration.as_millis()
+            ),
+            Ok(report) => {
+                let mut detail = String::new();
+                for f in report.failures.iter().take(10) {
+                    detail.push_str(&format!(
+                        "<li class=\"text-sm\">company {} · position {} · [{}] {}</li>",
+                        f.company_id,
+                        f.chain_position,
+                        html_escape(f.kind.code()),
+                        html_escape(&f.detail),
+                    ));
+                }
+                format!(
+                    r#"<div class="alert alert-error mb-4 flex-col items-start"><span>✗ Chain verification FAILED — {} failure(s) across {} entries.</span><ul class="list-disc ml-6 mt-2">{}</ul></div>"#,
+                    report.failure_count(), report.entries_verified, detail
+                )
+            }
+            Err(e) => format!(
+                r#"<div class="alert alert-warning mb-4"><span>Could not run verification: {}</span></div>"#,
+                html_escape(&e.to_string())
+            ),
+        }
+    } else {
+        String::new()
+    };
+
+    // ── Build table rows ────────────────────────────────────────────────
+    let mut rows_html = String::new();
+    for r in &rows {
+        let ts: chrono::DateTime<chrono::Utc> = r.get("timestamp");
+        let username: String = r.get("username");
+        let action: String = r.get("action");
+        let rtype: String = r.get("resource_type");
+        let rname: String = r.get("resource_name");
+        let success: bool = r.get("success");
+        let ip: String = r.get("ip");
+        let pos: Option<i64> = r.get("chain_position");
+
+        let success_badge = if success {
+            r#"<span class="badge badge-success badge-sm">OK</span>"#
+        } else {
+            r#"<span class="badge badge-error badge-sm">FAIL</span>"#
+        };
+        let resource_cell = if rname.is_empty() {
+            html_escape(&rtype)
+        } else {
+            format!("{} <span class=\"text-base-content/50\">· {}</span>", html_escape(&rtype), html_escape(&rname))
+        };
+        rows_html.push_str(&format!(
+            r##"<tr>
+                <td class="whitespace-nowrap text-sm">{ts}</td>
+                <td class="text-sm">{user}</td>
+                <td><code class="text-xs">{action}</code></td>
+                <td class="text-sm">{resource}</td>
+                <td>{badge}</td>
+                <td class="text-sm text-base-content/60">{ip}</td>
+                <td class="text-xs text-base-content/50">{pos}</td>
+            </tr>"##,
+            ts = ts.format("%Y-%m-%d %H:%M:%S"),
+            user = html_escape(&username),
+            action = html_escape(&action),
+            resource = resource_cell,
+            badge = success_badge,
+            ip = html_escape(&ip),
+            pos = pos.map(|p| format!("#{p}")).unwrap_or_default(),
+        ));
+    }
+    if rows.is_empty() {
+        rows_html.push_str(r#"<tr><td colspan="7" class="text-center text-base-content/50 py-8">No audit entries match these filters.</td></tr>"#);
+    }
+
+    // ── Action filter dropdown options ──────────────────────────────────
+    let mut action_options = String::from(r#"<option value="">All actions</option>"#);
+    for a in &actions {
+        let sel = if f_action.as_deref() == Some(a.as_str()) { " selected" } else { "" };
+        action_options.push_str(&format!(r#"<option value="{a}"{sel}>{a}</option>"#, a = html_escape(a), sel = sel));
+    }
+
+    // ── Preserve filters across pagination / verify / export links ──────
+    let enc = |s: &str| s.replace('%', "%25").replace(' ', "%20").replace('&', "%26").replace('#', "%23").replace('+', "%2B");
+    let mut base_qs = String::new();
+    if let Some(u) = &f_user { base_qs.push_str(&format!("&user={}", enc(u))); }
+    if let Some(a) = &f_action { base_qs.push_str(&format!("&action={}", enc(a))); }
+    if let Some(r) = &f_resource { base_qs.push_str(&format!("&resource={}", enc(r))); }
+    if let Some(fr) = &f_from { base_qs.push_str(&format!("&from={}", enc(fr))); }
+    if let Some(t) = &f_to { base_qs.push_str(&format!("&to={}", enc(t))); }
+
+    let total_pages = if total == 0 { 1 } else { ((total - 1) / PAGE_SIZE) + 1 };
+    let prev_link = if page > 0 {
+        format!(r#"<a href="/audit?page={}{}" class="btn btn-sm btn-ghost">← Prev</a>"#, page - 1, base_qs)
+    } else {
+        r#"<button class="btn btn-sm btn-ghost btn-disabled">← Prev</button>"#.to_string()
+    };
+    let next_link = if page + 1 < total_pages {
+        format!(r#"<a href="/audit?page={}{}" class="btn btn-sm btn-ghost">Next →</a>"#, page + 1, base_qs)
+    } else {
+        r#"<button class="btn btn-sm btn-ghost btn-disabled">Next →</button>"#.to_string()
+    };
+
+    // ── Page chrome ─────────────────────────────────────────────────────
+    let display_name = user.full_name.as_deref().unwrap_or(&user.username);
+    let initials = get_initials(display_name);
+    let installed = db_ctx.installed_modules.clone();
+    let sidebar = build_sidebar("audit", display_name, &initials, &installed, user.is_admin(), &state.plugin_registry, &user.roles);
+
+    let content = format!(
+        r##"<div class="flex items-center justify-between mb-6 flex-wrap gap-2">
+<div><h1 class="text-2xl font-bold">Audit Log</h1>
+<p class="text-base-content/60 text-sm">Read-only view over the tamper-evident WORM ledger · {total} entries</p></div>
+<div class="flex gap-2">
+<a href="/audit?verify=1{base_qs}" class="btn btn-sm btn-outline">Verify integrity</a>
+<a href="/audit?format=csv{base_qs}" class="btn btn-sm btn-primary">Export CSV</a>
+</div>
+</div>
+
+{verify_banner}
+
+<form method="get" action="/audit" class="card bg-base-100 shadow mb-4"><div class="card-body p-4">
+<div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3 items-end">
+<div class="form-control"><label class="label py-1"><span class="label-text text-xs">User</span></label>
+<input name="user" value="{f_user}" class="input input-bordered input-sm" placeholder="username"/></div>
+<div class="form-control"><label class="label py-1"><span class="label-text text-xs">Action</span></label>
+<select name="action" class="select select-bordered select-sm">{action_options}</select></div>
+<div class="form-control"><label class="label py-1"><span class="label-text text-xs">Resource type</span></label>
+<input name="resource" value="{f_resource}" class="input input-bordered input-sm" placeholder="e.g. country"/></div>
+<div class="form-control"><label class="label py-1"><span class="label-text text-xs">From</span></label>
+<input name="from" type="date" value="{f_from}" class="input input-bordered input-sm"/></div>
+<div class="form-control"><label class="label py-1"><span class="label-text text-xs">To</span></label>
+<input name="to" type="date" value="{f_to}" class="input input-bordered input-sm"/></div>
+</div>
+<div class="flex gap-2 mt-3">
+<button type="submit" class="btn btn-sm btn-primary">Apply</button>
+<a href="/audit" class="btn btn-sm btn-ghost">Clear</a>
+</div>
+</div></form>
+
+<div class="card bg-base-100 shadow"><div class="card-body p-0 overflow-x-auto">
+<table class="table table-sm">
+<thead><tr><th>Time (UTC)</th><th>User</th><th>Action</th><th>Resource</th><th>Result</th><th>IP</th><th>Chain</th></tr></thead>
+<tbody>{rows}</tbody>
+</table>
+</div></div>
+
+<div class="flex items-center justify-between mt-4">
+<span class="text-sm text-base-content/60">Page {page_disp} of {total_pages}</span>
+<div class="flex gap-2">{prev}{next}</div>
+</div>"##,
+        total = total,
+        base_qs = base_qs,
+        verify_banner = verify_banner,
+        f_user = html_escape(f_user.as_deref().unwrap_or("")),
+        f_resource = html_escape(f_resource.as_deref().unwrap_or("")),
+        f_from = html_escape(f_from.as_deref().unwrap_or("")),
+        f_to = html_escape(f_to.as_deref().unwrap_or("")),
+        action_options = action_options,
+        rows = rows_html,
+        page_disp = page + 1,
+        total_pages = total_pages,
+        prev = prev_link,
+        next = next_link,
+    );
+
+    let html = format!(
+        r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style><title>Audit Log - Remicle</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/>
+<script src="https://cdn.tailwindcss.com"></script></head>
+<body class="min-h-screen bg-base-200">
+<div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a></div>
+<div id="sidebar-overlay" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
+<div class="flex">{sidebar}
+<main class="flex-1 p-4 lg:p-6 min-w-0">{content}</main></div></body></html>"#,
+        sidebar = sidebar,
+        content = content,
+    );
     Html(html).into_response()
 }
 
@@ -8921,6 +10114,2910 @@ async fn activity_type_delete(
         .await;
 
     Redirect::to("/settings/activity-types").into_response()
+}
+
+// ============================================================================
+// Localization — Countries & States master data
+//
+// Address master data (countries/states) is *core* platform data: the
+// tables live in core migrations and are consumed by any vertical that
+// stores addresses (contacts, sales, HR, …). These pages let an operator
+// maintain that list from Settings without touching SQL. Read-only access
+// for forms is still served by /api/countries and /api/states/{id}.
+// ============================================================================
+
+#[derive(Debug, serde::Deserialize)]
+struct CountryForm {
+    code: String,
+    name: String,
+    alpha3: Option<String>,
+    phone_code: Option<String>,
+    currency_code: Option<String>,
+    sequence: Option<i32>,
+    active: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct StateForm {
+    country_id: uuid::Uuid,
+    code: String,
+    name: String,
+    active: Option<String>,
+}
+
+/// Minimal error page for a failed master-data write (e.g. a unique-code
+/// collision). Keeps the operator from silently losing their input.
+fn settings_write_error(back: &str, msg: &str) -> Response {
+    let html = format!(
+        r##"<!DOCTYPE html><html data-theme="dark"><head>
+<script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Error</title>
+<link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"><script src="https://cdn.tailwindcss.com"></script>
+</head><body class="min-h-screen bg-base-200"><div class="container mx-auto p-6 max-w-xl">
+<div class="alert alert-error mb-4"><span>{}</span></div>
+<a href="{}" class="btn btn-ghost btn-sm">← Back</a>
+</div></body></html>"##,
+        html_escape(msg), back
+    );
+    (StatusCode::BAD_REQUEST, Html(html)).into_response()
+}
+
+/// Success flash page with a link back (mirrors `settings_write_error`).
+fn settings_write_ok(back: &str, msg: &str) -> Response {
+    let html = format!(
+        r##"<!DOCTYPE html><html data-theme="dark"><head>
+<script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Done</title>
+<link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"><script src="https://cdn.tailwindcss.com"></script>
+</head><body class="min-h-screen bg-base-200"><div class="container mx-auto p-6 max-w-xl">
+<div class="alert alert-success mb-4"><span>{}</span></div>
+<a href="{}" class="btn btn-ghost btn-sm">← Back</a>
+</div></body></html>"##,
+        html_escape(msg), back
+    );
+    Html(html).into_response()
+}
+
+// ── Countries ───────────────────────────────────────────────────────────────
+
+async fn countries_list(
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+) -> Response {
+    let countries = sqlx::query(
+        "SELECT id, code, alpha3, name, phone_code, currency_code, sequence, active \
+         FROM countries ORDER BY sequence, name"
+    )
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default();
+
+    let mut rows_html = String::new();
+    for c in &countries {
+        let id: uuid::Uuid = c.get("id");
+        let code: String = c.get("code");
+        let alpha3: Option<String> = c.get("alpha3");
+        let name: String = c.get("name");
+        let phone_code: Option<String> = c.get("phone_code");
+        let currency_code: Option<String> = c.get("currency_code");
+        let sequence: i32 = c.get::<Option<i32>, _>("sequence").unwrap_or(100);
+        let active: bool = c.get::<Option<bool>, _>("active").unwrap_or(true);
+
+        let status_badge = if active {
+            r#"<span class="badge badge-success badge-sm">Active</span>"#
+        } else {
+            r#"<span class="badge badge-warning badge-sm">Archived</span>"#
+        };
+
+        rows_html.push_str(&format!(
+            r##"<tr>
+                <td><a href="/settings/countries/{}" class="link link-primary">{}</a></td>
+                <td><code class="text-sm">{}</code></td>
+                <td><code class="text-sm">{}</code></td>
+                <td>{}</td>
+                <td>{}</td>
+                <td>{}</td>
+                <td>{}</td>
+            </tr>"##,
+            id,
+            html_escape(&name),
+            html_escape(&code),
+            html_escape(alpha3.as_deref().unwrap_or("—")),
+            html_escape(phone_code.as_deref().unwrap_or("—")),
+            html_escape(currency_code.as_deref().unwrap_or("—")),
+            sequence,
+            status_badge,
+        ));
+    }
+
+    let html = format!(
+        r##"<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+    <script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script>
+    <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Countries - Settings</title>
+    <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"><script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="min-h-screen bg-base-200">
+    <div class="navbar bg-base-100 shadow-lg">
+        <div class="flex-1"><a href="/" class="btn btn-ghost text-xl">remicle</a></div>
+        <div class="flex-none"><span class="text-sm">@{user}</span></div>
+    </div>
+    <div class="container mx-auto p-6">
+        <div class="flex justify-between items-center mb-6">
+            <div>
+                <h1 class="text-2xl font-bold">Countries</h1>
+                <p class="text-base-content/60">Maintain the country master list</p>
+            </div>
+            <button class="btn btn-primary" onclick="document.getElementById('create-modal').showModal();">+ New Country</button>
+        </div>
+
+        <div class="mb-4">
+            <input id="flt" type="text" placeholder="Filter countries…" class="input input-bordered input-sm w-full max-w-xs"
+                oninput="var v=this.value.toLowerCase();document.querySelectorAll('#tbl tbody tr').forEach(function(r){{r.style.display=r.innerText.toLowerCase().indexOf(v)>-1?'':'none'}})"/>
+        </div>
+
+        <div class="card bg-base-100 shadow">
+            <div class="card-body p-0">
+                <table id="tbl" class="table">
+                    <thead><tr><th>Name</th><th>Code</th><th>Alpha-3</th><th>Phone</th><th>Currency</th><th>Seq</th><th>Status</th></tr></thead>
+                    <tbody>{rows}</tbody>
+                </table>
+            </div>
+        </div>
+
+        <div class="mt-4"><a href="/settings" class="btn btn-ghost btn-sm">← Back to Settings</a></div>
+    </div>
+
+    <dialog id="create-modal" class="modal">
+        <div class="modal-box">
+            <h3 class="font-bold text-lg mb-4">New Country</h3>
+            <form method="post" action="/settings/countries">
+                <div class="form-control mb-3"><label class="label"><span class="label-text">Name</span></label>
+                    <input type="text" name="name" class="input input-bordered" placeholder="e.g., Singapore" required/></div>
+                <div class="grid grid-cols-2 gap-4">
+                    <div class="form-control mb-3"><label class="label"><span class="label-text">Code (ISO-2)</span></label>
+                        <input type="text" name="code" class="input input-bordered" maxlength="3" placeholder="SG" required/></div>
+                    <div class="form-control mb-3"><label class="label"><span class="label-text">Alpha-3</span></label>
+                        <input type="text" name="alpha3" class="input input-bordered" maxlength="3" placeholder="SGP"/></div>
+                </div>
+                <div class="grid grid-cols-2 gap-4">
+                    <div class="form-control mb-3"><label class="label"><span class="label-text">Phone Code</span></label>
+                        <input type="text" name="phone_code" class="input input-bordered" placeholder="+65"/></div>
+                    <div class="form-control mb-3"><label class="label"><span class="label-text">Currency</span></label>
+                        <input type="text" name="currency_code" class="input input-bordered" maxlength="3" placeholder="SGD"/></div>
+                </div>
+                <div class="form-control mb-3"><label class="label"><span class="label-text">Sequence</span></label>
+                    <input type="number" name="sequence" class="input input-bordered" value="100" min="0"/></div>
+                <label class="cursor-pointer label justify-start gap-3 mb-2">
+                    <input type="checkbox" name="active" class="checkbox checkbox-sm" checked/><span class="label-text">Active</span></label>
+                <div class="modal-action">
+                    <button type="button" class="btn" onclick="document.getElementById('create-modal').close();">Cancel</button>
+                    <button type="submit" class="btn btn-primary">Create</button>
+                </div>
+            </form>
+        </div>
+        <form method="dialog" class="modal-backdrop"><button>close</button></form>
+    </dialog>
+</body>
+</html>"##,
+        user = user.username, rows = rows_html
+    );
+    Html(html).into_response()
+}
+
+async fn country_create(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Form(form): Form<CountryForm>,
+) -> Response {
+    let name = form.name.trim().to_string();
+    let code = form.code.trim().to_uppercase();
+    if name.is_empty() || code.is_empty() {
+        return settings_write_error("/settings/countries", "Name and code are required.");
+    }
+    let alpha3 = form.alpha3.as_deref().map(|s| s.trim().to_uppercase()).filter(|s| !s.is_empty());
+    let phone_code = form.phone_code.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let currency_code = form.currency_code.as_deref().map(|s| s.trim().to_uppercase()).filter(|s| !s.is_empty());
+
+    let id = uuid::Uuid::now_v7();
+    if let Err(e) = sqlx::query(
+        "INSERT INTO countries (id, code, alpha3, name, phone_code, currency_code, sequence, active) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
+    )
+    .bind(id)
+    .bind(&code)
+    .bind(&alpha3)
+    .bind(&name)
+    .bind(phone_code)
+    .bind(&currency_code)
+    .bind(form.sequence.unwrap_or(100))
+    .bind(form.active.is_some())
+    .execute(&db)
+    .await
+    {
+        error!(error = %e, "country create failed");
+        return settings_write_error("/settings/countries", &format!("Could not create country: {e}"));
+    }
+
+    let entry = AuditEntry::new(AuditAction::ConfigChanged, AuditSeverity::Info)
+        .with_user(vortex_common::UserId(user.id))
+        .with_username(&user.username)
+        .with_database(&db_ctx.db_name)
+        .with_resource("country", id.to_string())
+        .with_resource_name(&name)
+        .with_details(serde_json::json!({"action": "create", "code": code}));
+    let _ = state.audit.log(entry).await;
+
+    Redirect::to("/settings/countries").into_response()
+}
+
+async fn country_edit(
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Path(id): Path<uuid::Uuid>,
+) -> Response {
+    let row = sqlx::query(
+        "SELECT id, code, alpha3, name, phone_code, currency_code, sequence, active \
+         FROM countries WHERE id = $1"
+    )
+    .bind(id)
+    .fetch_optional(&db)
+    .await
+    .ok()
+    .flatten();
+
+    let Some(c) = row else {
+        return Redirect::to("/settings/countries").into_response();
+    };
+
+    let code: String = c.get("code");
+    let alpha3: Option<String> = c.get("alpha3");
+    let name: String = c.get("name");
+    let phone_code: Option<String> = c.get("phone_code");
+    let currency_code: Option<String> = c.get("currency_code");
+    let sequence: i32 = c.get::<Option<i32>, _>("sequence").unwrap_or(100);
+    let active: bool = c.get::<Option<bool>, _>("active").unwrap_or(true);
+
+    let html = format!(
+        r##"<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+    <script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script>
+    <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{name} - Country</title>
+    <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"><script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="min-h-screen bg-base-200">
+    <div class="navbar bg-base-100 shadow-lg">
+        <div class="flex-1"><a href="/" class="btn btn-ghost text-xl">remicle</a></div>
+        <div class="flex-none"><span class="text-sm">@{user}</span></div>
+    </div>
+    <div class="container mx-auto p-6 max-w-2xl">
+        <div class="mb-6"><a href="/settings/countries" class="btn btn-ghost btn-sm">← Back to Countries</a></div>
+        <div class="card bg-base-100 shadow"><div class="card-body">
+            <h2 class="card-title">{name}</h2>
+            <p class="text-base-content/60 mb-4">Edit country master data</p>
+            <form method="post" action="/settings/countries/{id}">
+                <div class="form-control mb-3"><label class="label"><span class="label-text">Name</span></label>
+                    <input type="text" name="name" class="input input-bordered" value="{name}" required/></div>
+                <div class="grid grid-cols-2 gap-4">
+                    <div class="form-control mb-3"><label class="label"><span class="label-text">Code (ISO-2)</span></label>
+                        <input type="text" name="code" class="input input-bordered" maxlength="3" value="{code}" required/></div>
+                    <div class="form-control mb-3"><label class="label"><span class="label-text">Alpha-3</span></label>
+                        <input type="text" name="alpha3" class="input input-bordered" maxlength="3" value="{alpha3}"/></div>
+                </div>
+                <div class="grid grid-cols-2 gap-4">
+                    <div class="form-control mb-3"><label class="label"><span class="label-text">Phone Code</span></label>
+                        <input type="text" name="phone_code" class="input input-bordered" value="{phone}"/></div>
+                    <div class="form-control mb-3"><label class="label"><span class="label-text">Currency</span></label>
+                        <input type="text" name="currency_code" class="input input-bordered" maxlength="3" value="{currency}"/></div>
+                </div>
+                <div class="form-control mb-3"><label class="label"><span class="label-text">Sequence</span></label>
+                    <input type="number" name="sequence" class="input input-bordered" value="{sequence}" min="0"/></div>
+                <label class="cursor-pointer label justify-start gap-3 mb-2">
+                    <input type="checkbox" name="active" class="checkbox checkbox-sm" {active}/><span class="label-text">Active</span></label>
+                <div class="card-actions justify-end mt-4"><button type="submit" class="btn btn-primary">Save Changes</button></div>
+            </form>
+        </div></div>
+    </div>
+</body>
+</html>"##,
+        user = user.username,
+        id = id,
+        name = html_escape(&name),
+        code = html_escape(&code),
+        alpha3 = html_escape(alpha3.as_deref().unwrap_or("")),
+        phone = html_escape(phone_code.as_deref().unwrap_or("")),
+        currency = html_escape(currency_code.as_deref().unwrap_or("")),
+        sequence = sequence,
+        active = if active { "checked" } else { "" },
+    );
+    Html(html).into_response()
+}
+
+async fn country_update(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<uuid::Uuid>,
+    Form(form): Form<CountryForm>,
+) -> Response {
+    let name = form.name.trim().to_string();
+    let code = form.code.trim().to_uppercase();
+    if name.is_empty() || code.is_empty() {
+        return settings_write_error(&format!("/settings/countries/{id}"), "Name and code are required.");
+    }
+    let alpha3 = form.alpha3.as_deref().map(|s| s.trim().to_uppercase()).filter(|s| !s.is_empty());
+    let phone_code = form.phone_code.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let currency_code = form.currency_code.as_deref().map(|s| s.trim().to_uppercase()).filter(|s| !s.is_empty());
+
+    if let Err(e) = sqlx::query(
+        "UPDATE countries SET code = $1, alpha3 = $2, name = $3, phone_code = $4, \
+         currency_code = $5, sequence = $6, active = $7, updated_at = NOW() WHERE id = $8"
+    )
+    .bind(&code)
+    .bind(&alpha3)
+    .bind(&name)
+    .bind(phone_code)
+    .bind(&currency_code)
+    .bind(form.sequence.unwrap_or(100))
+    .bind(form.active.is_some())
+    .bind(id)
+    .execute(&db)
+    .await
+    {
+        error!(error = %e, "country update failed");
+        return settings_write_error(&format!("/settings/countries/{id}"), &format!("Could not save country: {e}"));
+    }
+
+    let entry = AuditEntry::new(AuditAction::ConfigChanged, AuditSeverity::Info)
+        .with_user(vortex_common::UserId(user.id))
+        .with_username(&user.username)
+        .with_database(&db_ctx.db_name)
+        .with_resource("country", id.to_string())
+        .with_resource_name(&name)
+        .with_details(serde_json::json!({"action": "update", "code": code}));
+    let _ = state.audit.log(entry).await;
+
+    Redirect::to("/settings/countries").into_response()
+}
+
+// ── States ──────────────────────────────────────────────────────────────────
+
+async fn states_list(
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Query(query): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    // Optional country filter (?country_id=…).
+    let filter_country: Option<uuid::Uuid> = query
+        .get("country_id")
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse().ok());
+
+    let states = if let Some(cid) = filter_country {
+        sqlx::query(
+            "SELECT s.id, s.code, s.name, s.active, c.name AS country_name \
+             FROM states s JOIN countries c ON c.id = s.country_id \
+             WHERE s.country_id = $1 ORDER BY c.name, s.name"
+        )
+        .bind(cid)
+        .fetch_all(&db)
+        .await
+        .unwrap_or_default()
+    } else {
+        sqlx::query(
+            "SELECT s.id, s.code, s.name, s.active, c.name AS country_name \
+             FROM states s JOIN countries c ON c.id = s.country_id \
+             ORDER BY c.name, s.name"
+        )
+        .fetch_all(&db)
+        .await
+        .unwrap_or_default()
+    };
+
+    let mut rows_html = String::new();
+    for s in &states {
+        let id: uuid::Uuid = s.get("id");
+        let code: String = s.get("code");
+        let name: String = s.get("name");
+        let country_name: String = s.get("country_name");
+        let active: bool = s.get::<Option<bool>, _>("active").unwrap_or(true);
+        let status_badge = if active {
+            r#"<span class="badge badge-success badge-sm">Active</span>"#
+        } else {
+            r#"<span class="badge badge-warning badge-sm">Archived</span>"#
+        };
+        rows_html.push_str(&format!(
+            r##"<tr>
+                <td><a href="/settings/states/{}" class="link link-primary">{}</a></td>
+                <td><code class="text-sm">{}</code></td>
+                <td>{}</td>
+                <td>{}</td>
+            </tr>"##,
+            id, html_escape(&name), html_escape(&code), html_escape(&country_name), status_badge
+        ));
+    }
+
+    // Country dropdown (shared by the filter and the create modal).
+    let countries = sqlx::query("SELECT id, name FROM countries WHERE active = true ORDER BY sequence, name")
+        .fetch_all(&db)
+        .await
+        .unwrap_or_default();
+    let mut filter_options = String::from(r#"<option value="">All countries</option>"#);
+    let mut create_options = String::from(r#"<option value="">-- Select Country --</option>"#);
+    for c in &countries {
+        let cid: uuid::Uuid = c.get("id");
+        let cname: String = c.get("name");
+        let sel = if filter_country == Some(cid) { " selected" } else { "" };
+        filter_options.push_str(&format!(r#"<option value="{}"{}>{}</option>"#, cid, sel, html_escape(&cname)));
+        create_options.push_str(&format!(r#"<option value="{}">{}</option>"#, cid, html_escape(&cname)));
+    }
+
+    let html = format!(
+        r##"<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+    <script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script>
+    <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>States - Settings</title>
+    <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"><script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="min-h-screen bg-base-200">
+    <div class="navbar bg-base-100 shadow-lg">
+        <div class="flex-1"><a href="/" class="btn btn-ghost text-xl">remicle</a></div>
+        <div class="flex-none"><span class="text-sm">@{user}</span></div>
+    </div>
+    <div class="container mx-auto p-6">
+        <div class="flex justify-between items-center mb-6">
+            <div>
+                <h1 class="text-2xl font-bold">States / Provinces</h1>
+                <p class="text-base-content/60">Maintain states per country</p>
+            </div>
+            <button class="btn btn-primary" onclick="document.getElementById('create-modal').showModal();">+ New State</button>
+        </div>
+
+        <form method="get" action="/settings/states" class="mb-4 flex items-end gap-2">
+            <div class="form-control">
+                <label class="label"><span class="label-text">Filter by country</span></label>
+                <select name="country_id" class="select select-bordered select-sm" onchange="this.form.submit()">{filter_options}</select>
+            </div>
+        </form>
+
+        <div class="card bg-base-100 shadow">
+            <div class="card-body p-0">
+                <table class="table">
+                    <thead><tr><th>Name</th><th>Code</th><th>Country</th><th>Status</th></tr></thead>
+                    <tbody>{rows}</tbody>
+                </table>
+            </div>
+        </div>
+
+        <div class="mt-4"><a href="/settings" class="btn btn-ghost btn-sm">← Back to Settings</a></div>
+    </div>
+
+    <dialog id="create-modal" class="modal">
+        <div class="modal-box">
+            <h3 class="font-bold text-lg mb-4">New State / Province</h3>
+            <form method="post" action="/settings/states">
+                <div class="form-control mb-3"><label class="label"><span class="label-text">Country</span></label>
+                    <select name="country_id" class="select select-bordered" required>{create_options}</select></div>
+                <div class="form-control mb-3"><label class="label"><span class="label-text">Name</span></label>
+                    <input type="text" name="name" class="input input-bordered" placeholder="e.g., Selangor" required/></div>
+                <div class="form-control mb-3"><label class="label"><span class="label-text">Code</span></label>
+                    <input type="text" name="code" class="input input-bordered" maxlength="10" placeholder="e.g., SGR" required/></div>
+                <label class="cursor-pointer label justify-start gap-3 mb-2">
+                    <input type="checkbox" name="active" class="checkbox checkbox-sm" checked/><span class="label-text">Active</span></label>
+                <div class="modal-action">
+                    <button type="button" class="btn" onclick="document.getElementById('create-modal').close();">Cancel</button>
+                    <button type="submit" class="btn btn-primary">Create</button>
+                </div>
+            </form>
+        </div>
+        <form method="dialog" class="modal-backdrop"><button>close</button></form>
+    </dialog>
+</body>
+</html>"##,
+        user = user.username, rows = rows_html, filter_options = filter_options, create_options = create_options
+    );
+    Html(html).into_response()
+}
+
+async fn state_create(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Form(form): Form<StateForm>,
+) -> Response {
+    let name = form.name.trim().to_string();
+    let code = form.code.trim().to_uppercase();
+    if name.is_empty() || code.is_empty() {
+        return settings_write_error("/settings/states", "Name and code are required.");
+    }
+
+    let id = uuid::Uuid::now_v7();
+    if let Err(e) = sqlx::query(
+        "INSERT INTO states (id, country_id, code, name, active) VALUES ($1, $2, $3, $4, $5)"
+    )
+    .bind(id)
+    .bind(form.country_id)
+    .bind(&code)
+    .bind(&name)
+    .bind(form.active.is_some())
+    .execute(&db)
+    .await
+    {
+        error!(error = %e, "state create failed");
+        return settings_write_error("/settings/states", &format!("Could not create state: {e}"));
+    }
+
+    let entry = AuditEntry::new(AuditAction::ConfigChanged, AuditSeverity::Info)
+        .with_user(vortex_common::UserId(user.id))
+        .with_username(&user.username)
+        .with_database(&db_ctx.db_name)
+        .with_resource("state", id.to_string())
+        .with_resource_name(&name)
+        .with_details(serde_json::json!({"action": "create", "code": code, "country_id": form.country_id}));
+    let _ = state.audit.log(entry).await;
+
+    Redirect::to(&format!("/settings/states?country_id={}", form.country_id)).into_response()
+}
+
+async fn state_edit(
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Path(id): Path<uuid::Uuid>,
+) -> Response {
+    let row = sqlx::query(
+        "SELECT id, country_id, code, name, active FROM states WHERE id = $1"
+    )
+    .bind(id)
+    .fetch_optional(&db)
+    .await
+    .ok()
+    .flatten();
+
+    let Some(s) = row else {
+        return Redirect::to("/settings/states").into_response();
+    };
+
+    let country_id: uuid::Uuid = s.get("country_id");
+    let code: String = s.get("code");
+    let name: String = s.get("name");
+    let active: bool = s.get::<Option<bool>, _>("active").unwrap_or(true);
+
+    let countries = sqlx::query("SELECT id, name FROM countries ORDER BY sequence, name")
+        .fetch_all(&db)
+        .await
+        .unwrap_or_default();
+    let mut country_options = String::new();
+    for c in &countries {
+        let cid: uuid::Uuid = c.get("id");
+        let cname: String = c.get("name");
+        let sel = if cid == country_id { " selected" } else { "" };
+        country_options.push_str(&format!(r#"<option value="{}"{}>{}</option>"#, cid, sel, html_escape(&cname)));
+    }
+
+    let html = format!(
+        r##"<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+    <script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script>
+    <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{name} - State</title>
+    <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"><script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="min-h-screen bg-base-200">
+    <div class="navbar bg-base-100 shadow-lg">
+        <div class="flex-1"><a href="/" class="btn btn-ghost text-xl">remicle</a></div>
+        <div class="flex-none"><span class="text-sm">@{user}</span></div>
+    </div>
+    <div class="container mx-auto p-6 max-w-2xl">
+        <div class="mb-6"><a href="/settings/states" class="btn btn-ghost btn-sm">← Back to States</a></div>
+        <div class="card bg-base-100 shadow"><div class="card-body">
+            <h2 class="card-title">{name}</h2>
+            <p class="text-base-content/60 mb-4">Edit state / province</p>
+            <form method="post" action="/settings/states/{id}">
+                <div class="form-control mb-3"><label class="label"><span class="label-text">Country</span></label>
+                    <select name="country_id" class="select select-bordered" required>{country_options}</select></div>
+                <div class="form-control mb-3"><label class="label"><span class="label-text">Name</span></label>
+                    <input type="text" name="name" class="input input-bordered" value="{name}" required/></div>
+                <div class="form-control mb-3"><label class="label"><span class="label-text">Code</span></label>
+                    <input type="text" name="code" class="input input-bordered" maxlength="10" value="{code}" required/></div>
+                <label class="cursor-pointer label justify-start gap-3 mb-2">
+                    <input type="checkbox" name="active" class="checkbox checkbox-sm" {active}/><span class="label-text">Active</span></label>
+                <div class="card-actions justify-end mt-4"><button type="submit" class="btn btn-primary">Save Changes</button></div>
+            </form>
+        </div></div>
+    </div>
+</body>
+</html>"##,
+        user = user.username,
+        id = id,
+        name = html_escape(&name),
+        code = html_escape(&code),
+        country_options = country_options,
+        active = if active { "checked" } else { "" },
+    );
+    Html(html).into_response()
+}
+
+async fn state_update(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<uuid::Uuid>,
+    Form(form): Form<StateForm>,
+) -> Response {
+    let name = form.name.trim().to_string();
+    let code = form.code.trim().to_uppercase();
+    if name.is_empty() || code.is_empty() {
+        return settings_write_error(&format!("/settings/states/{id}"), "Name and code are required.");
+    }
+
+    if let Err(e) = sqlx::query(
+        "UPDATE states SET country_id = $1, code = $2, name = $3, active = $4, updated_at = NOW() WHERE id = $5"
+    )
+    .bind(form.country_id)
+    .bind(&code)
+    .bind(&name)
+    .bind(form.active.is_some())
+    .bind(id)
+    .execute(&db)
+    .await
+    {
+        error!(error = %e, "state update failed");
+        return settings_write_error(&format!("/settings/states/{id}"), &format!("Could not save state: {e}"));
+    }
+
+    let entry = AuditEntry::new(AuditAction::ConfigChanged, AuditSeverity::Info)
+        .with_user(vortex_common::UserId(user.id))
+        .with_username(&user.username)
+        .with_database(&db_ctx.db_name)
+        .with_resource("state", id.to_string())
+        .with_resource_name(&name)
+        .with_details(serde_json::json!({"action": "update", "code": code, "country_id": form.country_id}));
+    let _ = state.audit.log(entry).await;
+
+    Redirect::to(&format!("/settings/states?country_id={}", form.country_id)).into_response()
+}
+
+// ============================================================================
+// Stages — user-managed status-bar stages (record_stages)
+//
+// Data-driven backing for the core StatusBar widget: admins add / reorder /
+// recolour / hide a model's stages here, no code change. A record stores the
+// stage `code` in its own status column (e.g. contacts.record_state).
+// ============================================================================
+
+const STAGE_COLORS: [&str; 6] = ["neutral", "primary", "info", "success", "warning", "error"];
+
+#[derive(Debug, serde::Deserialize)]
+struct StageForm {
+    model: String,
+    code: String,
+    label: String,
+    color: Option<String>,
+    sequence: Option<i32>,
+    always_visible: Option<String>,
+    locked: Option<String>,
+    active: Option<String>,
+}
+
+fn stage_color_options(selected: &str) -> String {
+    STAGE_COLORS
+        .iter()
+        .map(|c| {
+            let sel = if *c == selected { " selected" } else { "" };
+            let cap = c[..1].to_uppercase() + &c[1..];
+            format!(r#"<option value="{c}"{sel}>{cap}</option>"#)
+        })
+        .collect()
+}
+
+async fn stages_list(
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+) -> Response {
+    let stages = sqlx::query(
+        "SELECT id, model, code, label, color, sequence, always_visible, active \
+         FROM record_stages ORDER BY model, sequence, label",
+    )
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default();
+
+    // Known model names for the datalist (model registry + existing stages).
+    let models: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM ir_model UNION SELECT DISTINCT model FROM record_stages ORDER BY 1",
+    )
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default();
+    let datalist: String = models
+        .iter()
+        .map(|m| format!(r#"<option value="{}">"#, html_escape(m)))
+        .collect();
+
+    let mut rows_html = String::new();
+    let mut current_model = String::new();
+    for s in &stages {
+        let id: uuid::Uuid = s.get("id");
+        let model: String = s.get("model");
+        let code: String = s.get("code");
+        let label: String = s.get("label");
+        let color: String = s.get("color");
+        let sequence: i32 = s.get("sequence");
+        let always: bool = s.get("always_visible");
+        let locked: bool = s.get("locked");
+        let active: bool = s.get("active");
+
+        if model != current_model {
+            rows_html.push_str(&format!(
+                r#"<tr class="bg-base-200"><td colspan="7" class="font-semibold">{}</td></tr>"#,
+                html_escape(&model)
+            ));
+            current_model = model.clone();
+        }
+        let vis = if always { "Always" } else { "When active" };
+        let lock_badge = if locked {
+            r#"<span class="badge badge-warning badge-sm gap-1">🔒 Locked</span>"#
+        } else {
+            r#"<span class="text-base-content/30">—</span>"#
+        };
+        let status = if active {
+            r#"<span class="badge badge-success badge-sm">Active</span>"#
+        } else {
+            r#"<span class="badge badge-warning badge-sm">Archived</span>"#
+        };
+        rows_html.push_str(&format!(
+            r##"<tr>
+                <td><a href="/settings/stages/{id}" class="link link-primary">{label}</a></td>
+                <td><code class="text-xs">{code}</code></td>
+                <td><span class="badge badge-{color}">{color}</span></td>
+                <td>{seq}</td>
+                <td>{vis}</td>
+                <td>{lock}</td>
+                <td>{status}</td>
+            </tr>"##,
+            id = id,
+            label = html_escape(&label),
+            code = html_escape(&code),
+            color = html_escape(&color),
+            seq = sequence,
+            vis = vis,
+            lock = lock_badge,
+            status = status,
+        ));
+    }
+    if stages.is_empty() {
+        rows_html.push_str(r#"<tr><td colspan="7" class="text-center text-base-content/50 py-6">No stages yet — add one below.</td></tr>"#);
+    }
+
+    let html = format!(
+        r##"<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+    <script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script>
+    <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Stages - Settings</title>
+    <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"><script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="min-h-screen bg-base-200">
+    <div class="navbar bg-base-100 shadow-lg">
+        <div class="flex-1"><a href="/" class="btn btn-ghost text-xl">remicle</a></div>
+        <div class="flex-none"><span class="text-sm">@{user}</span></div>
+    </div>
+    <div class="container mx-auto p-6">
+        <div class="flex justify-between items-center mb-6">
+            <div>
+                <h1 class="text-2xl font-bold">Stages</h1>
+                <p class="text-base-content/60">Status-bar stages per model — add, reorder, recolour, hide</p>
+            </div>
+            <button class="btn btn-primary" onclick="document.getElementById('create-modal').showModal();">+ New Stage</button>
+        </div>
+
+        <div class="card bg-base-100 shadow">
+            <div class="card-body p-0">
+                <table class="table">
+                    <thead><tr><th>Label</th><th>Code</th><th>Color</th><th>Seq</th><th>Visibility</th><th>Lock</th><th>Status</th></tr></thead>
+                    <tbody>{rows}</tbody>
+                </table>
+            </div>
+        </div>
+
+        <div class="mt-4"><a href="/settings" class="btn btn-ghost btn-sm">← Back to Settings</a></div>
+    </div>
+
+    <datalist id="model-list">{datalist}</datalist>
+    <dialog id="create-modal" class="modal">
+        <div class="modal-box">
+            <h3 class="font-bold text-lg mb-4">New Stage</h3>
+            <form method="post" action="/settings/stages">
+                <div class="grid grid-cols-2 gap-4">
+                    <div class="form-control mb-3"><label class="label"><span class="label-text">Model</span></label>
+                        <input name="model" list="model-list" class="input input-bordered" placeholder="e.g. contacts" required/></div>
+                    <div class="form-control mb-3"><label class="label"><span class="label-text">Code</span></label>
+                        <input name="code" class="input input-bordered" maxlength="50" placeholder="e.g. review" required/></div>
+                </div>
+                <div class="form-control mb-3"><label class="label"><span class="label-text">Label</span></label>
+                    <input name="label" class="input input-bordered" placeholder="e.g. In Review" required/></div>
+                <div class="grid grid-cols-2 gap-4">
+                    <div class="form-control mb-3"><label class="label"><span class="label-text">Color</span></label>
+                        <select name="color" class="select select-bordered">{colors}</select></div>
+                    <div class="form-control mb-3"><label class="label"><span class="label-text">Sequence</span></label>
+                        <input name="sequence" type="number" class="input input-bordered" value="50" min="0"/></div>
+                </div>
+                <label class="cursor-pointer label justify-start gap-3 mb-2">
+                    <input type="checkbox" name="always_visible" class="checkbox checkbox-sm" checked/>
+                    <span class="label-text">Always visible (uncheck = show only when this stage is active)</span></label>
+                <label class="cursor-pointer label justify-start gap-3 mb-2">
+                    <input type="checkbox" name="locked" class="checkbox checkbox-sm"/>
+                    <span class="label-text">Locked (records in this stage are read-only)</span></label>
+                <div class="modal-action">
+                    <button type="button" class="btn" onclick="document.getElementById('create-modal').close();">Cancel</button>
+                    <button type="submit" class="btn btn-primary">Create</button>
+                </div>
+            </form>
+        </div>
+        <form method="dialog" class="modal-backdrop"><button>close</button></form>
+    </dialog>
+</body>
+</html>"##,
+        user = user.username,
+        rows = rows_html,
+        datalist = datalist,
+        colors = stage_color_options("neutral"),
+    );
+    Html(html).into_response()
+}
+
+async fn stage_create(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Form(form): Form<StageForm>,
+) -> Response {
+    let model = form.model.trim().to_lowercase();
+    let code = form.code.trim().to_lowercase();
+    let label = form.label.trim().to_string();
+    if model.is_empty() || code.is_empty() || label.is_empty() {
+        return settings_write_error("/settings/stages", "Model, code and label are required.");
+    }
+    let color = form
+        .color
+        .as_deref()
+        .filter(|c| STAGE_COLORS.contains(c))
+        .unwrap_or("neutral");
+
+    // Re-adding a previously-archived (model, code) reactivates it.
+    if let Err(e) = sqlx::query(
+        "INSERT INTO record_stages (model, code, label, color, sequence, always_visible, locked, active) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, true) \
+         ON CONFLICT (model, code) DO UPDATE SET \
+            label = EXCLUDED.label, color = EXCLUDED.color, sequence = EXCLUDED.sequence, \
+            always_visible = EXCLUDED.always_visible, locked = EXCLUDED.locked, active = true, updated_at = NOW()",
+    )
+    .bind(&model)
+    .bind(&code)
+    .bind(&label)
+    .bind(color)
+    .bind(form.sequence.unwrap_or(50))
+    .bind(form.always_visible.is_some())
+    .bind(form.locked.is_some())
+    .execute(&db)
+    .await
+    {
+        error!(error = %e, "stage create failed");
+        return settings_write_error("/settings/stages", &format!("Could not create stage: {e}"));
+    }
+
+    let entry = AuditEntry::new(AuditAction::ConfigChanged, AuditSeverity::Info)
+        .with_user(vortex_common::UserId(user.id))
+        .with_username(&user.username)
+        .with_database(&db_ctx.db_name)
+        .with_resource("record_stage", format!("{model}/{code}"))
+        .with_resource_name(&label)
+        .with_details(serde_json::json!({"action": "create", "model": model, "code": code}));
+    let _ = state.audit.log(entry).await;
+
+    Redirect::to("/settings/stages").into_response()
+}
+
+async fn stage_edit(
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Path(id): Path<uuid::Uuid>,
+) -> Response {
+    let row = sqlx::query(
+        "SELECT id, model, code, label, color, sequence, always_visible, locked, active \
+         FROM record_stages WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&db)
+    .await
+    .ok()
+    .flatten();
+
+    let Some(s) = row else {
+        return Redirect::to("/settings/stages").into_response();
+    };
+    let model: String = s.get("model");
+    let code: String = s.get("code");
+    let label: String = s.get("label");
+    let color: String = s.get("color");
+    let sequence: i32 = s.get("sequence");
+    let always: bool = s.get("always_visible");
+    let locked: bool = s.get("locked");
+    let active: bool = s.get("active");
+
+    let html = format!(
+        r##"<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+    <script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script>
+    <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{label} - Stage</title>
+    <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"><script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="min-h-screen bg-base-200">
+    <div class="navbar bg-base-100 shadow-lg">
+        <div class="flex-1"><a href="/" class="btn btn-ghost text-xl">remicle</a></div>
+        <div class="flex-none"><span class="text-sm">@{user}</span></div>
+    </div>
+    <div class="container mx-auto p-6 max-w-2xl">
+        <div class="mb-6"><a href="/settings/stages" class="btn btn-ghost btn-sm">← Back to Stages</a></div>
+        <div class="card bg-base-100 shadow"><div class="card-body">
+            <h2 class="card-title">{label} <span class="text-base-content/40 font-mono text-sm">{model}/{code}</span></h2>
+            <p class="text-base-content/60 mb-4">Edit stage</p>
+            <form method="post" action="/settings/stages/{id}">
+                <input type="hidden" name="model" value="{model}"/>
+                <input type="hidden" name="code" value="{code}"/>
+                <div class="form-control mb-3"><label class="label"><span class="label-text">Label</span></label>
+                    <input name="label" class="input input-bordered" value="{label}" required/></div>
+                <div class="grid grid-cols-2 gap-4">
+                    <div class="form-control mb-3"><label class="label"><span class="label-text">Color</span></label>
+                        <select name="color" class="select select-bordered">{colors}</select></div>
+                    <div class="form-control mb-3"><label class="label"><span class="label-text">Sequence</span></label>
+                        <input name="sequence" type="number" class="input input-bordered" value="{seq}" min="0"/></div>
+                </div>
+                <label class="cursor-pointer label justify-start gap-3 mb-2">
+                    <input type="checkbox" name="always_visible" class="checkbox checkbox-sm" {always}/>
+                    <span class="label-text">Always visible</span></label>
+                <label class="cursor-pointer label justify-start gap-3 mb-2">
+                    <input type="checkbox" name="locked" class="checkbox checkbox-sm" {locked}/>
+                    <span class="label-text">Locked (records in this stage are read-only)</span></label>
+                <label class="cursor-pointer label justify-start gap-3 mb-2">
+                    <input type="checkbox" name="active" class="checkbox checkbox-sm" {active}/>
+                    <span class="label-text">Active</span></label>
+                <div class="card-actions justify-between mt-4">
+                    <form method="post" action="/settings/stages/{id}/delete" class="inline">
+                        <button type="submit" class="btn btn-error btn-outline" onclick="return confirm('Archive this stage?');">Archive</button>
+                    </form>
+                    <button type="submit" class="btn btn-primary">Save Changes</button>
+                </div>
+            </form>
+        </div></div>
+    </div>
+</body>
+</html>"##,
+        user = user.username,
+        id = id,
+        model = html_escape(&model),
+        code = html_escape(&code),
+        label = html_escape(&label),
+        colors = stage_color_options(&color),
+        seq = sequence,
+        always = if always { "checked" } else { "" },
+        locked = if locked { "checked" } else { "" },
+        active = if active { "checked" } else { "" },
+    );
+    Html(html).into_response()
+}
+
+async fn stage_update(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<uuid::Uuid>,
+    Form(form): Form<StageForm>,
+) -> Response {
+    let label = form.label.trim().to_string();
+    if label.is_empty() {
+        return settings_write_error(&format!("/settings/stages/{id}"), "Label is required.");
+    }
+    let color = form
+        .color
+        .as_deref()
+        .filter(|c| STAGE_COLORS.contains(c))
+        .unwrap_or("neutral");
+
+    if let Err(e) = sqlx::query(
+        "UPDATE record_stages SET label = $1, color = $2, sequence = $3, \
+         always_visible = $4, locked = $5, active = $6, updated_at = NOW() WHERE id = $7",
+    )
+    .bind(&label)
+    .bind(color)
+    .bind(form.sequence.unwrap_or(50))
+    .bind(form.always_visible.is_some())
+    .bind(form.locked.is_some())
+    .bind(form.active.is_some())
+    .bind(id)
+    .execute(&db)
+    .await
+    {
+        error!(error = %e, "stage update failed");
+        return settings_write_error(&format!("/settings/stages/{id}"), &format!("Could not save stage: {e}"));
+    }
+
+    let entry = AuditEntry::new(AuditAction::ConfigChanged, AuditSeverity::Info)
+        .with_user(vortex_common::UserId(user.id))
+        .with_username(&user.username)
+        .with_database(&db_ctx.db_name)
+        .with_resource("record_stage", id.to_string())
+        .with_resource_name(&label)
+        .with_details(serde_json::json!({"action": "update"}));
+    let _ = state.audit.log(entry).await;
+
+    Redirect::to("/settings/stages").into_response()
+}
+
+async fn stage_delete(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<uuid::Uuid>,
+) -> Response {
+    // Soft-archive so records still holding this code keep rendering it.
+    let _ = sqlx::query("UPDATE record_stages SET active = false, updated_at = NOW() WHERE id = $1")
+        .bind(id)
+        .execute(&db)
+        .await;
+
+    let entry = AuditEntry::new(AuditAction::ConfigChanged, AuditSeverity::Info)
+        .with_user(vortex_common::UserId(user.id))
+        .with_username(&user.username)
+        .with_database(&db_ctx.db_name)
+        .with_resource("record_stage", id.to_string())
+        .with_details(serde_json::json!({"action": "archive"}));
+    let _ = state.audit.log(entry).await;
+
+    Redirect::to("/settings/stages").into_response()
+}
+
+// ============================================================================
+// Stage Buttons — role-gated transition buttons (record_stage_actions)
+// ============================================================================
+
+const BUTTON_COLORS: [&str; 7] = ["primary", "success", "info", "warning", "error", "neutral", "ghost"];
+
+#[derive(Debug, serde::Deserialize)]
+struct StageButtonForm {
+    model: String,
+    label: String,
+    target_stage: String,
+    from_stage: Option<String>,
+    required_role: Option<String>,
+    color: Option<String>,
+    sequence: Option<i32>,
+    active: Option<String>,
+}
+
+fn button_color_options(selected: &str) -> String {
+    BUTTON_COLORS
+        .iter()
+        .map(|c| {
+            let sel = if *c == selected { " selected" } else { "" };
+            let cap = c[..1].to_uppercase() + &c[1..];
+            format!(r#"<option value="{c}"{sel}>{cap}</option>"#)
+        })
+        .collect()
+}
+
+async fn role_options(db: &sqlx::PgPool, selected: &str) -> String {
+    let roles: Vec<String> = sqlx::query_scalar("SELECT name FROM roles ORDER BY name")
+        .fetch_all(db)
+        .await
+        .unwrap_or_default();
+    let mut out = format!(
+        r#"<option value=""{}>— Anyone —</option>"#,
+        if selected.is_empty() { " selected" } else { "" }
+    );
+    for r in &roles {
+        let sel = if r == selected { " selected" } else { "" };
+        out.push_str(&format!(r#"<option value="{r}"{sel}>{r}</option>"#, r = html_escape(r), sel = sel));
+    }
+    out
+}
+
+async fn stage_buttons_list(
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+) -> Response {
+    let buttons = sqlx::query(
+        "SELECT id, model, label, target_stage, from_stage, required_role, color, sequence, active \
+         FROM record_stage_actions ORDER BY model, sequence, label",
+    )
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default();
+
+    let models: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM ir_model UNION SELECT DISTINCT model FROM record_stages ORDER BY 1",
+    )
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default();
+    let model_datalist: String = models.iter().map(|m| format!(r#"<option value="{}">"#, html_escape(m))).collect();
+    let stage_codes: Vec<String> = sqlx::query_scalar("SELECT DISTINCT code FROM record_stages ORDER BY 1")
+        .fetch_all(&db)
+        .await
+        .unwrap_or_default();
+    let stage_datalist: String = stage_codes.iter().map(|c| format!(r#"<option value="{}">"#, html_escape(c))).collect();
+
+    let mut rows_html = String::new();
+    let mut current_model = String::new();
+    for b in &buttons {
+        let id: uuid::Uuid = b.get("id");
+        let model: String = b.get("model");
+        let label: String = b.get("label");
+        let target: String = b.get("target_stage");
+        let from: Option<String> = b.get("from_stage");
+        let role: Option<String> = b.get("required_role");
+        let color: String = b.get("color");
+        let active: bool = b.get("active");
+
+        if model != current_model {
+            rows_html.push_str(&format!(
+                r#"<tr class="bg-base-200"><td colspan="6" class="font-semibold">{}</td></tr>"#,
+                html_escape(&model)
+            ));
+            current_model = model.clone();
+        }
+        let status = if active {
+            r#"<span class="badge badge-success badge-sm">Active</span>"#
+        } else {
+            r#"<span class="badge badge-warning badge-sm">Archived</span>"#
+        };
+        rows_html.push_str(&format!(
+            r##"<tr>
+                <td><a href="/settings/stage-buttons/{id}" class="link link-primary"><span class="badge badge-{color}">{label}</span></a></td>
+                <td><code class="text-xs">{from}</code> → <code class="text-xs">{target}</code></td>
+                <td>{role}</td>
+                <td>{status}</td>
+            </tr>"##,
+            id = id,
+            color = html_escape(&color),
+            label = html_escape(&label),
+            from = html_escape(from.as_deref().unwrap_or("any")),
+            target = html_escape(&target),
+            role = html_escape(role.as_deref().unwrap_or("Anyone")),
+            status = status,
+        ));
+    }
+    if buttons.is_empty() {
+        rows_html.push_str(r#"<tr><td colspan="6" class="text-center text-base-content/50 py-6">No stage buttons yet — add one below.</td></tr>"#);
+    }
+
+    let html = format!(
+        r##"<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+    <script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script>
+    <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Stage Buttons - Settings</title>
+    <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"><script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="min-h-screen bg-base-200">
+    <div class="navbar bg-base-100 shadow-lg">
+        <div class="flex-1"><a href="/" class="btn btn-ghost text-xl">remicle</a></div>
+        <div class="flex-none"><span class="text-sm">@{user}</span></div>
+    </div>
+    <div class="container mx-auto p-6">
+        <div class="flex justify-between items-center mb-6">
+            <div>
+                <h1 class="text-2xl font-bold">Stage Buttons</h1>
+                <p class="text-base-content/60">Role-gated buttons that move a record between stages</p>
+            </div>
+            <button class="btn btn-primary" onclick="document.getElementById('create-modal').showModal();">+ New Button</button>
+        </div>
+
+        <div class="card bg-base-100 shadow">
+            <div class="card-body p-0">
+                <table class="table">
+                    <thead><tr><th>Button</th><th>Transition</th><th>Required role</th><th>Status</th></tr></thead>
+                    <tbody>{rows}</tbody>
+                </table>
+            </div>
+        </div>
+
+        <div class="mt-4"><a href="/settings" class="btn btn-ghost btn-sm">← Back to Settings</a></div>
+    </div>
+
+    <datalist id="model-list">{model_datalist}</datalist>
+    <datalist id="stage-list">{stage_datalist}</datalist>
+    <dialog id="create-modal" class="modal">
+        <div class="modal-box">
+            <h3 class="font-bold text-lg mb-4">New Stage Button</h3>
+            <form method="post" action="/settings/stage-buttons">
+                <div class="grid grid-cols-2 gap-4">
+                    <div class="form-control mb-3"><label class="label"><span class="label-text">Model</span></label>
+                        <input name="model" list="model-list" class="input input-bordered" placeholder="contacts" required/></div>
+                    <div class="form-control mb-3"><label class="label"><span class="label-text">Button label</span></label>
+                        <input name="label" class="input input-bordered" placeholder="Approve" required/></div>
+                </div>
+                <div class="grid grid-cols-2 gap-4">
+                    <div class="form-control mb-3"><label class="label"><span class="label-text">From stage (blank = any)</span></label>
+                        <input name="from_stage" list="stage-list" class="input input-bordered" placeholder="confirmed"/></div>
+                    <div class="form-control mb-3"><label class="label"><span class="label-text">Moves to stage</span></label>
+                        <input name="target_stage" list="stage-list" class="input input-bordered" placeholder="done" required/></div>
+                </div>
+                <div class="grid grid-cols-3 gap-4">
+                    <div class="form-control mb-3"><label class="label"><span class="label-text">Required role</span></label>
+                        <select name="required_role" class="select select-bordered">{roles}</select></div>
+                    <div class="form-control mb-3"><label class="label"><span class="label-text">Color</span></label>
+                        <select name="color" class="select select-bordered">{colors}</select></div>
+                    <div class="form-control mb-3"><label class="label"><span class="label-text">Sequence</span></label>
+                        <input name="sequence" type="number" class="input input-bordered" value="10" min="0"/></div>
+                </div>
+                <div class="modal-action">
+                    <button type="button" class="btn" onclick="document.getElementById('create-modal').close();">Cancel</button>
+                    <button type="submit" class="btn btn-primary">Create</button>
+                </div>
+            </form>
+        </div>
+        <form method="dialog" class="modal-backdrop"><button>close</button></form>
+    </dialog>
+</body>
+</html>"##,
+        user = user.username,
+        rows = rows_html,
+        model_datalist = model_datalist,
+        stage_datalist = stage_datalist,
+        roles = role_options(&db, "").await,
+        colors = button_color_options("primary"),
+    );
+    Html(html).into_response()
+}
+
+async fn stage_button_create(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Form(form): Form<StageButtonForm>,
+) -> Response {
+    let model = form.model.trim().to_lowercase();
+    let label = form.label.trim().to_string();
+    let target = form.target_stage.trim().to_lowercase();
+    if model.is_empty() || label.is_empty() || target.is_empty() {
+        return settings_write_error("/settings/stage-buttons", "Model, label and target stage are required.");
+    }
+    let color = form.color.as_deref().filter(|c| BUTTON_COLORS.contains(c)).unwrap_or("primary");
+    let from = form.from_stage.as_deref().map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty());
+    let role = form.required_role.as_deref().map(str::trim).filter(|s| !s.is_empty());
+
+    if let Err(e) = sqlx::query(
+        "INSERT INTO record_stage_actions (model, label, target_stage, from_stage, required_role, color, sequence, active) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, true) \
+         ON CONFLICT (model, label) DO UPDATE SET \
+            target_stage = EXCLUDED.target_stage, from_stage = EXCLUDED.from_stage, \
+            required_role = EXCLUDED.required_role, color = EXCLUDED.color, \
+            sequence = EXCLUDED.sequence, active = true, updated_at = NOW()",
+    )
+    .bind(&model)
+    .bind(&label)
+    .bind(&target)
+    .bind(&from)
+    .bind(role)
+    .bind(color)
+    .bind(form.sequence.unwrap_or(10))
+    .execute(&db)
+    .await
+    {
+        error!(error = %e, "stage button create failed");
+        return settings_write_error("/settings/stage-buttons", &format!("Could not create button: {e}"));
+    }
+
+    let entry = AuditEntry::new(AuditAction::ConfigChanged, AuditSeverity::Info)
+        .with_user(vortex_common::UserId(user.id))
+        .with_username(&user.username)
+        .with_database(&db_ctx.db_name)
+        .with_resource("record_stage_action", format!("{model}/{label}"))
+        .with_resource_name(&label)
+        .with_details(serde_json::json!({"action": "create", "model": model, "target": target}));
+    let _ = state.audit.log(entry).await;
+
+    Redirect::to("/settings/stage-buttons").into_response()
+}
+
+async fn stage_button_edit(
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Path(id): Path<uuid::Uuid>,
+) -> Response {
+    let row = sqlx::query(
+        "SELECT id, model, label, target_stage, from_stage, required_role, color, sequence, active \
+         FROM record_stage_actions WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&db)
+    .await
+    .ok()
+    .flatten();
+    let Some(b) = row else {
+        return Redirect::to("/settings/stage-buttons").into_response();
+    };
+    let model: String = b.get("model");
+    let label: String = b.get("label");
+    let target: String = b.get("target_stage");
+    let from: String = b.get::<Option<String>, _>("from_stage").unwrap_or_default();
+    let role: String = b.get::<Option<String>, _>("required_role").unwrap_or_default();
+    let color: String = b.get("color");
+    let sequence: i32 = b.get("sequence");
+    let active: bool = b.get("active");
+
+    let stage_codes: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT code FROM record_stages WHERE model = $1 ORDER BY 1",
+    )
+    .bind(&model)
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default();
+    let stage_datalist: String = stage_codes.iter().map(|c| format!(r#"<option value="{}">"#, html_escape(c))).collect();
+
+    let html = format!(
+        r##"<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+    <script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script>
+    <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{label} - Stage Button</title>
+    <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"><script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="min-h-screen bg-base-200">
+    <div class="navbar bg-base-100 shadow-lg">
+        <div class="flex-1"><a href="/" class="btn btn-ghost text-xl">remicle</a></div>
+        <div class="flex-none"><span class="text-sm">@{user}</span></div>
+    </div>
+    <div class="container mx-auto p-6 max-w-2xl">
+        <div class="mb-6"><a href="/settings/stage-buttons" class="btn btn-ghost btn-sm">← Back to Stage Buttons</a></div>
+        <div class="card bg-base-100 shadow"><div class="card-body">
+            <h2 class="card-title">{label} <span class="text-base-content/40 font-mono text-sm">{model}</span></h2>
+            <p class="text-base-content/60 mb-4">Edit transition button</p>
+            <datalist id="stage-list">{stage_datalist}</datalist>
+            <form method="post" action="/settings/stage-buttons/{id}">
+                <input type="hidden" name="model" value="{model}"/>
+                <div class="form-control mb-3"><label class="label"><span class="label-text">Button label</span></label>
+                    <input name="label" class="input input-bordered" value="{label}" required/></div>
+                <div class="grid grid-cols-2 gap-4">
+                    <div class="form-control mb-3"><label class="label"><span class="label-text">From stage (blank = any)</span></label>
+                        <input name="from_stage" list="stage-list" class="input input-bordered" value="{from}"/></div>
+                    <div class="form-control mb-3"><label class="label"><span class="label-text">Moves to stage</span></label>
+                        <input name="target_stage" list="stage-list" class="input input-bordered" value="{target}" required/></div>
+                </div>
+                <div class="grid grid-cols-3 gap-4">
+                    <div class="form-control mb-3"><label class="label"><span class="label-text">Required role</span></label>
+                        <select name="required_role" class="select select-bordered">{roles}</select></div>
+                    <div class="form-control mb-3"><label class="label"><span class="label-text">Color</span></label>
+                        <select name="color" class="select select-bordered">{colors}</select></div>
+                    <div class="form-control mb-3"><label class="label"><span class="label-text">Sequence</span></label>
+                        <input name="sequence" type="number" class="input input-bordered" value="{seq}" min="0"/></div>
+                </div>
+                <label class="cursor-pointer label justify-start gap-3 mb-2">
+                    <input type="checkbox" name="active" class="checkbox checkbox-sm" {active}/>
+                    <span class="label-text">Active</span></label>
+                <div class="card-actions justify-between mt-4">
+                    <form method="post" action="/settings/stage-buttons/{id}/delete" class="inline">
+                        <button type="submit" class="btn btn-error btn-outline" onclick="return confirm('Archive this button?');">Archive</button>
+                    </form>
+                    <button type="submit" class="btn btn-primary">Save Changes</button>
+                </div>
+            </form>
+        </div></div>
+    </div>
+</body>
+</html>"##,
+        user = user.username,
+        id = id,
+        model = html_escape(&model),
+        label = html_escape(&label),
+        from = html_escape(&from),
+        target = html_escape(&target),
+        stage_datalist = stage_datalist,
+        roles = role_options(&db, &role).await,
+        colors = button_color_options(&color),
+        seq = sequence,
+        active = if active { "checked" } else { "" },
+    );
+    Html(html).into_response()
+}
+
+async fn stage_button_update(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<uuid::Uuid>,
+    Form(form): Form<StageButtonForm>,
+) -> Response {
+    let label = form.label.trim().to_string();
+    let target = form.target_stage.trim().to_lowercase();
+    if label.is_empty() || target.is_empty() {
+        return settings_write_error(&format!("/settings/stage-buttons/{id}"), "Label and target stage are required.");
+    }
+    let color = form.color.as_deref().filter(|c| BUTTON_COLORS.contains(c)).unwrap_or("primary");
+    let from = form.from_stage.as_deref().map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty());
+    let role = form.required_role.as_deref().map(str::trim).filter(|s| !s.is_empty());
+
+    if let Err(e) = sqlx::query(
+        "UPDATE record_stage_actions SET label = $1, target_stage = $2, from_stage = $3, \
+         required_role = $4, color = $5, sequence = $6, active = $7, updated_at = NOW() WHERE id = $8",
+    )
+    .bind(&label)
+    .bind(&target)
+    .bind(&from)
+    .bind(role)
+    .bind(color)
+    .bind(form.sequence.unwrap_or(10))
+    .bind(form.active.is_some())
+    .bind(id)
+    .execute(&db)
+    .await
+    {
+        error!(error = %e, "stage button update failed");
+        return settings_write_error(&format!("/settings/stage-buttons/{id}"), &format!("Could not save button: {e}"));
+    }
+
+    let entry = AuditEntry::new(AuditAction::ConfigChanged, AuditSeverity::Info)
+        .with_user(vortex_common::UserId(user.id))
+        .with_username(&user.username)
+        .with_database(&db_ctx.db_name)
+        .with_resource("record_stage_action", id.to_string())
+        .with_resource_name(&label)
+        .with_details(serde_json::json!({"action": "update"}));
+    let _ = state.audit.log(entry).await;
+
+    Redirect::to("/settings/stage-buttons").into_response()
+}
+
+async fn stage_button_delete(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<uuid::Uuid>,
+) -> Response {
+    let _ = sqlx::query("UPDATE record_stage_actions SET active = false, updated_at = NOW() WHERE id = $1")
+        .bind(id)
+        .execute(&db)
+        .await;
+
+    let entry = AuditEntry::new(AuditAction::ConfigChanged, AuditSeverity::Info)
+        .with_user(vortex_common::UserId(user.id))
+        .with_username(&user.username)
+        .with_database(&db_ctx.db_name)
+        .with_resource("record_stage_action", id.to_string())
+        .with_details(serde_json::json!({"action": "archive"}));
+    let _ = state.audit.log(entry).await;
+
+    Redirect::to("/settings/stage-buttons").into_response()
+}
+
+// ============================================================================
+// Approval Rules — multi-step sign-off attached to a stage button
+// ============================================================================
+
+#[derive(Debug, serde::Deserialize)]
+struct ApprovalRuleForm {
+    action_id: uuid::Uuid,
+    step: Option<i32>,
+    label: Option<String>,
+    approver_role: String,
+    min_approvals: Option<i32>,
+}
+
+/// GET /settings/approval-rules — admin view: every button, its ordered
+/// approval steps, and a form to add a step. A button with ≥1 step requires
+/// approval (handled generically by `vortex_framework::approval`).
+async fn approval_rules_list(Db(db): Db, Extension(user): Extension<AuthUser>) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Approval Rules"))).into_response();
+    }
+
+    // Buttons that can carry approval rules (active transition buttons).
+    let buttons = sqlx::query(
+        "SELECT a.id, a.model, a.label, a.target_stage, \
+                COUNT(r.id) AS steps \
+         FROM record_stage_actions a \
+         LEFT JOIN approval_rules r ON r.action_id = a.id \
+         WHERE a.active = true \
+         GROUP BY a.id, a.model, a.label, a.target_stage \
+         ORDER BY a.model, a.label",
+    )
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default();
+
+    let rules = sqlx::query(
+        "SELECT id, action_id, step, label, approver_role, min_approvals \
+         FROM approval_rules ORDER BY action_id, step",
+    )
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default();
+
+    let mut button_opts = String::new();
+    let mut cards = String::new();
+    for b in &buttons {
+        let aid: uuid::Uuid = b.get("id");
+        let model: String = b.get("model");
+        let label: String = b.get("label");
+        let target: String = b.get("target_stage");
+        let steps: i64 = b.get("steps");
+
+        button_opts.push_str(&format!(
+            r#"<option value="{aid}">{model} · {label} → {target}</option>"#,
+            aid = aid,
+            model = html_escape(&model),
+            label = html_escape(&label),
+            target = html_escape(&target),
+        ));
+
+        let mut step_rows = String::new();
+        for r in rules.iter().filter(|r| r.get::<uuid::Uuid, _>("action_id") == aid) {
+            let rid: uuid::Uuid = r.get("id");
+            let step: i32 = r.get("step");
+            let slabel: Option<String> = r.get("label");
+            let role: String = r.get("approver_role");
+            let minc: i32 = r.get("min_approvals");
+            step_rows.push_str(&format!(
+                r##"<tr>
+                    <td class="font-mono">{step}</td>
+                    <td>{slabel}</td>
+                    <td><span class="badge badge-ghost">{role}</span></td>
+                    <td>{minc}</td>
+                    <td class="text-right"><form method="post" action="/settings/approval-rules/{rid}/delete" class="inline">
+                        <button class="btn btn-xs btn-error btn-outline" onclick="return confirm('Remove this step?');">Remove</button>
+                    </form></td>
+                </tr>"##,
+                step = step,
+                slabel = html_escape(slabel.as_deref().unwrap_or("")),
+                role = html_escape(&role),
+                minc = minc,
+                rid = rid,
+            ));
+        }
+        let badge = if steps > 0 {
+            format!(r#"<span class="badge badge-warning">{steps}-step approval</span>"#)
+        } else {
+            r#"<span class="badge badge-ghost">No approval</span>"#.to_string()
+        };
+        let table = if steps > 0 {
+            format!(
+                r#"<table class="table table-sm"><thead><tr><th>Step</th><th>Label</th><th>Approver role</th><th>Min</th><th></th></tr></thead><tbody>{step_rows}</tbody></table>"#
+            )
+        } else {
+            r#"<p class="text-sm text-base-content/50">This button transitions immediately. Add a step below to require approval.</p>"#.to_string()
+        };
+        cards.push_str(&format!(
+            r#"<div class="card bg-base-100 shadow mb-3"><div class="card-body p-4">
+<div class="flex items-center justify-between"><h3 class="font-semibold">{model} · {label} <span class="text-base-content/40">→ {target}</span></h3>{badge}</div>
+{table}
+</div></div>"#,
+            model = html_escape(&model),
+            label = html_escape(&label),
+            target = html_escape(&target),
+            badge = badge,
+            table = table,
+        ));
+    }
+    if buttons.is_empty() {
+        cards.push_str(r#"<div class="alert">No stage buttons yet. Create one under Settings ▸ Stage Buttons first, then add approval steps here.</div>"#);
+    }
+
+    let html = format!(
+        r##"<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+    <script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script>
+    <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Approval Rules - Settings</title>
+    <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"><script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="min-h-screen bg-base-200">
+    <div class="navbar bg-base-100 shadow-lg">
+        <div class="flex-1"><a href="/" class="btn btn-ghost text-xl">remicle</a></div>
+        <div class="flex-none"><span class="text-sm">@{user}</span></div>
+    </div>
+    <div class="container mx-auto p-6 max-w-3xl">
+        <div class="flex justify-between items-center mb-6">
+            <div>
+                <h1 class="text-2xl font-bold">Approval Rules</h1>
+                <p class="text-base-content/60">Require sequential sign-off before a stage button takes effect. Each step names an approver role and how many approvals it needs; steps run in order.</p>
+            </div>
+            <button class="btn btn-primary" onclick="document.getElementById('create-modal').showModal();">+ Add Step</button>
+        </div>
+
+        {cards}
+
+        <div class="mt-4"><a href="/settings" class="btn btn-ghost btn-sm">← Back to Settings</a></div>
+    </div>
+
+    <dialog id="create-modal" class="modal">
+        <div class="modal-box">
+            <h3 class="font-bold text-lg mb-4">Add Approval Step</h3>
+            <form method="post" action="/settings/approval-rules">
+                <div class="form-control mb-3"><label class="label"><span class="label-text">Button</span></label>
+                    <select name="action_id" class="select select-bordered" required>{button_opts}</select></div>
+                <div class="grid grid-cols-2 gap-4">
+                    <div class="form-control mb-3"><label class="label"><span class="label-text">Step order</span></label>
+                        <input name="step" type="number" class="input input-bordered" value="1" min="1" required/></div>
+                    <div class="form-control mb-3"><label class="label"><span class="label-text">Min approvals</span></label>
+                        <input name="min_approvals" type="number" class="input input-bordered" value="1" min="1" required/></div>
+                </div>
+                <div class="form-control mb-3"><label class="label"><span class="label-text">Step label</span></label>
+                    <input name="label" class="input input-bordered" placeholder="Manager review"/></div>
+                <div class="form-control mb-3"><label class="label"><span class="label-text">Approver role</span></label>
+                    <select name="approver_role" class="select select-bordered" required>{roles}</select></div>
+                <div class="modal-action">
+                    <button type="button" class="btn" onclick="document.getElementById('create-modal').close();">Cancel</button>
+                    <button type="submit" class="btn btn-primary">Add Step</button>
+                </div>
+            </form>
+        </div>
+        <form method="dialog" class="modal-backdrop"><button>close</button></form>
+    </dialog>
+</body>
+</html>"##,
+        user = html_escape(&user.username),
+        cards = cards,
+        button_opts = button_opts,
+        roles = role_options(&db, "").await,
+    );
+    Html(html).into_response()
+}
+
+/// POST /settings/approval-rules — add one step to a button.
+async fn approval_rule_create(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Form(form): Form<ApprovalRuleForm>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Approval Rules"))).into_response();
+    }
+    let role = form.approver_role.trim().to_string();
+    if role.is_empty() {
+        return settings_write_error("/settings/approval-rules", "An approver role is required.");
+    }
+    let step = form.step.unwrap_or(1).max(1);
+    let minc = form.min_approvals.unwrap_or(1).max(1);
+    let label = form.label.as_deref().map(str::trim).filter(|s| !s.is_empty());
+
+    if let Err(e) = sqlx::query(
+        "INSERT INTO approval_rules (action_id, step, label, approver_role, min_approvals) \
+         VALUES ($1, $2, $3, $4, $5) \
+         ON CONFLICT (action_id, step) DO UPDATE SET \
+            label = EXCLUDED.label, approver_role = EXCLUDED.approver_role, \
+            min_approvals = EXCLUDED.min_approvals",
+    )
+    .bind(form.action_id)
+    .bind(step)
+    .bind(label)
+    .bind(&role)
+    .bind(minc)
+    .execute(&db)
+    .await
+    {
+        error!(error = %e, "approval rule create failed");
+        return settings_write_error("/settings/approval-rules", &format!("Could not add step: {e}"));
+    }
+
+    let entry = AuditEntry::new(AuditAction::ConfigChanged, AuditSeverity::Info)
+        .with_user(vortex_common::UserId(user.id))
+        .with_username(&user.username)
+        .with_database(&db_ctx.db_name)
+        .with_resource("approval_rule", form.action_id.to_string())
+        .with_details(serde_json::json!({"action": "create", "step": step, "role": role}));
+    let _ = state.audit.log(entry).await;
+
+    Redirect::to("/settings/approval-rules").into_response()
+}
+
+/// POST /settings/approval-rules/:id/delete — drop one step.
+async fn approval_rule_delete(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<uuid::Uuid>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Approval Rules"))).into_response();
+    }
+    let _ = sqlx::query("DELETE FROM approval_rules WHERE id = $1")
+        .bind(id)
+        .execute(&db)
+        .await;
+
+    let entry = AuditEntry::new(AuditAction::ConfigChanged, AuditSeverity::Info)
+        .with_user(vortex_common::UserId(user.id))
+        .with_username(&user.username)
+        .with_database(&db_ctx.db_name)
+        .with_resource("approval_rule", id.to_string())
+        .with_details(serde_json::json!({"action": "delete"}));
+    let _ = state.audit.log(entry).await;
+
+    Redirect::to("/settings/approval-rules").into_response()
+}
+
+// ============================================================================
+// Approvals — generic, cross-module inbox + decisions
+// ============================================================================
+
+#[derive(Debug, serde::Deserialize)]
+struct DecisionForm {
+    comment: Option<String>,
+}
+
+/// GET /approvals — the signed-in user's approval inbox: every pending request
+/// they may act on right now, across all modules. Generic over the model.
+async fn approvals_inbox(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+) -> Response {
+    use vortex_framework::approval;
+    let pending = approval::inbox(&db, user.id, &user.roles).await;
+
+    let mut rows = String::new();
+    for r in &pending {
+        // Convention: a record's detail page lives at /{model}/{record_id}.
+        let link = format!("/{}/{}", r.model, r.record_id);
+        rows.push_str(&format!(
+            r##"<tr>
+                <td><a href="{link}" class="link link-primary">{name}</a><div class="text-xs text-base-content/50">{model}</div></td>
+                <td><code class="text-xs">{from}</code> → <code class="text-xs">{target}</code></td>
+                <td>{req_by}</td>
+                <td>step {step}</td>
+                <td class="text-right">
+                    <form method="post" action="/approvals/{id}/approve" class="inline"><button class="btn btn-xs btn-success">Approve</button></form>
+                    <form method="post" action="/approvals/{id}/reject" class="inline"><button class="btn btn-xs btn-error btn-outline" onclick="return confirm('Reject this request?');">Reject</button></form>
+                </td>
+            </tr>"##,
+            link = html_escape(&link),
+            name = html_escape(r.resource_name.as_deref().unwrap_or("(record)")),
+            model = html_escape(&r.model),
+            from = html_escape(r.from_stage.as_deref().unwrap_or("")),
+            target = html_escape(&r.target_stage),
+            req_by = html_escape(r.requested_by_name.as_deref().unwrap_or("")),
+            step = r.current_step,
+            id = r.id,
+        ));
+    }
+    if pending.is_empty() {
+        rows.push_str(r#"<tr><td colspan="5" class="text-center text-base-content/50 py-8">Nothing awaiting your approval.</td></tr>"#);
+    }
+
+    let display_name = user.full_name.as_deref().unwrap_or(&user.username);
+    let initials = get_initials(display_name);
+    let installed = db_ctx.installed_modules.clone();
+    let sidebar = build_sidebar("approvals", display_name, &initials, &installed, user.is_admin(), &state.plugin_registry, &user.roles);
+
+    let content = format!(
+        r##"<div class="mb-6"><h1 class="text-2xl font-bold">Approvals</h1>
+<p class="text-base-content/60 text-sm">Requests awaiting your sign-off · {count} pending</p></div>
+<div class="card bg-base-100 shadow"><div class="card-body p-0 overflow-x-auto">
+<table class="table">
+<thead><tr><th>Record</th><th>Transition</th><th>Requested by</th><th>Stage</th><th></th></tr></thead>
+<tbody>{rows}</tbody>
+</table>
+</div></div>"##,
+        count = pending.len(),
+        rows = rows,
+    );
+
+    let html = format!(
+        r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><title>Approvals - Remicle</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/>
+<script src="https://cdn.tailwindcss.com"></script></head>
+<body class="min-h-screen bg-base-200">
+<div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a></div>
+<div id="sidebar-overlay" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
+<div class="flex">{sidebar}
+<main class="flex-1 p-4 lg:p-6 min-w-0">{content}</main></div></body></html>"#,
+        sidebar = sidebar,
+        content = content,
+    );
+    Html(html).into_response()
+}
+
+/// Redirect a decision back to where it was made (the record page if the
+/// form was posted from there, else the inbox).
+fn decision_redirect(headers: &HeaderMap) -> Redirect {
+    let referer = headers
+        .get(header::REFERER)
+        .and_then(|v| v.to_str().ok())
+        .filter(|r| !r.contains("/approvals"))
+        .map(|s| s.to_string());
+    match referer {
+        Some(url) => Redirect::to(&url),
+        None => Redirect::to("/approvals"),
+    }
+}
+
+/// POST /approvals/:id/approve
+async fn approval_approve(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<uuid::Uuid>,
+    headers: HeaderMap,
+    Form(form): Form<DecisionForm>,
+) -> Response {
+    use vortex_framework::approval;
+    let outcome = approval::decide(
+        &db, &state.audit, &db_ctx.db_name, id,
+        user.id, &user.username, &user.roles,
+        true, form.comment.as_deref().unwrap_or(""),
+    )
+    .await;
+    info!(?outcome, request = %id, "approval decision");
+    decision_redirect(&headers).into_response()
+}
+
+/// POST /approvals/:id/reject
+async fn approval_reject(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<uuid::Uuid>,
+    headers: HeaderMap,
+    Form(form): Form<DecisionForm>,
+) -> Response {
+    use vortex_framework::approval;
+    let outcome = approval::decide(
+        &db, &state.audit, &db_ctx.db_name, id,
+        user.id, &user.username, &user.roles,
+        false, form.comment.as_deref().unwrap_or(""),
+    )
+    .await;
+    info!(?outcome, request = %id, "approval decision");
+    decision_redirect(&headers).into_response()
+}
+
+// ============================================================================
+// Email / SMTP servers — per-tenant outbound mail (vortex_framework::mail)
+// ============================================================================
+
+#[derive(Debug, serde::Deserialize)]
+struct MailServerForm {
+    name: String,
+    provider: Option<String>,
+    host: String,
+    port: Option<i32>,
+    security: Option<String>,
+    username: Option<String>,
+    password: Option<String>,
+    from_address: String,
+    from_name: Option<String>,
+    is_default: Option<String>,
+    active: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct MailTestForm {
+    to: String,
+}
+
+fn provider_options(selected: &str) -> String {
+    vortex_framework::mail::PROVIDERS
+        .iter()
+        .map(|(val, label)| {
+            let sel = if *val == selected { " selected" } else { "" };
+            format!(r#"<option value="{val}"{sel}>{label}</option>"#, val = val, label = label, sel = sel)
+        })
+        .collect()
+}
+
+fn security_options(selected: &str) -> String {
+    [("starttls", "STARTTLS (587)"), ("tls", "TLS / SSL (465)"), ("none", "None (25)")]
+        .iter()
+        .map(|(val, label)| {
+            let sel = if *val == selected { " selected" } else { "" };
+            format!(r#"<option value="{val}"{sel}>{label}</option>"#, val = val, label = label, sel = sel)
+        })
+        .collect()
+}
+
+async fn email_servers_list(Db(db): Db, Extension(user): Extension<AuthUser>) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Email Settings"))).into_response();
+    }
+    let servers = sqlx::query(
+        "SELECT id, name, provider, host, port, security, from_address, is_default, active, \
+                (username IS NOT NULL) AS has_auth \
+         FROM mail_servers ORDER BY is_default DESC, name",
+    )
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default();
+
+    let mut rows = String::new();
+    for s in &servers {
+        let id: uuid::Uuid = s.get("id");
+        let name: String = s.get("name");
+        let provider: String = s.get("provider");
+        let host: String = s.get("host");
+        let port: i32 = s.get("port");
+        let security: String = s.get("security");
+        let from_address: String = s.get("from_address");
+        let is_default: bool = s.get("is_default");
+        let active: bool = s.get("active");
+        let default_badge = if is_default { r#" <span class="badge badge-primary badge-sm">default</span>"# } else { "" };
+        let status = if active {
+            r#"<span class="badge badge-success badge-sm">Active</span>"#
+        } else {
+            r#"<span class="badge badge-ghost badge-sm">Disabled</span>"#
+        };
+        rows.push_str(&format!(
+            r##"<tr>
+                <td><a href="/settings/email/{id}" class="link link-primary font-medium">{name}</a>{default_badge}<div class="text-xs text-base-content/50">{provider}</div></td>
+                <td><code class="text-xs">{host}:{port}</code> · {security}</td>
+                <td>{from_address}</td>
+                <td>{status}</td>
+                <td>
+                    <form method="post" action="/settings/email/{id}/test" class="flex gap-1 items-center">
+                        <input name="to" type="email" class="input input-bordered input-xs w-44" placeholder="test@example.com" required/>
+                        <button class="btn btn-xs btn-outline">Send test</button>
+                    </form>
+                </td>
+            </tr>"##,
+            id = id,
+            name = html_escape(&name),
+            default_badge = default_badge,
+            provider = html_escape(&provider),
+            host = html_escape(&host),
+            port = port,
+            security = html_escape(&security),
+            from_address = html_escape(&from_address),
+            status = status,
+        ));
+    }
+    if servers.is_empty() {
+        rows.push_str(r#"<tr><td colspan="5" class="text-center text-base-content/50 py-8">No mail servers yet — add one to enable outbound email.</td></tr>"#);
+    }
+
+    let html = format!(
+        r##"<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+    <script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script>
+    <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Email / SMTP - Settings</title>
+    <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"><script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="min-h-screen bg-base-200">
+    <div class="navbar bg-base-100 shadow-lg">
+        <div class="flex-1"><a href="/" class="btn btn-ghost text-xl">remicle</a></div>
+        <div class="flex-none"><span class="text-sm">@{user}</span></div>
+    </div>
+    <div class="container mx-auto p-6 max-w-4xl">
+        <div class="flex justify-between items-center mb-6">
+            <div>
+                <h1 class="text-2xl font-bold">Email / SMTP</h1>
+                <p class="text-base-content/60">Outbound mail servers for this tenant. Passwords are encrypted at rest. The default server is used by the system and by modules that send mail.</p>
+            </div>
+            <button class="btn btn-primary" onclick="document.getElementById('create-modal').showModal();">+ New Server</button>
+        </div>
+
+        <div class="card bg-base-100 shadow">
+            <div class="card-body p-0 overflow-x-auto">
+                <table class="table">
+                    <thead><tr><th>Name</th><th>Host</th><th>From</th><th>Status</th><th>Test</th></tr></thead>
+                    <tbody>{rows}</tbody>
+                </table>
+            </div>
+        </div>
+
+        <div class="mt-4"><a href="/settings" class="btn btn-ghost btn-sm">← Back to Settings</a></div>
+    </div>
+
+    <dialog id="create-modal" class="modal">
+        <div class="modal-box max-w-xl">
+            <h3 class="font-bold text-lg mb-4">New Mail Server</h3>
+            <form method="post" action="/settings/email">
+                <div class="grid grid-cols-2 gap-4">
+                    <div class="form-control mb-3"><label class="label"><span class="label-text">Name</span></label>
+                        <input name="name" class="input input-bordered" placeholder="Company mailbox" required/></div>
+                    <div class="form-control mb-3"><label class="label"><span class="label-text">Provider</span></label>
+                        <select name="provider" id="provider-sel" class="select select-bordered" onchange="applyPreset()">{providers}</select></div>
+                </div>
+                <div class="grid grid-cols-3 gap-4">
+                    <div class="form-control mb-3 col-span-2"><label class="label"><span class="label-text">SMTP host</span></label>
+                        <input name="host" id="host-inp" class="input input-bordered" placeholder="smtp.example.com" required/></div>
+                    <div class="form-control mb-3"><label class="label"><span class="label-text">Port</span></label>
+                        <input name="port" id="port-inp" type="number" class="input input-bordered" value="587"/></div>
+                </div>
+                <div class="form-control mb-3"><label class="label"><span class="label-text">Security</span></label>
+                    <select name="security" id="sec-sel" class="select select-bordered">{security}</select></div>
+                <div class="grid grid-cols-2 gap-4">
+                    <div class="form-control mb-3"><label class="label"><span class="label-text">Username</span></label>
+                        <input name="username" class="input input-bordered" placeholder="apikey or user@domain" autocomplete="off"/></div>
+                    <div class="form-control mb-3"><label class="label"><span class="label-text">Password / app password</span></label>
+                        <input name="password" type="password" class="input input-bordered" autocomplete="new-password"/></div>
+                </div>
+                <div class="grid grid-cols-2 gap-4">
+                    <div class="form-control mb-3"><label class="label"><span class="label-text">From address</span></label>
+                        <input name="from_address" type="email" class="input input-bordered" placeholder="noreply@domain" required/></div>
+                    <div class="form-control mb-3"><label class="label"><span class="label-text">From name</span></label>
+                        <input name="from_name" class="input input-bordered" placeholder="Acme ERP"/></div>
+                </div>
+                <label class="cursor-pointer label justify-start gap-3 mb-2">
+                    <input type="checkbox" name="is_default" class="checkbox checkbox-sm" checked/>
+                    <span class="label-text">Use as default server</span></label>
+                <p class="text-xs text-base-content/50 mb-2">Gmail and Microsoft 365 require an <strong>app password</strong> (not your login password) when 2FA is on.</p>
+                <div class="modal-action">
+                    <button type="button" class="btn" onclick="document.getElementById('create-modal').close();">Cancel</button>
+                    <button type="submit" class="btn btn-primary">Create</button>
+                </div>
+            </form>
+        </div>
+        <form method="dialog" class="modal-backdrop"><button>close</button></form>
+    </dialog>
+    <script>
+    function applyPreset() {{
+        var presets = {{
+            gmail:      {{host:'smtp.gmail.com', port:587, sec:'starttls'}},
+            office365:  {{host:'smtp.office365.com', port:587, sec:'starttls'}},
+            sendgrid:   {{host:'smtp.sendgrid.net', port:587, sec:'starttls'}},
+            mailgun:    {{host:'smtp.mailgun.org', port:587, sec:'starttls'}}
+        }};
+        var p = presets[document.getElementById('provider-sel').value];
+        if (p) {{
+            document.getElementById('host-inp').value = p.host;
+            document.getElementById('port-inp').value = p.port;
+            document.getElementById('sec-sel').value = p.sec;
+        }}
+    }}
+    </script>
+</body>
+</html>"##,
+        user = html_escape(&user.username),
+        rows = rows,
+        providers = provider_options("generic"),
+        security = security_options("starttls"),
+    );
+    Html(html).into_response()
+}
+
+/// Clear the default flag on all other servers (the partial unique index
+/// allows only one). Call before setting a new default.
+async fn clear_other_defaults(db: &sqlx::PgPool, keep: Option<uuid::Uuid>) {
+    let _ = match keep {
+        Some(id) => sqlx::query("UPDATE mail_servers SET is_default = false WHERE is_default AND id <> $1").bind(id).execute(db).await,
+        None => sqlx::query("UPDATE mail_servers SET is_default = false WHERE is_default").execute(db).await,
+    };
+}
+
+async fn email_server_create(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Form(form): Form<MailServerForm>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Email Settings"))).into_response();
+    }
+    let name = form.name.trim().to_string();
+    let host = form.host.trim().to_string();
+    let from_address = form.from_address.trim().to_string();
+    if name.is_empty() || host.is_empty() || from_address.is_empty() {
+        return settings_write_error("/settings/email", "Name, host and from-address are required.");
+    }
+    let provider = form.provider.as_deref().unwrap_or("generic").to_string();
+    let security = form.security.as_deref().unwrap_or("starttls").to_string();
+    let port = form.port.unwrap_or(587);
+    let username = form.username.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let from_name = form.from_name.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let is_default = form.is_default.is_some();
+
+    // Encrypt the password (if any) before it ever touches the row.
+    let password_enc: Option<Vec<u8>> = match form.password.as_deref().filter(|p| !p.is_empty()) {
+        Some(p) => match vortex_security::crypto::encrypt_str(p, &vortex_security::crypto::master_key()) {
+            Ok(blob) => Some(blob),
+            Err(_) => return settings_write_error("/settings/email", "Could not encrypt the password."),
+        },
+        None => None,
+    };
+
+    if is_default {
+        clear_other_defaults(&db, None).await;
+    }
+    if let Err(e) = sqlx::query(
+        "INSERT INTO mail_servers (name, provider, host, port, security, username, password_enc, from_address, from_name, is_default) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
+    )
+    .bind(&name).bind(&provider).bind(&host).bind(port).bind(&security)
+    .bind(username).bind(password_enc.as_deref()).bind(&from_address).bind(from_name).bind(is_default)
+    .execute(&db)
+    .await
+    {
+        error!(error = %e, "mail server create failed");
+        return settings_write_error("/settings/email", &format!("Could not save server: {e}"));
+    }
+
+    let entry = AuditEntry::new(AuditAction::ConfigChanged, AuditSeverity::Info)
+        .with_user(vortex_common::UserId(user.id))
+        .with_username(&user.username)
+        .with_database(&db_ctx.db_name)
+        .with_resource("mail_server", &name)
+        .with_resource_name(&name)
+        .with_details(serde_json::json!({"action": "create", "host": host, "provider": provider}));
+    let _ = state.audit.log(entry).await;
+
+    Redirect::to("/settings/email").into_response()
+}
+
+async fn email_server_edit(
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Path(id): Path<uuid::Uuid>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Email Settings"))).into_response();
+    }
+    let row = sqlx::query(
+        "SELECT id, name, provider, host, port, security, username, from_address, from_name, is_default, active, \
+                (password_enc IS NOT NULL) AS has_pw \
+         FROM mail_servers WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&db)
+    .await
+    .ok()
+    .flatten();
+    let Some(s) = row else { return Redirect::to("/settings/email").into_response(); };
+    let name: String = s.get("name");
+    let provider: String = s.get("provider");
+    let host: String = s.get("host");
+    let port: i32 = s.get("port");
+    let security: String = s.get("security");
+    let username: String = s.get::<Option<String>, _>("username").unwrap_or_default();
+    let from_address: String = s.get("from_address");
+    let from_name: String = s.get::<Option<String>, _>("from_name").unwrap_or_default();
+    let is_default: bool = s.get("is_default");
+    let active: bool = s.get("active");
+    let has_pw: bool = s.get("has_pw");
+    let pw_placeholder = if has_pw { "•••••••• (unchanged)" } else { "" };
+
+    let html = format!(
+        r##"<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+    <script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script>
+    <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{name} - Mail Server</title>
+    <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"><script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="min-h-screen bg-base-200">
+    <div class="navbar bg-base-100 shadow-lg">
+        <div class="flex-1"><a href="/" class="btn btn-ghost text-xl">remicle</a></div>
+        <div class="flex-none"><span class="text-sm">@{user}</span></div>
+    </div>
+    <div class="container mx-auto p-6 max-w-xl">
+        <div class="mb-6"><a href="/settings/email" class="btn btn-ghost btn-sm">← Back to Email Settings</a></div>
+        <div class="card bg-base-100 shadow"><div class="card-body">
+            <h2 class="card-title">{name}</h2>
+            <form method="post" action="/settings/email/{id}">
+                <div class="grid grid-cols-2 gap-4">
+                    <div class="form-control mb-3"><label class="label"><span class="label-text">Name</span></label>
+                        <input name="name" class="input input-bordered" value="{name}" required/></div>
+                    <div class="form-control mb-3"><label class="label"><span class="label-text">Provider</span></label>
+                        <select name="provider" class="select select-bordered">{providers}</select></div>
+                </div>
+                <div class="grid grid-cols-3 gap-4">
+                    <div class="form-control mb-3 col-span-2"><label class="label"><span class="label-text">SMTP host</span></label>
+                        <input name="host" class="input input-bordered" value="{host}" required/></div>
+                    <div class="form-control mb-3"><label class="label"><span class="label-text">Port</span></label>
+                        <input name="port" type="number" class="input input-bordered" value="{port}"/></div>
+                </div>
+                <div class="form-control mb-3"><label class="label"><span class="label-text">Security</span></label>
+                    <select name="security" class="select select-bordered">{security}</select></div>
+                <div class="grid grid-cols-2 gap-4">
+                    <div class="form-control mb-3"><label class="label"><span class="label-text">Username</span></label>
+                        <input name="username" class="input input-bordered" value="{username}" autocomplete="off"/></div>
+                    <div class="form-control mb-3"><label class="label"><span class="label-text">Password (blank = keep)</span></label>
+                        <input name="password" type="password" class="input input-bordered" placeholder="{pw_placeholder}" autocomplete="new-password"/></div>
+                </div>
+                <div class="grid grid-cols-2 gap-4">
+                    <div class="form-control mb-3"><label class="label"><span class="label-text">From address</span></label>
+                        <input name="from_address" type="email" class="input input-bordered" value="{from_address}" required/></div>
+                    <div class="form-control mb-3"><label class="label"><span class="label-text">From name</span></label>
+                        <input name="from_name" class="input input-bordered" value="{from_name}"/></div>
+                </div>
+                <div class="flex gap-6">
+                    <label class="cursor-pointer label justify-start gap-3"><input type="checkbox" name="is_default" class="checkbox checkbox-sm" {default_checked}/><span class="label-text">Default server</span></label>
+                    <label class="cursor-pointer label justify-start gap-3"><input type="checkbox" name="active" class="checkbox checkbox-sm" {active_checked}/><span class="label-text">Active</span></label>
+                </div>
+                <div class="card-actions justify-between mt-4">
+                    <form method="post" action="/settings/email/{id}/delete" class="inline">
+                        <button type="submit" class="btn btn-error btn-outline" onclick="return confirm('Delete this server?');">Delete</button>
+                    </form>
+                    <button type="submit" class="btn btn-primary">Save Changes</button>
+                </div>
+            </form>
+            <div class="divider">Test</div>
+            <form method="post" action="/settings/email/{id}/test" class="flex gap-2 items-end">
+                <div class="form-control flex-1"><label class="label"><span class="label-text">Send a test email to</span></label>
+                    <input name="to" type="email" class="input input-bordered" placeholder="you@example.com" required/></div>
+                <button class="btn btn-outline">Send test</button>
+            </form>
+        </div></div>
+    </div>
+</body>
+</html>"##,
+        user = html_escape(&user.username),
+        id = id,
+        name = html_escape(&name),
+        providers = provider_options(&provider),
+        host = html_escape(&host),
+        port = port,
+        security = security_options(&security),
+        username = html_escape(&username),
+        pw_placeholder = pw_placeholder,
+        from_address = html_escape(&from_address),
+        from_name = html_escape(&from_name),
+        default_checked = if is_default { "checked" } else { "" },
+        active_checked = if active { "checked" } else { "" },
+    );
+    Html(html).into_response()
+}
+
+async fn email_server_update(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<uuid::Uuid>,
+    Form(form): Form<MailServerForm>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Email Settings"))).into_response();
+    }
+    let name = form.name.trim().to_string();
+    let host = form.host.trim().to_string();
+    let from_address = form.from_address.trim().to_string();
+    if name.is_empty() || host.is_empty() || from_address.is_empty() {
+        return settings_write_error(&format!("/settings/email/{id}"), "Name, host and from-address are required.");
+    }
+    let provider = form.provider.as_deref().unwrap_or("generic").to_string();
+    let security = form.security.as_deref().unwrap_or("starttls").to_string();
+    let port = form.port.unwrap_or(587);
+    let username = form.username.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let from_name = form.from_name.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let is_default = form.is_default.is_some();
+    let active = form.active.is_some();
+
+    if is_default {
+        clear_other_defaults(&db, Some(id)).await;
+    }
+
+    // Update everything except the password first.
+    if let Err(e) = sqlx::query(
+        "UPDATE mail_servers SET name=$1, provider=$2, host=$3, port=$4, security=$5, \
+         username=$6, from_address=$7, from_name=$8, is_default=$9, active=$10, updated_at=NOW() WHERE id=$11",
+    )
+    .bind(&name).bind(&provider).bind(&host).bind(port).bind(&security)
+    .bind(username).bind(&from_address).bind(from_name).bind(is_default).bind(active).bind(id)
+    .execute(&db)
+    .await
+    {
+        error!(error = %e, "mail server update failed");
+        return settings_write_error(&format!("/settings/email/{id}"), &format!("Could not save server: {e}"));
+    }
+
+    // Only overwrite the password when a new one is supplied.
+    if let Some(p) = form.password.as_deref().filter(|p| !p.is_empty()) {
+        match vortex_security::crypto::encrypt_str(p, &vortex_security::crypto::master_key()) {
+            Ok(blob) => {
+                let _ = sqlx::query("UPDATE mail_servers SET password_enc=$1, updated_at=NOW() WHERE id=$2")
+                    .bind(blob).bind(id).execute(&db).await;
+            }
+            Err(_) => return settings_write_error(&format!("/settings/email/{id}"), "Could not encrypt the password."),
+        }
+    }
+
+    let entry = AuditEntry::new(AuditAction::ConfigChanged, AuditSeverity::Info)
+        .with_user(vortex_common::UserId(user.id))
+        .with_username(&user.username)
+        .with_database(&db_ctx.db_name)
+        .with_resource("mail_server", id.to_string())
+        .with_resource_name(&name)
+        .with_details(serde_json::json!({"action": "update"}));
+    let _ = state.audit.log(entry).await;
+
+    Redirect::to("/settings/email").into_response()
+}
+
+async fn email_server_delete(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<uuid::Uuid>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Email Settings"))).into_response();
+    }
+    let _ = sqlx::query("DELETE FROM mail_servers WHERE id = $1").bind(id).execute(&db).await;
+
+    let entry = AuditEntry::new(AuditAction::ConfigChanged, AuditSeverity::Info)
+        .with_user(vortex_common::UserId(user.id))
+        .with_username(&user.username)
+        .with_database(&db_ctx.db_name)
+        .with_resource("mail_server", id.to_string())
+        .with_details(serde_json::json!({"action": "delete"}));
+    let _ = state.audit.log(entry).await;
+
+    Redirect::to("/settings/email").into_response()
+}
+
+async fn email_server_test(
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Path(id): Path<uuid::Uuid>,
+    Form(form): Form<MailTestForm>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Email Settings"))).into_response();
+    }
+    let to = form.to.trim().to_string();
+    let Some(server) = vortex_framework::mail::server_by_id(&db, id).await else {
+        return settings_write_error("/settings/email", "Server not found.");
+    };
+    let msg = vortex_framework::mail::EmailMessage::text(
+        &to,
+        "Vortex SMTP test",
+        format!(
+            "This is a test message from Vortex via '{}' ({}:{}).\n\nIf you received it, outbound email is working.",
+            server.name, server.host, server.port
+        ),
+    );
+    match vortex_framework::mail::send_with(&db, &server, &msg, "test").await {
+        Ok(()) => settings_write_ok("/settings/email", &format!("Test email sent to {to}.")),
+        Err(e) => settings_write_error("/settings/email", &format!("Send failed: {e}")),
+    }
+}
+
+// ============================================================================
+// Background jobs — durable queue admin (ir_job, central in the primary DB)
+// ============================================================================
+
+async fn jobs_list(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Jobs"))).into_response();
+    }
+    // The queue is central: query the primary pool, not the request tenant.
+    let filter = q.get("status").map(|s| s.as_str()).filter(|s| !s.is_empty());
+    let rows = if let Some(f) = filter {
+        sqlx::query("SELECT id, kind, status, attempts, max_attempts, run_at, last_error, db_name, created_at FROM ir_job WHERE status=$1 ORDER BY created_at DESC LIMIT 200")
+            .bind(f).fetch_all(&state.db).await
+    } else {
+        sqlx::query("SELECT id, kind, status, attempts, max_attempts, run_at, last_error, db_name, created_at FROM ir_job ORDER BY created_at DESC LIMIT 200")
+            .fetch_all(&state.db).await
+    }.unwrap_or_default();
+
+    // Status counts for the summary chips.
+    let counts = sqlx::query("SELECT status, COUNT(*) AS n FROM ir_job GROUP BY status")
+        .fetch_all(&state.db).await.unwrap_or_default();
+    let mut chips = String::new();
+    for c in &counts {
+        let s: String = c.get("status");
+        let n: i64 = c.get("n");
+        chips.push_str(&format!(r#"<a href="/settings/jobs?status={s}" class="badge badge-outline gap-1">{s}: {n}</a> "#, s = html_escape(&s), n = n));
+    }
+
+    let mut body = String::new();
+    for r in &rows {
+        let id: uuid::Uuid = r.get("id");
+        let kind: String = r.get("kind");
+        let status: String = r.get("status");
+        let attempts: i32 = r.get("attempts");
+        let max_attempts: i32 = r.get("max_attempts");
+        let run_at: chrono::DateTime<chrono::Utc> = r.get("run_at");
+        let last_error: Option<String> = r.try_get("last_error").ok().flatten();
+        let db_name: Option<String> = r.try_get("db_name").ok().flatten();
+        let badge = match status.as_str() {
+            "succeeded" => "badge-success", "dead" => "badge-error",
+            "running" => "badge-info", "cancelled" => "badge-ghost", _ => "badge-warning",
+        };
+        let actions = if status == "dead" || status == "cancelled" {
+            format!(r#"<form method="post" action="/settings/jobs/{id}/retry" class="inline"><button class="btn btn-xs btn-outline">Retry</button></form>"#)
+        } else if status == "pending" {
+            format!(r#"<form method="post" action="/settings/jobs/{id}/cancel" class="inline"><button class="btn btn-xs btn-error btn-outline">Cancel</button></form>"#)
+        } else { String::new() };
+        body.push_str(&format!(
+            r##"<tr><td><code class="text-xs">{kind}</code><div class="text-xs opacity-40">{db}</div></td>
+            <td><span class="badge {badge} badge-sm">{status}</span></td>
+            <td class="text-xs">{attempts}/{max}</td>
+            <td class="text-xs">{run_at}</td>
+            <td class="text-xs text-error">{err}</td>
+            <td class="text-right">{actions}</td></tr>"##,
+            kind = html_escape(&kind), db = html_escape(db_name.as_deref().unwrap_or("")),
+            badge = badge, status = html_escape(&status), attempts = attempts, max = max_attempts,
+            run_at = run_at.format("%Y-%m-%d %H:%M"),
+            err = html_escape(last_error.as_deref().unwrap_or("")), actions = actions,
+        ));
+    }
+    if rows.is_empty() {
+        body.push_str(r#"<tr><td colspan="6" class="text-center opacity-50 py-8">No jobs.</td></tr>"#);
+    }
+
+    let html = format!(
+        r##"<!DOCTYPE html><html lang="en" data-theme="dark"><head>
+<script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Jobs - Settings</title>
+<link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"><script src="https://cdn.tailwindcss.com"></script></head>
+<body class="min-h-screen bg-base-200">
+<div class="navbar bg-base-100 shadow-lg"><div class="flex-1"><a href="/" class="btn btn-ghost text-xl">remicle</a></div><div class="flex-none"><span class="text-sm">@{user}</span></div></div>
+<div class="container mx-auto p-6 max-w-5xl">
+<div class="mb-4"><h1 class="text-2xl font-bold">Background Jobs</h1>
+<p class="text-base-content/60">Durable queue — retries with backoff, dead-letters after max attempts. Central across tenants.</p></div>
+<div class="mb-3 flex flex-wrap gap-1 items-center"><a href="/settings/jobs" class="badge badge-primary">all</a> {chips}</div>
+<div class="card bg-base-100 shadow"><div class="card-body p-0 overflow-x-auto">
+<table class="table table-sm"><thead><tr><th>Kind</th><th>Status</th><th>Tries</th><th>Run at (UTC)</th><th>Last error</th><th></th></tr></thead><tbody>{body}</tbody></table>
+</div></div>
+<div class="mt-4"><a href="/settings" class="btn btn-ghost btn-sm">← Back to Settings</a></div>
+</div></body></html>"##,
+        user = html_escape(&user.username), chips = chips, body = body,
+    );
+    Html(html).into_response()
+}
+
+async fn job_retry(State(state): State<Arc<AppState>>, Extension(user): Extension<AuthUser>, Path(id): Path<uuid::Uuid>) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Jobs"))).into_response();
+    }
+    let _ = sqlx::query("UPDATE ir_job SET status='pending', attempts=0, run_at=NOW(), locked_at=NULL, locked_by=NULL, last_error=NULL, finished_at=NULL, updated_at=NOW() WHERE id=$1")
+        .bind(id).execute(&state.db).await;
+    Redirect::to("/settings/jobs").into_response()
+}
+
+async fn job_cancel(State(state): State<Arc<AppState>>, Extension(user): Extension<AuthUser>, Path(id): Path<uuid::Uuid>) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Jobs"))).into_response();
+    }
+    let _ = sqlx::query("UPDATE ir_job SET status='cancelled', finished_at=NOW(), updated_at=NOW() WHERE id=$1 AND status IN ('pending','dead')")
+        .bind(id).execute(&state.db).await;
+    Redirect::to("/settings/jobs").into_response()
+}
+
+// ============================================================================
+// API Tokens Management (bearer credentials for the public REST API)
+// ============================================================================
+
+fn api_tokens_page_shell(user: &AuthUser, inner: &str) -> Html<String> {
+    Html(format!(
+        r##"<!DOCTYPE html><html lang="en" data-theme="dark"><head>
+<script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>API Tokens - Settings</title>
+<link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"><script src="https://cdn.tailwindcss.com"></script></head>
+<body class="min-h-screen bg-base-200">
+<div class="navbar bg-base-100 shadow-lg"><div class="flex-1"><a href="/" class="btn btn-ghost text-xl">remicle</a></div><div class="flex-none"><span class="text-sm">@{user}</span></div></div>
+<div class="container mx-auto p-6 max-w-5xl">{inner}</div></body></html>"##,
+        user = html_escape(&user.username),
+        inner = inner,
+    ))
+}
+
+async fn api_tokens_list(
+    State(_state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("API Tokens"))).into_response();
+    }
+    let tokens = vortex_framework::api::list_tokens(&db).await;
+
+    // Owner select options (active users).
+    let users = sqlx::query("SELECT id, username FROM users WHERE active = true ORDER BY username")
+        .fetch_all(&db).await.unwrap_or_default();
+    let mut options = String::new();
+    for u in &users {
+        let id: uuid::Uuid = u.get("id");
+        let uname: String = u.get("username");
+        options.push_str(&format!(r#"<option value="{id}">{uname}</option>"#, id = id, uname = html_escape(&uname)));
+    }
+
+    let mut rows = String::new();
+    for t in &tokens {
+        let status = if t.revoked {
+            r#"<span class="badge badge-ghost badge-sm">revoked</span>"#.to_string()
+        } else if t.expires_at.map(|e| e < chrono::Utc::now()).unwrap_or(false) {
+            r#"<span class="badge badge-warning badge-sm">expired</span>"#.to_string()
+        } else {
+            r#"<span class="badge badge-success badge-sm">active</span>"#.to_string()
+        };
+        let scopes = if t.scopes.is_empty() { "read".to_string() } else { format!("read, {}", t.scopes.join(", ")) };
+        let last = t.last_used_at.map(|d| d.format("%Y-%m-%d %H:%M").to_string()).unwrap_or_else(|| "—".into());
+        let exp = t.expires_at.map(|d| d.format("%Y-%m-%d").to_string()).unwrap_or_else(|| "never".into());
+        let revoke = if t.revoked {
+            String::new()
+        } else {
+            format!(r#"<form method="post" action="/settings/api-tokens/{id}/revoke" class="inline" onsubmit="return confirm('Revoke this token? Clients using it will stop working immediately.')"><button class="btn btn-xs btn-error btn-outline">Revoke</button></form>"#, id = t.id)
+        };
+        rows.push_str(&format!(
+            r##"<tr><td><div class="font-medium">{name}</div><code class="text-xs opacity-50">{prefix}…</code></td>
+            <td class="text-xs">@{owner}</td><td class="text-xs">{scopes}</td>
+            <td class="text-xs">{last}</td><td class="text-xs">{exp}</td>
+            <td>{status}</td><td class="text-right">{revoke}</td></tr>"##,
+            name = html_escape(&t.name), prefix = html_escape(&t.token_prefix), owner = html_escape(&t.username),
+            scopes = html_escape(&scopes), last = last, exp = exp, status = status, revoke = revoke,
+        ));
+    }
+    if tokens.is_empty() {
+        rows.push_str(r#"<tr><td colspan="7" class="text-center opacity-50 py-8">No API tokens yet.</td></tr>"#);
+    }
+
+    let inner = format!(
+        r##"<div class="mb-4"><h1 class="text-2xl font-bold">API Tokens</h1>
+<p class="text-base-content/60">Bearer credentials for the public REST API (<code>/api/v1</code>). A token acts as its owning user and inherits that user's roles. Send it as <code>Authorization: Bearer &lt;token&gt;</code> with header <code>X-Vortex-Database</code> naming the tenant.</p></div>
+<div class="card bg-base-100 shadow mb-6"><div class="card-body">
+<h2 class="card-title text-lg">Create token</h2>
+<form method="post" action="/settings/api-tokens" class="grid md:grid-cols-4 gap-3 items-end">
+<label class="form-control"><span class="label-text">Name</span><input name="name" required placeholder="e.g. CI pipeline" class="input input-bordered input-sm"/></label>
+<label class="form-control"><span class="label-text">Owner</span><select name="user_id" class="select select-bordered select-sm">{options}</select></label>
+<label class="form-control"><span class="label-text">Expires (days, optional)</span><input name="expires_days" type="number" min="1" placeholder="never" class="input input-bordered input-sm"/></label>
+<label class="label cursor-pointer gap-2 justify-start"><input type="checkbox" name="scope_write" value="1" class="checkbox checkbox-sm"/><span class="label-text">Allow writes</span></label>
+<div class="md:col-span-4"><button class="btn btn-primary btn-sm">Create token</button></div>
+</form></div></div>
+<div class="card bg-base-100 shadow"><div class="card-body">
+<table class="table table-sm"><thead><tr><th>Token</th><th>Owner</th><th>Scopes</th><th>Last used</th><th>Expires</th><th>Status</th><th></th></tr></thead>
+<tbody>{rows}</tbody></table></div></div>"##,
+        options = options, rows = rows,
+    );
+    api_tokens_page_shell(&user, &inner).into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct ApiTokenForm {
+    name: String,
+    user_id: uuid::Uuid,
+    expires_days: Option<String>,
+    scope_write: Option<String>,
+}
+
+async fn api_token_create(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Form(form): Form<ApiTokenForm>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("API Tokens"))).into_response();
+    }
+    let name = form.name.trim();
+    if name.is_empty() {
+        return (StatusCode::BAD_REQUEST, Html(forbidden_page("API Tokens"))).into_response();
+    }
+    let scopes: Vec<String> = if form.scope_write.is_some() { vec!["write".into()] } else { vec![] };
+    let expires_at = form
+        .expires_days
+        .as_deref()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .filter(|d| *d > 0)
+        .map(|d| chrono::Utc::now() + chrono::Duration::days(d));
+
+    let secret = match vortex_framework::api::create_token(
+        &db, name, form.user_id, &scopes, expires_at, Some(user.id),
+    ).await {
+        Ok(s) => s,
+        Err(e) => {
+            return api_tokens_page_shell(
+                &user,
+                &format!(r#"<div class="alert alert-error">Failed to create token: {}</div><a href="/settings/api-tokens" class="btn btn-sm mt-4">Back</a>"#, html_escape(&e)),
+            ).into_response();
+        }
+    };
+
+    // Audit the mint (the secret itself is never logged).
+    api_audit(
+        &state, &db_ctx.db_name, &user,
+        AuditAction::Custom("api_token_created".into()), AuditSeverity::Warning,
+        "api_token", Some(&form.user_id.to_string()),
+        serde_json::json!({"name": name, "scopes": scopes, "expires_at": expires_at}),
+    ).await;
+
+    // Show-once: the only time the secret is ever displayed.
+    let inner = format!(
+        r##"<div class="mb-4"><h1 class="text-2xl font-bold">Token created</h1></div>
+<div class="alert alert-warning mb-4"><span>Copy this token now — it is shown <strong>once</strong> and cannot be retrieved again.</span></div>
+<div class="card bg-base-100 shadow"><div class="card-body">
+<label class="label-text">Secret</label>
+<div class="join w-full"><input id="tok" readonly value="{secret}" class="input input-bordered join-item w-full font-mono text-sm"/>
+<button class="btn join-item" onclick="navigator.clipboard.writeText(document.getElementById('tok').value)">Copy</button></div>
+<div class="mt-4"><label class="label-text">Example</label>
+<pre class="bg-base-200 p-3 rounded text-xs overflow-x-auto">curl -H "Authorization: Bearer {secret}" \
+     -H "X-Vortex-Database: {db}" \
+     {scheme}/api/v1/whoami</pre></div>
+<a href="/settings/api-tokens" class="btn btn-primary btn-sm mt-4 w-fit">Done</a>
+</div></div>"##,
+        secret = html_escape(&secret),
+        db = html_escape(&db_ctx.db_name),
+        scheme = "http://localhost:8080",
+    );
+    api_tokens_page_shell(&user, &inner).into_response()
+}
+
+async fn api_token_revoke(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<uuid::Uuid>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("API Tokens"))).into_response();
+    }
+    let _ = vortex_framework::api::revoke_token(&db, id).await;
+    api_audit(
+        &state, &db_ctx.db_name, &user,
+        AuditAction::Custom("api_token_revoked".into()), AuditSeverity::Warning,
+        "api_token", Some(&id.to_string()), serde_json::json!({}),
+    ).await;
+    Redirect::to("/settings/api-tokens").into_response()
+}
+
+// ============================================================================
+// Webhooks Management (outbound event subscriptions)
+// ============================================================================
+
+fn webhooks_page_shell(user: &AuthUser, title: &str, inner: &str) -> Html<String> {
+    Html(format!(
+        r##"<!DOCTYPE html><html lang="en" data-theme="dark"><head>
+<script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>{title} - Settings</title>
+<link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"><script src="https://cdn.tailwindcss.com"></script></head>
+<body class="min-h-screen bg-base-200">
+<div class="navbar bg-base-100 shadow-lg"><div class="flex-1"><a href="/" class="btn btn-ghost text-xl">remicle</a></div><div class="flex-none"><span class="text-sm">@{user}</span></div></div>
+<div class="container mx-auto p-6 max-w-4xl">{inner}</div></body></html>"##,
+        title = html_escape(title), user = html_escape(&user.username), inner = inner,
+    ))
+}
+
+/// Comma/space/newline separated event types -> Vec, empty -> [] (all events).
+fn parse_event_types(raw: &str) -> Vec<String> {
+    raw.split([',', '\n', ' ', '\t'])
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect()
+}
+
+async fn webhooks_list(Db(db): Db, Extension(user): Extension<AuthUser>) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Webhooks"))).into_response();
+    }
+    let endpoints = vortex_framework::webhooks::list_endpoints(&db).await;
+    let mut rows = String::new();
+    for e in &endpoints {
+        let events = if e.event_types.is_empty() { "all events".to_string() } else { e.event_types.join(", ") };
+        let active = if e.active { r#"<span class="badge badge-success badge-sm">active</span>"# } else { r#"<span class="badge badge-ghost badge-sm">paused</span>"# };
+        let last = match (&e.last_status, e.last_delivery_at) {
+            (Some(s), Some(t)) => {
+                let badge = if s == "success" { "badge-success" } else { "badge-error" };
+                format!(r#"<span class="badge {badge} badge-xs">{s}</span> <span class="text-xs opacity-50">{}</span>"#, t.format("%Y-%m-%d %H:%M"))
+            }
+            _ => r#"<span class="opacity-40 text-xs">never</span>"#.to_string(),
+        };
+        rows.push_str(&format!(
+            r##"<tr><td><a href="/settings/webhooks/{id}" class="link link-primary font-medium">{name}</a><div class="text-xs opacity-50 truncate max-w-xs">{url}</div></td>
+            <td class="text-xs">{events}</td><td>{active}</td><td>{last}</td></tr>"##,
+            id = e.id, name = html_escape(&e.name), url = html_escape(&e.url),
+            events = html_escape(&events), active = active, last = last,
+        ));
+    }
+    if endpoints.is_empty() {
+        rows.push_str(r#"<tr><td colspan="4" class="text-center opacity-50 py-8">No webhook endpoints.</td></tr>"#);
+    }
+    let inner = format!(
+        r##"<div class="mb-4"><h1 class="text-2xl font-bold">Webhooks</h1>
+<p class="text-base-content/60">Subscribe external systems to events. Deliveries ride the durable job queue (retries, backoff, dead-letter) and are signed with <code>X-Vortex-Signature: sha256=HMAC(secret, body)</code>. Core events: <code>record.created</code>, <code>record.updated</code>, <code>record.deleted</code>.</p></div>
+<div class="card bg-base-100 shadow mb-6"><div class="card-body">
+<h2 class="card-title text-lg">Add endpoint</h2>
+<form method="post" action="/settings/webhooks" class="grid md:grid-cols-2 gap-3">
+<label class="form-control"><span class="label-text">Name</span><input name="name" required class="input input-bordered input-sm"/></label>
+<label class="form-control"><span class="label-text">Payload URL</span><input name="url" type="url" required placeholder="https://example.com/hook" class="input input-bordered input-sm"/></label>
+<label class="form-control"><span class="label-text">Signing secret (optional)</span><input name="secret" class="input input-bordered input-sm" placeholder="whsec_…"/></label>
+<label class="form-control"><span class="label-text">Event types (comma-sep, blank = all)</span><input name="event_types" class="input input-bordered input-sm" placeholder="record.created, record.deleted"/></label>
+<div class="md:col-span-2"><button class="btn btn-primary btn-sm">Add endpoint</button></div>
+</form></div></div>
+<div class="card bg-base-100 shadow"><div class="card-body">
+<table class="table table-sm"><thead><tr><th>Endpoint</th><th>Events</th><th>Status</th><th>Last delivery</th></tr></thead>
+<tbody>{rows}</tbody></table></div></div>"##,
+        rows = rows,
+    );
+    webhooks_page_shell(&user, "Webhooks", &inner).into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct WebhookForm {
+    name: String,
+    url: String,
+    #[serde(default)]
+    secret: String,
+    #[serde(default)]
+    event_types: String,
+    #[serde(default)]
+    active: Option<String>,
+}
+
+async fn webhook_create(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Form(form): Form<WebhookForm>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Webhooks"))).into_response();
+    }
+    let events = parse_event_types(&form.event_types);
+    match vortex_framework::webhooks::create_endpoint(
+        &db, form.name.trim(), form.url.trim(), &form.secret, &events, Some(user.id),
+    ).await {
+        Ok(id) => {
+            api_audit(&state, &db_ctx.db_name, &user,
+                AuditAction::Custom("webhook_created".into()), AuditSeverity::Info,
+                "webhook_endpoint", Some(&id.to_string()),
+                serde_json::json!({"url": form.url.trim(), "event_types": events})).await;
+            Redirect::to("/settings/webhooks").into_response()
+        }
+        Err(e) => webhooks_page_shell(&user, "Webhooks",
+            &format!(r#"<div class="alert alert-error">Failed: {}</div><a href="/settings/webhooks" class="btn btn-sm mt-4">Back</a>"#, html_escape(&e))).into_response(),
+    }
+}
+
+async fn webhook_edit(Db(db): Db, Extension(user): Extension<AuthUser>, Path(id): Path<uuid::Uuid>) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Webhooks"))).into_response();
+    }
+    let Some(e) = vortex_framework::webhooks::get_endpoint(&db, id).await else {
+        return (StatusCode::NOT_FOUND, Html(forbidden_page("Webhooks"))).into_response();
+    };
+    let deliveries = vortex_framework::webhooks::recent_deliveries(&db, id, 20).await;
+    let mut drows = String::new();
+    for d in &deliveries {
+        let st = d.get("status").and_then(|v| v.as_str()).unwrap_or("");
+        let badge = if st == "success" { "badge-success" } else { "badge-error" };
+        drows.push_str(&format!(
+            r##"<tr><td class="text-xs"><code>{ev}</code></td><td><span class="badge {badge} badge-xs">{st}</span></td>
+            <td class="text-xs">{code}</td><td class="text-xs">{ms}ms</td><td class="text-xs opacity-50">{at}</td>
+            <td class="text-xs text-error">{err}</td></tr>"##,
+            ev = html_escape(d.get("event_type").and_then(|v| v.as_str()).unwrap_or("")),
+            badge = badge, st = html_escape(st),
+            code = d.get("status_code").and_then(|v| v.as_i64()).map(|c| c.to_string()).unwrap_or_else(|| "—".into()),
+            ms = d.get("duration_ms").and_then(|v| v.as_i64()).unwrap_or(0),
+            at = html_escape(d.get("created_at").and_then(|v| v.as_str()).unwrap_or("")),
+            err = html_escape(d.get("error").and_then(|v| v.as_str()).unwrap_or("")),
+        ));
+    }
+    if deliveries.is_empty() {
+        drows.push_str(r#"<tr><td colspan="6" class="text-center opacity-50 py-6">No deliveries yet.</td></tr>"#);
+    }
+    let events_val = e.event_types.join(", ");
+    let checked = if e.active { "checked" } else { "" };
+    let inner = format!(
+        r##"<div class="mb-4"><a href="/settings/webhooks" class="btn btn-ghost btn-sm">← Webhooks</a><h1 class="text-2xl font-bold mt-2">{name}</h1></div>
+<div class="card bg-base-100 shadow mb-6"><div class="card-body">
+<form method="post" action="/settings/webhooks/{id}" class="grid md:grid-cols-2 gap-3">
+<label class="form-control"><span class="label-text">Name</span><input name="name" required value="{name}" class="input input-bordered input-sm"/></label>
+<label class="form-control"><span class="label-text">Payload URL</span><input name="url" type="url" required value="{url}" class="input input-bordered input-sm"/></label>
+<label class="form-control"><span class="label-text">Signing secret (blank = keep)</span><input name="secret" class="input input-bordered input-sm" placeholder="•••• unchanged"/></label>
+<label class="form-control"><span class="label-text">Event types (blank = all)</span><input name="event_types" value="{events}" class="input input-bordered input-sm"/></label>
+<label class="label cursor-pointer gap-2 justify-start"><input type="checkbox" name="active" value="1" {checked} class="checkbox checkbox-sm"/><span class="label-text">Active</span></label>
+<div class="md:col-span-2 flex gap-2"><button class="btn btn-primary btn-sm">Save</button></div>
+</form>
+<div class="flex gap-2 mt-2 pt-3 border-t border-base-300">
+<form method="post" action="/settings/webhooks/{id}/test"><button class="btn btn-outline btn-sm">Send test event</button></form>
+<form method="post" action="/settings/webhooks/{id}/delete" onsubmit="return confirm('Delete this endpoint?')"><button class="btn btn-error btn-outline btn-sm">Delete</button></form>
+</div></div></div>
+<div class="card bg-base-100 shadow"><div class="card-body">
+<h2 class="card-title text-lg">Recent deliveries</h2>
+<table class="table table-sm"><thead><tr><th>Event</th><th>Status</th><th>Code</th><th>Time</th><th>At</th><th>Error</th></tr></thead>
+<tbody>{drows}</tbody></table></div></div>"##,
+        id = e.id, name = html_escape(&e.name), url = html_escape(&e.url),
+        events = html_escape(&events_val), checked = checked, drows = drows,
+    );
+    webhooks_page_shell(&user, &e.name, &inner).into_response()
+}
+
+async fn webhook_update(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<uuid::Uuid>,
+    Form(form): Form<WebhookForm>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Webhooks"))).into_response();
+    }
+    let events = parse_event_types(&form.event_types);
+    let active = form.active.is_some();
+    let _ = vortex_framework::webhooks::update_endpoint(
+        &db, id, form.name.trim(), form.url.trim(), &form.secret, &events, active,
+    ).await;
+    api_audit(&state, &db_ctx.db_name, &user,
+        AuditAction::Custom("webhook_updated".into()), AuditSeverity::Info,
+        "webhook_endpoint", Some(&id.to_string()), serde_json::json!({"active": active})).await;
+    Redirect::to(&format!("/settings/webhooks/{id}")).into_response()
+}
+
+async fn webhook_delete(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<uuid::Uuid>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Webhooks"))).into_response();
+    }
+    let _ = vortex_framework::webhooks::delete_endpoint(&db, id).await;
+    api_audit(&state, &db_ctx.db_name, &user,
+        AuditAction::Custom("webhook_deleted".into()), AuditSeverity::Warning,
+        "webhook_endpoint", Some(&id.to_string()), serde_json::json!({})).await;
+    Redirect::to("/settings/webhooks").into_response()
+}
+
+/// Enqueue a `webhook.ping` test event to a single endpoint (bypasses the
+/// subscription filter so an operator can verify connectivity).
+async fn webhook_test(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<uuid::Uuid>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Webhooks"))).into_response();
+    }
+    if vortex_framework::webhooks::get_endpoint(&db, id).await.is_some() {
+        let job = vortex_framework::NewJob::new(
+            vortex_framework::webhooks::DELIVER_KIND,
+            serde_json::json!({"endpoint_id": id, "event_type": "ping", "data": {"message": "Test event from Vortex"}}),
+        ).for_db(&db_ctx.db_name).trace("webhook_endpoint", &id.to_string());
+        let _ = vortex_framework::jobs::enqueue(&state.db, job).await;
+    }
+    Redirect::to(&format!("/settings/webhooks/{id}")).into_response()
 }
 
 // ============================================================================
@@ -10047,13 +14144,88 @@ async fn report_list(
     Html(full_html).into_response()
 }
 
-async fn reports_list(
-    State(state): State<Arc<AppState>>,
-    Db(db): Db,
-    Extension(user): Extension<AuthUser>,
-) -> Response {
+// ── User-authored report builder + runner (vortex_framework::user_reports) ──
+
+/// May this user create/edit reports? Admins, or holders of "Report Author".
+fn report_author(user: &AuthUser) -> bool {
+    user.is_admin() || user.roles.iter().any(|r| r == "Report Author")
+}
+
+/// `<option>`s of a model's visible fields (from the model registry).
+async fn report_field_options(db: &sqlx::PgPool, model_name: &str, selected: &str, blank: Option<&str>) -> String {
+    let rows = sqlx::query(
+        "SELECT f.name, f.display_name, f.field_type FROM ir_model_field f \
+         JOIN ir_model m ON m.id = f.model_id WHERE m.name = $1 ORDER BY f.sequence, f.name",
+    )
+    .bind(model_name)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+    let mut out = String::new();
+    if let Some(b) = blank {
+        let sel = if selected.is_empty() { " selected" } else { "" };
+        out.push_str(&format!(r#"<option value=""{sel}>{}</option>"#, html_escape(b)));
+    }
+    for r in &rows {
+        let name: String = r.get("name");
+        let disp: Option<String> = r.try_get("display_name").ok().flatten();
+        let ftype: String = r.get("field_type");
+        let sel = if name == selected { " selected" } else { "" };
+        out.push_str(&format!(
+            r#"<option value="{name}"{sel}>{label} ({ftype})</option>"#,
+            name = html_escape(&name),
+            sel = sel,
+            label = html_escape(disp.as_deref().unwrap_or(&name)),
+            ftype = html_escape(&ftype),
+        ));
+    }
+    out
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ReportCreateForm {
+    code: String,
+    name: String,
+    model_name: String,
+    report_type: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ReportBasicsForm {
+    name: String,
+    description: Option<String>,
+    report_type: Option<String>,
+    sort_field: Option<String>,
+    sort_dir: Option<String>,
+    group_field: Option<String>,
+    row_limit: Option<i32>,
+    paper_size: Option<String>,
+    orientation: Option<String>,
+    required_role: Option<String>,
+    template: Option<String>,
+    active: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ColumnAddForm {
+    field: String,
+    label: Option<String>,
+    aggregate: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct FilterAddForm {
+    field: String,
+    operator: Option<String>,
+    value: Option<String>,
+}
+
+async fn reports_list(Db(db): Db, Extension(user): Extension<AuthUser>) -> Response {
+    if !report_author(&user) {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Reports"))).into_response();
+    }
     let reports = sqlx::query(
-        "SELECT id, name, model_name, report_type, paper_size, active FROM ir_report ORDER BY model_name, sequence, name"
+        "SELECT id, code, name, model_name, report_type, active FROM ir_report ORDER BY model_name, sequence, name",
     )
     .fetch_all(&db)
     .await
@@ -10062,272 +14234,549 @@ async fn reports_list(
     let mut rows_html = String::new();
     for report in &reports {
         let id: uuid::Uuid = report.get("id");
+        let code: String = report.get("code");
         let name: String = report.get("name");
         let model_name: String = report.get("model_name");
         let report_type: String = report.get("report_type");
-        let paper_size: String = report.get("paper_size");
         let active: bool = report.get("active");
-
         rows_html.push_str(&format!(
             r##"<tr>
-                <td><a href="/settings/reports/{}" class="link link-primary">{}</a></td>
-                <td><code class="text-xs">{}</code></td>
-                <td>{}</td>
-                <td>{}</td>
-                <td>{}</td>
+                <td><a href="/settings/reports/{id}" class="link link-primary">{name}</a><div class="text-xs opacity-50">{code}</div></td>
+                <td><code class="text-xs">{model}</code></td>
+                <td><span class="badge badge-ghost badge-sm">{rtype}</span></td>
+                <td>{status}</td>
+                <td class="text-right"><a href="/reports/run/{id}" class="btn btn-xs btn-outline" target="_blank">Run</a></td>
             </tr>"##,
-            id, name, model_name, report_type.to_uppercase(), paper_size,
-            if active { r#"<span class="badge badge-success badge-sm">Active</span>"# } else { r#"<span class="badge badge-ghost badge-sm">Inactive</span>"# }
+            id = id,
+            name = html_escape(&name),
+            code = html_escape(&code),
+            model = html_escape(&model_name),
+            rtype = html_escape(&report_type),
+            status = if active { r#"<span class="badge badge-success badge-sm">Active</span>"# } else { r#"<span class="badge badge-ghost badge-sm">Inactive</span>"# },
         ));
     }
+    if reports.is_empty() {
+        rows_html.push_str(r#"<tr><td colspan="5" class="text-center opacity-50 py-8">No reports yet — create one to get started.</td></tr>"#);
+    }
+
+    let models: Vec<String> = sqlx::query_scalar("SELECT name FROM ir_model WHERE is_active = true ORDER BY name")
+        .fetch_all(&db)
+        .await
+        .unwrap_or_default();
+    let model_opts: String = models.iter().map(|m| format!(r#"<option value="{0}">{0}</option>"#, html_escape(m))).collect();
 
     let html = format!(
         r##"<!DOCTYPE html>
 <html lang="en" data-theme="dark">
 <head>
-    <script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script>
+    <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Reports - Settings</title>
-    <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet">
-    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"><script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="min-h-screen bg-base-200">
-    <div class="navbar bg-base-100 shadow-lg">
-        <div class="flex-1"><a href="/" class="btn btn-ghost text-xl">remicle</a></div>
-        <div class="flex-none"><span class="text-sm">@{}</span></div>
-    </div>
-    <div class="container mx-auto p-6">
+    <div class="navbar bg-base-100 shadow-lg"><div class="flex-1"><a href="/" class="btn btn-ghost text-xl">remicle</a></div><div class="flex-none"><span class="text-sm">@{user}</span></div></div>
+    <div class="container mx-auto p-6 max-w-4xl">
         <div class="flex justify-between items-center mb-6">
-            <div>
-                <h1 class="text-2xl font-bold">Reports</h1>
-                <p class="text-base-content/60">Print templates for documents</p>
-            </div>
+            <div><h1 class="text-2xl font-bold">Reports</h1>
+            <p class="text-base-content/60">Build your own reports — pick a model and columns (tabular) or author an HTML template. No code required.</p></div>
             <button class="btn btn-primary" onclick="document.getElementById('create-modal').showModal();">+ New Report</button>
         </div>
-
-        <div class="card bg-base-100 shadow">
-            <div class="card-body p-0">
-                <table class="table">
-                    <thead>
-                        <tr>
-                            <th>Name</th>
-                            <th>Model</th>
-                            <th>Type</th>
-                            <th>Paper</th>
-                            <th>Status</th>
-                        </tr>
-                    </thead>
-                    <tbody>{}</tbody>
-                </table>
-            </div>
-        </div>
-
-        <div class="mt-4">
-            <a href="/settings" class="btn btn-ghost btn-sm">← Back to Settings</a>
-        </div>
+        <div class="card bg-base-100 shadow"><div class="card-body p-0 overflow-x-auto">
+            <table class="table"><thead><tr><th>Name</th><th>Model</th><th>Type</th><th>Status</th><th></th></tr></thead><tbody>{rows}</tbody></table>
+        </div></div>
+        <div class="mt-4"><a href="/settings" class="btn btn-ghost btn-sm">← Back to Settings</a></div>
     </div>
-
-    <dialog id="create-modal" class="modal">
-        <div class="modal-box">
-            <h3 class="font-bold text-lg mb-4">New Report</h3>
-            <form method="post" action="/settings/reports">
-                <div class="form-control mb-3">
-                    <label class="label"><span class="label-text">Name</span></label>
-                    <input type="text" name="name" class="input input-bordered" placeholder="e.g., Invoice" required/>
-                </div>
-                <div class="form-control mb-3">
-                    <label class="label"><span class="label-text">Model</span></label>
-                    <input type="text" name="model_name" class="input input-bordered" placeholder="e.g., contacts" required/>
-                </div>
-                <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                    <div class="form-control mb-3">
-                        <label class="label"><span class="label-text">Paper Size</span></label>
-                        <select name="paper_size" class="select select-bordered">
-                            <option value="A4">A4</option>
-                            <option value="Letter">Letter</option>
-                            <option value="Legal">Legal</option>
-                        </select>
-                    </div>
-                    <div class="form-control mb-3">
-                        <label class="label"><span class="label-text">Orientation</span></label>
-                        <select name="orientation" class="select select-bordered">
-                            <option value="portrait">Portrait</option>
-                            <option value="landscape">Landscape</option>
-                        </select>
-                    </div>
-                </div>
-                <div class="form-control mb-4">
-                    <label class="label"><span class="label-text">Template (HTML)</span></label>
-                    <textarea name="template" class="textarea textarea-bordered h-32" placeholder="<div>{{name}}</div>"></textarea>
-                </div>
-                <div class="modal-action">
-                    <button type="button" class="btn" onclick="document.getElementById('create-modal').close();">Cancel</button>
-                    <button type="submit" class="btn btn-primary">Create</button>
-                </div>
-            </form>
-        </div>
-        <form method="dialog" class="modal-backdrop"><button>close</button></form>
-    </dialog>
-</body>
-</html>"##,
-        user.username, rows_html
+    <dialog id="create-modal" class="modal"><div class="modal-box">
+        <h3 class="font-bold text-lg mb-4">New Report</h3>
+        <form method="post" action="/settings/reports">
+            <div class="grid grid-cols-2 gap-4">
+                <div class="form-control mb-3"><label class="label"><span class="label-text">Code</span></label>
+                    <input name="code" class="input input-bordered" placeholder="contacts_by_country" required/></div>
+                <div class="form-control mb-3"><label class="label"><span class="label-text">Name</span></label>
+                    <input name="name" class="input input-bordered" placeholder="Contacts by Country" required/></div>
+            </div>
+            <div class="grid grid-cols-2 gap-4">
+                <div class="form-control mb-3"><label class="label"><span class="label-text">Model</span></label>
+                    <select name="model_name" class="select select-bordered" required>{model_opts}</select></div>
+                <div class="form-control mb-3"><label class="label"><span class="label-text">Type</span></label>
+                    <select name="report_type" class="select select-bordered">
+                        <option value="tabular">Tabular (columns + groups)</option>
+                        <option value="template">Template (HTML document)</option>
+                    </select></div>
+            </div>
+            <div class="modal-action">
+                <button type="button" class="btn" onclick="document.getElementById('create-modal').close();">Cancel</button>
+                <button type="submit" class="btn btn-primary">Create &amp; configure</button>
+            </div>
+        </form>
+    </div><form method="dialog" class="modal-backdrop"><button>close</button></form></dialog>
+</body></html>"##,
+        user = html_escape(&user.username),
+        rows = rows_html,
+        model_opts = model_opts,
     );
-
     Html(html).into_response()
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct ReportForm {
-    name: String,
-    model_name: String,
-    paper_size: Option<String>,
-    orientation: Option<String>,
-    template: Option<String>,
 }
 
 async fn report_create(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
-    Form(form): Form<ReportForm>,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Form(form): Form<ReportCreateForm>,
 ) -> Response {
-    let _ = sqlx::query(
-        "INSERT INTO ir_report (name, model_name, paper_size, orientation, template)
-         VALUES ($1, $2, $3, $4, $5)"
+    if !report_author(&user) {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Reports"))).into_response();
+    }
+    let code = form.code.trim().to_lowercase();
+    let name = form.name.trim().to_string();
+    let model = form.model_name.trim().to_string();
+    if code.is_empty() || name.is_empty() || model.is_empty() {
+        return settings_write_error("/settings/reports", "Code, name and model are required.");
+    }
+    let rtype = match form.report_type.as_deref() { Some("template") => "template", _ => "tabular" };
+    let row = sqlx::query(
+        "INSERT INTO ir_report (code, name, model_name, report_type, created_by) \
+         VALUES ($1,$2,$3,$4,$5) RETURNING id",
     )
-    .bind(&form.name)
-    .bind(&form.model_name)
-    .bind(form.paper_size.as_deref().unwrap_or("A4"))
-    .bind(form.orientation.as_deref().unwrap_or("portrait"))
-    .bind(form.template.as_deref().unwrap_or("<div>{{name}}</div>"))
-    .execute(&db)
+    .bind(&code).bind(&name).bind(&model).bind(rtype).bind(user.id)
+    .fetch_optional(&db)
     .await;
-
-    Redirect::to("/settings/reports").into_response()
+    let new_id = match row {
+        Ok(Some(r)) => r.get::<uuid::Uuid, _>("id"),
+        _ => return settings_write_error("/settings/reports", "Could not create report (code may already exist)."),
+    };
+    let entry = AuditEntry::new(AuditAction::ConfigChanged, AuditSeverity::Info)
+        .with_user(vortex_common::UserId(user.id)).with_username(&user.username)
+        .with_database(&db_ctx.db_name).with_resource("ir_report", &code).with_resource_name(&name)
+        .with_details(serde_json::json!({"action":"create","model":model,"type":rtype}));
+    let _ = state.audit.log(entry).await;
+    Redirect::to(&format!("/settings/reports/{new_id}")).into_response()
 }
 
-async fn report_edit(
-    State(state): State<Arc<AppState>>,
-    Db(db): Db,
-    Extension(user): Extension<AuthUser>,
-    Path(id): Path<uuid::Uuid>,
-) -> Response {
-    let report = sqlx::query(
-        "SELECT id, name, model_name, paper_size, orientation, template, active FROM ir_report WHERE id = $1"
-    )
-    .bind(id)
-    .fetch_optional(&db)
-    .await
-    .ok()
-    .flatten();
-
-    let Some(report) = report else {
+async fn report_edit(Db(db): Db, Extension(user): Extension<AuthUser>, Path(id): Path<uuid::Uuid>) -> Response {
+    if !report_author(&user) {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Reports"))).into_response();
+    }
+    let Some(def) = vortex_framework::user_reports::load(&db, id).await else {
         return Redirect::to("/settings/reports").into_response();
     };
+    let is_template = def.report_type == "template";
 
-    let name: String = report.get("name");
-    let model_name: String = report.get("model_name");
-    let paper_size: String = report.get("paper_size");
-    let orientation: String = report.get("orientation");
-    let template: String = report.get("template");
+    // Columns table + filters table.
+    let cols = sqlx::query("SELECT id, field, label, aggregate FROM ir_report_column WHERE report_id = $1 ORDER BY sequence, field")
+        .bind(id).fetch_all(&db).await.unwrap_or_default();
+    let mut cols_html = String::new();
+    for c in &cols {
+        let cid: uuid::Uuid = c.get("id");
+        let field: String = c.get("field");
+        let label: Option<String> = c.try_get("label").ok().flatten();
+        let agg: String = c.get("aggregate");
+        cols_html.push_str(&format!(
+            r##"<tr><td><code class="text-xs">{field}</code></td><td>{label}</td><td>{agg}</td>
+            <td class="text-right"><form method="post" action="/settings/reports/{id}/columns/{cid}/delete" class="inline"><button class="btn btn-xs btn-error btn-outline">×</button></form></td></tr>"##,
+            field = html_escape(&field), label = html_escape(label.as_deref().unwrap_or("")),
+            agg = if agg == "none" { String::new() } else { format!(r#"<span class="badge badge-sm">{}</span>"#, html_escape(&agg)) },
+            id = id, cid = cid,
+        ));
+    }
+    let filters = sqlx::query("SELECT id, field, operator, value FROM ir_report_filter WHERE report_id = $1 ORDER BY sequence")
+        .bind(id).fetch_all(&db).await.unwrap_or_default();
+    let mut filt_html = String::new();
+    for f in &filters {
+        let fid: uuid::Uuid = f.get("id");
+        let field: String = f.get("field");
+        let op: String = f.get("operator");
+        let val: Option<String> = f.try_get("value").ok().flatten();
+        filt_html.push_str(&format!(
+            r##"<tr><td><code class="text-xs">{field}</code></td><td>{op}</td><td>{val}</td>
+            <td class="text-right"><form method="post" action="/settings/reports/{id}/filters/{fid}/delete" class="inline"><button class="btn btn-xs btn-error btn-outline">×</button></form></td></tr>"##,
+            field = html_escape(&field), op = html_escape(&op), val = html_escape(val.as_deref().unwrap_or("")), id = id, fid = fid,
+        ));
+    }
 
-    let paper_options = ["A4", "Letter", "Legal"];
-    let paper_select: String = paper_options.iter().map(|opt| {
-        let selected = if *opt == paper_size { " selected" } else { "" };
-        format!(r#"<option value="{}"{}>{}  </option>"#, opt, selected, opt)
-    }).collect();
+    let field_opts_col = report_field_options(&db, &def.model_name, "", None).await;
+    let field_opts_filter = report_field_options(&db, &def.model_name, "", None).await;
+    let group_opts = report_field_options(&db, &def.model_name, def.group_field.as_deref().unwrap_or(""), Some("— No grouping —")).await;
+    let sort_opts = report_field_options(&db, &def.model_name, def.sort_field.as_deref().unwrap_or(""), Some("— Default —")).await;
+    let roles: Vec<String> = sqlx::query_scalar("SELECT name FROM roles ORDER BY name").fetch_all(&db).await.unwrap_or_default();
+    let role_opts: String = {
+        let mut o = format!(r#"<option value=""{}>— Any user —</option>"#, if def.required_role.is_none() { " selected" } else { "" });
+        for r in &roles {
+            let sel = if def.required_role.as_deref() == Some(r) { " selected" } else { "" };
+            o.push_str(&format!(r#"<option value="{0}"{1}>{0}</option>"#, html_escape(r), sel));
+        }
+        o
+    };
+    let agg_opts = |sel: &str| -> String {
+        ["none","sum","avg","count","min","max"].iter().map(|a| {
+            format!(r#"<option value="{a}"{s}>{a}</option>"#, a = a, s = if *a == sel { " selected" } else { "" })
+        }).collect()
+    };
+    let op_opts: String = ["=","!=","ilike",">","<",">=","<="].iter().map(|o| format!(r#"<option value="{0}">{0}</option>"#, o)).collect();
 
-    let orient_portrait = if orientation == "portrait" { " selected" } else { "" };
-    let orient_landscape = if orientation == "landscape" { " selected" } else { "" };
+    // Field reference for template authors.
+    let field_ref = report_field_options(&db, &def.model_name, "", None).await
+        .replace("<option", "<li class=\"text-xs\"><code")
+        .replace("</option>", "</code></li>");
+
+    let tabular_section = format!(
+        r##"<div class="card bg-base-100 shadow mb-4"><div class="card-body">
+        <h2 class="card-title text-base">Columns</h2>
+        <table class="table table-sm"><thead><tr><th>Field</th><th>Label</th><th>Aggregate</th><th></th></tr></thead><tbody>{cols}</tbody></table>
+        <form method="post" action="/settings/reports/{id}/columns" class="flex flex-wrap gap-2 items-end mt-2">
+            <div class="form-control"><label class="label py-0"><span class="label-text text-xs">Field</span></label><select name="field" class="select select-bordered select-sm" required>{field_opts_col}</select></div>
+            <div class="form-control"><label class="label py-0"><span class="label-text text-xs">Label</span></label><input name="label" class="input input-bordered input-sm" placeholder="(optional)"/></div>
+            <div class="form-control"><label class="label py-0"><span class="label-text text-xs">Aggregate</span></label><select name="aggregate" class="select select-bordered select-sm">{agg_none}</select></div>
+            <button class="btn btn-sm btn-primary">Add column</button>
+        </form></div></div>
+
+        <div class="card bg-base-100 shadow mb-4"><div class="card-body">
+        <h2 class="card-title text-base">Filters <span class="text-xs opacity-50">(all conditions must match)</span></h2>
+        <table class="table table-sm"><thead><tr><th>Field</th><th>Op</th><th>Value</th><th></th></tr></thead><tbody>{filt}</tbody></table>
+        <form method="post" action="/settings/reports/{id}/filters" class="flex flex-wrap gap-2 items-end mt-2">
+            <div class="form-control"><label class="label py-0"><span class="label-text text-xs">Field</span></label><select name="field" class="select select-bordered select-sm" required>{field_opts_filter}</select></div>
+            <div class="form-control"><label class="label py-0"><span class="label-text text-xs">Operator</span></label><select name="operator" class="select select-bordered select-sm">{op_opts}</select></div>
+            <div class="form-control"><label class="label py-0"><span class="label-text text-xs">Value</span></label><input name="value" class="input input-bordered input-sm"/></div>
+            <button class="btn btn-sm btn-primary">Add filter</button>
+        </form></div></div>"##,
+        cols = cols_html, id = id, field_opts_col = field_opts_col, agg_none = agg_opts("none"),
+        filt = filt_html, field_opts_filter = field_opts_filter, op_opts = op_opts,
+    );
+
+    let template_section = format!(
+        r##"<div class="card bg-base-100 shadow mb-4"><div class="card-body">
+        <h2 class="card-title text-base">Template (HTML)</h2>
+        <p class="text-xs opacity-60">Syntax: <code>{{{{ field }}}}</code>, <code>{{%for r in records%}}…{{%endfor%}}</code>, <code>{{%if field%}}…{{%endif%}}</code>. Data is auto-escaped. Globals: <code>report_name</code>, <code>generated_at</code>, <code>count</code>.</p>
+        <textarea name="template" form="basics-form" class="textarea textarea-bordered font-mono text-xs h-64 w-full">{template}</textarea>
+        <details class="mt-2"><summary class="text-xs cursor-pointer">Available fields for <code>{model}</code></summary><ul class="mt-1 ml-4 list-disc">{field_ref}</ul></details>
+        </div></div>"##,
+        template = html_escape(def.template.as_deref().unwrap_or("")), model = html_escape(&def.model_name), field_ref = field_ref,
+    );
+
+    let body_section = if is_template { template_section } else { tabular_section };
 
     let html = format!(
         r##"<!DOCTYPE html>
 <html lang="en" data-theme="dark">
 <head>
-    <script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{} - Report</title>
-    <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet">
-    <script src="https://cdn.tailwindcss.com"></script>
+    <script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script>
+    <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{name} - Report</title>
+    <link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"><script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="min-h-screen bg-base-200">
-    <div class="navbar bg-base-100 shadow-lg">
-        <div class="flex-1"><a href="/" class="btn btn-ghost text-xl">remicle</a></div>
-        <div class="flex-none"><span class="text-sm">@{}</span></div>
-    </div>
-    <div class="container mx-auto p-6 max-w-4xl">
-        <div class="mb-6">
-            <a href="/settings/reports" class="btn btn-ghost btn-sm">← Back to Reports</a>
+    <div class="navbar bg-base-100 shadow-lg"><div class="flex-1"><a href="/" class="btn btn-ghost text-xl">remicle</a></div><div class="flex-none"><span class="text-sm">@{user}</span></div></div>
+    <div class="container mx-auto p-6 max-w-3xl">
+        <div class="flex justify-between items-center mb-4">
+            <a href="/settings/reports" class="btn btn-ghost btn-sm">← Reports</a>
+            <a href="/reports/run/{id}" target="_blank" class="btn btn-sm btn-success">▶ Run report</a>
         </div>
-
-        <div class="card bg-base-100 shadow">
-            <div class="card-body">
-                <h2 class="card-title">{}</h2>
-                <p class="text-base-content/60 mb-4">Model: <code>{}</code></p>
-
-                <form method="post" action="/settings/reports/{}">
-                    <div class="form-control mb-3">
-                        <label class="label"><span class="label-text">Name</span></label>
-                        <input type="text" name="name" class="input input-bordered" value="{}" required/>
-                    </div>
-                    <div class="form-control mb-3">
-                        <label class="label"><span class="label-text">Model</span></label>
-                        <input type="text" name="model_name" class="input input-bordered" value="{}" required/>
-                    </div>
-                    <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                        <div class="form-control mb-3">
-                            <label class="label"><span class="label-text">Paper Size</span></label>
-                            <select name="paper_size" class="select select-bordered">{}</select>
-                        </div>
-                        <div class="form-control mb-3">
-                            <label class="label"><span class="label-text">Orientation</span></label>
-                            <select name="orientation" class="select select-bordered">
-                                <option value="portrait"{}>Portrait</option>
-                                <option value="landscape"{}>Landscape</option>
-                            </select>
-                        </div>
-                    </div>
-                    <div class="form-control mb-4">
-                        <label class="label"><span class="label-text">Template (HTML)</span></label>
-                        <textarea name="template" class="textarea textarea-bordered font-mono text-sm h-64">{}</textarea>
-                        <label class="label"><span class="label-text-alt">Use {{{{field_name}}}} for placeholders. Use {{{{#records}}}}...{{{{/records}}}} for lists.</span></label>
-                    </div>
-                    <div class="card-actions justify-end">
-                        <button type="submit" class="btn btn-primary">Save Changes</button>
-                    </div>
-                </form>
-            </div>
-        </div>
+        <div class="card bg-base-100 shadow mb-4"><div class="card-body">
+            <h2 class="card-title">{name} <span class="badge badge-ghost">{rtype}</span> <code class="text-xs opacity-50">{model}</code></h2>
+            <form id="basics-form" method="post" action="/settings/reports/{id}">
+                <div class="grid grid-cols-2 gap-4">
+                    <div class="form-control mb-2"><label class="label"><span class="label-text">Name</span></label><input name="name" class="input input-bordered input-sm" value="{name}" required/></div>
+                    <div class="form-control mb-2"><label class="label"><span class="label-text">Can run (role)</span></label><select name="required_role" class="select select-bordered select-sm">{role_opts}</select></div>
+                </div>
+                <div class="form-control mb-2"><label class="label"><span class="label-text">Description</span></label><input name="description" class="input input-bordered input-sm" value="{description}"/></div>
+                <div class="grid grid-cols-4 gap-3">
+                    <div class="form-control mb-2"><label class="label"><span class="label-text text-xs">Group by</span></label><select name="group_field" class="select select-bordered select-sm">{group_opts}</select></div>
+                    <div class="form-control mb-2"><label class="label"><span class="label-text text-xs">Sort by</span></label><select name="sort_field" class="select select-bordered select-sm">{sort_opts}</select></div>
+                    <div class="form-control mb-2"><label class="label"><span class="label-text text-xs">Direction</span></label><select name="sort_dir" class="select select-bordered select-sm"><option value="asc"{asc}>Asc</option><option value="desc"{desc}>Desc</option></select></div>
+                    <div class="form-control mb-2"><label class="label"><span class="label-text text-xs">Row limit</span></label><input name="row_limit" type="number" class="input input-bordered input-sm" value="{row_limit}"/></div>
+                </div>
+                <input type="hidden" name="report_type" value="{rtype}"/>
+                <div class="grid grid-cols-2 gap-3 {tmpl_show}">
+                    <div class="form-control mb-2"><label class="label"><span class="label-text text-xs">Paper</span></label><select name="paper_size" class="select select-bordered select-sm"><option {a4}>A4</option><option {lt}>Letter</option><option {lg}>Legal</option></select></div>
+                    <div class="form-control mb-2"><label class="label"><span class="label-text text-xs">Orientation</span></label><select name="orientation" class="select select-bordered select-sm"><option value="portrait"{port}>Portrait</option><option value="landscape"{land}>Landscape</option></select></div>
+                </div>
+                <label class="cursor-pointer label justify-start gap-3 mt-1"><input type="checkbox" name="active" class="checkbox checkbox-sm" {active}/><span class="label-text">Active</span></label>
+                <div class="flex justify-between mt-3">
+                    <form method="post" action="/settings/reports/{id}/delete" class="inline"><button class="btn btn-sm btn-error btn-outline" onclick="return confirm('Delete this report?');">Delete</button></form>
+                    <button type="submit" class="btn btn-sm btn-primary">Save</button>
+                </div>
+            </form>
+        </div></div>
+        {body_section}
     </div>
-</body>
-</html>"##,
-        name, user.username, name, model_name, id, name, model_name, paper_select, orient_portrait, orient_landscape, template
+</body></html>"##,
+        user = html_escape(&user.username), id = id, name = html_escape(&def.name), rtype = html_escape(&def.report_type),
+        model = html_escape(&def.model_name), role_opts = role_opts,
+        description = html_escape(def.description.as_deref().unwrap_or("")),
+        group_opts = group_opts, sort_opts = sort_opts,
+        asc = if def.sort_dir != "desc" { "selected" } else { "" }, desc = if def.sort_dir == "desc" { "selected" } else { "" },
+        row_limit = def.row_limit,
+        tmpl_show = if is_template { "" } else { "hidden" },
+        a4 = if def.paper_size == "A4" { "selected" } else { "" }, lt = if def.paper_size == "Letter" { "selected" } else { "" }, lg = if def.paper_size == "Legal" { "selected" } else { "" },
+        port = if def.orientation != "landscape" { "selected" } else { "" }, land = if def.orientation == "landscape" { "selected" } else { "" },
+        active = "checked",
+        body_section = body_section,
     );
-
     Html(html).into_response()
 }
 
 async fn report_update(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
     Path(id): Path<uuid::Uuid>,
-    Form(form): Form<ReportForm>,
+    Form(form): Form<ReportBasicsForm>,
 ) -> Response {
+    if !report_author(&user) {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Reports"))).into_response();
+    }
+    let name = form.name.trim().to_string();
+    if name.is_empty() {
+        return settings_write_error(&format!("/settings/reports/{id}"), "Name is required.");
+    }
+    let rtype = match form.report_type.as_deref() { Some("template") => "template", _ => "tabular" };
+    let sort_dir = if form.sort_dir.as_deref() == Some("desc") { "desc" } else { "asc" };
+    let blank_to_null = |o: Option<String>| o.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     let _ = sqlx::query(
-        "UPDATE ir_report SET name = $1, model_name = $2, paper_size = $3, orientation = $4, template = $5, updated_at = NOW()
-         WHERE id = $6"
+        "UPDATE ir_report SET name=$1, description=$2, report_type=$3, sort_field=$4, sort_dir=$5, \
+         group_field=$6, row_limit=$7, paper_size=$8, orientation=$9, required_role=$10, template=$11, \
+         active=$12, updated_at=NOW() WHERE id=$13",
     )
-    .bind(&form.name)
-    .bind(&form.model_name)
+    .bind(&name)
+    .bind(blank_to_null(form.description))
+    .bind(rtype)
+    .bind(blank_to_null(form.sort_field))
+    .bind(sort_dir)
+    .bind(blank_to_null(form.group_field))
+    .bind(form.row_limit.unwrap_or(1000).clamp(1, 100_000))
     .bind(form.paper_size.as_deref().unwrap_or("A4"))
     .bind(form.orientation.as_deref().unwrap_or("portrait"))
-    .bind(form.template.as_deref().unwrap_or(""))
+    .bind(blank_to_null(form.required_role))
+    .bind(blank_to_null(form.template))
+    .bind(form.active.is_some())
     .bind(id)
     .execute(&db)
     .await;
+    let entry = AuditEntry::new(AuditAction::ConfigChanged, AuditSeverity::Info)
+        .with_user(vortex_common::UserId(user.id)).with_username(&user.username)
+        .with_database(&db_ctx.db_name).with_resource("ir_report", id.to_string()).with_resource_name(&name)
+        .with_details(serde_json::json!({"action":"update"}));
+    let _ = state.audit.log(entry).await;
+    Redirect::to(&format!("/settings/reports/{id}")).into_response()
+}
 
+async fn report_column_add(
+    Db(db): Db, Extension(user): Extension<AuthUser>, Path(id): Path<uuid::Uuid>, Form(form): Form<ColumnAddForm>,
+) -> Response {
+    if !report_author(&user) {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Reports"))).into_response();
+    }
+    let field = form.field.trim().to_string();
+    if validate_identifier(&field) {
+        let agg = form.aggregate.as_deref().filter(|a| ["none","sum","avg","count","min","max"].contains(a)).unwrap_or("none");
+        let label = form.label.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let seq: i32 = sqlx::query_scalar("SELECT COALESCE(MAX(sequence),0)+10 FROM ir_report_column WHERE report_id=$1")
+            .bind(id).fetch_one(&db).await.unwrap_or(10);
+        let _ = sqlx::query("INSERT INTO ir_report_column (report_id, field, label, aggregate, sequence) VALUES ($1,$2,$3,$4,$5)")
+            .bind(id).bind(&field).bind(label).bind(agg).bind(seq).execute(&db).await;
+    }
+    Redirect::to(&format!("/settings/reports/{id}")).into_response()
+}
+
+async fn report_column_delete(Db(db): Db, Extension(user): Extension<AuthUser>, Path((id, cid)): Path<(uuid::Uuid, uuid::Uuid)>) -> Response {
+    if !report_author(&user) {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Reports"))).into_response();
+    }
+    let _ = sqlx::query("DELETE FROM ir_report_column WHERE id=$1 AND report_id=$2").bind(cid).bind(id).execute(&db).await;
+    Redirect::to(&format!("/settings/reports/{id}")).into_response()
+}
+
+async fn report_filter_add(
+    Db(db): Db, Extension(user): Extension<AuthUser>, Path(id): Path<uuid::Uuid>, Form(form): Form<FilterAddForm>,
+) -> Response {
+    if !report_author(&user) {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Reports"))).into_response();
+    }
+    let field = form.field.trim().to_string();
+    let op = form.operator.as_deref().filter(|o| ["=","!=","ilike",">","<",">=","<="].contains(o)).unwrap_or("=");
+    if validate_identifier(&field) {
+        let seq: i32 = sqlx::query_scalar("SELECT COALESCE(MAX(sequence),0)+10 FROM ir_report_filter WHERE report_id=$1")
+            .bind(id).fetch_one(&db).await.unwrap_or(10);
+        let _ = sqlx::query("INSERT INTO ir_report_filter (report_id, field, operator, value, sequence) VALUES ($1,$2,$3,$4,$5)")
+            .bind(id).bind(&field).bind(op).bind(form.value.as_deref()).bind(seq).execute(&db).await;
+    }
+    Redirect::to(&format!("/settings/reports/{id}")).into_response()
+}
+
+async fn report_filter_delete(Db(db): Db, Extension(user): Extension<AuthUser>, Path((id, fid)): Path<(uuid::Uuid, uuid::Uuid)>) -> Response {
+    if !report_author(&user) {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Reports"))).into_response();
+    }
+    let _ = sqlx::query("DELETE FROM ir_report_filter WHERE id=$1 AND report_id=$2").bind(fid).bind(id).execute(&db).await;
+    Redirect::to(&format!("/settings/reports/{id}")).into_response()
+}
+
+async fn report_delete(
+    State(state): State<Arc<AppState>>, Db(db): Db, Extension(user): Extension<AuthUser>, Extension(db_ctx): Extension<DatabaseContext>, Path(id): Path<uuid::Uuid>,
+) -> Response {
+    if !report_author(&user) {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Reports"))).into_response();
+    }
+    let _ = sqlx::query("DELETE FROM ir_report WHERE id=$1").bind(id).execute(&db).await;
+    let entry = AuditEntry::new(AuditAction::ConfigChanged, AuditSeverity::Info)
+        .with_user(vortex_common::UserId(user.id)).with_username(&user.username)
+        .with_database(&db_ctx.db_name).with_resource("ir_report", id.to_string())
+        .with_details(serde_json::json!({"action":"delete"}));
+    let _ = state.audit.log(entry).await;
     Redirect::to("/settings/reports").into_response()
+}
+
+/// GET /reports — a hub listing reports the current user is allowed to run.
+async fn reports_hub(
+    State(state): State<Arc<AppState>>, Db(db): Db, Extension(user): Extension<AuthUser>, Extension(db_ctx): Extension<DatabaseContext>,
+) -> Response {
+    let reports = sqlx::query("SELECT id, code, name, description, model_name, report_type, required_role FROM ir_report WHERE active = true ORDER BY name")
+        .fetch_all(&db).await.unwrap_or_default();
+    let mut cards = String::new();
+    for r in &reports {
+        let req: Option<String> = r.try_get("required_role").ok().flatten();
+        let allowed = match &req { None => true, Some(role) => user.is_admin() || user.roles.iter().any(|x| x == role) };
+        if !allowed { continue; }
+        let id: uuid::Uuid = r.get("id");
+        let name: String = r.get("name");
+        let desc: Option<String> = r.try_get("description").ok().flatten();
+        let model: String = r.get("model_name");
+        let rtype: String = r.get("report_type");
+        cards.push_str(&format!(
+            r##"<a href="/reports/run/{id}" target="_blank" class="card bg-base-100 shadow hover:shadow-lg transition"><div class="card-body p-4">
+            <h3 class="card-title text-base">{name} <span class="badge badge-ghost badge-sm">{rtype}</span></h3>
+            <p class="text-sm opacity-60">{desc}</p><p class="text-xs opacity-40"><code>{model}</code></p></div></a>"##,
+            id = id, name = html_escape(&name), rtype = html_escape(&rtype),
+            desc = html_escape(desc.as_deref().unwrap_or("")), model = html_escape(&model),
+        ));
+    }
+    if cards.is_empty() {
+        cards.push_str(r#"<div class="alert">No reports available to you yet.</div>"#);
+    }
+    let author_btn = if report_author(&user) { r#"<a href="/settings/reports" class="btn btn-sm btn-outline">Build reports</a>"# } else { "" };
+    let display_name = user.full_name.as_deref().unwrap_or(&user.username);
+    let initials = get_initials(display_name);
+    let installed = db_ctx.installed_modules.clone();
+    let sidebar = build_sidebar("reports", display_name, &initials, &installed, user.is_admin(), &state.plugin_registry, &user.roles);
+    let content = format!(
+        r##"<div class="flex justify-between items-center mb-6"><div><h1 class="text-2xl font-bold">Reports</h1><p class="text-base-content/60 text-sm">Run a report</p></div>{author_btn}</div>
+        <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">{cards}</div>"##,
+        author_btn = author_btn, cards = cards,
+    );
+    let html = format!(
+        r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><title>Reports - Remicle</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"><link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/><script src="https://cdn.tailwindcss.com"></script></head>
+<body class="min-h-screen bg-base-200"><div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a></div>
+<div id="sidebar-overlay" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
+<div class="flex">{sidebar}<main class="flex-1 p-4 lg:p-6 min-w-0">{content}</main></div></body></html>"#,
+        sidebar = sidebar, content = content,
+    );
+    Html(html).into_response()
+}
+
+/// GET /reports/run/{id} — render a report. ?format=csv|json for downloads.
+async fn report_run(
+    State(state): State<Arc<AppState>>, Db(db): Db, Extension(user): Extension<AuthUser>, Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<uuid::Uuid>, Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    use vortex_framework::user_reports as ur;
+    let Some(def) = ur::load(&db, id).await else {
+        return (StatusCode::NOT_FOUND, Html("Report not found")).into_response();
+    };
+    if !def.can_run(&user.roles, user.is_admin()) {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page(&def.name))).into_response();
+    }
+    let format = q.get("format").map(|s| s.as_str()).unwrap_or("html");
+
+    // Audit the run (read/export) against the tenant DB.
+    let entry = AuditEntry::new(AuditAction::BulkExport, AuditSeverity::Info)
+        .with_user(vortex_common::UserId(user.id)).with_username(&user.username)
+        .with_database(&db_ctx.db_name).with_resource("ir_report", def.code.clone()).with_resource_name(&def.name)
+        .with_details(serde_json::json!({"action":"run","format":format}));
+    let _ = state.audit.log(entry).await;
+
+    // Build the printable HTML page for both shapes. CSV/JSON short-circuit
+    // (tabular only); HTML and PDF share the same rendered page.
+    let printable: String = if def.report_type == "template" {
+        let records = match ur::fetch_template_records(&db, &def).await {
+            Ok(r) => r, Err(e) => return (StatusCode::BAD_REQUEST, Html(format!("Report error: {}", html_escape(&e)))).into_response(),
+        };
+        let mut globals = std::collections::BTreeMap::new();
+        globals.insert("report_name".to_string(), def.name.clone());
+        globals.insert("generated_at".to_string(), chrono::Utc::now().format("%Y-%m-%d %H:%M UTC").to_string());
+        globals.insert("count".to_string(), records.len().to_string());
+        let inner = ur::render_template(def.template.as_deref().unwrap_or(""), &records, &globals);
+        report_print_page(&def, &inner)
+    } else {
+        let res = match ur::run_tabular(&db, &def).await {
+            Ok(r) => r, Err(e) => return (StatusCode::BAD_REQUEST, Html(format!("Report error: {}", html_escape(&e)))).into_response(),
+        };
+        match format {
+            "csv" => {
+                let bytes = ur::render_tabular_csv(&res);
+                return ([(axum::http::header::CONTENT_TYPE, "text/csv"),
+                  (axum::http::header::CONTENT_DISPOSITION, &format!("attachment; filename=\"{}.csv\"", def.code))], bytes).into_response();
+            }
+            "json" => {
+                return ([(axum::http::header::CONTENT_TYPE, "application/json")], ur::render_tabular_json(&res)).into_response();
+            }
+            _ => report_print_page(&def, &ur::render_tabular_html(&def, &res)),
+        }
+    };
+
+    if format == "pdf" {
+        use vortex_framework::pdf;
+        let opts = pdf::PdfOptions {
+            landscape: def.orientation == "landscape",
+            paper: pdf::Paper::parse(&def.paper_size),
+            print_background: true,
+            margin_in: 0.4,
+        };
+        return match pdf::html_to_pdf(&printable, &opts).await {
+            Ok(bytes) => ([(axum::http::header::CONTENT_TYPE, "application/pdf"),
+                (axum::http::header::CONTENT_DISPOSITION, &format!("inline; filename=\"{}.pdf\"", def.code))], bytes).into_response(),
+            Err(pdf::PdfError::NotAvailable) => (
+                StatusCode::NOT_IMPLEMENTED,
+                Html("PDF export is not enabled in this build. Rebuild the server with <code>--features pdf</code> and install a Chromium binary."),
+            ).into_response(),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Html(format!("PDF render failed: {}", html_escape(&e.to_string())))).into_response(),
+        };
+    }
+
+    Html(printable).into_response()
+}
+
+/// Wrap report HTML in a printable page with toolbar + export links.
+fn report_print_page(def: &vortex_framework::user_reports::ReportDef, inner: &str) -> String {
+    let page = if def.orientation == "landscape" { "@page { size: landscape; }" } else { "@page { size: portrait; }" };
+    let mut exports = String::new();
+    if def.report_type == "tabular" {
+        exports.push_str(&format!(r#"<a href="/reports/run/{id}?format=csv" class="btn btn-sm btn-outline">CSV</a><a href="/reports/run/{id}?format=json" class="btn btn-sm btn-outline">JSON</a>"#, id = def.id));
+    }
+    // Server-side PDF link only when a backend is compiled in; otherwise the
+    // browser Print/PDF button covers it.
+    if vortex_framework::pdf::available() {
+        exports.push_str(&format!(r#"<a href="/reports/run/{id}?format=pdf" class="btn btn-sm btn-outline">PDF</a>"#, id = def.id));
+    }
+    // Self-hosted CSS inlined — no CDN, so PDF rendering is offline and
+    // deterministic (no JS JIT / network race before printToPDF).
+    format!(
+        r##"<!DOCTYPE html><html><head><meta charset="UTF-8"><title>{name}</title>
+<style>{css}
+{page}</style></head>
+<body class="bg-white text-black p-8">
+<div class="no-print fixed top-4 right-4 flex gap-2">{exports}<button onclick="window.print()" class="btn btn-sm btn-primary">Print / PDF</button></div>
+<h1 class="text-2xl font-bold mb-1">{name}</h1><p class="text-sm text-gray-500 mb-4">{desc}</p>
+{inner}
+</body></html>"##,
+        name = html_escape(&def.name),
+        css = vortex_framework::user_reports::REPORT_CSS,
+        page = page, exports = exports,
+        desc = html_escape(def.description.as_deref().unwrap_or("")), inner = inner,
+    )
 }
 
 // ============================================================================

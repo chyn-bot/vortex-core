@@ -13,6 +13,12 @@ const MIG_002_STREET3: &str = include_str!("../migrations/002_street3/postgres.s
 const MIG_003_PIVOT_METADATA: &str =
     include_str!("../migrations/003_pivot_metadata/postgres.sql");
 const MIG_004_LIST_URL: &str = include_str!("../migrations/004_list_url/postgres.sql");
+const MIG_005_CONTACT_STAGES: &str =
+    include_str!("../migrations/005_contact_stages/postgres.sql");
+const MIG_006_CONTACT_WORKFLOW: &str =
+    include_str!("../migrations/006_contact_workflow/postgres.sql");
+const MIG_007_CONTACT_APPROVALS: &str =
+    include_str!("../migrations/007_contact_approvals/postgres.sql");
 
 pub struct ContactsPlugin;
 
@@ -87,6 +93,24 @@ impl Plugin for ContactsPlugin {
                 up_sql: MIG_004_LIST_URL,
                 down_sql: None,
                 requires_core_migration: Some("123_model_list_url"),
+            },
+            PluginMigration {
+                name: "005_contact_stages",
+                up_sql: MIG_005_CONTACT_STAGES,
+                down_sql: None,
+                requires_core_migration: Some("124_record_stages"),
+            },
+            PluginMigration {
+                name: "006_contact_workflow",
+                up_sql: MIG_006_CONTACT_WORKFLOW,
+                down_sql: None,
+                requires_core_migration: Some("125_stage_actions"),
+            },
+            PluginMigration {
+                name: "007_contact_approvals",
+                up_sql: MIG_007_CONTACT_APPROVALS,
+                down_sql: None,
+                requires_core_migration: Some("126_approvals"),
             },
         ]
     }

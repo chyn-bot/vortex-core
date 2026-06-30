@@ -1,0 +1,5 @@
+[migration]
+module = "core"
+description = "Outbound webhooks (webhook_endpoints, webhook_deliveries): HMAC-signed event delivery over the job queue"
+reversible = true
+dependencies = ["130_api_tokens"]

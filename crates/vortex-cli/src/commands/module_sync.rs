@@ -73,23 +73,30 @@ pub async fn sync_plugins_to_installed_modules(
         // through this sync path — an `ON CONFLICT DO UPDATE` here
         // leaves their `is_core` flag alone because we don't touch
         // it on update.
+        let category = plugin.category();
+        let summary = plugin.summary();
+
         let result = sqlx::query(
             r#"
             INSERT INTO installed_modules (
-                technical_name, name, version, state, category,
+                technical_name, name, version, state, category, summary,
                 is_core, application, sequence
             )
-            VALUES ($1, $2, $3, 'uninstalled', 'Plugin', false, true, 100)
+            VALUES ($1, $2, $3, 'uninstalled', $4, $5, false, true, 100)
             ON CONFLICT (technical_name) DO UPDATE
-            SET name    = EXCLUDED.name,
-                version = EXCLUDED.version,
+            SET name     = EXCLUDED.name,
+                version  = EXCLUDED.version,
+                category = EXCLUDED.category,
+                summary  = EXCLUDED.summary,
                 updated_at = NOW()
-            RETURNING (xmax = 0) AS was_insert
+            RETURNING id, (xmax = 0) AS was_insert
             "#,
         )
         .bind(technical_name)
         .bind(display_name)
         .bind(version)
+        .bind(category)
+        .bind(summary)
         .fetch_one(pool)
         .await
         .with_context(|| format!("failed to upsert module '{}'", technical_name))?;
@@ -98,7 +105,30 @@ pub async fn sync_plugins_to_installed_modules(
         // was an INSERT rather than an UPDATE, because `xmax` is
         // only set when the row existed and was re-versioned by the
         // DO UPDATE path.
+        let module_uuid: uuid::Uuid = sqlx::Row::try_get(&result, "id")
+            .with_context(|| format!("missing id for module '{}'", technical_name))?;
         let was_insert: bool = sqlx::Row::try_get(&result, "was_insert").unwrap_or(false);
+
+        // Refresh this module's declared dependencies into
+        // `module_dependencies` (delete-then-insert so removed deps don't
+        // linger). Feeds the existing uninstall guard and the app detail
+        // page's dependency graph.
+        sqlx::query("DELETE FROM module_dependencies WHERE module_id = $1")
+            .bind(module_uuid)
+            .execute(pool)
+            .await
+            .with_context(|| format!("failed clearing deps for '{}'", technical_name))?;
+        for dep in plugin.dependencies() {
+            sqlx::query(
+                "INSERT INTO module_dependencies (id, module_id, depends_on, optional) \
+                 VALUES (gen_random_uuid(), $1, $2, false)",
+            )
+            .bind(module_uuid)
+            .bind(dep)
+            .execute(pool)
+            .await
+            .with_context(|| format!("failed recording dep '{}' -> '{}'", technical_name, dep))?;
+        }
         if was_insert {
             inserted += 1;
             info!(

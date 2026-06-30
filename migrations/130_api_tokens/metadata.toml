@@ -1,0 +1,5 @@
+[migration]
+module = "core"
+description = "API tokens (api_tokens): hashed bearer credentials for the public REST API"
+reversible = true
+dependencies = ["129_job_queue"]

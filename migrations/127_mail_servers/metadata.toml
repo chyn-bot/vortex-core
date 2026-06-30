@@ -1,0 +1,5 @@
+[migration]
+module = "core"
+description = "Outbound email: per-tenant SMTP servers (encrypted passwords) + send log"
+reversible = true
+dependencies = ["126_approvals"]

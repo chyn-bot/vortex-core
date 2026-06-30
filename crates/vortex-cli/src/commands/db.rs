@@ -20,6 +20,10 @@ use crate::DbCommands;
 fn build_migration_registry() -> PluginRegistry {
     let mut registry = PluginRegistry::new();
     registry.register(Arc::new(vortex_contacts::ContactsPlugin::new()));
+    registry.register(Arc::new(vortex_inventory::InventoryPlugin::new()));
+    registry.register(Arc::new(vortex_purchase::PurchasePlugin::new()));
+    registry.register(Arc::new(vortex_maintenance::MaintenancePlugin::new()));
+    registry.register(Arc::new(vortex_sesb_eam::SesbEamPlugin::new()));
     #[cfg(feature = "cr")]
     registry.register(Arc::new(vortex_change::ChangeRequestPlugin::new()));
     registry
@@ -153,6 +157,13 @@ pub async fn run(command: DbCommands) -> Result<()> {
                                     pa, ps
                                 );
                             }
+                            // Sync this DB's apps list too.
+                            let registry = build_migration_registry();
+                            if let Ok((ins, upd)) = crate::commands::module_sync::sync_plugins_to_installed_modules(&pool, &registry).await {
+                                if ins > 0 || upd > 0 {
+                                    println!("  Apps list synced: {} new, {} refreshed", ins, upd);
+                                }
+                            }
                         }
                         Err(e) => {
                             println!("  Warning: Could not connect to '{}': {}", db_name, e);
@@ -261,6 +272,20 @@ pub async fn run(command: DbCommands) -> Result<()> {
             let (plugin_applied, plugin_skipped) = run_plugin_migrations(&pool).await?;
             applied_count += plugin_applied;
             skipped_count += plugin_skipped;
+
+            // Register every compiled-in plugin in this DB's
+            // `installed_modules` so new apps surface in Apps & Modules
+            // (the CLI counterpart of the "Update Apps List" button).
+            {
+                let registry = build_migration_registry();
+                match crate::commands::module_sync::sync_plugins_to_installed_modules(&pool, &registry).await {
+                    Ok((ins, upd)) if ins > 0 || upd > 0 => {
+                        println!("Apps list synced: {} new, {} refreshed", ins, upd)
+                    }
+                    Ok(_) => {}
+                    Err(e) => println!("Warning: apps list sync failed: {}", e),
+                }
+            }
 
             if applied_count > 0 {
                 println!("\nApplied {} migration(s), skipped {} (already applied)", applied_count, skipped_count);
@@ -740,6 +765,82 @@ async fn run_plugin_migrations(pool: &PgPool) -> Result<(usize, usize)> {
                             format!("Failed to apply plugin migration '{}'", key)
                         });
                     }
+                }
+            }
+        }
+    }
+
+    Ok((applied, skipped))
+}
+
+/// Provision a single plugin's schema into `pool` — a specific tenant
+/// database. Ensures the migration-tracking table exists, then applies
+/// that plugin's `Plugin::migrations()` idempotently and records each.
+/// Returns `(applied, skipped)`. No-op (`(0, 0)`) when `technical_name`
+/// is not a compiled-in plugin (e.g. a core module) or has no migrations.
+///
+/// This is what the Apps & Modules "Install" action calls so that
+/// installing a module in a tenant DB actually creates its tables there,
+/// rather than only flipping the `installed_modules` flag.
+pub async fn install_plugin_schema(pool: &PgPool, technical_name: &str) -> Result<(usize, usize)> {
+    init_migrations_table(pool).await?;
+
+    let registry = build_migration_registry();
+    let Some(plugin) = registry
+        .plugins_iter()
+        .find(|p| p.technical_name() == technical_name)
+    else {
+        return Ok((0, 0));
+    };
+
+    let migrations = plugin.migrations();
+    if migrations.is_empty() {
+        return Ok((0, 0));
+    }
+
+    // Fail fast if a required core migration is missing from this DB.
+    for mig in &migrations {
+        if let Some(required) = mig.requires_core_migration {
+            let ok: bool =
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM vortex_migrations WHERE name = $1)")
+                    .bind(required)
+                    .fetch_one(pool)
+                    .await?;
+            if !ok {
+                anyhow::bail!(
+                    "module '{}' requires core migration '{}', which is not applied to this database. Run `vortex db migrate` against it first.",
+                    technical_name,
+                    required
+                );
+            }
+        }
+    }
+
+    let module = plugin.technical_name();
+    let mut applied = 0usize;
+    let mut skipped = 0usize;
+    for mig in migrations {
+        let key = plugin_migration_key(module, mig.name);
+        if is_migration_applied(pool, &key).await? {
+            skipped += 1;
+            continue;
+        }
+        let start = std::time::Instant::now();
+        match sqlx::raw_sql(mig.up_sql).execute(pool).await {
+            Ok(_) => {
+                let elapsed = start.elapsed().as_millis() as i32;
+                record_migration(pool, &key, module, elapsed).await?;
+                applied += 1;
+            }
+            Err(e) => {
+                if e.to_string().contains("already exists") {
+                    // Objects already present (e.g. created out of band):
+                    // record the key so we don't keep retrying.
+                    record_migration(pool, &key, module, 0).await?;
+                    skipped += 1;
+                } else {
+                    return Err(e)
+                        .with_context(|| format!("Failed to apply plugin migration '{}'", key));
                 }
             }
         }

@@ -104,6 +104,15 @@ pub mod prelude {
         format_date, Locale, Translation, TranslationService, DEFAULT_LOCALE,
     };
 
+    // ── Outbound email ── (send via `framework::mail::send_default`)
+    pub use vortex_framework::{EmailMessage, MailError};
+
+    // ── Background jobs ── (enqueue via `framework::jobs::enqueue`)
+    pub use vortex_framework::{JobContext, JobRegistry, NewJob};
+
+    // ── Webhooks ── (emit events via `framework::webhooks::emit`)
+    pub use vortex_framework::WebhookEndpoint;
+
     // ── Async trait ──
     pub use async_trait::async_trait;
 

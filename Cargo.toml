@@ -14,6 +14,10 @@ members = [
     "crates/vortex-cli",
     "crates/vortex-change",
     "crates/vortex-contacts",
+    "crates/vortex-inventory",
+    "crates/vortex-purchase",
+    "crates/vortex-maintenance",
+    "crates/vortex-sesb-eam",
     "crates/vortex-plugin-sdk",
 ]
 
@@ -59,6 +63,14 @@ serde_json = "1.0"
 axum = { version = "0.8", features = ["macros", "multipart"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace", "compression-gzip"] }
+
+# Outbound email (SMTP). rustls instead of native-tls so there is no
+# build-time openssl dependency; async transport on the tokio1 runtime.
+lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1", "tokio1-rustls-tls", "hostname"] }
+
+# Outbound HTTP client (webhook delivery). rustls + bundled Mozilla roots so
+# there is no system-openssl or system-cert dependency; JSON body support.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
 # Security & Crypto
 argon2 = "0.5"
@@ -106,6 +118,10 @@ vortex-chatter = { path = "crates/vortex-chatter" }
 vortex-server = { path = "crates/vortex-server" }
 vortex-change = { path = "crates/vortex-change" }
 vortex-contacts = { path = "crates/vortex-contacts" }
+vortex-inventory = { path = "crates/vortex-inventory" }
+vortex-purchase = { path = "crates/vortex-purchase" }
+vortex-maintenance = { path = "crates/vortex-maintenance" }
+vortex-sesb-eam = { path = "crates/vortex-sesb-eam" }
 vortex-plugin-sdk = { path = "crates/vortex-plugin-sdk" }
 
 [profile.release]

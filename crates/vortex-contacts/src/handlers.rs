@@ -25,7 +25,9 @@ pub fn contacts_routes() -> Router<Arc<AppState>> {
         .route("/contacts/create", post(create_contact))
         .route("/contacts/{id}", get(edit_contact))
         .route("/contacts/{id}", post(update_contact))
-        .route("/contacts/{id}/delete", post(delete_contact))
+        .route("/contacts/{id}/archive", post(archive_contact))
+        .route("/contacts/{id}/unarchive", post(unarchive_contact))
+        .route("/contacts/{id}/status/{state}", post(change_contact_status))
 }
 
 /// Wrap page content in the platform's full HTML shell with sidebar,
@@ -165,9 +167,13 @@ async fn list_contacts(
     Html(page_shell(&sidebar, "Contacts", &content)).into_response()
 }
 
-/// GET /contacts/new — create form.
+/// GET /contacts/new — create form. Mirrors the edit form's full field set so
+/// every column can be populated at creation time, not only after first save.
+/// (The status bar, approval panel, audit history, and delete action are
+/// intentionally absent — they only apply once the record exists.)
 async fn new_contact_form(
     State(state): State<Arc<AppState>>,
+    Db(db): Db,
     Extension(user): Extension<AuthUser>,
     Extension(db_ctx): Extension<DatabaseContext>,
 ) -> Response {
@@ -180,24 +186,44 @@ async fn new_contact_form(
         &state.plugin_registry, &user.roles,
     );
 
-    let content = r#"<div class="max-w-2xl">
-<a href="/contacts" class="btn btn-ghost btn-sm mb-4">← Back to Contacts</a>
+    // Country dropdown, same source as the edit form. States load on demand
+    // via /api/states/{country_id} once a country is picked.
+    let countries_rows = vortex_plugin_sdk::sqlx::query(
+        "SELECT id, code, alpha3, name FROM countries WHERE active = true ORDER BY name",
+    )
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default();
+
+    let mut country_options = String::from(r#"<option value="">-- Select Country --</option>"#);
+    for cr in &countries_rows {
+        let cid: Uuid = cr.get("id");
+        let cname: String = cr.get("name");
+        let ccode: Option<String> = cr.try_get("alpha3").ok();
+        country_options.push_str(&format!(
+            r#"<option value="{id}">{name} ({code})</option>"#,
+            id = cid,
+            name = vortex_plugin_sdk::framework::html_escape(&cname),
+            code = vortex_plugin_sdk::framework::html_escape(ccode.as_deref().unwrap_or("")),
+        ));
+    }
+
+    let content = format!(
+        r#"<a href="/contacts" class="btn btn-ghost btn-sm mb-2">← Back to Contacts</a>
 <h1 class="text-2xl font-bold mb-6">New Contact</h1>
+
 <form method="POST" action="/contacts/create">
-<div class="card bg-base-100 shadow"><div class="card-body">
+<div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+
+<!-- Left column -->
+<div class="card bg-base-100 shadow">
+<div class="card-body">
+<h2 class="card-title text-lg mb-4">General</h2>
 <div class="form-control mb-3">
 <label class="label"><span class="label-text">Name *</span></label>
 <input name="name" class="input input-bordered input-sm" required/>
 </div>
 <div class="form-control mb-3">
-<label class="label"><span class="label-text">Email</span></label>
-<input name="email" type="email" class="input input-bordered input-sm"/>
-</div>
-<div class="form-control mb-3">
-<label class="label"><span class="label-text">Phone</span></label>
-<input name="phone" class="input input-bordered input-sm"/>
-</div>
-<div class="form-control mb-4">
 <label class="label"><span class="label-text">Type</span></label>
 <select name="contact_type" class="select select-bordered select-sm">
 <option value="customer">Customer</option>
@@ -206,15 +232,130 @@ async fn new_contact_form(
 <option value="other">Other</option>
 </select>
 </div>
-<div class="flex gap-2">
+<div class="form-control mb-3">
+<label class="cursor-pointer label justify-start gap-3">
+<input type="checkbox" name="is_company" class="checkbox checkbox-sm"/>
+<span class="label-text">Is a Company</span>
+</label>
+</div>
+<div class="form-control mb-3">
+<label class="label"><span class="label-text">VAT Number</span></label>
+<input name="vat_number" class="input input-bordered input-sm"/>
+</div>
+<div class="form-control mb-3">
+<label class="label"><span class="label-text">Credit Limit</span></label>
+<input name="credit_limit" type="number" step="0.01" class="input input-bordered input-sm"/>
+</div>
+<div class="form-control mb-3">
+<label class="cursor-pointer label justify-start gap-3">
+<input type="checkbox" name="active" class="checkbox checkbox-sm" checked/>
+<span class="label-text">Active</span>
+</label>
+</div>
+</div>
+</div>
+
+<!-- Right column -->
+<div class="space-y-6">
+<div class="card bg-base-100 shadow">
+<div class="card-body">
+<h2 class="card-title text-lg mb-4">Contact Info</h2>
+<div class="form-control mb-3">
+<label class="label"><span class="label-text">Email</span></label>
+<input name="email" type="email" class="input input-bordered input-sm"/>
+</div>
+<div class="form-control mb-3">
+<label class="label"><span class="label-text">Phone</span></label>
+<input name="phone" class="input input-bordered input-sm"/>
+</div>
+<div class="form-control mb-3">
+<label class="label"><span class="label-text">Mobile</span></label>
+<input name="mobile" class="input input-bordered input-sm"/>
+</div>
+</div>
+</div>
+
+<div class="card bg-base-100 shadow">
+<div class="card-body">
+<h2 class="card-title text-lg mb-4">Address</h2>
+<div class="form-control mb-3">
+<label class="label"><span class="label-text">Street</span></label>
+<input name="street" class="input input-bordered input-sm" placeholder="Address line 1"/>
+<input name="street2" class="input input-bordered input-sm mt-1" placeholder="Address line 2"/>
+<input name="street3" class="input input-bordered input-sm mt-1" placeholder="Address line 3"/>
+</div>
+<div class="form-control mb-3">
+<label class="label"><span class="label-text">Country</span></label>
+<select name="country_id" id="country-select" class="select select-bordered select-sm"
+  onchange="loadStates(this.value)">
+{country_options}
+</select>
+</div>
+<div class="form-control mb-3">
+<label class="label"><span class="label-text">State / Province</span></label>
+<select name="state_id" id="state-select" class="select select-bordered select-sm">
+<option value="">-- Select State --</option>
+</select>
+</div>
+<div class="grid grid-cols-2 gap-3">
+<div class="form-control mb-3">
+<label class="label"><span class="label-text">City</span></label>
+<input name="city" class="input input-bordered input-sm"/>
+</div>
+<div class="form-control mb-3">
+<label class="label"><span class="label-text">ZIP</span></label>
+<input name="zip" class="input input-bordered input-sm"/>
+</div>
+</div>
+<script>
+async function loadStates(countryId) {{
+  var sel = document.getElementById('state-select');
+  sel.innerHTML = '<option value="">Loading...</option>';
+  if (!countryId) {{
+    sel.innerHTML = '<option value="">-- Select State --</option>';
+    return;
+  }}
+  try {{
+    var res = await fetch('/api/states/' + countryId);
+    if (!res.ok) {{
+      sel.innerHTML = '<option value="">Error loading states</option>';
+      return;
+    }}
+    var states = await res.json();
+    sel.innerHTML = '<option value="">-- Select State --</option>';
+    for (var i = 0; i < states.length; i++) {{
+      var opt = document.createElement('option');
+      opt.value = states[i].id;
+      opt.textContent = states[i].name + ' (' + states[i].code + ')';
+      sel.appendChild(opt);
+    }}
+    if (states.length === 0) {{
+      sel.innerHTML = '<option value="">No states available</option>';
+    }}
+  }} catch(e) {{
+    sel.innerHTML = '<option value="">Error: ' + e.message + '</option>';
+  }}
+}}
+</script>
+</div>
+</div>
+</div>
+</div>
+
+<div class="form-control mt-4">
+<label class="label"><span class="label-text">Notes</span></label>
+<textarea name="notes" class="textarea textarea-bordered" rows="3"></textarea>
+</div>
+
+<div class="mt-6 flex gap-2">
 <button type="submit" class="btn btn-primary btn-sm">Create</button>
 <a href="/contacts" class="btn btn-ghost btn-sm">Cancel</a>
 </div>
-</div></div>
-</form>
-</div>"#;
+</form>"#,
+        country_options = country_options,
+    );
 
-    Html(page_shell(&sidebar, "New Contact", content)).into_response()
+    Html(page_shell(&sidebar, "New Contact", &content)).into_response()
 }
 
 /// POST /contacts/create — create a new contact with auto-generated
@@ -223,15 +364,23 @@ async fn create_contact(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
     vortex_plugin_sdk::axum::extract::Form(form): vortex_plugin_sdk::axum::extract::Form<HashMap<String, String>>,
 ) -> Response {
     let name = form.get("name").cloned().unwrap_or_default();
     if name.trim().is_empty() {
         return (vortex_plugin_sdk::axum::http::StatusCode::BAD_REQUEST, "Name is required").into_response();
     }
-    let email = form.get("email").cloned().unwrap_or_default();
-    let phone = form.get("phone").cloned().unwrap_or_default();
     let contact_type = form.get("contact_type").cloned().unwrap_or("customer".into());
+
+    let country_id: Option<Uuid> = form
+        .get("country_id")
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse().ok());
+    let state_id: Option<Uuid> = form
+        .get("state_id")
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse().ok());
 
     // Generate a unique contact code via the core sequence service.
     let code = match vortex_plugin_sdk::orm::sequence::next(&state.pool, &CONTACT_SEQ).await {
@@ -264,16 +413,36 @@ async fn create_contact(
 
     let contact_id = Uuid::now_v7();
     if let Err(e) = vortex_plugin_sdk::sqlx::query(
-        "INSERT INTO contacts (id, company_id, name, code, email, phone, contact_type, created_by) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+        "INSERT INTO contacts (id, company_id, name, code, email, phone, mobile, \
+         street, street2, street3, city, zip, country_id, state_id, \
+         contact_type, is_company, vat_number, credit_limit, notes, active, created_by) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, \
+         $15, $16, $17, $18, $19, $20, $21)",
     )
     .bind(contact_id)
     .bind(company_id)
     .bind(&name)
     .bind(&code)
-    .bind(if email.is_empty() { None } else { Some(&email) })
-    .bind(if phone.is_empty() { None } else { Some(&phone) })
+    .bind(form.get("email").filter(|s| !s.is_empty()))
+    .bind(form.get("phone").filter(|s| !s.is_empty()))
+    .bind(form.get("mobile").filter(|s| !s.is_empty()))
+    .bind(form.get("street").filter(|s| !s.is_empty()))
+    .bind(form.get("street2").filter(|s| !s.is_empty()))
+    .bind(form.get("street3").filter(|s| !s.is_empty()))
+    .bind(form.get("city").filter(|s| !s.is_empty()))
+    .bind(form.get("zip").filter(|s| !s.is_empty()))
+    .bind(country_id)
+    .bind(state_id)
     .bind(&contact_type)
+    .bind(form.contains_key("is_company"))
+    .bind(form.get("vat_number").filter(|s| !s.is_empty()))
+    .bind(
+        form.get("credit_limit")
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(0.0),
+    )
+    .bind(form.get("notes").filter(|s| !s.is_empty()))
+    .bind(form.contains_key("active"))
     .bind(user.id)
     .execute(&db)
     .await
@@ -292,6 +461,7 @@ async fn create_contact(
     )
     .with_user(vortex_plugin_sdk::common::UserId(user.id))
     .with_username(&user.username)
+    .with_database(&db_ctx.db_name)
     .with_resource("contact", contact_id.to_string())
     .with_resource_name(&name)
     .with_details(json!({
@@ -329,7 +499,7 @@ async fn edit_contact(
         "SELECT id, name, code, email, phone, mobile, \
          street, street2, street3, city, zip, \
          country_id, state_id, \
-         contact_type, is_company, vat_number, credit_limit, notes, active \
+         contact_type, is_company, vat_number, credit_limit, notes, active, record_state \
          FROM contacts WHERE id = $1",
     )
     .bind(id)
@@ -362,6 +532,7 @@ async fn edit_contact(
     let credit_limit: Option<f64> = row.try_get::<rust_decimal::Decimal, _>("credit_limit").ok().and_then(|d| d.to_string().parse().ok());
     let notes: Option<String> = row.try_get("notes").ok();
     let active: bool = row.try_get("active").unwrap_or(true);
+    let record_state: String = row.try_get("record_state").unwrap_or_else(|_| "draft".to_string());
 
     // Load countries for dropdown
     let countries_rows = vortex_plugin_sdk::sqlx::query(
@@ -415,18 +586,73 @@ async fn edit_contact(
 
     let sel = |val: &str, opt: &str| if val == opt { "selected" } else { "" };
 
+    // Per-record audit trail (reusable core widget over the WORM ledger).
+    let history_panel = vortex_plugin_sdk::framework::render_audit_trail(&db, "contact", id).await;
+
+    // Status section: display-only progress bar + role-gated transition
+    // buttons, plus a lock banner when the current stage is locked.
+    let status_change_base = format!("/contacts/{}/status", id);
+    let bar = contact_status(&db).await;
+    let is_locked = bar.is_locked(&record_state);
+    let bar_html = bar.render(&record_state, &status_change_base);
+    let action_buttons = vortex_plugin_sdk::framework::StageActions::from_db(&db, "contacts")
+        .await
+        .render(&record_state, &user.roles, &status_change_base);
+
+    // On-record approval panel: shows pending step/progress and an
+    // approve/reject form when this user is an eligible approver. Empty
+    // unless an approval is in flight for this contact.
+    let approval_panel = vortex_plugin_sdk::framework::approval::render_for_record(
+        &db, "contacts", id, user.id, &user.roles,
+    )
+    .await;
+    let lock_banner = if is_locked {
+        r#"<div class="alert alert-warning mb-4"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/></svg><span>This contact is locked in its current stage. Fields are read-only — use the buttons to change its status.</span></div>"#
+    } else {
+        ""
+    };
+    let status_bar = format!(
+        r#"<div class="flex flex-wrap items-center justify-between gap-3">{bar}{buttons}</div>{banner}"#,
+        bar = bar_html,
+        buttons = action_buttons,
+        banner = lock_banner,
+    );
+    let form_disabled = if is_locked { " disabled" } else { "" };
+
+    // Archive / un-archive control. "Delete" here is a soft delete (active =
+    // false), so we name it honestly: active records get an Archive button,
+    // already-archived records get an Un-archive button that restores them.
+    let archive_button = if active {
+        format!(
+            r#"<form method="POST" action="/contacts/{id}/archive" onsubmit="return confirm('Archive this contact?')">
+<button class="btn btn-warning btn-sm btn-outline">Archive</button>
+</form>"#,
+            id = id,
+        )
+    } else {
+        format!(
+            r#"<form method="POST" action="/contacts/{id}/unarchive">
+<button class="btn btn-success btn-sm btn-outline">Un-archive</button>
+</form>"#,
+            id = id,
+        )
+    };
+
     let content = format!(
         r#"<div class="flex items-center justify-between mb-6">
 <div>
 <a href="/contacts" class="btn btn-ghost btn-sm mb-2">← Back to Contacts</a>
 <h1 class="text-2xl font-bold">{name} <span class="text-base-content/40 font-mono text-sm">{code}</span></h1>
 </div>
-<form method="POST" action="/contacts/{id}/delete" onsubmit="return confirm('Delete this contact?')">
-<button class="btn btn-error btn-sm btn-outline">Delete</button>
-</form>
+{archive_button}
 </div>
 
+{status_bar}
+
+{approval_panel}
+
 <form method="POST" action="/contacts/{id}">
+<fieldset class="contents"{form_disabled}>
 <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
 
 <!-- Left column -->
@@ -553,6 +779,7 @@ async function loadStates(countryId) {{
 </script>
 </div>
 </div>
+{history_panel}
 </div>
 </div>
 
@@ -565,6 +792,7 @@ async function loadStates(countryId) {{
 <button type="submit" class="btn btn-primary btn-sm">Save</button>
 <a href="/contacts" class="btn btn-ghost btn-sm">Cancel</a>
 </div>
+</fieldset>
 </form>"#,
         id = id,
         name = esc(&name),
@@ -589,9 +817,128 @@ async function loadStates(countryId) {{
         sel_other = sel(&contact_type, "other"),
         is_company_checked = if is_company { "checked" } else { "" },
         active_checked = if active { "checked" } else { "" },
+        history_panel = history_panel,
+        status_bar = status_bar,
+        approval_panel = approval_panel,
+        form_disabled = form_disabled,
+        archive_button = archive_button,
     );
 
     Html(page_shell(&sidebar, &format!("Edit {}", name), &content)).into_response()
+}
+
+/// The contact model's tracked fields — Vortex's `tracking=True` analogue.
+/// Declared once; the framework snapshots these before a save and posts a
+/// field-level diff to the audit trail after. Add a `.text()/.money()/…`
+/// line here and the field is tracked — no handler changes needed.
+fn contact_tracker() -> vortex_plugin_sdk::framework::Tracker {
+    use vortex_plugin_sdk::framework::Tracker;
+    Tracker::new("contacts")
+        .text("name", "Name")
+        .text("email", "Email")
+        .text("phone", "Phone")
+        .text("mobile", "Mobile")
+        .text("street", "Street")
+        .text("street2", "Street 2")
+        .text("street3", "Street 3")
+        .text("city", "City")
+        .text("zip", "ZIP")
+        .text("vat_number", "VAT Number")
+        .text("notes", "Notes")
+        .selection("contact_type", "Type")
+        .boolean("is_company", "Company", "Company", "Individual")
+        .boolean("active", "Status", "Active", "Archived")
+        .money("credit_limit", "Credit Limit")
+        .reference("country_id", "Country", "countries")
+        .reference("state_id", "State", "states")
+}
+
+/// Load the contacts status bar from the user-managed `record_stages` table.
+/// Stages are data, not code — admins add/reorder/recolour them in Settings.
+async fn contact_status(db: &vortex_plugin_sdk::sqlx::PgPool) -> vortex_plugin_sdk::framework::StatusBar {
+    vortex_plugin_sdk::framework::StatusBar::from_db(db, "contacts", "contacts", "record_state").await
+}
+
+/// POST /contacts/:id/status/:state — move a contact to a new stage.
+async fn change_contact_status(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path((id, new_state)): Path<(Uuid, String)>,
+) -> Response {
+    let row = vortex_plugin_sdk::sqlx::query("SELECT name, record_state FROM contacts WHERE id = $1")
+        .bind(id)
+        .fetch_optional(&db)
+        .await
+        .ok()
+        .flatten();
+    let (name, current) = match row {
+        Some(r) => (r.get::<String, _>("name"), r.get::<String, _>("record_state")),
+        None => return (vortex_plugin_sdk::axum::http::StatusCode::NOT_FOUND, "Contact not found").into_response(),
+    };
+
+    // Server-side role gate: resolve the exact button the user would press
+    // (mirrors the rendered buttons); `None` means they may not transition.
+    let actions = vortex_plugin_sdk::framework::StageActions::from_db(&db, "contacts").await;
+    let Some(action) = actions.action_for(&current, &new_state, &user.roles) else {
+        return (
+            vortex_plugin_sdk::axum::http::StatusCode::FORBIDDEN,
+            "You are not allowed to make this transition.",
+        )
+            .into_response();
+    };
+
+    // If the button requires approval, create a request instead of moving the
+    // record. The transition is applied later, once approvers sign off.
+    if let Some(action_id) = action.id {
+        use vortex_plugin_sdk::framework::approval;
+        if approval::requires_approval(&db, action_id).await {
+            match approval::create_request(
+                &db,
+                &state.db, // primary pool — the durable job queue lives here
+                &state.audit,
+                &db_ctx.db_name,
+                approval::NewRequest {
+                    model: "contacts",
+                    record_id: id,
+                    action_id,
+                    status_table: "contacts",
+                    status_column: "record_state",
+                    from_stage: &current,
+                    target_stage: &new_state,
+                    resource_name: &name,
+                    requested_by: user.id,
+                    requested_by_name: &user.username,
+                },
+            )
+            .await
+            {
+                Ok(_) => {}
+                Err(e) => info!(error = %e, "approval request not created"),
+            }
+            return vortex_plugin_sdk::axum::response::Redirect::to(&format!("/contacts/{id}")).into_response();
+        }
+    }
+
+    match contact_status(&db)
+        .await
+        .apply(
+            &db, &state.audit, &db_ctx.db_name,
+            user.id, &user.username, "contact", id, &name, &new_state,
+        )
+        .await
+    {
+        Ok(()) => vortex_plugin_sdk::axum::response::Redirect::to(&format!("/contacts/{id}")).into_response(),
+        Err(e) => {
+            error!(error = %e, "contact status change failed");
+            (
+                vortex_plugin_sdk::axum::http::StatusCode::BAD_REQUEST,
+                format!("Could not change status: {e}"),
+            )
+                .into_response()
+        }
+    }
 }
 
 /// POST /contacts/:id — update an existing contact.
@@ -599,12 +946,30 @@ async fn update_contact(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
     Path(id): Path<Uuid>,
     vortex_plugin_sdk::axum::extract::Form(form): vortex_plugin_sdk::axum::extract::Form<HashMap<String, String>>,
 ) -> Response {
     let name = form.get("name").cloned().unwrap_or_default();
     if name.trim().is_empty() {
         return (vortex_plugin_sdk::axum::http::StatusCode::BAD_REQUEST, "Name is required").into_response();
+    }
+
+    // Refuse field edits while the contact sits in a locked stage. The UI
+    // also disables the inputs, but enforce it server-side regardless.
+    let current_state: String = vortex_plugin_sdk::sqlx::query_scalar("SELECT record_state FROM contacts WHERE id = $1")
+        .bind(id)
+        .fetch_optional(&db)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    if contact_status(&db).await.is_locked(&current_state) {
+        return (
+            vortex_plugin_sdk::axum::http::StatusCode::FORBIDDEN,
+            "This contact is locked and cannot be edited. Change its status first.",
+        )
+            .into_response();
     }
 
     let country_id: Option<Uuid> = form
@@ -615,6 +980,9 @@ async fn update_contact(
         .get("state_id")
         .filter(|s| !s.is_empty())
         .and_then(|s| s.parse().ok());
+
+    // Snapshot tracked fields BEFORE the update (Odoo-style `tracking=True`).
+    let before = contact_tracker().snapshot(&db, id).await;
 
     if let Err(e) = vortex_plugin_sdk::sqlx::query(
         "UPDATE contacts SET \
@@ -660,29 +1028,27 @@ async fn update_contact(
         ).into_response();
     }
 
-    // Audit
-    let audit_entry = vortex_plugin_sdk::security::AuditEntry::new(
-        vortex_plugin_sdk::security::AuditAction::RecordUpdated,
-        vortex_plugin_sdk::security::AuditSeverity::Info,
-    )
-    .with_user(vortex_plugin_sdk::common::UserId(user.id))
-    .with_username(&user.username)
-    .with_resource("contact", id.to_string())
-    .with_resource_name(&name);
-    let _ = state.audit.log(audit_entry).await;
+    // Diff the tracked fields against the snapshot and post the change set
+    // to the tenant WORM ledger — one call, no hand-written diff logic.
+    contact_tracker()
+        .log_update(
+            &state.audit, &db, &db_ctx.db_name,
+            user.id, &user.username, "contact", id, &name, &before, &form,
+        )
+        .await;
 
     info!(id = %id, name = %name, "contact updated");
     vortex_plugin_sdk::axum::response::Redirect::to("/contacts").into_response()
 }
 
-/// POST /contacts/:id/delete — delete a contact.
-async fn delete_contact(
+/// POST /contacts/:id/archive — archive a contact (soft delete: active = false).
+async fn archive_contact(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
     Path(id): Path<Uuid>,
 ) -> Response {
-    // Soft delete — set active = false
     if let Err(e) = vortex_plugin_sdk::sqlx::query(
         "UPDATE contacts SET active = false, updated_by = $1, updated_at = NOW() WHERE id = $2",
     )
@@ -691,22 +1057,63 @@ async fn delete_contact(
     .execute(&db)
     .await
     {
-        error!(error = %e, "contact delete failed");
+        error!(error = %e, "contact archive failed");
         return (
             vortex_plugin_sdk::axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to delete: {e}"),
+            format!("Failed to archive: {e}"),
         ).into_response();
     }
 
     let audit_entry = vortex_plugin_sdk::security::AuditEntry::new(
-        vortex_plugin_sdk::security::AuditAction::RecordDeleted,
+        vortex_plugin_sdk::security::AuditAction::RecordUpdated,
         vortex_plugin_sdk::security::AuditSeverity::Info,
     )
     .with_user(vortex_plugin_sdk::common::UserId(user.id))
     .with_username(&user.username)
-    .with_resource("contact", id.to_string());
+    .with_database(&db_ctx.db_name)
+    .with_resource("contact", id.to_string())
+    .with_details(json!({ "changes": [{ "field": "active", "from": "Active", "to": "Archived" }] }));
     let _ = state.audit.log(audit_entry).await;
 
-    info!(id = %id, "contact deleted (soft)");
-    vortex_plugin_sdk::axum::response::Redirect::to("/contacts").into_response()
+    info!(id = %id, "contact archived");
+    // Return to the record so the Un-archive button is immediately visible.
+    vortex_plugin_sdk::axum::response::Redirect::to(&format!("/contacts/{id}")).into_response()
+}
+
+/// POST /contacts/:id/unarchive — restore an archived contact (active = true).
+async fn unarchive_contact(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<Uuid>,
+) -> Response {
+    if let Err(e) = vortex_plugin_sdk::sqlx::query(
+        "UPDATE contacts SET active = true, updated_by = $1, updated_at = NOW() WHERE id = $2",
+    )
+    .bind(user.id)
+    .bind(id)
+    .execute(&db)
+    .await
+    {
+        error!(error = %e, "contact unarchive failed");
+        return (
+            vortex_plugin_sdk::axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to un-archive: {e}"),
+        ).into_response();
+    }
+
+    let audit_entry = vortex_plugin_sdk::security::AuditEntry::new(
+        vortex_plugin_sdk::security::AuditAction::RecordUpdated,
+        vortex_plugin_sdk::security::AuditSeverity::Info,
+    )
+    .with_user(vortex_plugin_sdk::common::UserId(user.id))
+    .with_username(&user.username)
+    .with_database(&db_ctx.db_name)
+    .with_resource("contact", id.to_string())
+    .with_details(json!({ "changes": [{ "field": "active", "from": "Archived", "to": "Active" }] }));
+    let _ = state.audit.log(audit_entry).await;
+
+    info!(id = %id, "contact un-archived");
+    vortex_plugin_sdk::axum::response::Redirect::to(&format!("/contacts/{id}")).into_response()
 }

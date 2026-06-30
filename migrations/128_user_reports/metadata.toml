@@ -1,0 +1,5 @@
+[migration]
+module = "core"
+description = "User-authored report engine: ir_report (tabular + template) + columns/filters + Report Author role"
+reversible = true
+dependencies = ["127_mail_servers"]

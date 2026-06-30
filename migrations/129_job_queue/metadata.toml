@@ -1,0 +1,5 @@
+[migration]
+module = "core"
+description = "Durable background job queue (ir_job): retries, backoff, dead-letter"
+reversible = true
+dependencies = ["128_user_reports"]
