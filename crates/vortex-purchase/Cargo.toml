@@ -1,0 +1,16 @@
+[package]
+name = "vortex-purchase"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Purchasing plugin — vendors → purchase orders → receipts, posting goods into the inventory primitive"
+
+# The first module that COMPOSES a primitive: receipts call
+# vortex_inventory::post_move to flow goods through the stock ledger.
+# Vendors are core contacts; products + locations come from inventory;
+# currency comes from commerce. Nothing reinvented.
+
+[dependencies]
+vortex-plugin-sdk = { workspace = true }
+vortex-inventory = { workspace = true }

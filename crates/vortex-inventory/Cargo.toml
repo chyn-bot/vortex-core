@@ -1,0 +1,16 @@
+[package]
+name = "vortex-inventory"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Inventory / Stock plugin — a generic, reusable stock primitive (products, locations, moves, on-hand) that any goods-handling vertical builds on"
+
+# This is a HORIZONTAL primitive, not a vertical. Maintenance (spare
+# parts), procurement (receipts), manufacturing and retail all reuse
+# its products + double-entry stock ledger instead of reinventing it.
+# Built entirely against vortex-plugin-sdk — zero host-binary code
+# beyond the two registration lines.
+
+[dependencies]
+vortex-plugin-sdk = { workspace = true }

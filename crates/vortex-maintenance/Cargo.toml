@@ -1,0 +1,16 @@
+[package]
+name = "vortex-maintenance"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Maintenance / CMMS plugin — generic assets, work orders and preventive plans; the base an asset-intensive vertical (e.g. electrical EAM) specializes"
+
+# Generic maintenance management, NOT a vertical. Composes two
+# primitives: inventory (work-order parts consumed via stock moves) and
+# the scheduler (plans generate work orders on a cadence). Verticals add
+# equipment-type detail tables linked by asset_id.
+
+[dependencies]
+vortex-plugin-sdk = { workspace = true }
+vortex-inventory = { workspace = true }
