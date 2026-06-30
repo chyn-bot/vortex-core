@@ -1,0 +1,378 @@
+/* ============================================
+   Transmission - Tower Map & SLD Styles
+   ============================================ */
+
+/* ─── Tower Map ─────────────────────────────── */
+.tower-map-view {
+    background: #f0f2f5;
+    min-height: 100%;
+    display: flex;
+    flex-direction: column;
+}
+
+.tower-map-toolbar {
+    background: #fff;
+    border-bottom: 1px solid #dee2e6;
+    padding: 10px 16px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-shrink: 0;
+    flex-wrap: wrap;
+}
+
+.tower-map-toolbar h4 {
+    margin: 0;
+    font-size: 16px;
+    font-weight: 600;
+    white-space: nowrap;
+}
+
+.tower-map-toolbar select {
+    min-width: 160px;
+    max-width: 280px;
+}
+
+.tower-map-legend {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-left: auto;
+    flex-wrap: wrap;
+}
+
+.tower-map-legend-item {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 11px;
+    color: #6c757d;
+    white-space: nowrap;
+}
+
+.tower-map-legend-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 2px;
+    flex-shrink: 0;
+}
+
+/* ─── Transmission SLD ─────────────────────── */
+.transmission-sld-view {
+    background: #f0f2f5;
+    min-height: 100%;
+    display: flex;
+    flex-direction: column;
+}
+
+.tsld-toolbar {
+    background: #fff;
+    border-bottom: 1px solid #dee2e6;
+    padding: 10px 16px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-shrink: 0;
+    flex-wrap: wrap;
+}
+
+.tsld-toolbar h4 {
+    margin: 0;
+    font-size: 16px;
+    font-weight: 600;
+    white-space: nowrap;
+}
+
+.tsld-toolbar-spacer {
+    flex: 1;
+}
+
+/* Network View */
+.tsld-canvas-wrapper {
+    flex: 1;
+    overflow: auto;
+    padding: 20px;
+    position: relative;
+}
+
+.tsld-network-canvas {
+    position: relative;
+    min-height: 500px;
+    margin: 0 auto;
+}
+
+.tsld-substation-node {
+    position: absolute;
+    background: #fff;
+    border: 2px solid #495057;
+    border-radius: 8px;
+    padding: 8px 12px;
+    cursor: pointer;
+    min-width: 120px;
+    text-align: center;
+    transition: box-shadow 0.15s, border-color 0.15s;
+    z-index: 5;
+}
+
+.tsld-substation-node:hover {
+    border-color: #0d6efd;
+    box-shadow: 0 3px 12px rgba(13, 110, 253, 0.2);
+}
+
+.tsld-substation-name {
+    font-size: 12px;
+    font-weight: 600;
+    color: #212529;
+    margin-bottom: 2px;
+}
+
+.tsld-substation-code {
+    font-size: 10px;
+    color: #6c757d;
+}
+
+.tsld-line-label {
+    position: absolute;
+    background: #fff;
+    border: 1px solid #dee2e6;
+    border-radius: 4px;
+    padding: 3px 8px;
+    font-size: 10px;
+    font-weight: 600;
+    cursor: pointer;
+    white-space: nowrap;
+    z-index: 4;
+    transition: box-shadow 0.15s, border-color 0.15s;
+}
+
+.tsld-line-label:hover {
+    border-color: #0d6efd;
+    box-shadow: 0 2px 8px rgba(13, 110, 253, 0.15);
+}
+
+/* Line View */
+.tsld-line-canvas {
+    position: relative;
+    min-height: 400px;
+    margin: 0 auto;
+    padding: 40px 20px;
+}
+
+.tsld-line-header {
+    background: #fff;
+    border-bottom: 1px solid #dee2e6;
+    padding: 8px 16px;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    font-size: 12px;
+    flex-shrink: 0;
+}
+
+.tsld-line-info-item {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.tsld-line-info-label {
+    color: #6c757d;
+}
+
+.tsld-line-info-value {
+    font-weight: 600;
+    color: #212529;
+}
+
+.tsld-endpoint-node {
+    position: absolute;
+    background: #e9ecef;
+    border: 2px solid #495057;
+    border-radius: 8px;
+    padding: 8px 14px;
+    min-width: 100px;
+    text-align: center;
+    cursor: pointer;
+    z-index: 5;
+}
+
+.tsld-endpoint-node:hover {
+    border-color: #0d6efd;
+    box-shadow: 0 3px 12px rgba(13, 110, 253, 0.2);
+}
+
+.tsld-endpoint-label {
+    font-size: 11px;
+    font-weight: 600;
+    color: #212529;
+}
+
+.tsld-endpoint-sub {
+    font-size: 9px;
+    color: #6c757d;
+}
+
+.tsld-tower-node {
+    position: absolute;
+    text-align: center;
+    cursor: pointer;
+    z-index: 5;
+    transition: transform 0.15s;
+}
+
+.tsld-tower-node:hover {
+    transform: scale(1.1);
+}
+
+.tsld-tower-icon {
+    width: 72px;
+    height: 96px;
+    margin: 0 auto 4px;
+}
+
+.tsld-tower-icon svg {
+    width: 100%;
+    height: 100%;
+}
+
+.tsld-tower-label {
+    font-size: 9px;
+    font-weight: 600;
+    color: #212529;
+    white-space: nowrap;
+}
+
+.tsld-tower-number {
+    font-size: 8px;
+    color: #6c757d;
+}
+
+.tsld-tower-equipment {
+    margin-top: 4px;
+}
+
+.tsld-tower-equip-item {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 24px;
+    background: #fff;
+    border: 1px solid #dee2e6;
+    border-radius: 4px;
+    margin: 1px;
+    cursor: pointer;
+    transition: transform 0.15s;
+}
+
+.tsld-tower-equip-item:hover {
+    transform: scale(1.2);
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.15);
+    z-index: 10;
+}
+
+.tsld-tower-equip-item svg {
+    width: 16px;
+    height: 16px;
+}
+
+/* Conductor SVG overlay */
+.tsld-conductor-svg {
+    position: absolute;
+    left: 0;
+    top: 0;
+    pointer-events: none;
+    z-index: 2;
+}
+
+/* Tower info badges */
+.tsld-tower-info {
+    font-size: 8px;
+    color: #888;
+    margin-top: 2px;
+    display: flex;
+    gap: 4px;
+    justify-content: center;
+    flex-wrap: wrap;
+}
+
+.tsld-tower-info span {
+    background: #f0f2f5;
+    padding: 1px 5px;
+    border-radius: 3px;
+    white-space: nowrap;
+}
+
+/* Empty / Loading states */
+.tsld-empty-state {
+    text-align: center;
+    padding: 60px 20px;
+    color: #6c757d;
+}
+
+.tsld-empty-state i {
+    font-size: 48px;
+    margin-bottom: 16px;
+    display: block;
+    color: #adb5bd;
+}
+
+.tsld-empty-state p {
+    font-size: 14px;
+    margin: 0;
+}
+
+.tsld-loading {
+    text-align: center;
+    padding: 60px 20px;
+    color: #6c757d;
+}
+
+.tsld-loading i {
+    font-size: 24px;
+    margin-bottom: 12px;
+    display: block;
+}
+
+/* Voltage legend in SLD */
+.tsld-legend {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+}
+
+.tsld-legend-item {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 11px;
+    color: #6c757d;
+    white-space: nowrap;
+}
+
+.tsld-legend-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 2px;
+    flex-shrink: 0;
+}
+
+/* Responsive */
+@media (max-width: 768px) {
+    .tower-map-toolbar,
+    .tsld-toolbar {
+        padding: 8px 12px;
+        gap: 8px;
+    }
+
+    .tower-map-toolbar select,
+    .tsld-toolbar select {
+        min-width: 120px;
+    }
+
+    .tower-map-legend,
+    .tsld-legend {
+        display: none;
+    }
+}

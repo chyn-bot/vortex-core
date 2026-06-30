@@ -1,0 +1,18 @@
+[package]
+name = "vortex-sesb-eam"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "SESB Enterprise Asset Management — electrical-utility EAM vertical (Sabah Electricity). Specializes the generic CMMS base with the full transmission/distribution/UGC asset hierarchy, condition monitoring, reliability analytics, field portal and IEEE-1366 reporting."
+
+# VERTICAL PLUGIN. Self-contained electrical-utility EAM built to the
+# SESB_EAM_BUILD_SPECIFICATION. Owns its eam_* schema (field-level parity
+# is a hard requirement), composes the inventory primitive for spare-part
+# consumption, and reuses core contacts/companies/users/sequences/audit.
+# Registered AFTER vortex-inventory.
+
+[dependencies]
+vortex-plugin-sdk = { workspace = true }
+vortex-inventory = { workspace = true }
+reqwest = { workspace = true }

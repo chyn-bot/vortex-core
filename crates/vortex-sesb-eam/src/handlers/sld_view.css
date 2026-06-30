@@ -1,0 +1,451 @@
+/* ============================================
+   Single Line Diagram (SLD) View Styles
+   ============================================ */
+
+/* Main container */
+.sld-view {
+    background: #f0f2f5;
+    min-height: 100%;
+    display: flex;
+    flex-direction: column;
+}
+
+/* Toolbar */
+.sld-toolbar {
+    background: #fff;
+    border-bottom: 1px solid #dee2e6;
+    padding: 10px 16px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-shrink: 0;
+    flex-wrap: wrap;
+}
+
+.sld-toolbar h4 {
+    margin: 0;
+    font-size: 16px;
+    font-weight: 600;
+    white-space: nowrap;
+}
+
+.sld-toolbar select {
+    min-width: 240px;
+    max-width: 400px;
+}
+
+.sld-toolbar-spacer {
+    flex: 1;
+}
+
+.sld-busbar-config-badge {
+    font-size: 11px;
+    padding: 3px 8px;
+    text-transform: capitalize;
+    white-space: nowrap;
+}
+
+/* Voltage legend */
+.sld-legend {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+}
+
+.sld-legend-item {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 11px;
+    color: #6c757d;
+    white-space: nowrap;
+}
+
+.sld-legend-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 2px;
+    flex-shrink: 0;
+}
+
+/* Status legend */
+.sld-status-legend {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-left: 12px;
+    padding-left: 12px;
+    border-left: 1px solid #dee2e6;
+    flex-wrap: wrap;
+}
+
+.sld-status-legend-item {
+    display: flex;
+    align-items: center;
+    gap: 3px;
+    font-size: 10px;
+    color: #6c757d;
+}
+
+.sld-status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+}
+
+/* Canvas wrapper - scrollable */
+.sld-canvas-wrapper {
+    flex: 1;
+    overflow: auto;
+    padding: 20px;
+}
+
+/* Canvas - relative positioned container */
+.sld-canvas {
+    position: relative;
+    min-height: 400px;
+    margin: 0 auto;
+}
+
+/* Busbar - horizontal bar */
+.sld-busbar {
+    position: absolute;
+    left: 0;
+    right: 0;
+    height: 6px;
+    border-radius: 3px;
+    z-index: 1;
+}
+
+.sld-busbar-label {
+    position: absolute;
+    left: 0;
+    top: -10px;
+    transform: translateY(-100%);
+    padding: 2px 10px;
+    border-radius: 10px;
+    color: #fff;
+    font-size: 11px;
+    font-weight: 600;
+    white-space: nowrap;
+    z-index: 2;
+}
+
+/* Bay column */
+.sld-bay-column {
+    position: absolute;
+    width: 140px;
+    z-index: 3;
+}
+
+/* Bay header card */
+.sld-bay-header {
+    background: #fff;
+    border: 1px solid #dee2e6;
+    border-radius: 6px;
+    padding: 6px 8px;
+    cursor: pointer;
+    transition: box-shadow 0.15s, border-color 0.15s;
+    margin-bottom: 4px;
+}
+
+.sld-bay-header:hover {
+    border-color: #0d6efd;
+    box-shadow: 0 2px 8px rgba(13, 110, 253, 0.15);
+}
+
+.sld-bay-name {
+    font-size: 11px;
+    font-weight: 600;
+    color: #212529;
+    margin-bottom: 2px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.sld-bay-type {
+    font-size: 9px;
+    text-transform: uppercase;
+    color: #6c757d;
+    letter-spacing: 0.5px;
+}
+
+.sld-bay-feeder {
+    font-size: 9px;
+    color: #495057;
+    margin-top: 2px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.sld-bay-destination {
+    font-size: 8px;
+    color: #adb5bd;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* Bay state badge */
+.sld-bay-state {
+    display: inline-block;
+    font-size: 8px;
+    padding: 1px 5px;
+    border-radius: 8px;
+    text-transform: capitalize;
+    margin-top: 3px;
+}
+
+/* Bay stem - vertical line from busbar to equipment */
+.sld-bay-stem {
+    width: 2px;
+    margin: 0 auto;
+    position: relative;
+}
+
+/* Equipment stack */
+.sld-equipment-stack {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0;
+    padding: 0 10px;
+}
+
+/* Equipment item */
+.sld-equipment-item {
+    width: 44px;
+    height: 44px;
+    background: #fff;
+    border: 2px solid #dee2e6;
+    border-radius: 6px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    transition: transform 0.15s, box-shadow 0.15s, border-color 0.15s;
+    position: relative;
+    z-index: 4;
+}
+
+.sld-equipment-item:hover {
+    transform: scale(1.15);
+    box-shadow: 0 3px 10px rgba(0, 0, 0, 0.15);
+    z-index: 10;
+}
+
+.sld-equipment-item svg {
+    width: 30px;
+    height: 30px;
+}
+
+/* Vertical connector between equipment items */
+.sld-equipment-connector {
+    width: 2px;
+    height: 8px;
+    background: #adb5bd;
+    margin: 0 auto;
+}
+
+/* Status border colors */
+.sld-status-operational {
+    border-color: #198754;
+}
+
+.sld-status-standby {
+    border-color: #ffc107;
+}
+
+.sld-status-out_of_service {
+    border-color: #dc3545;
+}
+
+.sld-status-under_repair {
+    border-color: #fd7e14;
+}
+
+.sld-status-decommissioned {
+    border-color: #6c757d;
+}
+
+/* Tooltip */
+.sld-equipment-item .sld-tooltip {
+    display: none;
+    position: absolute;
+    bottom: calc(100% + 8px);
+    left: 50%;
+    transform: translateX(-50%);
+    background: #212529;
+    color: #fff;
+    padding: 8px 10px;
+    border-radius: 6px;
+    font-size: 10px;
+    white-space: nowrap;
+    z-index: 100;
+    pointer-events: none;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+}
+
+.sld-equipment-item .sld-tooltip::after {
+    content: '';
+    position: absolute;
+    top: 100%;
+    left: 50%;
+    transform: translateX(-50%);
+    border: 5px solid transparent;
+    border-top-color: #212529;
+}
+
+.sld-equipment-item:hover .sld-tooltip {
+    display: block;
+}
+
+.sld-tooltip-name {
+    font-weight: 600;
+    margin-bottom: 2px;
+    font-size: 11px;
+}
+
+.sld-tooltip-code {
+    color: #adb5bd;
+    margin-bottom: 4px;
+}
+
+.sld-tooltip-row {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    line-height: 1.5;
+}
+
+.sld-tooltip-label {
+    color: #adb5bd;
+}
+
+.sld-tooltip-value {
+    font-weight: 500;
+    text-transform: capitalize;
+}
+
+/* Transformer bridge - dashed line to lower voltage busbar */
+.sld-transformer-bridge {
+    width: 2px;
+    border-left: 2px dashed #adb5bd;
+    margin: 0 auto;
+    position: relative;
+}
+
+/* Bay state badge colors */
+.sld-state-in_service {
+    background: #d1e7dd;
+    color: #0f5132;
+}
+
+.sld-state-available {
+    background: #cfe2ff;
+    color: #084298;
+}
+
+.sld-state-out_of_service {
+    background: #f8d7da;
+    color: #842029;
+}
+
+.sld-state-under_maintenance {
+    background: #fff3cd;
+    color: #664d03;
+}
+
+.sld-state-reserved {
+    background: #e2e3e5;
+    color: #41464b;
+}
+
+/* Empty / Loading states */
+.sld-empty-state {
+    text-align: center;
+    padding: 60px 20px;
+    color: #6c757d;
+}
+
+.sld-empty-state i {
+    font-size: 48px;
+    margin-bottom: 16px;
+    display: block;
+    color: #adb5bd;
+}
+
+.sld-empty-state p {
+    font-size: 14px;
+    margin: 0;
+}
+
+.sld-loading {
+    text-align: center;
+    padding: 60px 20px;
+    color: #6c757d;
+}
+
+.sld-loading i {
+    font-size: 24px;
+    margin-bottom: 12px;
+    display: block;
+}
+
+/* Substation info bar */
+.sld-info-bar {
+    background: #fff;
+    border-bottom: 1px solid #dee2e6;
+    padding: 8px 16px;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    font-size: 12px;
+    flex-shrink: 0;
+}
+
+.sld-info-bar .sld-info-item {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.sld-info-bar .sld-info-label {
+    color: #6c757d;
+}
+
+.sld-info-bar .sld-info-value {
+    font-weight: 600;
+    color: #212529;
+}
+
+.sld-substation-link {
+    color: #0d6efd;
+    cursor: pointer;
+    text-decoration: none;
+    font-weight: 600;
+}
+
+.sld-substation-link:hover {
+    text-decoration: underline;
+}
+
+/* Responsive adjustments */
+@media (max-width: 768px) {
+    .sld-toolbar {
+        padding: 8px 12px;
+        gap: 8px;
+    }
+
+    .sld-toolbar select {
+        min-width: 180px;
+    }
+
+    .sld-legend {
+        display: none;
+    }
+}

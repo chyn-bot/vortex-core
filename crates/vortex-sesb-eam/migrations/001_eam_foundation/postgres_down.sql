@@ -1,0 +1,13 @@
+-- Down: SESB EAM foundation
+DROP TABLE IF EXISTS eam_substation_voltage_level;
+DROP TABLE IF EXISTS eam_site_voltage_level;
+DROP TABLE IF EXISTS eam_bay;
+DROP TABLE IF EXISTS eam_substation;
+DROP TABLE IF EXISTS eam_site;
+DROP TABLE IF EXISTS eam_kawasan;
+DROP TABLE IF EXISTS eam_zon;
+DROP TABLE IF EXISTS eam_region;
+DROP TABLE IF EXISTS eam_asset_type;
+DROP TABLE IF EXISTS eam_asset_class;
+DROP TABLE IF EXISTS eam_manufacturer;
+DROP TABLE IF EXISTS eam_voltage_level;
