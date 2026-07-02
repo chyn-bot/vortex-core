@@ -14,6 +14,7 @@ members = [
     "crates/vortex-cli",
     "crates/vortex-change",
     "crates/vortex-contacts",
+    "crates/vortex-accounting",
     "crates/vortex-inventory",
     "crates/vortex-purchase",
     "crates/vortex-maintenance",
@@ -118,6 +119,7 @@ vortex-chatter = { path = "crates/vortex-chatter" }
 vortex-server = { path = "crates/vortex-server" }
 vortex-change = { path = "crates/vortex-change" }
 vortex-contacts = { path = "crates/vortex-contacts" }
+vortex-accounting = { path = "crates/vortex-accounting" }
 vortex-inventory = { path = "crates/vortex-inventory" }
 vortex-purchase = { path = "crates/vortex-purchase" }
 vortex-maintenance = { path = "crates/vortex-maintenance" }

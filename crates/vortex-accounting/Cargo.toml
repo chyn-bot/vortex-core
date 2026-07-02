@@ -1,0 +1,21 @@
+[package]
+name = "vortex-accounting"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Accounting base — chart of accounts, journals, double-entry moves; the posting engine other modules adopt"
+
+# The platform's double-entry primitive. An AR invoice or AP bill IS a
+# journal entry (unified move model), so sub-ledgers can never drift from
+# the GL. Posted entries are immutable (DB triggers); corrections are
+# reversals. Partners are core contacts; currency/taxes come from commerce;
+# numbering from the sequence service; posting is WORM-audited.
+
+[dependencies]
+vortex-plugin-sdk = { workspace = true }
+
+[dev-dependencies]
+rust_decimal = { workspace = true }
+rust_decimal_macros = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

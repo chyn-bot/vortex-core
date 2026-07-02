@@ -982,6 +982,11 @@ pub async fn run(host: String, port: u16, _workers: Option<usize>) -> Result<()>
     // (migrations, sequences, translations, scheduled actions,
     // reports, audit logging).
     plugin_registry.register(Arc::new(vortex_contacts::ContactsPlugin::new()));
+    // Accounting — the double-entry base (chart of accounts, journals,
+    // posting engine). Registered early: it is a primitive-style plugin
+    // other modules adopt via its service API; its migrations only need
+    // core tables (contacts, currencies, taxes).
+    plugin_registry.register(Arc::new(vortex_accounting::AccountingPlugin::new()));
     // Inventory — a generic, always-on stock primitive (products,
     // locations, double-entry moves, on-hand) reused by maintenance
     // and procurement verticals.

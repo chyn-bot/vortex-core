@@ -1,0 +1,870 @@
+//! AR/AP document handlers — customer invoices, vendor bills, payments.
+//! All lifecycle actions go through [`crate::documents`], the same API
+//! adopting modules use.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use vortex_plugin_sdk::prelude::*;
+use vortex_plugin_sdk::rust_decimal::Decimal;
+use vortex_plugin_sdk::sqlx::Row;
+use vortex_plugin_sdk::tracing::error;
+use vortex_plugin_sdk::uuid::Uuid;
+
+use crate::documents::{self, NewPayment, PaymentDirection};
+use crate::handlers::{
+    audit_move, date_or_today, dec_or_zero, default_company, money, opt_str, page_shell,
+    redirect, render_sidebar,
+};
+
+pub fn document_routes() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/accounting/invoices", get(list_invoices))
+        .route("/accounting/bills", get(list_bills))
+        .route("/accounting/documents/new", get(new_document_form))
+        .route("/accounting/documents/create", post(create_document))
+        .route("/accounting/documents/{id}", get(document_detail))
+        .route("/accounting/documents/{id}/lines", post(add_doc_line))
+        .route(
+            "/accounting/documents/{id}/lines/{line_id}/delete",
+            post(delete_doc_line),
+        )
+        .route("/accounting/documents/{id}/post", post(post_document))
+        .route("/accounting/documents/{id}/pay", post(pay_document))
+        .route("/accounting/payments", get(list_payments))
+}
+
+fn doc_family(move_type: &str) -> (&'static str, &'static str, &'static str) {
+    // (list title, list url, partner filter)
+    if move_type.starts_with("customer") {
+        ("Customer Invoices", "/accounting/invoices", "customer")
+    } else {
+        ("Vendor Bills", "/accounting/bills", "supplier")
+    }
+}
+
+const DOC_TYPES: &[(&str, &str)] = &[
+    ("customer_invoice", "Customer Invoice"),
+    ("customer_credit_note", "Customer Credit Note"),
+    ("vendor_bill", "Vendor Bill"),
+    ("vendor_credit_note", "Vendor Credit Note"),
+];
+
+fn doc_type_label(t: &str) -> &'static str {
+    DOC_TYPES.iter().find(|(k, _)| *k == t).map(|(_, l)| *l).unwrap_or("Document")
+}
+
+async fn doc_partner_options(
+    db: &vortex_plugin_sdk::sqlx::PgPool,
+    kind: &str,
+    selected: Option<Uuid>,
+) -> String {
+    let esc = vortex_plugin_sdk::framework::html_escape;
+    let sql = if kind == "customer" {
+        "SELECT id, name FROM contacts WHERE active AND contact_type IN ('customer','both') ORDER BY name"
+    } else {
+        "SELECT id, name FROM contacts WHERE active AND contact_type IN ('supplier','both') ORDER BY name"
+    };
+    let rows = vortex_plugin_sdk::sqlx::query(sql).fetch_all(db).await.unwrap_or_default();
+    let mut out = String::new();
+    for row in rows {
+        let id: Uuid = row.get("id");
+        let name: String = row.get("name");
+        let sel = if Some(id) == selected { " selected" } else { "" };
+        out.push_str(&format!(
+            r#"<option value="{id}"{sel}>{name}</option>"#,
+            id = id,
+            sel = sel,
+            name = esc(&name)
+        ));
+    }
+    out
+}
+
+async fn tax_options(db: &vortex_plugin_sdk::sqlx::PgPool, use_kind: &str) -> String {
+    let esc = vortex_plugin_sdk::framework::html_escape;
+    let rows = vortex_plugin_sdk::sqlx::query(
+        "SELECT id, name FROM taxes WHERE active AND type_tax_use IN ($1, 'none') ORDER BY name",
+    )
+    .bind(use_kind)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+    let mut out = String::from(r#"<option value="">— no tax —</option>"#);
+    for row in rows {
+        let id: Uuid = row.get("id");
+        let name: String = row.get("name");
+        out.push_str(&format!(
+            r#"<option value="{id}">{name}</option>"#,
+            id = id,
+            name = esc(&name)
+        ));
+    }
+    out
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Lists
+// ─────────────────────────────────────────────────────────────────────────
+
+async fn document_list(
+    state: Arc<AppState>,
+    db: vortex_plugin_sdk::sqlx::PgPool,
+    user: AuthUser,
+    db_ctx: DatabaseContext,
+    query: HashMap<String, String>,
+    customer_side: bool,
+) -> Response {
+    use vortex_plugin_sdk::framework::list::{
+        execute_list, render_list, ListColumn, ListConfig, ListParams,
+    };
+    let sidebar = render_sidebar(&state, &user, &db_ctx);
+    let (title, base_url, _) = if customer_side {
+        ("Customer Invoices", "/accounting/invoices", "customer")
+    } else {
+        ("Vendor Bills", "/accounting/bills", "supplier")
+    };
+    let type_filter = if customer_side {
+        "m.move_type IN ('customer_invoice','customer_credit_note')"
+    } else {
+        "m.move_type IN ('vendor_bill','vendor_credit_note')"
+    };
+    let new_url = if customer_side {
+        "/accounting/documents/new?kind=customer_invoice"
+    } else {
+        "/accounting/documents/new?kind=vendor_bill"
+    };
+
+    let config = ListConfig::new(title, "acc_move")
+        .custom_from("acc_move m JOIN contacts p ON p.id = m.partner_id")
+        .custom_select(
+            "m.id, COALESCE(m.number, '/') AS number, p.name AS partner_name, \
+             m.invoice_date::text AS invoice_date, m.due_date::text AS due_date, \
+             m.total_amount::text AS total_amount, m.amount_residual::text AS amount_residual, \
+             m.state, m.payment_state",
+        )
+        .base_filter(type_filter)
+        .column(ListColumn::new("number", "Number").sortable().code().sql_expr("m.number"))
+        .column(ListColumn::new("partner_name", "Partner").sortable().searchable().sql_expr("p.name"))
+        .column(ListColumn::new("invoice_date", "Date").sortable().sql_expr("m.invoice_date"))
+        .column(ListColumn::new("due_date", "Due").sortable().sql_expr("m.due_date"))
+        .column(ListColumn::new("total_amount", "Total").sortable().sql_expr("m.total_amount"))
+        .column(ListColumn::new("amount_residual", "Open").sortable().sql_expr("m.amount_residual"))
+        .column(
+            ListColumn::new("state", "Status")
+                .filterable(&[("draft", "Draft"), ("posted", "Posted"), ("cancelled", "Cancelled")])
+                .badge(&[
+                    ("draft", "Draft", "badge-ghost"),
+                    ("posted", "Posted", "badge-success"),
+                    ("cancelled", "Cancelled", "badge-error"),
+                ])
+                .sql_expr("m.state"),
+        )
+        .column(
+            ListColumn::new("payment_state", "Payment")
+                .filterable(&[
+                    ("not_paid", "Not Paid"),
+                    ("partial", "Partial"),
+                    ("paid", "Paid"),
+                    ("reversed", "Reversed"),
+                ])
+                .badge(&[
+                    ("not_paid", "Not Paid", "badge-warning"),
+                    ("partial", "Partial", "badge-info"),
+                    ("paid", "Paid", "badge-success"),
+                    ("reversed", "Reversed", "badge-ghost"),
+                ])
+                .sql_expr("m.payment_state"),
+        )
+        .detail_url("/accounting/documents/{id}")
+        .create(
+            if customer_side { "New Invoice" } else { "New Bill" },
+            new_url,
+        )
+        .default_sort("invoice_date")
+        .group_by_options(&[("partner_name", "Partner"), ("payment_state", "Payment")]);
+
+    let params = ListParams::from_query(&query);
+    let result = match execute_list(&db, &config, &params).await {
+        Ok(r) => r,
+        Err(e) => {
+            error!(error = %e, "document list query failed");
+            return Html("<h1>Failed to load documents</h1>").into_response();
+        }
+    };
+    let list_html = render_list(&config, &result, &params, base_url);
+    Html(page_shell(&sidebar, title, &list_html)).into_response()
+}
+
+async fn list_invoices(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    document_list(state, db, user, db_ctx, query, true).await
+}
+
+async fn list_bills(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    document_list(state, db, user, db_ctx, query, false).await
+}
+
+async fn list_payments(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    use vortex_plugin_sdk::framework::list::{
+        execute_list, render_list, ListColumn, ListConfig, ListParams,
+    };
+    let sidebar = render_sidebar(&state, &user, &db_ctx);
+    let config = ListConfig::new("Payments", "acc_move")
+        .custom_from(
+            "acc_move m JOIN acc_journal j ON j.id = m.journal_id \
+             LEFT JOIN contacts p ON p.id = m.partner_id",
+        )
+        .custom_select(
+            "m.id, COALESCE(m.number, '/') AS number, j.code AS journal_code, \
+             COALESCE(p.name, '') AS partner_name, m.move_date::text AS move_date, \
+             COALESCE(m.ref, '') AS ref, m.total_amount::text AS total_amount, m.state",
+        )
+        .base_filter("m.move_type = 'payment'")
+        .column(ListColumn::new("number", "Number").sortable().code().sql_expr("m.number"))
+        .column(ListColumn::new("partner_name", "Partner").searchable().sql_expr("p.name"))
+        .column(ListColumn::new("journal_code", "Journal").sql_expr("j.code"))
+        .column(ListColumn::new("move_date", "Date").sortable().sql_expr("m.move_date"))
+        .column(ListColumn::new("ref", "Memo").searchable().sql_expr("m.ref"))
+        .column(
+            ListColumn::new("state", "Status")
+                .badge(&[
+                    ("draft", "Draft", "badge-ghost"),
+                    ("posted", "Posted", "badge-success"),
+                    ("cancelled", "Cancelled", "badge-error"),
+                ])
+                .sql_expr("m.state"),
+        )
+        .detail_url("/accounting/moves/{id}")
+        .default_sort("move_date");
+
+    let params = ListParams::from_query(&query);
+    let result = match execute_list(&db, &config, &params).await {
+        Ok(r) => r,
+        Err(e) => {
+            error!(error = %e, "payments list query failed");
+            return Html("<h1>Failed to load payments</h1>").into_response();
+        }
+    };
+    let list_html = render_list(&config, &result, &params, "/accounting/payments");
+    Html(page_shell(&sidebar, "Payments", &list_html)).into_response()
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Create
+// ─────────────────────────────────────────────────────────────────────────
+
+async fn new_document_form(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let sidebar = render_sidebar(&state, &user, &db_ctx);
+    let kind = query.get("kind").map(String::as_str).unwrap_or("customer_invoice");
+    let (family_title, family_url, partner_kind) = doc_family(kind);
+    let partners = doc_partner_options(&db, partner_kind, None).await;
+
+    let type_options: String = DOC_TYPES
+        .iter()
+        .filter(|(k, _)| k.starts_with(if partner_kind == "customer" { "customer" } else { "vendor" }))
+        .map(|(k, l)| {
+            let sel = if *k == kind { " selected" } else { "" };
+            format!(r#"<option value="{k}"{sel}>{l}</option>"#)
+        })
+        .collect();
+
+    let content = format!(
+        r#"<div class="max-w-xl">
+<a href="{family_url}" class="btn btn-ghost btn-sm mb-4">← Back to {family_title}</a>
+<h1 class="text-2xl font-bold mb-6">New {label}</h1>
+<form method="POST" action="/accounting/documents/create">
+<div class="card bg-base-100 shadow"><div class="card-body">
+<div class="form-control mb-3">
+<label class="label"><span class="label-text">Type</span></label>
+<select name="move_type" class="select select-bordered select-sm">{type_options}</select>
+</div>
+<div class="form-control mb-3">
+<label class="label"><span class="label-text">Partner *</span></label>
+<select name="partner_id" class="select select-bordered select-sm" required>{partners}</select>
+</div>
+<div class="grid grid-cols-2 gap-3">
+<div class="form-control mb-3">
+<label class="label"><span class="label-text">Document Date</span></label>
+<input name="invoice_date" type="date" class="input input-bordered input-sm"/>
+</div>
+<div class="form-control mb-3">
+<label class="label"><span class="label-text">Due Date</span></label>
+<input name="due_date" type="date" class="input input-bordered input-sm"/>
+</div>
+</div>
+<button type="submit" class="btn btn-primary btn-sm">Create Draft</button>
+</div></div>
+</form>
+<p class="text-sm opacity-60 mt-4">Lines are added on the document page; posting expands them into balanced journal lines.</p>
+</div>"#,
+        family_url = family_url,
+        family_title = family_title,
+        label = doc_type_label(kind),
+        type_options = type_options,
+        partners = partners,
+    );
+    Html(page_shell(&sidebar, "New Document", &content)).into_response()
+}
+
+async fn create_document(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    vortex_plugin_sdk::axum::extract::Form(form): vortex_plugin_sdk::axum::extract::Form<
+        HashMap<String, String>,
+    >,
+) -> Response {
+    let move_type = form
+        .get("move_type")
+        .map(String::as_str)
+        .unwrap_or("customer_invoice")
+        .to_string();
+    let Some(partner_id) = form.get("partner_id").and_then(|s| s.parse::<Uuid>().ok()) else {
+        return (
+            vortex_plugin_sdk::axum::http::StatusCode::BAD_REQUEST,
+            "Partner is required",
+        )
+            .into_response();
+    };
+    let invoice_date = date_or_today(&form, "invoice_date");
+    let due_date = form
+        .get("due_date")
+        .and_then(|s| s.parse::<vortex_plugin_sdk::chrono::NaiveDate>().ok());
+    let company_id = default_company(&db).await;
+
+    // The UI creates an *empty* draft header and lands on the detail page
+    // where lines are added one at a time. `documents::create_invoice`
+    // enforces "≥ 1 line, positive total" — correct for adopting modules
+    // that build a full document in one shot, but wrong for this two-step
+    // flow — so the header is inserted directly here. Totals stay at zero
+    // until lines are added; the positive-total guard still applies when the
+    // draft is posted (`post_invoice`).
+    let journal_code = if move_type.starts_with("customer") { "SAL" } else { "PUR" };
+    let journal_id = match crate::service::journal_by_code(&db, company_id, journal_code).await {
+        Ok(Some((jid, _))) => jid,
+        Ok(None) => {
+            return (
+                vortex_plugin_sdk::axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                Html(format!("<p>Cannot create document: no '{journal_code}' journal configured</p>")),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            error!(error = %e, "journal lookup failed");
+            return (
+                vortex_plugin_sdk::axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                Html("<p>Cannot create document: journal lookup failed</p>".to_string()),
+            )
+                .into_response();
+        }
+    };
+
+    let created: Result<Uuid, _> = vortex_plugin_sdk::sqlx::query_scalar(
+        "INSERT INTO acc_move \
+            (journal_id, move_date, move_type, partner_id, invoice_date, due_date, \
+             company_id, created_by, updated_by) \
+         VALUES ($1, $2, $3, $4, $2, $5, $6, $7, $7) \
+         RETURNING id",
+    )
+    .bind(journal_id)
+    .bind(invoice_date)
+    .bind(&move_type)
+    .bind(partner_id)
+    .bind(due_date)
+    .bind(company_id)
+    .bind(user.id)
+    .fetch_one(&db)
+    .await;
+
+    match created {
+        Ok(id) => {
+            audit_move(&state, &db_ctx, &db, user.id, &user.username, id, "created").await;
+            redirect(&format!("/accounting/documents/{id}"))
+        }
+        Err(e) => {
+            error!(error = %e, "document header insert failed");
+            (
+                vortex_plugin_sdk::axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                Html(format!(
+                    "<p>Cannot create document: {}</p>",
+                    vortex_plugin_sdk::framework::html_escape(&e.to_string())
+                )),
+            )
+                .into_response()
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Detail
+// ─────────────────────────────────────────────────────────────────────────
+
+async fn document_detail(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<Uuid>,
+) -> Response {
+    let esc = vortex_plugin_sdk::framework::html_escape;
+    let sidebar = render_sidebar(&state, &user, &db_ctx);
+
+    let Some(head) = vortex_plugin_sdk::sqlx::query(
+        "SELECT m.number, m.move_type, m.state, m.payment_state, \
+                m.invoice_date::text AS invoice_date, m.due_date::text AS due_date, \
+                m.untaxed_amount, m.tax_amount, m.total_amount, m.amount_residual, \
+                m.origin_ref, p.name AS partner_name \
+         FROM acc_move m JOIN contacts p ON p.id = m.partner_id \
+         WHERE m.id = $1 AND m.move_type <> 'entry'",
+    )
+    .bind(id)
+    .fetch_optional(&db)
+    .await
+    .ok()
+    .flatten() else {
+        return (
+            vortex_plugin_sdk::axum::http::StatusCode::NOT_FOUND,
+            "Document not found",
+        )
+            .into_response();
+    };
+
+    let number: Option<String> = head.get("number");
+    let number = number.unwrap_or_else(|| "/".to_string());
+    let move_type: String = head.get("move_type");
+    let doc_state: String = head.get("state");
+    let payment_state: String = head.get("payment_state");
+    let partner_name: String = head.get("partner_name");
+    let invoice_date: Option<String> = head.get("invoice_date");
+    let due_date: Option<String> = head.get("due_date");
+    let untaxed: Decimal = head.get("untaxed_amount");
+    let tax: Decimal = head.get("tax_amount");
+    let total: Decimal = head.get("total_amount");
+    let residual: Decimal = head.get("amount_residual");
+    let origin_ref: Option<String> = head.get("origin_ref");
+    let is_draft = doc_state == "draft";
+    let (family_title, family_url, _) = doc_family(&move_type);
+    let use_kind = if move_type.starts_with("customer") { "sale" } else { "purchase" };
+
+    // Document lines
+    let line_rows = vortex_plugin_sdk::sqlx::query(
+        "SELECT l.id, l.description, l.quantity, l.unit_price, t.name AS tax_name \
+         FROM acc_invoice_line l LEFT JOIN taxes t ON t.id = l.tax_id \
+         WHERE l.move_id = $1 ORDER BY l.sequence",
+    )
+    .bind(id)
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default();
+
+    let mut lines_html = String::new();
+    for row in &line_rows {
+        let line_id: Uuid = row.get("id");
+        let description: String = row.get("description");
+        let quantity: Decimal = row.get("quantity");
+        let unit_price: Decimal = row.get("unit_price");
+        let tax_name: Option<String> = row.get("tax_name");
+        let delete_btn = if is_draft {
+            format!(
+                r#"<form method="POST" action="/accounting/documents/{id}/lines/{line_id}/delete" style="display:inline">
+<button class="btn btn-ghost btn-xs text-error" onclick="return confirm('Remove this line?')">✕</button></form>"#
+            )
+        } else {
+            String::new()
+        };
+        lines_html.push_str(&format!(
+            r#"<tr><td>{description}</td><td class="text-right font-mono">{qty}</td>
+<td class="text-right font-mono">{price}</td><td>{tax}</td>
+<td class="text-right font-mono">{subtotal}</td><td>{delete_btn}</td></tr>"#,
+            description = esc(&description),
+            qty = quantity.normalize(),
+            price = money(unit_price),
+            tax = esc(tax_name.as_deref().unwrap_or("")),
+            subtotal = money((quantity * unit_price).round_dp(2)),
+            delete_btn = delete_btn,
+        ));
+    }
+
+    let add_line_form = if is_draft {
+        let taxes = tax_options(&db, use_kind).await;
+        format!(
+            r#"<div class="card bg-base-100 shadow mt-4"><div class="card-body py-4">
+<h3 class="font-semibold mb-2">Add Line</h3>
+<form method="POST" action="/accounting/documents/{id}/lines" class="grid grid-cols-12 gap-2 items-end">
+<div class="form-control col-span-5">
+<label class="label py-0"><span class="label-text-alt">Description *</span></label>
+<input name="description" class="input input-bordered input-sm" required/>
+</div>
+<div class="form-control col-span-1">
+<label class="label py-0"><span class="label-text-alt">Qty</span></label>
+<input name="quantity" type="number" step="0.0001" min="0.0001" value="1" class="input input-bordered input-sm"/>
+</div>
+<div class="form-control col-span-2">
+<label class="label py-0"><span class="label-text-alt">Unit Price</span></label>
+<input name="unit_price" type="number" step="0.01" class="input input-bordered input-sm"/>
+</div>
+<div class="form-control col-span-2">
+<label class="label py-0"><span class="label-text-alt">Tax</span></label>
+<select name="tax_id" class="select select-bordered select-sm">{taxes}</select>
+</div>
+<div class="col-span-2">
+<button class="btn btn-primary btn-sm w-full">Add</button>
+</div>
+</form>
+</div></div>"#
+        )
+    } else {
+        String::new()
+    };
+
+    // Actions
+    let mut actions = String::new();
+    if is_draft {
+        actions.push_str(&format!(
+            r#"<form method="POST" action="/accounting/documents/{id}/post" style="display:inline">
+<button class="btn btn-success btn-sm">Post</button></form>"#
+        ));
+    } else if doc_state == "posted" && (payment_state == "not_paid" || payment_state == "partial") {
+        actions.push_str(&format!(
+            r#"<form method="POST" action="/accounting/documents/{id}/pay" class="flex items-center gap-2">
+<input name="amount" type="number" step="0.01" min="0.01" value="{residual}" class="input input-bordered input-sm w-32"/>
+<select name="journal_code" class="select select-bordered select-sm w-24">
+<option value="BNK">Bank</option><option value="CSH">Cash</option>
+</select>
+<button class="btn btn-primary btn-sm">Register Payment</button>
+</form>"#,
+            residual = money(residual),
+        ));
+    }
+
+    // Related payments (via reconciliation)
+    let payment_rows = vortex_plugin_sdk::sqlx::query(
+        "SELECT DISTINCT pm.id, pm.number, pm.move_date::text AS move_date, pr.amount \
+         FROM acc_partial_reconcile pr \
+         JOIN acc_move_line dl ON dl.id = pr.debit_line_id \
+         JOIN acc_move_line cl ON cl.id = pr.credit_line_id \
+         JOIN acc_move_line pl ON pl.id IN (pr.debit_line_id, pr.credit_line_id) \
+         JOIN acc_move pm ON pm.id = pl.move_id AND pm.id <> $1 \
+         WHERE dl.move_id = $1 OR cl.move_id = $1 \
+         ORDER BY pm.number",
+    )
+    .bind(id)
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default();
+    let mut payments_html = String::new();
+    for row in &payment_rows {
+        let pid: Uuid = row.get("id");
+        let pnumber: Option<String> = row.get("number");
+        let pdate: String = row.get("move_date");
+        let amount: Decimal = row.get("amount");
+        payments_html.push_str(&format!(
+            r#"<tr><td><a class="link" href="/accounting/moves/{pid}">{num}</a></td>
+<td>{date}</td><td class="text-right font-mono">{amount}</td></tr>"#,
+            pid = pid,
+            num = esc(pnumber.as_deref().unwrap_or("/")),
+            date = esc(&pdate),
+            amount = money(amount),
+        ));
+    }
+    let payments_block = if payments_html.is_empty() {
+        String::new()
+    } else {
+        format!(
+            r#"<div class="card bg-base-100 shadow mt-4"><div class="card-body py-4">
+<h3 class="font-semibold mb-2">Payments</h3>
+<table class="table table-sm"><thead><tr><th>Number</th><th>Date</th><th class="text-right">Allocated</th></tr></thead>
+<tbody>{payments_html}</tbody></table>
+</div></div>"#
+        )
+    };
+
+    let payment_badge = match payment_state.as_str() {
+        "paid" => r#"<span class="badge badge-success">Paid</span>"#,
+        "partial" => r#"<span class="badge badge-info">Partial</span>"#,
+        "reversed" => r#"<span class="badge badge-ghost">Reversed</span>"#,
+        _ if doc_state == "posted" => r#"<span class="badge badge-warning">Not Paid</span>"#,
+        _ => "",
+    };
+    let state_badge = match doc_state.as_str() {
+        "draft" => r#"<span class="badge badge-ghost">Draft</span>"#,
+        "posted" => r#"<span class="badge badge-success">Posted</span>"#,
+        _ => r#"<span class="badge badge-error">Cancelled</span>"#,
+    };
+    let origin_block = origin_ref
+        .map(|o| {
+            format!(
+                r#"<div class="text-xs opacity-60 mt-2">Origin: <span class="font-mono">{}</span></div>"#,
+                esc(&o)
+            )
+        })
+        .unwrap_or_default();
+    let gl_link = if doc_state == "posted" {
+        format!(
+            r#"<a class="link text-sm" href="/accounting/moves/{id}">View journal entry →</a>"#
+        )
+    } else {
+        String::new()
+    };
+
+    let history_panel = vortex_plugin_sdk::framework::render_audit_trail(&db, "acc_move", id).await;
+
+    let content = format!(
+        r#"<div class="max-w-5xl">
+<a href="{family_url}" class="btn btn-ghost btn-sm mb-4">← Back to {family_title}</a>
+<div class="flex items-center justify-between mb-4">
+<h1 class="text-2xl font-bold">{number} <span class="text-base opacity-60 font-normal">{type_label}</span> {state_badge} {payment_badge}</h1>
+<div>{actions}</div>
+</div>
+<div class="card bg-base-100 shadow"><div class="card-body py-4">
+<div class="grid grid-cols-4 gap-4 text-sm">
+<div><span class="opacity-60">Partner</span><br/>{partner}</div>
+<div><span class="opacity-60">Date</span><br/>{invoice_date}</div>
+<div><span class="opacity-60">Due</span><br/>{due_date}</div>
+<div><span class="opacity-60">Open Amount</span><br/><span class="font-mono">{residual}</span></div>
+</div>
+{origin_block}
+{gl_link}
+</div></div>
+<div class="card bg-base-100 shadow mt-4"><div class="card-body py-4">
+<h3 class="font-semibold mb-2">Lines</h3>
+<div class="overflow-x-auto"><table class="table table-sm">
+<thead><tr><th>Description</th><th class="text-right">Qty</th><th class="text-right">Unit Price</th><th>Tax</th><th class="text-right">Subtotal</th><th></th></tr></thead>
+<tbody>{lines}</tbody>
+<tfoot>
+<tr><td colspan="4" class="text-right">Untaxed</td><td class="text-right font-mono">{untaxed}</td><td></td></tr>
+<tr><td colspan="4" class="text-right">Tax</td><td class="text-right font-mono">{tax}</td><td></td></tr>
+<tr class="font-bold"><td colspan="4" class="text-right">Total</td><td class="text-right font-mono">{total}</td><td></td></tr>
+</tfoot>
+</table></div>
+</div></div>
+{add_line_form}
+{payments_block}
+<div class="mt-6">{history}</div>
+</div>"#,
+        family_url = family_url,
+        family_title = family_title,
+        number = esc(&number),
+        type_label = doc_type_label(&move_type),
+        state_badge = state_badge,
+        payment_badge = payment_badge,
+        actions = actions,
+        partner = esc(&partner_name),
+        invoice_date = esc(invoice_date.as_deref().unwrap_or("—")),
+        due_date = esc(due_date.as_deref().unwrap_or("—")),
+        residual = money(residual),
+        origin_block = origin_block,
+        gl_link = gl_link,
+        lines = lines_html,
+        untaxed = money(untaxed),
+        tax = money(tax),
+        total = money(total),
+        add_line_form = add_line_form,
+        payments_block = payments_block,
+        history = history_panel,
+    );
+
+    Html(page_shell(&sidebar, &format!("{number}"), &content)).into_response()
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Lines + lifecycle
+// ─────────────────────────────────────────────────────────────────────────
+
+async fn add_doc_line(
+    State(_state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(_user): Extension<AuthUser>,
+    Path(id): Path<Uuid>,
+    vortex_plugin_sdk::axum::extract::Form(form): vortex_plugin_sdk::axum::extract::Form<
+        HashMap<String, String>,
+    >,
+) -> Response {
+    let Some(description) = opt_str(&form, "description") else {
+        return redirect(&format!("/accounting/documents/{id}"));
+    };
+    let quantity = {
+        let q = dec_or_zero(&form, "quantity");
+        if q <= Decimal::ZERO { Decimal::ONE } else { q }
+    };
+    let unit_price = dec_or_zero(&form, "unit_price");
+    let tax_id = form
+        .get("tax_id")
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse::<Uuid>().ok());
+    let company_id = default_company(&db).await;
+
+    let result = vortex_plugin_sdk::sqlx::query(
+        "INSERT INTO acc_invoice_line \
+            (move_id, sequence, description, quantity, unit_price, tax_id, company_id) \
+         SELECT $1, COALESCE(MAX(l.sequence), 0) + 10, $2, $3, $4, $5, $6 \
+         FROM acc_move m LEFT JOIN acc_invoice_line l ON l.move_id = m.id \
+         WHERE m.id = $1 AND m.state = 'draft' \
+         GROUP BY m.id",
+    )
+    .bind(id)
+    .bind(description)
+    .bind(quantity)
+    .bind(unit_price)
+    .bind(tax_id)
+    .bind(company_id)
+    .execute(&db)
+    .await;
+    if let Err(e) = result {
+        error!(error = %e, "document line insert failed");
+    }
+    let _ = documents::refresh_document_totals(&db, id).await;
+    redirect(&format!("/accounting/documents/{id}"))
+}
+
+async fn delete_doc_line(
+    State(_state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(_user): Extension<AuthUser>,
+    Path((id, line_id)): Path<(Uuid, Uuid)>,
+) -> Response {
+    let result = vortex_plugin_sdk::sqlx::query(
+        "DELETE FROM acc_invoice_line l USING acc_move m \
+         WHERE l.id = $1 AND l.move_id = $2 AND m.id = l.move_id AND m.state = 'draft'",
+    )
+    .bind(line_id)
+    .bind(id)
+    .execute(&db)
+    .await;
+    if let Err(e) = result {
+        error!(error = %e, "document line delete failed");
+    }
+    let _ = documents::refresh_document_totals(&db, id).await;
+    redirect(&format!("/accounting/documents/{id}"))
+}
+
+async fn post_document(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<Uuid>,
+) -> Response {
+    match documents::post_invoice(&db, &state.pool, id, user.id).await {
+        Ok(number) => {
+            audit_move(&state, &db_ctx, &db, user.id, &user.username, id, "posted").await;
+            vortex_plugin_sdk::tracing::info!(number = %number, "document posted");
+            redirect(&format!("/accounting/documents/{id}"))
+        }
+        Err(e) => (
+            vortex_plugin_sdk::axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            Html(format!(
+                r#"<p>Cannot post: {}</p><p><a href="/accounting/documents/{id}">← back to the document</a></p>"#,
+                vortex_plugin_sdk::framework::html_escape(&e.to_string())
+            )),
+        )
+            .into_response(),
+    }
+}
+
+async fn pay_document(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<Uuid>,
+    vortex_plugin_sdk::axum::extract::Form(form): vortex_plugin_sdk::axum::extract::Form<
+        HashMap<String, String>,
+    >,
+) -> Response {
+    let Some(head) = vortex_plugin_sdk::sqlx::query(
+        "SELECT move_type, partner_id, company_id, amount_residual FROM acc_move \
+         WHERE id = $1 AND state = 'posted' AND move_type <> 'entry'",
+    )
+    .bind(id)
+    .fetch_optional(&db)
+    .await
+    .ok()
+    .flatten() else {
+        return redirect(&format!("/accounting/documents/{id}"));
+    };
+    let move_type: String = head.get("move_type");
+    let partner_id: Option<Uuid> = head.get("partner_id");
+    let company_id: Option<Uuid> = head.get("company_id");
+    let residual: Decimal = head.get("amount_residual");
+    let Some(partner_id) = partner_id else {
+        return redirect(&format!("/accounting/documents/{id}"));
+    };
+
+    let amount = {
+        let a = dec_or_zero(&form, "amount");
+        if a <= Decimal::ZERO { residual } else { a.min(residual) }
+    };
+    let journal_code = form
+        .get("journal_code")
+        .map(String::as_str)
+        .filter(|s| *s == "BNK" || *s == "CSH")
+        .unwrap_or("BNK");
+    // Customer invoices are settled by inbound money; vendor bills by
+    // outbound. Credit notes settle the other way around.
+    let customer = move_type.starts_with("customer");
+    let credit_note = move_type.ends_with("credit_note");
+    let direction = if customer ^ credit_note {
+        PaymentDirection::Inbound
+    } else {
+        PaymentDirection::Outbound
+    };
+    let today = vortex_plugin_sdk::chrono::Utc::now().date_naive();
+
+    match documents::register_payment(
+        &db,
+        &state.pool,
+        user.id,
+        &NewPayment {
+            partner_id,
+            direction,
+            journal_code,
+            amount,
+            payment_date: today,
+            memo: opt_str(&form, "memo"),
+            company_id,
+            allocate_to: vec![id],
+        },
+    )
+    .await
+    {
+        Ok(_payment_id) => {
+            audit_move(&state, &db_ctx, &db, user.id, &user.username, id, "payment_registered")
+                .await;
+            redirect(&format!("/accounting/documents/{id}"))
+        }
+        Err(e) => (
+            vortex_plugin_sdk::axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            Html(format!(
+                r#"<p>Cannot register payment: {}</p><p><a href="/accounting/documents/{id}">← back to the document</a></p>"#,
+                vortex_plugin_sdk::framework::html_escape(&e.to_string())
+            )),
+        )
+            .into_response(),
+    }
+}

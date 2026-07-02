@@ -29,6 +29,7 @@ vortex-contacts = { workspace = true }
 # locations, double-entry moves, on-hand) that maintenance and
 # procurement verticals build on.
 vortex-inventory = { workspace = true }
+vortex-accounting = { workspace = true }
 # Purchasing plugin — composes the inventory primitive (receipts post
 # stock moves). Always enabled.
 vortex-purchase = { workspace = true }
