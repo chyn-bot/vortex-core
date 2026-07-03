@@ -64,6 +64,27 @@ async fn auth_middleware(
         });
 
     let Some(cookie_value) = session_cookie else {
+        // No browser cookie. If the client presented a Bearer token (the
+        // field app calling plugin routes like `/sesb-eam/api/v1/*`), resolve
+        // it and speak JSON; otherwise this is a browser → redirect to login.
+        if request.headers().get(header::AUTHORIZATION).is_some() {
+            match resolve_bearer(&state, request.headers()).await {
+                Some((auth_user, pool, db_ctx, tok)) => {
+                    request.extensions_mut().insert(auth_user);
+                    request.extensions_mut().insert(tok);
+                    request.extensions_mut().insert(pool);
+                    request.extensions_mut().insert(db_ctx);
+                    return next.run(request).await;
+                }
+                None => {
+                    return api_error(
+                        StatusCode::UNAUTHORIZED,
+                        "invalid_token",
+                        "Invalid, expired, or revoked token.",
+                    );
+                }
+            }
+        }
         warn!("No session cookie found, redirecting to login");
         return Redirect::to("/login").into_response();
     };
@@ -301,10 +322,25 @@ async fn api_auth_middleware(
     };
     let db = pool.pool();
 
-    let Some(tok) = vortex_framework::api::resolve_token(db, &secret).await else {
+    // A mobile access token (vtxa_…) takes priority over a service api_token,
+    // so the same `/api/v1/*` surface serves both the field app and backend
+    // integrations. Both resolve to the owning user + roles.
+    let tok = if let Some(m) = vortex_framework::mobile_auth::resolve_access(db, &secret).await {
+        vortex_framework::mobile_auth::touch_last_used(db, m.token_id).await;
+        vortex_framework::api::ResolvedToken {
+            token_id: m.token_id,
+            user_id: m.user_id,
+            username: m.username,
+            full_name: m.full_name,
+            roles: m.roles,
+            scopes: m.scopes,
+        }
+    } else if let Some(t) = vortex_framework::api::resolve_token(db, &secret).await {
+        vortex_framework::api::touch_last_used(db, t.token_id).await;
+        t
+    } else {
         return api_error(StatusCode::UNAUTHORIZED, "invalid_token", "Invalid, expired, or revoked token.");
     };
-    vortex_framework::api::touch_last_used(db, tok.token_id).await;
 
     let installed_modules: HashSet<String> = sqlx::query_scalar(
         "SELECT technical_name FROM installed_modules WHERE state = 'installed'",
@@ -332,6 +368,673 @@ async fn api_auth_middleware(
     });
 
     next.run(request).await
+}
+
+// ─── Mobile / programmatic auth (/api/v1/auth/*) ──────────────────────────
+// Username+password login → short access token + long refresh token, for
+// first-party apps such as the SESB field-technician app. See
+// `vortex_framework::mobile_auth` and migration 132. The offline field flow:
+// the device works against a local queue offline (guarded by device unlock),
+// and only *sync* presents the access token; when it has expired mid-shift the
+// app rotates the refresh token for a new one.
+
+/// Access-token lifetime. Short by default so a sniffed token has a small
+/// window; override with `VORTEX_MOBILE_ACCESS_TTL_SECS`.
+fn mobile_access_ttl() -> chrono::Duration {
+    let secs = std::env::var("VORTEX_MOBILE_ACCESS_TTL_SECS")
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(3600);
+    chrono::Duration::seconds(secs)
+}
+
+/// Refresh-token lifetime. Size this to the worst realistic offline gap plus
+/// margin; override with `VORTEX_MOBILE_REFRESH_TTL_DAYS` (default 30 days).
+fn mobile_refresh_ttl() -> chrono::Duration {
+    let days = std::env::var("VORTEX_MOBILE_REFRESH_TTL_DAYS")
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(30);
+    chrono::Duration::days(days)
+}
+
+/// Resolve the target tenant DB for a mobile auth request: an explicit body
+/// `database` wins, then the `X-Vortex-Database` header (the same header the
+/// bearer middleware uses), then the host-based default. Keeping the header in
+/// the resolution path means login/refresh name their tenant exactly the way
+/// every other API call does.
+fn resolve_tenant(state: &AppState, headers: &HeaderMap, body_db: Option<&str>) -> String {
+    if let Some(d) = body_db.filter(|s| !s.is_empty()) {
+        return d.to_string();
+    }
+    if let Some(d) = headers
+        .get("x-vortex-database")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        return d.to_string();
+    }
+    resolve_database(state, headers, None)
+}
+
+/// Best-effort client IP (first `X-Forwarded-For` hop) and user-agent for the
+/// token's audit columns.
+fn request_fingerprint(headers: &HeaderMap) -> (Option<String>, Option<String>) {
+    let ip = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let ua = headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    (ip, ua)
+}
+
+/// Resolve an `Authorization: Bearer` token — a mobile **access** token first,
+/// then a service `api_token` — into a full request context. `None` if there
+/// is no bearer, the tenant header is malformed, the DB is down, or the token
+/// is invalid/expired/revoked. Used by both the API and (as a fallback to the
+/// cookie) the plugin auth middleware, so the field app reaches plugin routes
+/// like `/sesb-eam/api/v1/*`.
+async fn resolve_bearer(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Option<(
+    AuthUser,
+    Arc<ConnectionPool>,
+    DatabaseContext,
+    vortex_framework::api::ResolvedToken,
+)> {
+    let secret = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())?;
+
+    let db_name = headers
+        .get("x-vortex-database")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| state.default_db.clone());
+    if !db_name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    let pool = state.pool_manager.get_pool(&db_name).await.ok()?;
+    let db = pool.pool();
+
+    // Mobile access token (vtxa_…) takes priority over service PATs.
+    let tok = if let Some(m) = vortex_framework::mobile_auth::resolve_access(db, &secret).await {
+        vortex_framework::mobile_auth::touch_last_used(db, m.token_id).await;
+        vortex_framework::api::ResolvedToken {
+            token_id: m.token_id,
+            user_id: m.user_id,
+            username: m.username,
+            full_name: m.full_name,
+            roles: m.roles,
+            scopes: m.scopes,
+        }
+    } else {
+        let t = vortex_framework::api::resolve_token(db, &secret).await?;
+        vortex_framework::api::touch_last_used(db, t.token_id).await;
+        t
+    };
+
+    let installed_modules: HashSet<String> = sqlx::query_scalar(
+        "SELECT technical_name FROM installed_modules WHERE state = 'installed'",
+    )
+    .fetch_all(db)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .collect();
+
+    let auth_user = AuthUser {
+        id: tok.user_id,
+        username: tok.username.clone(),
+        full_name: tok.full_name.clone(),
+        session_id: tok.token_id,
+        roles: tok.roles.clone(),
+    };
+    let db_ctx = DatabaseContext {
+        db_name,
+        pool: pool.clone(),
+        installed_modules,
+    };
+    Some((auth_user, pool, db_ctx, tok))
+}
+
+#[derive(serde::Deserialize)]
+struct MobileLoginBody {
+    username: String,
+    password: String,
+    database: Option<String>,
+    device_id: Option<String>,
+    device_name: Option<String>,
+    /// Requested capability scopes; defaults to `["write"]` so a technician
+    /// can complete work orders. Policy (Cedar) still gates every call.
+    scopes: Option<Vec<String>>,
+    /// TOTP code, required when enrolling a *new* device for an MFA-enabled
+    /// user. Omit on trusted (already-seen) devices.
+    mfa_code: Option<String>,
+}
+
+/// `POST /api/v1/auth/login` — exchange credentials for an access+refresh pair.
+/// Public + rate-limited. Same credential path as the web login
+/// (`verify_password`), so identity and lockout rules are identical.
+async fn mobile_login(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<MobileLoginBody>,
+) -> Response {
+    let db_name = resolve_tenant(&state, &headers, body.database.as_deref());
+    if !db_name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return api_error(StatusCode::BAD_REQUEST, "invalid_database", "Invalid database.");
+    }
+    let pool = match state.pool_manager.get_pool(&db_name).await {
+        Ok(p) => p,
+        Err(_) => {
+            return api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "database_unavailable",
+                "Database unavailable.",
+            )
+        }
+    };
+    let db = pool.pool();
+
+    let user = sqlx::query_as::<_, UserRow>(
+        "SELECT id, username, password_hash, full_name, active, locked FROM users WHERE username = $1",
+    )
+    .bind(&body.username)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten();
+
+    let ok = user
+        .as_ref()
+        .map(|u| u.active && !u.locked && verify_password(&body.password, &u.password_hash))
+        .unwrap_or(false);
+
+    if !ok {
+        // Audit the failure against the tenant chain (best-effort).
+        let entry = AuditEntry::new(AuditAction::LoginFailure, AuditSeverity::Warning)
+            .with_username(&body.username)
+            .with_database(&db_name)
+            .with_details(serde_json::json!({"database": db_name, "channel": "mobile"}));
+        let _ = state.audit.log(entry).await;
+        return api_error(
+            StatusCode::UNAUTHORIZED,
+            "invalid_credentials",
+            "Invalid username or password.",
+        );
+    }
+    let user = user.unwrap();
+
+    // ── MFA gate ──────────────────────────────────────────────────────────
+    // MFA is enforced at *device enrollment*: a brand-new device is challenged
+    // (or, if the user has never set MFA up, walked through enrollment); an
+    // already-seen device is trusted and skips the code, so the offline
+    // silent-refresh flow is never blocked mid-shift.
+    match mobile_mfa_gate(db, &user, body.device_id.as_deref(), body.mfa_code.as_deref()).await {
+        MfaGate::Ok => {}
+        MfaGate::Reject(resp) => {
+            if matches!(&resp, MfaReject::InvalidCode) {
+                let entry = AuditEntry::new(AuditAction::LoginFailure, AuditSeverity::Warning)
+                    .with_user(vortex_common::UserId(user.id))
+                    .with_username(&user.username)
+                    .with_database(&db_name)
+                    .with_details(serde_json::json!({"database": db_name, "channel": "mobile", "reason": "mfa"}));
+                let _ = state.audit.log(entry).await;
+            }
+            return resp.into_response(&user.username);
+        }
+    }
+
+    let scopes = body.scopes.unwrap_or_else(|| vec!["write".to_string()]);
+    issue_mobile_session(
+        &state, db, &db_name, user.id, &user.username, user.full_name.as_deref(),
+        &headers, scopes, body.device_id.as_deref(), body.device_name.as_deref(),
+    )
+    .await
+}
+
+/// Whether a device has been seen before for this user (any token row, live or
+/// not). A device_id we've issued to before is "trusted" for MFA purposes.
+async fn is_known_device(db: &sqlx::PgPool, user_id: uuid::Uuid, device_id: Option<&str>) -> bool {
+    let Some(dev) = device_id.filter(|s| !s.is_empty()) else {
+        return false; // no device id → treat every login as a new device
+    };
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM mobile_auth_token WHERE user_id = $1 AND device_id = $2)",
+    )
+    .bind(user_id)
+    .bind(dev)
+    .fetch_one(db)
+    .await
+    .unwrap_or(false)
+}
+
+enum MfaGate {
+    Ok,
+    Reject(MfaReject),
+}
+
+enum MfaReject {
+    /// User is MFA-enabled, new device, and no/blank code was supplied.
+    CodeRequired,
+    /// A code was supplied but did not verify.
+    InvalidCode,
+    /// User has no MFA yet: return a provisioning secret to enroll with.
+    EnrollmentRequired { secret_b32: String, username: String },
+}
+
+impl MfaReject {
+    fn into_response(self, username: &str) -> Response {
+        match self {
+            MfaReject::CodeRequired => api_error(
+                StatusCode::UNAUTHORIZED,
+                "mfa_required",
+                "This device needs a one-time code from your authenticator app.",
+            ),
+            MfaReject::InvalidCode => api_error(
+                StatusCode::UNAUTHORIZED,
+                "mfa_invalid_code",
+                "Incorrect or expired authenticator code.",
+            ),
+            MfaReject::EnrollmentRequired { secret_b32, .. } => {
+                let uri = vortex_security::mfa::provisioning_uri("Vortex", username, &secret_b32);
+                (
+                    StatusCode::UNAUTHORIZED,
+                    Json(serde_json::json!({
+                        "error": {
+                            "code": "mfa_enrollment_required",
+                            "message": "Set up your authenticator app, then confirm at /api/v1/auth/mfa/enroll."
+                        },
+                        "mfa": { "secret": secret_b32, "otpauth_uri": uri, "issuer": "Vortex", "account": username }
+                    })),
+                )
+                    .into_response()
+            }
+        }
+    }
+}
+
+/// Decide the MFA outcome for a password-authenticated user on this device.
+async fn mobile_mfa_gate(
+    db: &sqlx::PgPool,
+    user: &UserRow,
+    device_id: Option<&str>,
+    mfa_code: Option<&str>,
+) -> MfaGate {
+    let row = sqlx::query(
+        "SELECT mfa_enabled, mfa_secret FROM users WHERE id = $1",
+    )
+    .bind(user.id)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten();
+    let mfa_enabled: bool = row.as_ref().map(|r| r.get("mfa_enabled")).unwrap_or(false);
+    let stored_secret: Option<String> =
+        row.as_ref().and_then(|r| r.try_get("mfa_secret").ok().flatten());
+
+    if is_known_device(db, user.id, device_id).await {
+        return MfaGate::Ok; // trusted device — no challenge
+    }
+
+    if mfa_enabled {
+        // New device on an MFA user → require a valid code.
+        let (Some(code), Some(enc)) = (mfa_code.filter(|s| !s.is_empty()), stored_secret) else {
+            return MfaGate::Reject(MfaReject::CodeRequired);
+        };
+        let Some(secret) = vortex_security::mfa::open_secret(&enc) else {
+            return MfaGate::Reject(MfaReject::CodeRequired);
+        };
+        let now = chrono::Utc::now().timestamp().max(0) as u64;
+        if vortex_security::mfa::verify(&secret, code, now) {
+            MfaGate::Ok
+        } else {
+            MfaGate::Reject(MfaReject::InvalidCode)
+        }
+    } else {
+        // Not enrolled yet → hand back a provisioning secret. Reuse a pending
+        // one if present so re-hitting login shows the same QR until enrolled.
+        let secret_b32 = match stored_secret.as_deref().and_then(vortex_security::mfa::open_secret) {
+            Some(existing) => existing,
+            None => {
+                let fresh = vortex_security::mfa::generate_secret();
+                if let Some(sealed) = vortex_security::mfa::seal_secret(&fresh) {
+                    let _ = sqlx::query(
+                        "UPDATE users SET mfa_secret = $2, mfa_enabled = false WHERE id = $1",
+                    )
+                    .bind(user.id)
+                    .bind(&sealed)
+                    .execute(db)
+                    .await;
+                }
+                fresh
+            }
+        };
+        MfaGate::Reject(MfaReject::EnrollmentRequired {
+            secret_b32,
+            username: user.username.clone(),
+        })
+    }
+}
+
+/// Issue an access+refresh pair, update last-login, audit, and return the
+/// token JSON. Shared by login (post-MFA) and enrollment confirmation.
+#[allow(clippy::too_many_arguments)]
+async fn issue_mobile_session(
+    state: &AppState,
+    db: &sqlx::PgPool,
+    db_name: &str,
+    user_id: uuid::Uuid,
+    username: &str,
+    full_name: Option<&str>,
+    headers: &HeaderMap,
+    scopes: Vec<String>,
+    device_id: Option<&str>,
+    device_name: Option<&str>,
+) -> Response {
+    let (ip, ua) = request_fingerprint(headers);
+    let ctx = vortex_framework::mobile_auth::IssueCtx {
+        user_id,
+        device_id,
+        device_name,
+        scopes: &scopes,
+        access_ttl: mobile_access_ttl(),
+        refresh_ttl: mobile_refresh_ttl(),
+        ip: ip.as_deref(),
+        user_agent: ua.as_deref(),
+    };
+    let pair = match vortex_framework::mobile_auth::issue_pair(db, &ctx).await {
+        Ok(p) => p,
+        Err(e) => {
+            error!("mobile issue_pair failed: {}", e);
+            return api_error(StatusCode::INTERNAL_SERVER_ERROR, "issue_failed", "Could not issue tokens.");
+        }
+    };
+
+    let _ = sqlx::query(
+        "UPDATE users SET last_login_at = NOW(), failed_login_attempts = 0 WHERE id = $1",
+    )
+    .bind(user_id)
+    .execute(db)
+    .await;
+
+    let roles: Vec<String> = sqlx::query_scalar(
+        "SELECT r.name FROM roles r JOIN user_roles ur ON ur.role_id = r.id WHERE ur.user_id = $1",
+    )
+    .bind(user_id)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+
+    let entry = AuditEntry::new(AuditAction::LoginSuccess, AuditSeverity::Info)
+        .with_user(vortex_common::UserId(user_id))
+        .with_username(username)
+        .with_database(db_name)
+        .with_resource("mobile_auth_token", pair.family_id.to_string())
+        .with_details(serde_json::json!({
+            "database": db_name, "channel": "mobile",
+            "device_id": device_id, "family_id": pair.family_id,
+        }));
+    let _ = state.audit.log(entry).await;
+
+    let now = chrono::Utc::now();
+    Json(serde_json::json!({
+        "access_token": pair.access_token,
+        "refresh_token": pair.refresh_token,
+        "token_type": "Bearer",
+        "expires_in": (pair.access_expires_at - now).num_seconds(),
+        "refresh_expires_in": (pair.refresh_expires_at - now).num_seconds(),
+        "database": db_name,
+        "user": { "id": user_id, "username": username, "full_name": full_name, "roles": roles },
+    }))
+    .into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct MobileMfaEnrollBody {
+    username: String,
+    password: String,
+    /// TOTP code from the authenticator app the user just configured with the
+    /// secret returned by `login`'s `mfa_enrollment_required` response.
+    code: String,
+    database: Option<String>,
+    device_id: Option<String>,
+    device_name: Option<String>,
+    scopes: Option<Vec<String>>,
+}
+
+/// `POST /api/v1/auth/mfa/enroll` — confirm a first-time MFA setup: verify
+/// password + the first TOTP code against the pending secret, flip
+/// `mfa_enabled`, and issue the device's first token pair. Public + rate-limited.
+async fn mobile_mfa_enroll(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<MobileMfaEnrollBody>,
+) -> Response {
+    let db_name = resolve_tenant(&state, &headers, body.database.as_deref());
+    if !db_name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return api_error(StatusCode::BAD_REQUEST, "invalid_database", "Invalid database.");
+    }
+    let pool = match state.pool_manager.get_pool(&db_name).await {
+        Ok(p) => p,
+        Err(_) => {
+            return api_error(StatusCode::SERVICE_UNAVAILABLE, "database_unavailable", "Database unavailable.")
+        }
+    };
+    let db = pool.pool();
+
+    let user = sqlx::query_as::<_, UserRow>(
+        "SELECT id, username, password_hash, full_name, active, locked FROM users WHERE username = $1",
+    )
+    .bind(&body.username)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten();
+    let ok = user
+        .as_ref()
+        .map(|u| u.active && !u.locked && verify_password(&body.password, &u.password_hash))
+        .unwrap_or(false);
+    if !ok {
+        return api_error(StatusCode::UNAUTHORIZED, "invalid_credentials", "Invalid username or password.");
+    }
+    let user = user.unwrap();
+
+    // Verify the code against the pending (or existing) secret.
+    let stored: Option<String> = sqlx::query_scalar("SELECT mfa_secret FROM users WHERE id = $1")
+        .bind(user.id)
+        .fetch_one(db)
+        .await
+        .ok()
+        .flatten();
+    let Some(secret) = stored.as_deref().and_then(vortex_security::mfa::open_secret) else {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "no_pending_enrollment",
+            "Call /api/v1/auth/login first to obtain an enrollment secret.",
+        );
+    };
+    let now = chrono::Utc::now().timestamp().max(0) as u64;
+    if !vortex_security::mfa::verify(&secret, body.code.trim(), now) {
+        return api_error(StatusCode::UNAUTHORIZED, "mfa_invalid_code", "Incorrect or expired authenticator code.");
+    }
+
+    // Confirm enrollment, then issue the first session on this device.
+    let _ = sqlx::query("UPDATE users SET mfa_enabled = true WHERE id = $1")
+        .bind(user.id)
+        .execute(db)
+        .await;
+    let entry = AuditEntry::new(AuditAction::RecordUpdated, AuditSeverity::Info)
+        .with_user(vortex_common::UserId(user.id))
+        .with_username(&user.username)
+        .with_database(&db_name)
+        .with_resource("users", user.id.to_string())
+        .with_details(serde_json::json!({"channel": "mobile", "event": "mfa_enrolled"}));
+    let _ = state.audit.log(entry).await;
+
+    let scopes = body.scopes.unwrap_or_else(|| vec!["write".to_string()]);
+    issue_mobile_session(
+        &state, db, &db_name, user.id, &user.username, user.full_name.as_deref(),
+        &headers, scopes, body.device_id.as_deref(), body.device_name.as_deref(),
+    )
+    .await
+}
+
+#[derive(serde::Deserialize)]
+struct MobileRefreshBody {
+    refresh_token: String,
+    database: Option<String>,
+}
+
+/// `POST /api/v1/auth/refresh` — rotate a refresh token for a fresh pair.
+/// Public + rate-limited. Distinct error codes let the app tell "log in again"
+/// (`refresh_expired`) from "you were compromised" (`refresh_reuse_detected`).
+async fn mobile_refresh(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<MobileRefreshBody>,
+) -> Response {
+    let db_name = resolve_tenant(&state, &headers, body.database.as_deref());
+    if !db_name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return api_error(StatusCode::BAD_REQUEST, "invalid_database", "Invalid database.");
+    }
+    let pool = match state.pool_manager.get_pool(&db_name).await {
+        Ok(p) => p,
+        Err(_) => {
+            return api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "database_unavailable",
+                "Database unavailable.",
+            )
+        }
+    };
+    let db = pool.pool();
+    let (ip, ua) = request_fingerprint(&headers);
+
+    use vortex_framework::mobile_auth::RefreshError;
+    match vortex_framework::mobile_auth::rotate_refresh(
+        db,
+        &body.refresh_token,
+        mobile_access_ttl(),
+        mobile_refresh_ttl(),
+        ip.as_deref(),
+        ua.as_deref(),
+    )
+    .await
+    {
+        Ok(pair) => {
+            let now = chrono::Utc::now();
+            Json(serde_json::json!({
+                "access_token": pair.access_token,
+                "refresh_token": pair.refresh_token,
+                "token_type": "Bearer",
+                "expires_in": (pair.access_expires_at - now).num_seconds(),
+                "refresh_expires_in": (pair.refresh_expires_at - now).num_seconds(),
+            }))
+            .into_response()
+        }
+        Err(RefreshError::Expired) => api_error(
+            StatusCode::UNAUTHORIZED,
+            "refresh_expired",
+            "Refresh token expired — please log in again.",
+        ),
+        Err(RefreshError::Reused) => api_error(
+            StatusCode::UNAUTHORIZED,
+            "refresh_reuse_detected",
+            "Refresh token was already used — the session has been revoked. Log in again.",
+        ),
+        Err(RefreshError::Invalid) => api_error(
+            StatusCode::UNAUTHORIZED,
+            "invalid_refresh",
+            "Invalid or revoked refresh token.",
+        ),
+    }
+}
+
+/// `POST /api/v1/auth/logout` — revoke the presented token's whole family
+/// (this device session). Bearer-authenticated.
+async fn mobile_logout(
+    Db(db): Db,
+    headers: HeaderMap,
+    Extension(_user): Extension<AuthUser>,
+) -> Response {
+    if let Some(secret) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "))
+        .map(|s| s.trim())
+    {
+        vortex_framework::mobile_auth::revoke_by_secret(&db, secret, "logout").await;
+    }
+    (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
+}
+
+/// `GET /api/v1/auth/me` — current identity, roles, scopes, and tenant.
+async fn mobile_me(
+    Extension(user): Extension<AuthUser>,
+    Extension(tok): Extension<vortex_framework::api::ResolvedToken>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+) -> Response {
+    Json(serde_json::json!({
+        "user": {
+            "id": user.id,
+            "username": user.username,
+            "full_name": user.full_name,
+            "roles": user.roles,
+        },
+        "scopes": tok.scopes,
+        "database": db_ctx.db_name,
+    }))
+    .into_response()
+}
+
+/// `GET /api/v1/auth/devices` — active device sessions for the current user.
+async fn mobile_devices(
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+) -> Response {
+    let devices = vortex_framework::mobile_auth::list_devices(&db, user.id).await;
+    let items: Vec<serde_json::Value> = devices
+        .iter()
+        .map(|d| {
+            serde_json::json!({
+                "family_id": d.family_id,
+                "device_id": d.device_id,
+                "device_name": d.device_name,
+                "last_used_at": d.last_used_at,
+                "created_at": d.created_at,
+                "expires_at": d.expires_at,
+            })
+        })
+        .collect();
+    Json(serde_json::json!({ "devices": items })).into_response()
+}
+
+/// `POST /api/v1/auth/devices/{family_id}/revoke` — revoke one of the current
+/// user's device sessions (lost/decommissioned device).
+async fn mobile_revoke_device(
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Path(family_id): Path<uuid::Uuid>,
+) -> Response {
+    let n = vortex_framework::mobile_auth::revoke_device(&db, user.id, family_id, "device_revoked").await;
+    if n == 0 {
+        return api_error(StatusCode::NOT_FOUND, "not_found", "No such active device session.");
+    }
+    (StatusCode::OK, Json(serde_json::json!({"ok": true, "revoked": n}))).into_response()
 }
 
 /// `GET /api/v1/whoami` — identity, roles, scopes, and active tenant.
@@ -1419,17 +2122,43 @@ fn build_router(state: Arc<AppState>) -> Router {
         per_user: false,
     });
 
-    // Rate-limited login route
+    // Rate-limited login route. The `Extension` must be the outermost layer
+    // (added last) so the rate-limit middleware can read the `RateLimiter`
+    // from request extensions — otherwise the limiter is never found and the
+    // brute-force guard silently no-ops.
     let login_routes = Router::new()
         .route("/auth/login", post(login_submit))
-        .layer(Extension(login_limiter))
-        .layer(middleware::from_fn(vortex_server::middleware::rate_limit::rate_limit_middleware));
+        .layer(middleware::from_fn(vortex_server::middleware::rate_limit::rate_limit_middleware))
+        .layer(Extension(login_limiter));
+
+    // Public, rate-limited mobile auth: credential login + refresh rotation.
+    // These MUST stay outside `api_auth_middleware` (they mint the very token
+    // that middleware requires). Static paths outrank `/api/v1/{model}`.
+    let mobile_auth_limiter = RateLimiter::new(RateLimitConfig {
+        max_requests: 10,
+        window: std::time::Duration::from_secs(60),
+        per_user: false,
+    });
+    let mobile_auth_public = Router::new()
+        .route("/api/v1/auth/login", post(mobile_login))
+        .route("/api/v1/auth/mfa/enroll", post(mobile_mfa_enroll))
+        .route("/api/v1/auth/refresh", post(mobile_refresh))
+        // Order matters: the LAST `.layer` is the outermost. The rate-limit
+        // middleware reads the `RateLimiter` from request extensions, so the
+        // `Extension` must wrap (be outer to) it — hence added last.
+        .layer(middleware::from_fn(vortex_server::middleware::rate_limit::rate_limit_middleware))
+        .layer(Extension(mobile_auth_limiter));
 
     // ─── Public REST API (Phase: developer platform) ──────────────
     // Bearer-token authenticated, JSON in/out, separate from the cookie
     // tree. Static segments (`whoami`, `models`) take precedence over the
     // `{model}` parameter in the router, so they are not shadowed.
     let api_routes = Router::new()
+        // Bearer-authenticated mobile auth: logout, identity, device sessions.
+        .route("/api/v1/auth/logout", post(mobile_logout))
+        .route("/api/v1/auth/me", get(mobile_me))
+        .route("/api/v1/auth/devices", get(mobile_devices))
+        .route("/api/v1/auth/devices/{family_id}/revoke", post(mobile_revoke_device))
         .route("/api/v1/whoami", get(api_whoami))
         .route("/api/v1/models", get(api_list_models))
         .route("/api/v1/{model}", get(api_list_records).post(api_create_record))
@@ -1453,6 +2182,9 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/", get(|| async { Redirect::to("/login") }))
         .route("/login", get(login_page))
         .merge(login_routes)
+
+        // Public mobile auth (login + refresh), rate-limited
+        .merge(mobile_auth_public)
 
         // Database manager (public, master-password protected)
         .nest("/web/database/manager", super::db_manager::db_manager_routes())

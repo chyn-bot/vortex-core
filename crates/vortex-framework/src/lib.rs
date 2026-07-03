@@ -41,6 +41,7 @@ pub mod jobs;
 pub mod list;
 pub mod mail;
 pub mod menu;
+pub mod mobile_auth;
 pub mod pdf;
 pub mod plugin;
 pub mod registry;

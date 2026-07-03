@@ -42,6 +42,7 @@ pub mod controller;
 pub mod crypto;
 pub mod csv_loader;
 pub mod domain;
+pub mod mfa;
 pub mod password;
 pub mod rbac;
 pub mod session;
