@@ -1,0 +1,16 @@
+# Vortex nightly backup — install:
+#   cp deploy/vortex-backup.{service,timer} /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now vortex-backup.timer
+[Unit]
+Description=Vortex full-deployment backup
+After=postgresql.service
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/home/vortex/vortex-core
+Environment=DATABASE_URL=postgres://vortex:vortex@localhost:5432/vortex
+Environment=BACKUP_DIR=/var/backups/vortex
+Environment=UPLOADS_DIR=/home/vortex/vortex-core/uploads
+Environment=RETENTION_DAYS=14
+ExecStart=/usr/bin/bash /home/vortex/vortex-core/scripts/backup.sh
