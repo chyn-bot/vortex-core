@@ -386,7 +386,6 @@ pub async fn post_invoice(
     .fetch_one(db)
     .await
     .map_err(|e| VortexError::QueryExecution(e.to_string()))?;
-    let tax_amount: Decimal = totals.get("tax_amount");
     let total_amount: Decimal = totals.get("total_amount");
     if total_amount <= Decimal::ZERO {
         return Err(VortexError::ValidationFailed(
@@ -396,6 +395,18 @@ pub async fn post_invoice(
 
     let customer = is_customer_doc(&move_type);
     let credit_note = move_type.ends_with("credit_note");
+
+    // Credit control (policy-configured): block or warn on customer
+    // invoices that push the partner past their limit.
+    if move_type == "customer_invoice" {
+        if let Some(pid) = partner_id {
+            if let Some(warning) =
+                crate::banking::check_credit_limit(db, pid, total_amount).await?
+            {
+                vortex_plugin_sdk::tracing::warn!("credit control: {warning}");
+            }
+        }
+    }
     // Which side of the balance sheet the counterpart sits on, and which
     // side of each GL line gets the amount. Customer invoice: AR debit /
     // income credit. Vendor bill: AP credit / expense debit. Credit notes
@@ -637,7 +648,7 @@ pub async fn post_invoice(
 // ─── Payments & reconciliation ───────────────────────────────────────────
 
 /// The open (unreconciled) receivable/payable GL line of a posted document.
-async fn open_counterpart_line(
+pub(crate) async fn open_counterpart_line(
     db: &PgPool,
     document_move_id: Uuid,
 ) -> VortexResult<Option<(Uuid, Decimal, bool)>> {
@@ -677,13 +688,12 @@ pub async fn refresh_payment_state(db: &PgPool, document_move_id: Uuid) -> Vorte
     .fetch_one(db)
     .await
     .map_err(|e| VortexError::QueryExecution(e.to_string()))?;
-    let mut total: Decimal = head.get("total_amount");
+    let total: Decimal = head.get("total_amount");
     let fx_rate: Option<Decimal> = head.get("currency_rate");
 
     // FX documents settle in DOCUMENT currency: residual comes from the
     // partial reconciles' currency amounts, with the MYR residual
     // derived at the booked rate for display/reports.
-    let mut residual_currency: Option<Decimal> = None;
     if let Some(rate) = fx_rate {
         let settled_cur: Decimal = vortex_plugin_sdk::sqlx::query_scalar(
             "SELECT COALESCE(SUM(debit_amount_currency), 0) FROM acc_partial_reconcile \
@@ -695,10 +705,7 @@ pub async fn refresh_payment_state(db: &PgPool, document_move_id: Uuid) -> Vorte
         .map_err(|e| VortexError::QueryExecution(e.to_string()))?;
         // `total` is already in document currency for FX documents.
         let open_cur = (total - settled_cur).max(Decimal::ZERO);
-        residual_currency = Some(open_cur);
         open = crate::currency::to_myr(open_cur, rate);
-        // Keep the state thresholds in currency terms.
-        total = total; // document-currency total drives the comparison below
         let payment_state = if open_cur <= Decimal::ZERO {
             "paid"
         } else if open_cur < total {
@@ -730,7 +737,6 @@ pub async fn refresh_payment_state(db: &PgPool, document_move_id: Uuid) -> Vorte
         }
         return Ok(());
     }
-    let _ = residual_currency;
 
     let payment_state = if open <= Decimal::ZERO {
         "paid"

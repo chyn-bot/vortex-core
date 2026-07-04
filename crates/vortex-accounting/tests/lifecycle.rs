@@ -822,6 +822,20 @@ async fn multicurrency_fx_lifecycle() {
     .unwrap();
     let (reval, reversal) = result.expect("open USD item to revalue");
     // 500 USD booked at 4.70 = 2350; at 4.60 = 2300 → unrealized loss 50.
+    // Assert on THIS invoice's per-item line — the batch may also carry
+    // leftovers from earlier runs against a reused test DB.
+    let inv2_number: String = move_field(&db, inv2, "number").await;
+    let item_credit: Decimal = vortex_plugin_sdk::sqlx::query_scalar(
+        "SELECT l.credit FROM acc_move_line l \
+         WHERE l.move_id = $1 AND l.name = $2",
+    )
+    .bind(reval)
+    .bind(format!("Revaluation {inv2_number} USD"))
+    .fetch_one(&db)
+    .await
+    .expect("per-item revaluation line for inv2");
+    assert_eq!(item_credit, dec!(50.00));
+    // The batch loss on 6960 covers at least this item.
     let loss: Option<Decimal> = vortex_plugin_sdk::sqlx::query_scalar(
         "SELECT SUM(l.debit) FROM acc_move_line l \
          JOIN acc_account a ON a.id = l.account_id \
@@ -831,7 +845,7 @@ async fn multicurrency_fx_lifecycle() {
     .fetch_one(&db)
     .await
     .unwrap();
-    assert_eq!(loss, Some(dec!(50.00)));
+    assert!(loss.unwrap_or_default() >= dec!(50.00));
     // The reversal exists and is posted.
     let rev_state: String =
         vortex_plugin_sdk::sqlx::query_scalar("SELECT state FROM acc_move WHERE id = $1")
@@ -854,4 +868,272 @@ async fn multicurrency_fx_lifecycle() {
 
 fn date_rate(s: &str) -> Decimal {
     s.parse().unwrap()
+}
+
+/// Phase 4: PDC lifecycle, bank statement import → match → finalize,
+/// AR↔AP contra, and credit-limit enforcement.
+#[tokio::test]
+async fn banking_and_arap_lifecycle() {
+    let Some((db, seq_pool, user_id, partner_id)) = setup().await else {
+        return;
+    };
+    use vortex_accounting::banking;
+    // The sibling test opens a lock_date == today window; post tomorrow.
+    let today = Utc::now().date_naive();
+    let op_date = today + vortex_plugin_sdk::chrono::Duration::days(1);
+    // Amounts unique to this test so statement matching can't collide
+    // with GL lines written by the parallel tests.
+    let pdc_amount = dec!(5137.42);
+    let charges = dec!(-10.53);
+
+    // ── PDC received: holding entry, then clear to bank ────────────────
+    let cheque = format!("MBB{}", &Uuid::new_v4().simple().to_string()[..6]);
+    let pdc = banking::record_pdc(
+        &db, &seq_pool, user_id, None, "received", partner_id, &cheque,
+        Some("Maybank"), pdc_amount, op_date, None, op_date,
+    )
+    .await
+    .expect("record received PDC");
+    let holding: Uuid = vortex_plugin_sdk::sqlx::query_scalar(
+        "SELECT holding_move_id FROM acc_pdc WHERE id = $1",
+    )
+    .bind(pdc)
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    let (d, c, n) = line_sums(&db, holding).await;
+    assert_eq!(n, 2, "holding entry: PDC account vs AR");
+    assert_eq!(d, pdc_amount);
+    assert_eq!(c, pdc_amount);
+    let clearing = banking::clear_pdc(&db, &seq_pool, user_id, pdc, op_date)
+        .await
+        .expect("clear PDC");
+    let state: String =
+        vortex_plugin_sdk::sqlx::query_scalar("SELECT state FROM acc_pdc WHERE id = $1")
+            .bind(pdc)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(state, "cleared");
+    banking::clear_pdc(&db, &seq_pool, user_id, pdc, op_date)
+        .await
+        .expect_err("cleared PDC cannot clear twice");
+
+    // ── PDC issued: bounce reverses the holding entry ───────────────────
+    let cheque2 = format!("PBB{}", &Uuid::new_v4().simple().to_string()[..6]);
+    let pdc2 = banking::record_pdc(
+        &db, &seq_pool, user_id, None, "issued", partner_id, &cheque2,
+        None, dec!(1200.00), op_date, None, op_date,
+    )
+    .await
+    .expect("record issued PDC");
+    banking::bounce_pdc(&db, &seq_pool, user_id, pdc2, op_date)
+        .await
+        .expect("bounce PDC");
+    let state2: String =
+        vortex_plugin_sdk::sqlx::query_scalar("SELECT state FROM acc_pdc WHERE id = $1")
+            .bind(pdc2)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(state2, "bounced");
+
+    // ── Statement import → auto-match → quick counterpart → finalize ────
+    let csv = format!(
+        "date,description,amount\n\
+         {op_date},PDC {cheque} BANKED IN,{pdc_amount}\n\
+         {op_date},BANK SERVICE CHARGES,{charges}\n"
+    );
+    let parsed = banking::parse_statement_csv(&csv).expect("parse CSV");
+    assert_eq!(parsed.len(), 2);
+    let journal_id: Uuid = vortex_plugin_sdk::sqlx::query_scalar(
+        "SELECT id FROM acc_journal WHERE code = 'BNK'",
+    )
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    let sid: Uuid = vortex_plugin_sdk::sqlx::query_scalar(
+        "INSERT INTO acc_bank_statement (journal_id, name, statement_date, created_by) \
+         VALUES ($1, 'Lifecycle import', $2, $3) RETURNING id",
+    )
+    .bind(journal_id)
+    .bind(op_date)
+    .bind(user_id)
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    for (date, desc, amount) in &parsed {
+        vortex_plugin_sdk::sqlx::query(
+            "INSERT INTO acc_bank_statement_line (statement_id, line_date, description, amount) \
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(sid)
+        .bind(date)
+        .bind(desc)
+        .bind(amount)
+        .execute(&db)
+        .await
+        .unwrap();
+    }
+    banking::finalize_statement(&db, sid)
+        .await
+        .expect_err("unmatched lines must block finalize");
+    let suggestions = banking::auto_match_suggestions(&db, sid).await.expect("suggestions");
+    // The clearing move debited the bank for exactly pdc_amount on op_date.
+    let clearing_bank_line: Uuid = vortex_plugin_sdk::sqlx::query_scalar(
+        "SELECT l.id FROM acc_move_line l WHERE l.move_id = $1 AND l.debit = $2",
+    )
+    .bind(clearing)
+    .bind(pdc_amount)
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    let hit = suggestions
+        .iter()
+        .find(|(_, gl, _)| *gl == clearing_bank_line)
+        .expect("auto-match must propose the PDC clearing bank line");
+    assert_eq!(hit.2, 100, "same amount + same date = perfect score");
+    banking::match_line(&db, hit.0, clearing_bank_line, user_id)
+        .await
+        .expect("match line");
+    // Bank charges: quick counterpart into an expense account.
+    let expense: Uuid = vortex_plugin_sdk::sqlx::query_scalar(
+        "SELECT id FROM acc_account WHERE code = '6000'",
+    )
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    let charges_line: Uuid = vortex_plugin_sdk::sqlx::query_scalar(
+        "SELECT id FROM acc_bank_statement_line \
+         WHERE statement_id = $1 AND matched_line_id IS NULL",
+    )
+    .bind(sid)
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    let charge_move = banking::quick_counterpart(&db, &seq_pool, user_id, charges_line, expense)
+        .await
+        .expect("quick counterpart for bank charges");
+    let (d, c, _) = line_sums(&db, charge_move).await;
+    assert_eq!(d, charges.abs());
+    assert_eq!(c, charges.abs());
+    banking::finalize_statement(&db, sid).await.expect("finalize");
+    let st_state: String = vortex_plugin_sdk::sqlx::query_scalar(
+        "SELECT state FROM acc_bank_statement WHERE id = $1",
+    )
+    .bind(sid)
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert_eq!(st_state, "reconciled");
+
+    // ── Contra: 800 AR vs 300 AP nets to 300, bill fully settled ────────
+    let inv = documents::create_invoice(
+        &db,
+        user_id,
+        &NewInvoice {
+            move_type: "customer_invoice",
+            partner_id,
+            invoice_date: op_date,
+            due_date: None,
+            journal_code: None,
+            currency_id: None,
+            origin_ref: Some("test_banking:contra_ar"),
+            narration: None,
+            company_id: None,
+            lines: vec![InvoiceLine::new("Services", dec!(1), dec!(800.00))],
+        },
+    )
+    .await
+    .expect("create AR invoice");
+    documents::post_invoice(&db, &seq_pool, inv, user_id).await.expect("post AR");
+    let bill = documents::create_invoice(
+        &db,
+        user_id,
+        &NewInvoice {
+            move_type: "vendor_bill",
+            partner_id,
+            invoice_date: op_date,
+            due_date: None,
+            journal_code: None,
+            currency_id: None,
+            origin_ref: Some("test_banking:contra_ap"),
+            narration: None,
+            company_id: None,
+            lines: vec![InvoiceLine::new("Subcontract", dec!(1), dec!(300.00))],
+        },
+    )
+    .await
+    .expect("create AP bill");
+    documents::post_invoice(&db, &seq_pool, bill, user_id).await.expect("post AP");
+    let contra_move =
+        banking::contra(&db, &seq_pool, user_id, None, partner_id, &[inv], &[bill], op_date)
+            .await
+            .expect("contra");
+    let (d, c, n) = line_sums(&db, contra_move).await;
+    assert_eq!(n, 2);
+    assert_eq!(d, dec!(300.00));
+    assert_eq!(c, dec!(300.00));
+    assert_eq!(move_field::<String>(&db, bill, "payment_state").await, "paid");
+    assert_eq!(move_field::<String>(&db, inv, "payment_state").await, "partial");
+    assert_eq!(move_field::<Decimal>(&db, inv, "amount_residual").await, dec!(500.00));
+
+    // ── Credit control: block over the limit, warn posts anyway ─────────
+    let company_id: Uuid = vortex_plugin_sdk::sqlx::query_scalar(
+        "SELECT id FROM companies ORDER BY created_at LIMIT 1",
+    )
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    let risky: Uuid = vortex_plugin_sdk::sqlx::query_scalar(
+        "INSERT INTO contacts (name, contact_type, company_id, active, credit_limit) \
+         VALUES ($1, 'customer', $2, TRUE, 100.00) RETURNING id",
+    )
+    .bind(format!("Risky {}", &Uuid::new_v4().simple().to_string()[..6]))
+    .bind(company_id)
+    .fetch_one(&db)
+    .await
+    .expect("seed risky partner");
+    vortex_plugin_sdk::sqlx::query("UPDATE acc_config SET credit_limit_policy = 'block'")
+        .execute(&db)
+        .await
+        .unwrap();
+    let post_for = |amount: Decimal| {
+        let db = db.clone();
+        let seq_pool = seq_pool.clone();
+        async move {
+            let doc = documents::create_invoice(
+                &db,
+                user_id,
+                &NewInvoice {
+                    move_type: "customer_invoice",
+                    partner_id: risky,
+                    invoice_date: op_date,
+                    due_date: None,
+                    journal_code: None,
+                    currency_id: None,
+                    origin_ref: Some("test_banking:credit"),
+                    narration: None,
+                    company_id: None,
+                    lines: vec![InvoiceLine::new("Goods", dec!(1), amount)],
+                },
+            )
+            .await
+            .expect("create credit-test invoice");
+            documents::post_invoice(&db, &seq_pool, doc, user_id).await
+        }
+    };
+    post_for(dec!(50.00)).await.expect("within limit posts");
+    post_for(dec!(80.00))
+        .await
+        .expect_err("50 exposure + 80 new > 100 limit must block");
+    vortex_plugin_sdk::sqlx::query("UPDATE acc_config SET credit_limit_policy = 'warn'")
+        .execute(&db)
+        .await
+        .unwrap();
+    post_for(dec!(80.00)).await.expect("warn policy posts anyway");
+    vortex_plugin_sdk::sqlx::query("UPDATE acc_config SET credit_limit_policy = 'off'")
+        .execute(&db)
+        .await
+        .unwrap();
 }

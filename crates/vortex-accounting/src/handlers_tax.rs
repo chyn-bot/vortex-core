@@ -86,6 +86,15 @@ fn settings_form() -> FormConfig {
         .section("Period Control")
         .field(FormField::date("lock_date", "Lock Date")
             .help("Posting on or before this date is rejected"))
+        .section("Credit & Ageing")
+        .field(FormField::select("credit_limit_policy", "Credit Limit Policy", &[
+            ("off", "Off"),
+            ("warn", "Warn (post anyway, log a warning)"),
+            ("block", "Block (reject posting over the limit)"),
+        ]).help("Checked against contacts.credit_limit when posting customer invoices"))
+        .field(FormField::json("aging_buckets", "Ageing Buckets (days)")
+            .placeholder("[30, 60, 90, 120]")
+            .help("Upper bounds for aged AR/AP report columns, JSON array of days"))
 }
 
 fn tax_profile_form() -> FormConfig {

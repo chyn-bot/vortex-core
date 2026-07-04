@@ -92,6 +92,14 @@ fn validate(config: &FormConfig, values: &FormValues) -> Vec<FieldError> {
                     });
                 }
             }
+            FieldKind::Json => {
+                if serde_json::from_str::<serde_json::Value>(value).is_err() {
+                    errors.push(FieldError {
+                        field: field.name.clone(),
+                        message: format!("{} must be valid JSON", field.label),
+                    });
+                }
+            }
             _ => {}
         }
     }
@@ -106,6 +114,7 @@ fn cast(kind: &FieldKind) -> &'static str {
         FieldKind::DateTime => "::timestamptz",
         FieldKind::Checkbox => "::boolean",
         FieldKind::Many2One { .. } => "::uuid",
+        FieldKind::Json => "::jsonb",
         _ => "",
     }
 }

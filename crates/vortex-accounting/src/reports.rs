@@ -90,7 +90,44 @@ pub fn report_defs() -> Vec<ReportDef> {
         sst02(),
         tax_detail(),
         einvoice_register(),
+        statement_of_account(),
+        bank_reconciliation(),
     ]
+}
+
+/// Ageing bucket upper bounds from `acc_config.aging_buckets`
+/// (JSONB int array), falling back to the classic 30/60/90/120.
+async fn aging_buckets(state: &AppState) -> Vec<i64> {
+    let raw: Option<vortex_plugin_sdk::serde_json::Value> = vortex_plugin_sdk::sqlx::query_scalar(
+        "SELECT aging_buckets FROM acc_config ORDER BY company_id NULLS LAST LIMIT 1",
+    )
+    .fetch_optional(&state.db)
+    .await
+    .ok()
+    .flatten();
+    let mut buckets: Vec<i64> = raw
+        .and_then(|v| {
+            v.as_array().map(|a| a.iter().filter_map(|x| x.as_i64()).filter(|n| *n > 0).collect())
+        })
+        .unwrap_or_default();
+    buckets.sort_unstable();
+    buckets.dedup();
+    if buckets.is_empty() {
+        buckets = vec![30, 60, 90, 120];
+    }
+    buckets
+}
+
+/// Human labels for bucket columns: "1–30", "31–60", …, "120+".
+fn bucket_labels(buckets: &[i64]) -> Vec<String> {
+    let mut labels = Vec::new();
+    let mut lo = 1;
+    for b in buckets {
+        labels.push(format!("{lo}\u{2013}{b}"));
+        lo = b + 1;
+    }
+    labels.push(format!("{}+", buckets.last().copied().unwrap_or(0)));
+    labels
 }
 
 /// Trial balance — per-account debit/credit totals and balance.
@@ -280,9 +317,9 @@ fn general_ledger() -> ReportDef {
 /// Aged open documents by partner in 30-day buckets.
 fn aged(code: &'static str, title: &'static str, receivable: bool) -> ReportDef {
     let description = if receivable {
-        "Open customer invoices by partner in ageing buckets (current, 1-30, 31-60, 61-90, 90+)"
+        "Open customer invoices by partner in configurable ageing buckets (Settings ▸ aging buckets)"
     } else {
-        "Open vendor bills by partner in ageing buckets (current, 1-30, 31-60, 61-90, 90+)"
+        "Open vendor bills by partner in configurable ageing buckets (Settings ▸ aging buckets)"
     };
     ReportDef::new(
         code,
@@ -295,18 +332,28 @@ fn aged(code: &'static str, title: &'static str, receivable: bool) -> ReportDef 
             } else {
                 "m.move_type = 'vendor_bill'"
             };
+            let buckets = aging_buckets(&state).await;
+            // Dynamic bucket columns b0..bn from validated integers only.
+            let mut cases = String::new();
+            let mut lo = 1i64;
+            for (i, hi) in buckets.iter().enumerate() {
+                cases.push_str(&format!(
+                    "SUM(CASE WHEN CURRENT_DATE - m.due_date BETWEEN {lo} AND {hi} \
+                     THEN m.amount_residual ELSE 0 END) AS b{i}, "
+                ));
+                lo = hi + 1;
+            }
+            let last = buckets.len();
+            let over = buckets.last().copied().unwrap_or(0);
+            cases.push_str(&format!(
+                "SUM(CASE WHEN CURRENT_DATE - m.due_date > {over} \
+                 THEN m.amount_residual ELSE 0 END) AS b{last}, "
+            ));
             let sql = format!(
                 "SELECT p.name AS partner, \
                     SUM(CASE WHEN m.due_date IS NULL OR m.due_date >= CURRENT_DATE \
                         THEN m.amount_residual ELSE 0 END) AS current, \
-                    SUM(CASE WHEN CURRENT_DATE - m.due_date BETWEEN 1 AND 30 \
-                        THEN m.amount_residual ELSE 0 END) AS b30, \
-                    SUM(CASE WHEN CURRENT_DATE - m.due_date BETWEEN 31 AND 60 \
-                        THEN m.amount_residual ELSE 0 END) AS b60, \
-                    SUM(CASE WHEN CURRENT_DATE - m.due_date BETWEEN 61 AND 90 \
-                        THEN m.amount_residual ELSE 0 END) AS b90, \
-                    SUM(CASE WHEN CURRENT_DATE - m.due_date > 90 \
-                        THEN m.amount_residual ELSE 0 END) AS older, \
+                    {cases} \
                     SUM(m.amount_residual) AS total \
                  FROM acc_move m JOIN contacts p ON p.id = m.partner_id \
                  WHERE m.state = 'posted' AND {type_filter} \
@@ -319,34 +366,41 @@ fn aged(code: &'static str, title: &'static str, receivable: bool) -> ReportDef 
                 .await
                 .map_err(|e| VortexError::QueryExecution(e.to_string()))?;
 
-            let cols = ["current", "b30", "b60", "b90", "older", "total"];
+            let mut cols: Vec<String> = vec!["current".into()];
+            cols.extend((0..=last).map(|i| format!("b{i}")));
+            cols.push("total".into());
+            let mut headers: Vec<String> = vec!["Current".into()];
+            headers.extend(bucket_labels(&buckets));
+            headers.push("Total".into());
             match params.format {
                 ReportFormat::Csv => {
-                    let mut csv =
-                        String::from("partner,current,1-30,31-60,61-90,90+,total\n");
+                    let mut csv = String::from("partner");
+                    for h in &headers {
+                        csv.push_str(&format!(",{}", csv_escape(h)));
+                    }
+                    csv.push('\n');
                     for r in &rows {
                         let partner: String = r.get("partner");
                         csv.push_str(&csv_escape(&partner));
-                        for col in cols {
-                            csv.push_str(&format!(",{}", money(r.get(col))));
+                        for col in &cols {
+                            csv.push_str(&format!(",{}", money(r.get(col.as_str()))));
                         }
                         csv.push('\n');
                     }
                     Ok(ReportOutput::csv(&format!("{}.csv", title.to_lowercase().replace(' ', "-")), csv.into_bytes()))
                 }
                 _ => {
-                    let mut table = String::from(
-                        "<table><tr><th>Partner</th><th class=\"num\">Current</th>\
-                         <th class=\"num\">1–30</th><th class=\"num\">31–60</th>\
-                         <th class=\"num\">61–90</th><th class=\"num\">90+</th>\
-                         <th class=\"num\">Total</th></tr>",
-                    );
-                    let mut totals = [Decimal::ZERO; 6];
+                    let mut table = String::from("<table><tr><th>Partner</th>");
+                    for h in &headers {
+                        table.push_str(&format!("<th class=\"num\">{}</th>", esc(h)));
+                    }
+                    table.push_str("</tr>");
+                    let mut totals = vec![Decimal::ZERO; cols.len()];
                     for r in &rows {
                         let partner: String = r.get("partner");
                         table.push_str(&format!("<tr><td>{}</td>", esc(&partner)));
                         for (i, col) in cols.iter().enumerate() {
-                            let v: Decimal = r.get(*col);
+                            let v: Decimal = r.get(col.as_str());
                             totals[i] += v;
                             table.push_str(&format!("<td class=\"num\">{}</td>", money(v)));
                         }
@@ -363,6 +417,188 @@ fn aged(code: &'static str, title: &'static str, receivable: bool) -> ReportDef 
                     ))
                 }
             }
+        },
+    )
+}
+
+/// Statement of Account — every posted AR/AP ledger line for one
+/// partner with a running balance. Params: `partner` (contact UUID,
+/// required), `from`, `to`.
+fn statement_of_account() -> ReportDef {
+    ReportDef::new(
+        "accounting.statement_of_account",
+        "Statement of Account",
+        "Per-partner AR/AP ledger with running balance — send to customers for collections",
+        vec![ReportFormat::Html, ReportFormat::Csv],
+        |state, params| async move {
+            let partner: vortex_plugin_sdk::uuid::Uuid = params
+                .get("partner")
+                .unwrap_or("")
+                .parse()
+                .map_err(|_| {
+                    VortexError::ValidationFailed(
+                        "pass ?partner=<contact uuid> — see /accounting/tax-profiles for IDs".into(),
+                    )
+                })?;
+            let (date_sql, date_label) = date_clause(&params);
+            let partner_name: String = vortex_plugin_sdk::sqlx::query_scalar(
+                "SELECT name FROM contacts WHERE id = $1",
+            )
+            .bind(partner)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| VortexError::QueryExecution(e.to_string()))?
+            .unwrap_or_else(|| "Unknown partner".into());
+            let sql = format!(
+                "SELECT m.move_date, m.number, m.move_type, COALESCE(m.ref, '') AS ref, \
+                        l.debit, l.credit \
+                 FROM acc_move_line l \
+                 JOIN acc_move m ON m.id = l.move_id AND m.state = 'posted'{date_sql} \
+                 JOIN acc_account a ON a.id = l.account_id \
+                 WHERE l.partner_id = $1 \
+                   AND a.account_type IN ('asset_receivable', 'liability_payable') \
+                 ORDER BY m.move_date, m.created_at"
+            );
+            let rows = vortex_plugin_sdk::sqlx::query(&sql)
+                .bind(partner)
+                .fetch_all(&state.db)
+                .await
+                .map_err(|e| VortexError::QueryExecution(e.to_string()))?;
+            let mut balance = Decimal::ZERO;
+            match params.format {
+                ReportFormat::Csv => {
+                    let mut csv = String::from("date,number,type,ref,debit,credit,balance\n");
+                    for r in &rows {
+                        let debit: Decimal = r.get("debit");
+                        let credit: Decimal = r.get("credit");
+                        balance += debit - credit;
+                        csv.push_str(&format!(
+                            "{},{},{},{},{},{},{}\n",
+                            r.get::<vortex_plugin_sdk::chrono::NaiveDate, _>("move_date"),
+                            csv_escape(r.get::<Option<String>, _>("number").as_deref().unwrap_or("/")),
+                            csv_escape(&r.get::<String, _>("move_type")),
+                            csv_escape(&r.get::<String, _>("ref")),
+                            money(debit),
+                            money(credit),
+                            money(balance),
+                        ));
+                    }
+                    Ok(ReportOutput::csv("statement-of-account.csv", csv.into_bytes()))
+                }
+                _ => {
+                    let mut table = String::from(
+                        "<table><tr><th>Date</th><th>Number</th><th>Type</th><th>Ref</th>\
+                         <th class=\"num\">Debit</th><th class=\"num\">Credit</th>\
+                         <th class=\"num\">Balance</th></tr>",
+                    );
+                    for r in &rows {
+                        let debit: Decimal = r.get("debit");
+                        let credit: Decimal = r.get("credit");
+                        balance += debit - credit;
+                        table.push_str(&format!(
+                            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td>\
+                             <td class=\"num\">{}</td><td class=\"num\">{}</td>\
+                             <td class=\"num\">{}</td></tr>",
+                            r.get::<vortex_plugin_sdk::chrono::NaiveDate, _>("move_date"),
+                            esc(r.get::<Option<String>, _>("number").as_deref().unwrap_or("/")),
+                            esc(&r.get::<String, _>("move_type").replace('_', " ")),
+                            esc(&r.get::<String, _>("ref")),
+                            money(debit),
+                            money(credit),
+                            money(balance),
+                        ));
+                    }
+                    table.push_str(&format!(
+                        "<tr class=\"total\"><td colspan=\"6\">Balance due</td>\
+                         <td class=\"num\">{}</td></tr></table>",
+                        money(balance),
+                    ));
+                    Ok(ReportOutput::html(
+                        "statement-of-account.html",
+                        html_page(
+                            &format!("Statement of Account — {partner_name}"),
+                            &date_label,
+                            &table,
+                        ),
+                    ))
+                }
+            }
+        },
+    )
+}
+
+/// Bank reconciliation statement — per bank journal: book balance,
+/// matched vs unmatched statement lines, outstanding GL items.
+fn bank_reconciliation() -> ReportDef {
+    ReportDef::new(
+        "accounting.bank_reconciliation",
+        "Bank Reconciliation",
+        "Per bank journal: GL book balance, unmatched statement lines and outstanding book items",
+        vec![ReportFormat::Html],
+        |state, _params| async move {
+            let journals = vortex_plugin_sdk::sqlx::query(
+                "SELECT j.id, j.code, j.name, j.default_account_id \
+                 FROM acc_journal j WHERE j.journal_type IN ('bank','cash') AND j.active \
+                 ORDER BY j.code",
+            )
+            .fetch_all(&state.db)
+            .await
+            .map_err(|e| VortexError::QueryExecution(e.to_string()))?;
+            let mut body = String::new();
+            for j in &journals {
+                let jid: vortex_plugin_sdk::uuid::Uuid = j.get("id");
+                let account: Option<vortex_plugin_sdk::uuid::Uuid> = j.get("default_account_id");
+                let Some(account) = account else { continue };
+                let book: Decimal = vortex_plugin_sdk::sqlx::query_scalar(
+                    "SELECT COALESCE(SUM(l.debit - l.credit), 0) FROM acc_move_line l \
+                     JOIN acc_move m ON m.id = l.move_id AND m.state = 'posted' \
+                     WHERE l.account_id = $1",
+                )
+                .bind(account)
+                .fetch_one(&state.db)
+                .await
+                .map_err(|e| VortexError::QueryExecution(e.to_string()))?;
+                let unmatched_stmt: Decimal = vortex_plugin_sdk::sqlx::query_scalar(
+                    "SELECT COALESCE(SUM(b.amount), 0) FROM acc_bank_statement_line b \
+                     JOIN acc_bank_statement s ON s.id = b.statement_id \
+                     WHERE s.journal_id = $1 AND b.matched_line_id IS NULL",
+                )
+                .bind(jid)
+                .fetch_one(&state.db)
+                .await
+                .map_err(|e| VortexError::QueryExecution(e.to_string()))?;
+                let outstanding: Decimal = vortex_plugin_sdk::sqlx::query_scalar(
+                    "SELECT COALESCE(SUM(l.debit - l.credit), 0) FROM acc_move_line l \
+                     JOIN acc_move m ON m.id = l.move_id AND m.state = 'posted' \
+                     WHERE l.account_id = $1 \
+                       AND NOT EXISTS (SELECT 1 FROM acc_bank_statement_line b \
+                                       WHERE b.matched_line_id = l.id)",
+                )
+                .bind(account)
+                .fetch_one(&state.db)
+                .await
+                .map_err(|e| VortexError::QueryExecution(e.to_string()))?;
+                body.push_str(&format!(
+                    "<tr class=\"section\"><th colspan=\"2\">{} — {}</th></tr>\
+                     <tr><td>Book balance (GL)</td><td class=\"num\">{}</td></tr>\
+                     <tr><td>Outstanding book items (not on any statement)</td><td class=\"num\">{}</td></tr>\
+                     <tr><td>Unmatched statement lines</td><td class=\"num\">{}</td></tr>\
+                     <tr class=\"total\"><td>Reconciled bank balance</td><td class=\"num\">{}</td></tr>",
+                    esc(&j.get::<String, _>("code")),
+                    esc(&j.get::<String, _>("name")),
+                    money(book),
+                    money(outstanding),
+                    money(unmatched_stmt),
+                    money(book - outstanding + unmatched_stmt),
+                ));
+            }
+            let table = format!(
+                "<table><tr><th>Item</th><th class=\"num\">Amount (MYR)</th></tr>{body}</table>"
+            );
+            Ok(ReportOutput::html(
+                "bank-reconciliation.html",
+                html_page("Bank Reconciliation", "as of today", &table),
+            ))
         },
     )
 }

@@ -19,6 +19,9 @@ pub enum FieldKind {
     /// Fixed choice list (`<select>`); submitted value must be one of
     /// the declared option codes.
     Select(Vec<(String, String)>),
+    /// JSON value in a single-line input; submitted text must parse as
+    /// JSON, cast `::jsonb`.
+    Json,
     /// Reference to another record (`<select>` over the related
     /// table), cast `::uuid`. Options load at render time as
     /// `SELECT id, <display> FROM <table> WHERE active IS NOT FALSE`.
@@ -66,6 +69,9 @@ impl FormField {
     }
     pub fn number(name: &str, label: &str) -> Self {
         Self::new(name, label, FieldKind::Number)
+    }
+    pub fn json(name: &str, label: &str) -> Self {
+        Self::new(name, label, FieldKind::Json)
     }
     pub fn date(name: &str, label: &str) -> Self {
         Self::new(name, label, FieldKind::Date)

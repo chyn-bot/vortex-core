@@ -51,6 +51,9 @@ fn widget(field: &FormField, value: &str, m2o_options: &[(String, String)]) -> S
         FieldKind::Number => format!(
             r#"<input type="number" step="any" name="{name}" value="{val}" class="input input-bordered w-full"{placeholder}{required}{readonly}/>"#
         ),
+        FieldKind::Json => format!(
+            r#"<input type="text" name="{name}" value="{val}" class="input input-bordered w-full font-mono"{placeholder}{required}{readonly}/>"#
+        ),
         FieldKind::Date => format!(
             r#"<input type="date" name="{name}" value="{val}" class="input input-bordered w-full"{required}{readonly}/>"#
         ),

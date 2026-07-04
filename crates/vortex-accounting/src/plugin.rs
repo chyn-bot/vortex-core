@@ -1,10 +1,14 @@
 //! [`AccountingPlugin`] — the Plugin impl for the accounting base.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use vortex_plugin_sdk::prelude::*;
 
-use crate::{handlers, handlers_currency, handlers_documents, handlers_einvoice, handlers_tax};
+use crate::{
+    handlers, handlers_banking, handlers_currency, handlers_documents, handlers_einvoice,
+    handlers_tax,
+};
 
 const MIG_001_ACCOUNTING: &str = include_str!("../migrations/001_accounting/postgres.sql");
 const MIG_002_DOCUMENTS: &str =
@@ -17,6 +21,8 @@ const MIG_005_EINVOICE: &str =
     include_str!("../migrations/005_einvoice/postgres.sql");
 const MIG_006_MULTICURRENCY: &str =
     include_str!("../migrations/006_multicurrency/postgres.sql");
+const MIG_007_BANKING_ARAP: &str =
+    include_str!("../migrations/007_banking_arap/postgres.sql");
 
 pub struct AccountingPlugin;
 
@@ -77,6 +83,7 @@ impl Plugin for AccountingPlugin {
             .merge(handlers_tax::tax_routes())
             .merge(handlers_einvoice::einvoice_routes())
             .merge(handlers_currency::currency_routes())
+            .merge(handlers_banking::banking_routes())
     }
 
     fn menu_entries(&self) -> Vec<MenuEntry> {
@@ -114,6 +121,27 @@ impl Plugin for AccountingPlugin {
                 "accounting.einvoice",
                 "e-Invoices",
                 "/accounting/einvoice",
+                MenuGroup::Operations,
+            )
+            .under("accounting.moves"),
+            MenuEntry::new(
+                "accounting.banking",
+                "Bank Reconciliation",
+                "/accounting/bank-statements",
+                MenuGroup::Operations,
+            )
+            .under("accounting.moves"),
+            MenuEntry::new(
+                "accounting.pdc",
+                "Post-dated Cheques",
+                "/accounting/pdc",
+                MenuGroup::Operations,
+            )
+            .under("accounting.moves"),
+            MenuEntry::new(
+                "accounting.contra",
+                "AR/AP Contra",
+                "/accounting/contra",
                 MenuGroup::Operations,
             )
             .under("accounting.moves"),
@@ -226,7 +254,26 @@ impl Plugin for AccountingPlugin {
                 down_sql: None,
                 requires_core_migration: Some("119_commerce_primitives"),
             },
+            PluginMigration {
+                name: "007_banking_arap",
+                up_sql: MIG_007_BANKING_ARAP,
+                down_sql: None,
+                requires_core_migration: Some("119_commerce_primitives"),
+            },
         ]
+    }
+
+    /// Daily: clear matured post-dated cheques (holding → bank).
+    fn scheduled_actions(&self) -> Vec<ScheduledAction> {
+        vec![ScheduledAction::new(
+            ScheduledActionDef {
+                code: "accounting.pdc.mature",
+                name: "Accounting: clear matured post-dated cheques",
+                schedule: Schedule::Every(Duration::from_secs(24 * 60 * 60)),
+                enabled_by_default: true,
+            },
+            |state| async move { crate::banking::run_pdc_maturity(&state).await },
+        )]
     }
 
     fn reports(&self) -> Vec<ReportDef> {
