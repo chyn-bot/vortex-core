@@ -87,6 +87,8 @@ pub fn report_defs() -> Vec<ReportDef> {
         aged("accounting.aged_payables", "Aged Payables", false),
         profit_and_loss(),
         balance_sheet(),
+        sst02(),
+        tax_detail(),
     ]
 }
 
@@ -587,4 +589,242 @@ fn balance_sheet() -> ReportDef {
             ))
         },
     )
+}
+
+// ─── Malaysian tax reports (Phase 1) ─────────────────────────────────────
+
+/// The last COMPLETED bi-monthly SST taxable period before `today`.
+/// Periods are Jan–Feb, Mar–Apr, May–Jun, Jul–Aug, Sep–Oct, Nov–Dec.
+fn last_sst_period(today: vortex_plugin_sdk::chrono::NaiveDate) -> (
+    vortex_plugin_sdk::chrono::NaiveDate,
+    vortex_plugin_sdk::chrono::NaiveDate,
+) {
+    use vortex_plugin_sdk::chrono::{Datelike, NaiveDate};
+    // First month of the CURRENT period (1,3,5,7,9,11), then step back 2.
+    let cur_start_month = if today.month() % 2 == 0 { today.month() - 1 } else { today.month() };
+    let (from_y, from_m) = if cur_start_month <= 2 {
+        (today.year() - 1, cur_start_month + 10)
+    } else {
+        (today.year(), cur_start_month - 2)
+    };
+    let from = NaiveDate::from_ymd_opt(from_y, from_m, 1).expect("valid period start");
+    // Period end = day before the current period's start.
+    let to = NaiveDate::from_ymd_opt(today.year(), cur_start_month, 1)
+        .expect("valid period start")
+        .pred_opt()
+        .expect("valid period end");
+    (from, to)
+}
+
+/// SST-02 return worksheet — output vs input tax by SST category over a
+/// taxable period. Params: `from`, `to` (default: last completed
+/// bi-monthly period). Figures read from posted GL tax lines
+/// (`tax_base_amount`), so they reconcile with the ledger by construction.
+fn sst02() -> ReportDef {
+    ReportDef::new(
+        "accounting.sst02",
+        "SST-02 Return Worksheet",
+        "Sales & Service Tax return: taxable value and tax by category, output vs input",
+        vec![ReportFormat::Html, ReportFormat::Csv],
+        |state, params| async move {
+            let today = vortex_plugin_sdk::chrono::Utc::now().date_naive();
+            let (def_from, def_to) = last_sst_period(today);
+            let from = params
+                .get("from")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(def_from);
+            let to = params.get("to").and_then(|s| s.parse().ok()).unwrap_or(def_to);
+            let rows = crate::tax::sst_return(&state.db, None, from, to).await?;
+
+            let label = |c: &str| match c {
+                "sales_tax_5" => "Sales Tax 5%",
+                "sales_tax_10" => "Sales Tax 10%",
+                "service_tax_6" => "Service Tax 6%",
+                "service_tax_8" => "Service Tax 8%",
+                "exempt" => "Exempt",
+                "zero_rated" => "Zero-rated",
+                _ => "Out of scope",
+            };
+            let subtitle = format!("Taxable period {from} to {to}");
+
+            match params.format {
+                ReportFormat::Csv => {
+                    let mut csv =
+                        String::from("direction,category,taxable_value,tax_amount\n");
+                    for r in &rows {
+                        csv.push_str(&format!(
+                            "{},{},{},{}\n",
+                            r.direction,
+                            label(&r.sst_category),
+                            money(r.taxable_value),
+                            money(r.tax_amount),
+                        ));
+                    }
+                    Ok(ReportOutput::csv("sst02.csv", csv.into_bytes()))
+                }
+                _ => {
+                    let mut table = String::new();
+                    for direction in ["output", "input"] {
+                        let section: Vec<_> =
+                            rows.iter().filter(|r| r.direction == direction).collect();
+                        table.push_str(&format!(
+                            "<table><tr class=\"section\"><th colspan=\"3\">{} tax</th></tr>\
+                             <tr><th>Category</th><th class=\"num\">Taxable Value (RM)</th>\
+                             <th class=\"num\">Tax (RM)</th></tr>",
+                            if direction == "output" { "Output (sales)" } else { "Input (purchases)" },
+                        ));
+                        let mut tv = Decimal::ZERO;
+                        let mut ta = Decimal::ZERO;
+                        for r in &section {
+                            tv += r.taxable_value;
+                            ta += r.tax_amount;
+                            table.push_str(&format!(
+                                "<tr><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td></tr>",
+                                label(&r.sst_category),
+                                money(r.taxable_value),
+                                money(r.tax_amount),
+                            ));
+                        }
+                        table.push_str(&format!(
+                            "<tr class=\"total\"><td>Total</td><td class=\"num\">{}</td>\
+                             <td class=\"num\">{}</td></tr></table><br/>",
+                            money(tv),
+                            money(ta),
+                        ));
+                    }
+                    Ok(ReportOutput::html(
+                        "sst02.html",
+                        html_page("SST-02 Return Worksheet", &subtitle, &table),
+                    ))
+                }
+            }
+        },
+    )
+}
+
+/// Tax audit detail — every posted GL tax line with its document, partner
+/// and taxable base. This is the MyInvois ↔ SST-02 consistency artifact.
+/// Params: `from`, `to` (default: last completed bi-monthly period).
+fn tax_detail() -> ReportDef {
+    ReportDef::new(
+        "accounting.tax_detail",
+        "Tax Detail Listing",
+        "Every posted tax line: document, partner, taxable base and tax amount",
+        vec![ReportFormat::Html, ReportFormat::Csv],
+        |state, params| async move {
+            let today = vortex_plugin_sdk::chrono::Utc::now().date_naive();
+            let (def_from, def_to) = last_sst_period(today);
+            let from: vortex_plugin_sdk::chrono::NaiveDate = params
+                .get("from")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(def_from);
+            let to: vortex_plugin_sdk::chrono::NaiveDate =
+                params.get("to").and_then(|s| s.parse().ok()).unwrap_or(def_to);
+
+            let rows = vortex_plugin_sdk::sqlx::query(
+                "SELECT m.number, m.move_date, m.move_type, t.name AS tax_name, \
+                        COALESCE(c.name, '') AS partner, \
+                        COALESCE(l.tax_base_amount, 0) AS base, \
+                        (CASE WHEN l.credit > 0 THEN l.credit ELSE -l.debit END) AS tax \
+                 FROM acc_move_line l \
+                 JOIN acc_move m ON m.id = l.move_id AND m.state = 'posted' \
+                 JOIN taxes t ON t.id = l.tax_id \
+                 LEFT JOIN contacts c ON c.id = m.partner_id \
+                 WHERE l.tax_id IS NOT NULL AND m.move_date BETWEEN $1 AND $2 \
+                 ORDER BY m.move_date, m.number",
+            )
+            .bind(from)
+            .bind(to)
+            .fetch_all(&state.db)
+            .await
+            .map_err(|e| VortexError::QueryExecution(e.to_string()))?;
+
+            let subtitle = format!("Period {from} to {to} — {} tax lines", rows.len());
+            match params.format {
+                ReportFormat::Csv => {
+                    let mut csv =
+                        String::from("date,number,type,partner,tax,taxable_base,tax_amount\n");
+                    for r in &rows {
+                        let d: vortex_plugin_sdk::chrono::NaiveDate = r.get("move_date");
+                        csv.push_str(&format!(
+                            "{},{},{},{},{},{},{}\n",
+                            d,
+                            csv_escape(r.get::<Option<String>, _>("number").as_deref().unwrap_or("/")),
+                            csv_escape(&r.get::<String, _>("move_type")),
+                            csv_escape(&r.get::<String, _>("partner")),
+                            csv_escape(&r.get::<String, _>("tax_name")),
+                            money(r.get("base")),
+                            money(r.get("tax")),
+                        ));
+                    }
+                    Ok(ReportOutput::csv("tax-detail.csv", csv.into_bytes()))
+                }
+                _ => {
+                    let mut table = String::from(
+                        "<table><tr><th>Date</th><th>Number</th><th>Type</th><th>Partner</th>\
+                         <th>Tax</th><th class=\"num\">Taxable Base</th><th class=\"num\">Tax</th></tr>",
+                    );
+                    let mut total_base = Decimal::ZERO;
+                    let mut total_tax = Decimal::ZERO;
+                    for r in &rows {
+                        let d: vortex_plugin_sdk::chrono::NaiveDate = r.get("move_date");
+                        let base: Decimal = r.get("base");
+                        let tax: Decimal = r.get("tax");
+                        total_base += base;
+                        total_tax += tax;
+                        table.push_str(&format!(
+                            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>\
+                             <td class=\"num\">{}</td><td class=\"num\">{}</td></tr>",
+                            d,
+                            esc(r.get::<Option<String>, _>("number").as_deref().unwrap_or("/")),
+                            esc(&r.get::<String, _>("move_type")),
+                            esc(&r.get::<String, _>("partner")),
+                            esc(&r.get::<String, _>("tax_name")),
+                            money(base),
+                            money(tax),
+                        ));
+                    }
+                    table.push_str(&format!(
+                        "<tr class=\"total\"><td colspan=\"5\">Totals</td>\
+                         <td class=\"num\">{}</td><td class=\"num\">{}</td></tr></table>",
+                        money(total_base),
+                        money(total_tax),
+                    ));
+                    Ok(ReportOutput::html(
+                        "tax-detail.html",
+                        html_page("Tax Detail Listing", &subtitle, &table),
+                    ))
+                }
+            }
+        },
+    )
+}
+
+#[cfg(test)]
+mod sst_period_tests {
+    use super::last_sst_period;
+    use vortex_plugin_sdk::chrono::NaiveDate;
+
+    fn d(y: i32, m: u32, day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, day).unwrap()
+    }
+
+    #[test]
+    fn mid_period_returns_previous_period() {
+        // Today in Jul–Aug period → last completed is May–Jun.
+        assert_eq!(last_sst_period(d(2026, 7, 4)), (d(2026, 5, 1), d(2026, 6, 30)));
+        assert_eq!(last_sst_period(d(2026, 8, 31)), (d(2026, 5, 1), d(2026, 6, 30)));
+    }
+
+    #[test]
+    fn january_wraps_to_previous_year() {
+        // Jan–Feb period → last completed is Nov–Dec of prior year.
+        assert_eq!(last_sst_period(d(2026, 1, 15)), (d(2025, 11, 1), d(2025, 12, 31)));
+        assert_eq!(last_sst_period(d(2026, 2, 28)), (d(2025, 11, 1), d(2025, 12, 31)));
+    }
+
+    #[test]
+    fn march_gets_jan_feb() {
+        assert_eq!(last_sst_period(d(2026, 3, 1)), (d(2026, 1, 1), d(2026, 2, 28)));
+    }
 }

@@ -390,6 +390,25 @@ pub async fn post_move(
         }
     }
 
+    // Closed-fiscal-year check (period control). A date inside a
+    // closed year is rejected even when the lock date lags behind.
+    let closed_fy: Option<String> = vortex_plugin_sdk::sqlx::query_scalar(
+        "SELECT code FROM acc_fiscal_year \
+         WHERE state = 'closed' AND $1 BETWEEN date_from AND date_to \
+           AND (company_id = $2 OR company_id IS NULL) \
+         LIMIT 1",
+    )
+    .bind(move_date)
+    .bind(company_id)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| VortexError::QueryExecution(e.to_string()))?;
+    if let Some(fy) = closed_fy {
+        return Err(VortexError::ValidationFailed(format!(
+            "cannot post on {move_date}: fiscal year {fy} is closed"
+        )));
+    }
+
     // Balance check
     let line_rows = vortex_plugin_sdk::sqlx::query(
         "SELECT debit, credit FROM acc_move_line WHERE move_id = $1",

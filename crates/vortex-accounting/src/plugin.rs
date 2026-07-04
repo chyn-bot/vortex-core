@@ -4,13 +4,15 @@ use std::sync::Arc;
 
 use vortex_plugin_sdk::prelude::*;
 
-use crate::{handlers, handlers_documents};
+use crate::{handlers, handlers_documents, handlers_tax};
 
 const MIG_001_ACCOUNTING: &str = include_str!("../migrations/001_accounting/postgres.sql");
 const MIG_002_DOCUMENTS: &str =
     include_str!("../migrations/002_accounting_documents/postgres.sql");
 const MIG_003_REGISTRY: &str =
     include_str!("../migrations/003_accounting_registry/postgres.sql");
+const MIG_004_MALAYSIAN_TAX: &str =
+    include_str!("../migrations/004_malaysian_tax/postgres.sql");
 
 pub struct AccountingPlugin;
 
@@ -66,7 +68,9 @@ impl Plugin for AccountingPlugin {
     }
 
     fn routes(&self) -> Router<Arc<AppState>> {
-        handlers::accounting_routes().merge(handlers_documents::document_routes())
+        handlers::accounting_routes()
+            .merge(handlers_documents::document_routes())
+            .merge(handlers_tax::tax_routes())
     }
 
     fn menu_entries(&self) -> Vec<MenuEntry> {
@@ -122,6 +126,34 @@ impl Plugin for AccountingPlugin {
                 MenuGroup::Operations,
             )
             .under("accounting.config"),
+            MenuEntry::new(
+                "accounting.config.taxes",
+                "Taxes",
+                "/accounting/taxes",
+                MenuGroup::Operations,
+            )
+            .under("accounting.config"),
+            MenuEntry::new(
+                "accounting.config.fiscal_years",
+                "Fiscal Years",
+                "/accounting/fiscal-years",
+                MenuGroup::Operations,
+            )
+            .under("accounting.config"),
+            MenuEntry::new(
+                "accounting.config.tax_profiles",
+                "Partner Tax Profiles",
+                "/accounting/tax-profiles",
+                MenuGroup::Operations,
+            )
+            .under("accounting.config"),
+            MenuEntry::new(
+                "accounting.config.settings",
+                "Settings",
+                "/accounting/settings",
+                MenuGroup::Operations,
+            )
+            .under("accounting.config"),
         ]
     }
 
@@ -148,6 +180,12 @@ impl Plugin for AccountingPlugin {
                 up_sql: MIG_003_REGISTRY,
                 down_sql: None,
                 requires_core_migration: Some("122_model_registry"),
+            },
+            PluginMigration {
+                name: "004_malaysian_tax",
+                up_sql: MIG_004_MALAYSIAN_TAX,
+                down_sql: None,
+                requires_core_migration: Some("119_commerce_primitives"),
             },
         ]
     }

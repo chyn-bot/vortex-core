@@ -406,7 +406,6 @@ pub async fn post_invoice(
         )));
     };
     let default_line_account = service::default_account(db, company_id, line_role).await?;
-    let tax_account = service::default_account(db, company_id, "tax").await?;
 
     // Wipe any previously generated GL lines (re-post attempt after a fix),
     // then expand fresh. Only drafts reach this point, so deletes are legal.
@@ -426,7 +425,9 @@ pub async fn post_invoice(
     .map_err(|e| VortexError::QueryExecution(e.to_string()))?;
 
     let mut seq = 10i32;
-    let mut insert_line = Vec::<(Uuid, Option<Uuid>, String, Decimal, Decimal)>::new();
+    // (account, partner, name, debit, credit, tax_id, tax_base_amount)
+    type GlLine = (Uuid, Option<Uuid>, String, Decimal, Decimal, Option<Uuid>, Option<Decimal>);
+    let mut insert_line = Vec::<GlLine>::new();
 
     // 1) counterpart (AR/AP) line for the full total, on the partner
     insert_line.push((
@@ -435,9 +436,14 @@ pub async fn post_invoice(
         move_type.replace('_', " "),
         if counterpart_is_debit { total_amount } else { Decimal::ZERO },
         if counterpart_is_debit { Decimal::ZERO } else { total_amount },
+        None,
+        None,
     ));
 
-    // 2) one income/expense line per document line (net of tax)
+    // 2) one income/expense line per document line (net of tax), while
+    //    collecting (gross, tax) pairs for the per-tax aggregation
+    let mut taxes_by_id: std::collections::BTreeMap<Uuid, Tax> = Default::default();
+    let mut taxed_lines: Vec<(Decimal, Option<Uuid>)> = Vec::new();
     for row in &doc_lines {
         let description: String = row.get("description");
         let quantity: Decimal = row.get("quantity");
@@ -448,13 +454,17 @@ pub async fn post_invoice(
         let gross = (quantity * unit_price).round_dp(2);
         let base = match tax_id {
             Some(tid) => {
-                let Some(tax) = load_tax(db, tid).await? else {
-                    return Err(VortexError::ValidationFailed(format!("tax {tid} not found")));
-                };
-                compute_tax_amount(gross, &tax).base.round_dp(2)
+                if !taxes_by_id.contains_key(&tid) {
+                    let Some(tax) = load_tax(db, tid).await? else {
+                        return Err(VortexError::ValidationFailed(format!("tax {tid} not found")));
+                    };
+                    taxes_by_id.insert(tid, tax);
+                }
+                compute_tax_amount(gross, &taxes_by_id[&tid]).base.round_dp(2)
             }
             None => gross,
         };
+        taxed_lines.push((gross, tax_id));
         let Some(account) = account_override.or(default_line_account) else {
             return Err(VortexError::ValidationFailed(format!(
                 "no {line_role} account for line '{description}' — set one on the line or in acc_config"
@@ -466,22 +476,37 @@ pub async fn post_invoice(
             description,
             if counterpart_is_debit { Decimal::ZERO } else { base },
             if counterpart_is_debit { base } else { Decimal::ZERO },
+            None,
+            None,
         ));
     }
 
-    // 3) tax line
-    if !tax_amount.is_zero() {
-        let Some(tax_acc) = tax_account else {
-            return Err(VortexError::ValidationFailed(
-                "no tax account configured — set one in acc_config".to_string(),
-            ));
+    // 3) one GL tax line PER DISTINCT TAX, carrying tax_id and the
+    //    taxable base — SST-02 and e-invoice tax blocks read these
+    //    lines directly, so the return can never drift from the GL.
+    let tax_inputs: Vec<(Decimal, Option<&Tax>)> = taxed_lines
+        .iter()
+        .map(|(gross, tid)| (*gross, tid.as_ref().and_then(|t| taxes_by_id.get(t))))
+        .collect();
+    for bucket in crate::tax::aggregate_by_tax(&tax_inputs) {
+        if bucket.tax.is_zero() {
+            continue; // zero-rated/exempt: base tracked on doc lines, no GL tax line
+        }
+        let Some(tax_acc) = crate::tax::tax_account_for(db, company_id, bucket.tax_id).await?
+        else {
+            return Err(VortexError::ValidationFailed(format!(
+                "no tax account configured for '{}' — set acc_tax_config or acc_config",
+                bucket.tax_name
+            )));
         };
         insert_line.push((
             tax_acc,
             None,
-            "Tax".to_string(),
-            if counterpart_is_debit { Decimal::ZERO } else { tax_amount },
-            if counterpart_is_debit { tax_amount } else { Decimal::ZERO },
+            bucket.tax_name.clone(),
+            if counterpart_is_debit { Decimal::ZERO } else { bucket.tax },
+            if counterpart_is_debit { bucket.tax } else { Decimal::ZERO },
+            Some(bucket.tax_id),
+            Some(bucket.base),
         ));
     }
 
@@ -489,11 +514,12 @@ pub async fn post_invoice(
         .begin()
         .await
         .map_err(|e| VortexError::QueryExecution(e.to_string()))?;
-    for (account, line_partner, name, debit, credit) in insert_line {
+    for (account, line_partner, name, debit, credit, line_tax, tax_base) in insert_line {
         vortex_plugin_sdk::sqlx::query(
             "INSERT INTO acc_move_line \
-                (move_id, sequence, account_id, partner_id, name, debit, credit, company_id) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                (move_id, sequence, account_id, partner_id, name, debit, credit, company_id, \
+                 tax_id, tax_base_amount) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
         )
         .bind(move_id)
         .bind(seq)
@@ -503,6 +529,8 @@ pub async fn post_invoice(
         .bind(debit)
         .bind(credit)
         .bind(company_id)
+        .bind(line_tax)
+        .bind(tax_base)
         .execute(&mut *tx)
         .await
         .map_err(|e| VortexError::QueryExecution(e.to_string()))?;

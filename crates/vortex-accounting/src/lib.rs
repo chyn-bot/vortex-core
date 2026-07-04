@@ -27,9 +27,11 @@
 pub mod documents;
 pub mod handlers;
 pub mod handlers_documents;
+pub mod handlers_tax;
 pub mod plugin;
 pub mod reports;
 pub mod service;
+pub mod tax;
 
 pub use plugin::AccountingPlugin;
 pub use documents::{

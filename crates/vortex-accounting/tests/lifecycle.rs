@@ -341,3 +341,188 @@ async fn full_gl_and_document_lifecycle() {
 
     println!("lifecycle OK: entry {number}, reversal {reversal_id}, invoice {inv_number}");
 }
+
+// ═════════════════════════════════════════════════════════════════════════
+// Phase 1: Malaysian tax engine + fiscal calendar
+// ═════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn malaysian_tax_engine() {
+    let Some((db, seq_pool, user_id, partner_id)) = setup().await else {
+        return;
+    };
+    // The sibling test opens a lock_date == today window; everything here
+    // is dated tomorrow / far-future so the two tests cannot interfere.
+    let today = Utc::now().date_naive();
+    let doc_date = today + vortex_plugin_sdk::chrono::Duration::days(1);
+
+    // ── Multi-rate invoice: one GL tax line PER TAX, with base ──────────
+    let st8: Uuid = vortex_plugin_sdk::sqlx::query_scalar(
+        "SELECT id FROM taxes WHERE name = 'Service Tax 8%'",
+    )
+    .fetch_one(&db)
+    .await
+    .expect("Service Tax 8% seeded by migration 004");
+    let st6: Uuid = vortex_plugin_sdk::sqlx::query_scalar(
+        "SELECT id FROM taxes WHERE name = 'Service Tax 6%'",
+    )
+    .fetch_one(&db)
+    .await
+    .expect("Service Tax 6% seeded");
+
+    let inv = documents::create_invoice(
+        &db,
+        user_id,
+        &NewInvoice {
+            move_type: "customer_invoice",
+            partner_id,
+            invoice_date: doc_date,
+            due_date: None,
+            journal_code: None,
+            currency_id: None,
+            origin_ref: Some("test_mytax:multirate"),
+            narration: None,
+            company_id: None,
+            lines: vec![
+                InvoiceLine::new("Consulting", dec!(1), dec!(1000.00)).with_tax(st8),
+                InvoiceLine::new("Logistics", dec!(1), dec!(500.00)).with_tax(st6),
+                InvoiceLine::new("Untaxed disbursement", dec!(1), dec!(100.00)),
+            ],
+        },
+    )
+    .await
+    .expect("create multi-rate invoice");
+    documents::post_invoice(&db, &seq_pool, inv, user_id)
+        .await
+        .expect("post multi-rate invoice");
+
+    // Header: 1600 untaxed + 80 + 30 tax = 1710 total.
+    let head = vortex_plugin_sdk::sqlx::query(
+        "SELECT untaxed_amount, tax_amount, total_amount FROM acc_move WHERE id = $1",
+    )
+    .bind(inv)
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert_eq!(head.get::<Decimal, _>("untaxed_amount"), dec!(1600.00));
+    assert_eq!(head.get::<Decimal, _>("tax_amount"), dec!(110.00));
+    assert_eq!(head.get::<Decimal, _>("total_amount"), dec!(1710.00));
+
+    // GL: AR + 3 revenue lines + 2 tax lines = 6, balanced.
+    let (d, c, n) = line_sums(&db, inv).await;
+    assert_eq!(n, 6, "AR + 3 doc lines + 2 per-tax lines");
+    assert_eq!(d, c, "balanced");
+
+    // Tax lines carry tax_id + tax_base_amount and hit the SST account.
+    let tax_lines = vortex_plugin_sdk::sqlx::query(
+        "SELECT t.name, l.credit, l.tax_base_amount, a.code AS account_code \
+         FROM acc_move_line l JOIN taxes t ON t.id = l.tax_id \
+         JOIN acc_account a ON a.id = l.account_id \
+         WHERE l.move_id = $1 ORDER BY t.name",
+    )
+    .bind(inv)
+    .fetch_all(&db)
+    .await
+    .unwrap();
+    assert_eq!(tax_lines.len(), 2);
+    assert_eq!(tax_lines[0].get::<String, _>("name"), "Service Tax 6%");
+    assert_eq!(tax_lines[0].get::<Decimal, _>("credit"), dec!(30.00));
+    assert_eq!(tax_lines[0].get::<Option<Decimal>, _>("tax_base_amount"), Some(dec!(500.00)));
+    assert_eq!(tax_lines[0].get::<String, _>("account_code"), "2110");
+    assert_eq!(tax_lines[1].get::<String, _>("name"), "Service Tax 8%");
+    assert_eq!(tax_lines[1].get::<Decimal, _>("credit"), dec!(80.00));
+    assert_eq!(tax_lines[1].get::<Option<Decimal>, _>("tax_base_amount"), Some(dec!(1000.00)));
+
+    // ── SST-02 aggregation reads it back off the GL ─────────────────────
+    let rows = vortex_accounting::tax::sst_return(&db, None, doc_date, doc_date)
+        .await
+        .expect("sst_return");
+    let st8_row = rows
+        .iter()
+        .find(|r| r.sst_category == "service_tax_8" && r.direction == "output")
+        .expect("service_tax_8 output row");
+    assert!(st8_row.taxable_value >= dec!(1000.00));
+    assert!(st8_row.tax_amount >= dec!(80.00));
+
+    // ── Closed fiscal year blocks posting ────────────────────────────────
+    // Far future: outside any lock_date the sibling test sets.
+    let fy_from = today + vortex_plugin_sdk::chrono::Duration::days(3650);
+    let fy_to = today + vortex_plugin_sdk::chrono::Duration::days(3656);
+    let fy_post_date = today + vortex_plugin_sdk::chrono::Duration::days(3652);
+    let fy_code = format!("FYTEST{}", &Uuid::new_v4().simple().to_string()[..6]);
+    let fy_id: Uuid = vortex_plugin_sdk::sqlx::query_scalar(
+        "INSERT INTO acc_fiscal_year (code, date_from, date_to, state) \
+         VALUES ($1, $2, $3, 'closed') RETURNING id",
+    )
+    .bind(&fy_code)
+    .bind(fy_from)
+    .bind(fy_to)
+    .fetch_one(&db)
+    .await
+    .unwrap();
+
+    let suspense: Uuid = vortex_plugin_sdk::sqlx::query_scalar(
+        "SELECT id FROM acc_account WHERE code = '9999' LIMIT 1",
+    )
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    let sales: Uuid = vortex_plugin_sdk::sqlx::query_scalar(
+        "SELECT id FROM acc_account WHERE code = '4000' LIMIT 1",
+    )
+    .fetch_one(&db)
+    .await
+    .unwrap();
+
+    let blocked = service::create_and_post(
+        &db,
+        &seq_pool,
+        user_id,
+        &NewMove {
+            journal_code: "GEN",
+            move_date: fy_post_date,
+            move_type: "entry",
+            ref_: Some("should be blocked"),
+            narration: None,
+            partner_id: None,
+            origin_ref: None,
+            company_id: None,
+            lines: vec![
+                MoveLine::debit(suspense, dec!(10), Some("test")),
+                MoveLine::credit(sales, dec!(10), Some("test")),
+            ],
+        },
+    )
+    .await;
+    assert!(blocked.is_err(), "posting into a closed fiscal year must fail");
+    let msg = format!("{:?}", blocked.err());
+    assert!(msg.contains("closed"), "error should name the closed year: {msg}");
+
+    // Reopen so later tests in this DB aren't blocked, then verify posting works.
+    vortex_plugin_sdk::sqlx::query("UPDATE acc_fiscal_year SET state = 'open' WHERE id = $1")
+        .bind(fy_id)
+        .execute(&db)
+        .await
+        .unwrap();
+    service::create_and_post(
+        &db,
+        &seq_pool,
+        user_id,
+        &NewMove {
+            journal_code: "GEN",
+            move_date: fy_post_date,
+            move_type: "entry",
+            ref_: Some("open year posts fine"),
+            narration: None,
+            partner_id: None,
+            origin_ref: None,
+            company_id: None,
+            lines: vec![
+                MoveLine::debit(suspense, dec!(10), Some("test")),
+                MoveLine::credit(sales, dec!(10), Some("test")),
+            ],
+        },
+    )
+    .await
+    .expect("posting into an open year succeeds");
+}
