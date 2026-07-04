@@ -112,7 +112,7 @@ fn render_sidebar_active(state: &AppState, user: &AuthUser, db_ctx: &DatabaseCon
         display_name,
         &initials,
         &db_ctx.installed_modules,
-        user.roles.contains(&"system_administrator".to_string()),
+        user.is_admin(),
         &state.plugin_registry,
         &user.roles,
     )

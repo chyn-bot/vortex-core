@@ -75,7 +75,7 @@ pub(crate) fn render_sidebar(state: &AppState, user: &AuthUser, db_ctx: &Databas
         display_name,
         &initials,
         &db_ctx.installed_modules,
-        user.roles.contains(&"system_administrator".to_string()),
+        user.is_admin(),
         &state.plugin_registry,
         &user.roles,
     )

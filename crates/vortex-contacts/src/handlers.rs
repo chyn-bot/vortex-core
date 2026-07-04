@@ -79,7 +79,7 @@ async fn list_contacts(
         display_name,
         &initials,
         &installed,
-        user.roles.contains(&"system_administrator".to_string()),
+        user.is_admin(),
         &state.plugin_registry,
         &user.roles,
     );
@@ -182,7 +182,7 @@ async fn new_contact_form(
     let installed = db_ctx.installed_modules.clone();
     let sidebar = vortex_plugin_sdk::framework::build_sidebar(
         "contacts", display_name, &initials, &installed,
-        user.roles.contains(&"system_administrator".to_string()),
+        user.is_admin(),
         &state.plugin_registry, &user.roles,
     );
 
@@ -491,7 +491,7 @@ async fn edit_contact(
     let installed = db_ctx.installed_modules.clone();
     let sidebar = vortex_plugin_sdk::framework::build_sidebar(
         "contacts", display_name, &initials, &installed,
-        user.roles.contains(&"system_administrator".to_string()),
+        user.is_admin(),
         &state.plugin_registry, &user.roles,
     );
 
