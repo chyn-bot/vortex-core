@@ -684,7 +684,16 @@ pub async fn search_tin_for_profile(db: &PgPool, profile_id: Uuid) -> Result<Opt
     ) else {
         return Err("fill in ID type and ID value (BRN/NRIC) first — LHDN searches by them".into());
     };
+    // LHDN wants bare digits/letters — strip dashes, spaces, dots.
+    let id_value: String = id_value.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
     let api = api_client_from_settings(db).await?;
+    // ID-only first: it is the precise key. LHDN ANDs the criteria,
+    // so a name spelled differently from the registration would turn
+    // a correct ID into a false "not found" — only add the name when
+    // the ID alone finds nothing.
+    if let Some(tin) = api.search_tin(&id_type, &id_value, None).await? {
+        return Ok(Some(tin));
+    }
     api.search_tin(&id_type, &id_value, Some(&name)).await
 }
 
@@ -708,6 +717,8 @@ pub async fn validate_tin_for_profile(db: &PgPool, profile_id: Uuid) -> Result<b
     ) else {
         return Err("TIN, ID type and ID value must all be filled to validate".into());
     };
+    let tin: String = tin.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+    let id_value: String = id_value.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
     let api = api_client_from_settings(db).await?;
     api.validate_tin(&tin, &id_type, &id_value).await
 }
