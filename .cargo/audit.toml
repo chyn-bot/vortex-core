@@ -1,0 +1,17 @@
+# cargo-audit configuration.
+#
+# Every ignore below MUST carry a rationale and should be re-checked
+# when its upstream situation changes.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071 — `rsa` crate Marvin timing side-channel.
+    # No patched version exists upstream. The crate reaches our
+    # Cargo.lock only through sqlx-macros-core, which lists every
+    # database driver (including sqlx-mysql -> rsa) in the lockfile
+    # regardless of enabled features. Vortex compiles the Postgres
+    # driver only: `cargo tree -i rsa --target all -e all` proves rsa
+    # is never built into any artifact. Re-check if we ever enable a
+    # MySQL feature or if RustCrypto ships a constant-time fix.
+    "RUSTSEC-2023-0071",
+]

@@ -33,6 +33,9 @@ jobs:
   audit:
     name: Supply-chain audit
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write   # audit-check posts results as a check run
     steps:
       - uses: actions/checkout@v4
       - name: cargo audit
