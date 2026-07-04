@@ -372,6 +372,76 @@ impl Plugin for AccountingPlugin {
         crate::einvois::jobs::register(registry);
     }
 
+    /// Contribute the Malaysian tax identity (TIN, BRN/NRIC, SST) to
+    /// the contact detail page — contacts stays industry-neutral, the
+    /// geography-specific fields ride in from here.
+    fn record_panels(&self) -> Vec<RecordPanel> {
+        vec![RecordPanel::new(
+            RecordPanelDef {
+                model: "contacts",
+                title: "Tax & e-Invoice Identity (Malaysia)",
+                priority: 50,
+            },
+            |_state, db, contact_id| async move {
+                use vortex_plugin_sdk::sqlx::Row;
+                let esc = vortex_plugin_sdk::framework::html_escape;
+                let row = vortex_plugin_sdk::sqlx::query(
+                    "SELECT tin, id_type, id_value, sst_registration, msic_code, \
+                            einvoice_email, einvoice_optout \
+                     FROM acc_partner_tax_profile WHERE contact_id = $1",
+                )
+                .bind(contact_id)
+                .fetch_optional(&db)
+                .await
+                .map_err(|e| {
+                    vortex_plugin_sdk::common::VortexError::QueryExecution(e.to_string())
+                })?;
+                let field = |label: &str, value: Option<String>| {
+                    format!(
+                        "<div><div class=\"text-base-content/50 text-xs\">{}</div>\
+                         <div class=\"font-medium\">{}</div></div>",
+                        esc(label),
+                        esc(value.filter(|v| !v.is_empty()).as_deref().unwrap_or("—")),
+                    )
+                };
+                let body = match &row {
+                    Some(r) => {
+                        let id_label = format!(
+                            "{} No.",
+                            r.get::<Option<String>, _>("id_type").as_deref().unwrap_or("BRN/NRIC")
+                        );
+                        format!(
+                            "<div class=\"grid grid-cols-2 md:grid-cols-4 gap-3 text-sm\">{}{}{}{}{}{}</div>",
+                            field("TIN", r.get("tin")),
+                            field(&id_label, r.get("id_value")),
+                            field("SST Registration", r.get("sst_registration")),
+                            field("MSIC Code", r.get("msic_code")),
+                            field("e-Invoice Email", r.get("einvoice_email")),
+                            field(
+                                "e-Invoice",
+                                Some(
+                                    if r.get::<bool, _>("einvoice_optout") {
+                                        "consolidated only".to_string()
+                                    } else {
+                                        "individual".to_string()
+                                    },
+                                ),
+                            ),
+                        )
+                    }
+                    None => "<p class=\"text-sm opacity-60\">No tax profile yet — required for \
+                             MyInvois e-invoicing and SST reporting.</p>"
+                        .to_string(),
+                };
+                Ok(format!(
+                    "{body}<div class=\"mt-3\"><a href=\"/accounting/tax-profiles/by-contact/{contact_id}\" \
+                     class=\"btn btn-sm btn-outline\">{} Tax Profile</a></div>",
+                    if row.is_some() { "Edit" } else { "Create" },
+                ))
+            },
+        )]
+    }
+
     fn translations(&self) -> Vec<Translation> {
         vec![
             // English

@@ -824,6 +824,12 @@ async function loadStates(countryId) {{
         archive_button = archive_button,
     );
 
+    // Panels other plugins contribute to the contact record (e.g.
+    // accounting's Malaysian tax identity card).
+    let panels =
+        vortex_plugin_sdk::framework::render_record_panels(&state, &db, "contacts", id).await;
+    let content = format!("{content}{panels}");
+
     Html(page_shell(&sidebar, &format!("Edit {}", name), &content)).into_response()
 }
 

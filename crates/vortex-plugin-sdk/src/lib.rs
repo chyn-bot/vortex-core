@@ -94,6 +94,9 @@ pub mod prelude {
     // ── Scheduler ──
     pub use vortex_framework::{Schedule, ScheduledAction, ScheduledActionDef, Scheduler};
 
+    // ── Record panels (cross-plugin detail-page contributions) ──
+    pub use vortex_framework::{render_record_panels, RecordPanel, RecordPanelDef};
+
     // ── Reports ──
     pub use vortex_framework::{
         ReportDef, ReportFormat, ReportOutput, ReportParams, ReportRegistry,

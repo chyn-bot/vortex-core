@@ -310,6 +310,17 @@ pub trait Plugin: Send + Sync {
         Vec::new()
     }
 
+    /// Panels this plugin contributes to OTHER modules' record detail
+    /// pages (`crate::record_panel`) — e.g. accounting adds a tax
+    /// profile card to the contacts form. The owning module renders
+    /// them via `record_panel::render_record_panels` with its model
+    /// name; contributors need no dependency from the owner.
+    ///
+    /// Default: no panels.
+    fn record_panels(&self) -> Vec<crate::record_panel::RecordPanel> {
+        Vec::new()
+    }
+
     /// Register durable job-queue handlers (`crate::jobs`). Called once
     /// at startup while the host assembles the [`crate::jobs::JobRegistry`],
     /// before the worker starts. Namespace kinds with the plugin's

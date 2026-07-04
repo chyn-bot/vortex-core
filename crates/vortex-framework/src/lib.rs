@@ -46,6 +46,7 @@ pub mod menu;
 pub mod mobile_auth;
 pub mod pdf;
 pub mod plugin;
+pub mod record_panel;
 pub mod registry;
 pub mod report_jobs;
 pub mod reports;
@@ -86,6 +87,7 @@ pub use reports::{
     render_report, reports_routes, ReportDef, ReportFormat, ReportOutput, ReportParams,
     ReportRegistry,
 };
+pub use record_panel::{render_record_panels, RecordPanel, RecordPanelDef};
 pub use scheduler::{Schedule, ScheduledAction, ScheduledActionDef, Scheduler};
 pub use sidebar::build_sidebar;
 pub use state::{AppState, DatabaseContext};
