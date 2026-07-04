@@ -104,6 +104,13 @@ pub struct AppState {
     /// `crate::reports::render_report(state, code, params)` to get
     /// the same bytes without going through HTTP.
     pub reports: Arc<ReportRegistry>,
+    /// File/attachment storage backend (`[files]` in vortex.toml):
+    /// local directory by default, S3-compatible object storage for
+    /// multi-server deployments. Handlers and plugins store blobs via
+    /// `state.files` and persist only the returned key — never a
+    /// filesystem path — so rows stay portable across backends. See
+    /// `crate::files` for the contract.
+    pub files: Arc<dyn crate::files::FileStore>,
 }
 
 /// Database context injected by the auth middleware for request-scoped

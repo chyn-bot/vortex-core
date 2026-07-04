@@ -1,0 +1,41 @@
+# Vortex Core CI — build, test, and supply-chain audit on every push.
+#
+# Deliberately starts with a guaranteed-green baseline: build + tests +
+# cargo-audit. Tighten in this order once the existing warnings are
+# cleaned up:
+#   1. add `cargo fmt --all --check`
+#   2. add `cargo clippy --workspace --all-targets -- -D warnings`
+#   3. add a postgres service container and run the DB-gated
+#      (#[ignore]) integration tests
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Build & test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build workspace
+        run: cargo build --workspace --locked
+      - name: Run tests
+        run: cargo test --workspace --locked
+
+  audit:
+    name: Supply-chain audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: cargo audit
+        uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

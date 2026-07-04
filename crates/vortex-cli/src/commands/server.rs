@@ -122,6 +122,7 @@ async fn auth_middleware(
             s.id as session_id,
             s.user_id,
             s.expires_at,
+            s.last_activity_at,
             s.revoked,
             u.username,
             u.full_name,
@@ -156,13 +157,23 @@ async fn auth_middleware(
                 return redirect_to_login_with_message("Account locked");
             }
 
-            // Update last activity (extends session on activity)
-            let _ = sqlx::query(
-                "UPDATE sessions SET last_activity_at = NOW(), expires_at = NOW() + INTERVAL '30 minutes' WHERE id = $1"
-            )
-            .bind(&session.session_id)
-            .execute(db)
-            .await;
+            // Update last activity (extends session on activity).
+            // Throttled to once a minute per session: refreshing on
+            // every request would turn each page's burst of API calls
+            // into that many row updates + WAL records on a hot table,
+            // and a 30-minute sliding window doesn't need sub-minute
+            // precision.
+            let refresh_due = session
+                .last_activity_at
+                .map_or(true, |t| chrono::Utc::now() - t > chrono::Duration::seconds(60));
+            if refresh_due {
+                let _ = sqlx::query(
+                    "UPDATE sessions SET last_activity_at = NOW(), expires_at = NOW() + INTERVAL '30 minutes' WHERE id = $1"
+                )
+                .bind(&session.session_id)
+                .execute(db)
+                .await;
+            }
 
             // Fetch user roles
             let roles: Vec<String> = sqlx::query_scalar(
@@ -226,6 +237,7 @@ struct SessionWithUser {
     session_id: uuid::Uuid,
     user_id: uuid::Uuid,
     expires_at: chrono::DateTime<chrono::Utc>,
+    last_activity_at: Option<chrono::DateTime<chrono::Utc>>,
     revoked: bool,
     username: String,
     full_name: Option<String>,
@@ -405,7 +417,7 @@ fn mobile_refresh_ttl() -> chrono::Duration {
 /// bearer middleware uses), then the host-based default. Keeping the header in
 /// the resolution path means login/refresh name their tenant exactly the way
 /// every other API call does.
-fn resolve_tenant(state: &AppState, headers: &HeaderMap, body_db: Option<&str>) -> String {
+async fn resolve_tenant(state: &AppState, headers: &HeaderMap, body_db: Option<&str>) -> String {
     if let Some(d) = body_db.filter(|s| !s.is_empty()) {
         return d.to_string();
     }
@@ -417,7 +429,7 @@ fn resolve_tenant(state: &AppState, headers: &HeaderMap, body_db: Option<&str>) 
     {
         return d.to_string();
     }
-    resolve_database(state, headers, None)
+    resolve_database(state, headers, None).await
 }
 
 /// Best-effort client IP (first `X-Forwarded-For` hop) and user-agent for the
@@ -533,7 +545,7 @@ async fn mobile_login(
     headers: HeaderMap,
     Json(body): Json<MobileLoginBody>,
 ) -> Response {
-    let db_name = resolve_tenant(&state, &headers, body.database.as_deref());
+    let db_name = resolve_tenant(&state, &headers, body.database.as_deref()).await;
     if !db_name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
         return api_error(StatusCode::BAD_REQUEST, "invalid_database", "Invalid database.");
     }
@@ -824,7 +836,7 @@ async fn mobile_mfa_enroll(
     headers: HeaderMap,
     Json(body): Json<MobileMfaEnrollBody>,
 ) -> Response {
-    let db_name = resolve_tenant(&state, &headers, body.database.as_deref());
+    let db_name = resolve_tenant(&state, &headers, body.database.as_deref()).await;
     if !db_name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
         return api_error(StatusCode::BAD_REQUEST, "invalid_database", "Invalid database.");
     }
@@ -907,7 +919,7 @@ async fn mobile_refresh(
     headers: HeaderMap,
     Json(body): Json<MobileRefreshBody>,
 ) -> Response {
-    let db_name = resolve_tenant(&state, &headers, body.database.as_deref());
+    let db_name = resolve_tenant(&state, &headers, body.database.as_deref()).await;
     if !db_name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
         return api_error(StatusCode::BAD_REQUEST, "invalid_database", "Invalid database.");
     }
@@ -1376,11 +1388,19 @@ pub fn parse_db_manager_config() -> (bool, String, String, String, String) {
         .and_then(|v: &toml::Value| v.as_str())
         .unwrap_or("vortex_master")
         .to_string();
-    let master_password = section
-        .and_then(|s: &toml::Value| s.get("master_password"))
-        .and_then(|v: &toml::Value| v.as_str())
-        .unwrap_or("")
-        .to_string();
+    // Secret: env wins over the config file so vortex.toml can live in
+    // version control without embedding the master credential. Accepts
+    // either an $argon2 hash or (dev only) a plaintext value.
+    let master_password = std::env::var("VORTEX_MASTER_PASSWORD")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            section
+                .and_then(|s: &toml::Value| s.get("master_password"))
+                .and_then(|v: &toml::Value| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        });
     let db_filter = section
         .and_then(|s: &toml::Value| s.get("db_filter"))
         .and_then(|v: &toml::Value| v.as_str())
@@ -1393,6 +1413,61 @@ pub fn parse_db_manager_config() -> (bool, String, String, String, String) {
         .to_string();
 
     (enabled, master_database, master_password, db_filter, db_name_prefix)
+}
+
+/// Parse `[files]` from vortex.toml into a storage backend config.
+/// Absent section → local directory "uploads" (single-tier default).
+/// S3 credentials come from VORTEX_S3_ACCESS_KEY / VORTEX_S3_SECRET_KEY,
+/// never from the config file.
+fn parse_files_config() -> anyhow::Result<vortex_framework::files::FilesConfig> {
+    use vortex_framework::files::{FilesConfig, S3Config};
+    let config_str = std::fs::read_to_string("vortex.toml").unwrap_or_default();
+    let config: toml::Value = config_str.parse::<toml::Value>().unwrap_or(toml::Value::Table(Default::default()));
+    let section = config.get("files");
+    let backend = section
+        .and_then(|s| s.get("backend"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("local");
+    let str_key = |table: &str, key: &str, default: &str| -> String {
+        section
+            .and_then(|s| s.get(table))
+            .and_then(|t| t.get(key))
+            .and_then(|v| v.as_str())
+            .unwrap_or(default)
+            .to_string()
+    };
+    match backend {
+        "local" => Ok(FilesConfig::Local { path: str_key("local", "path", "uploads") }),
+        "s3" => Ok(FilesConfig::S3(S3Config {
+            endpoint: str_key("s3", "endpoint", ""),
+            region: str_key("s3", "region", "us-east-1"),
+            bucket: str_key("s3", "bucket", ""),
+            path_style: section
+                .and_then(|s| s.get("s3"))
+                .and_then(|t| t.get("path_style"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true),
+            access_key: std::env::var("VORTEX_S3_ACCESS_KEY").unwrap_or_default(),
+            secret_key: std::env::var("VORTEX_S3_SECRET_KEY").unwrap_or_default(),
+        })),
+        other => anyhow::bail!("[files] backend must be \"local\" or \"s3\", got {other:?}"),
+    }
+}
+
+/// Global connection budget from `[database] max_connections` in
+/// vortex.toml. This caps the SUM of every pool the manager opens
+/// (primary + master + one per active tenant) — keep it below the
+/// Postgres server's own `max_connections`.
+fn parse_global_connection_budget() -> u32 {
+    let config_str = std::fs::read_to_string("vortex.toml").unwrap_or_default();
+    let config: toml::Value = config_str.parse::<toml::Value>().unwrap_or(toml::Value::Table(Default::default()));
+    config
+        .get("database")
+        .and_then(|s| s.get("max_connections"))
+        .and_then(|v| v.as_integer())
+        .filter(|n| *n > 0)
+        .map(|n| n as u32)
+        .unwrap_or(100)
 }
 
 /// Extract the database name from a full DATABASE_URL.
@@ -1511,8 +1586,14 @@ pub async fn run(host: String, port: u16, _workers: Option<usize>) -> Result<()>
     // Constructed before the audit storage so the multi-DB pool manager
     // can be passed to PgAuditStorage for per-tenant audit scoping.
     let pool_manager = if multi_db_enabled {
+        let global_budget = parse_global_connection_budget();
+        info!(
+            "Pool manager: global connection budget {} across all tenant pools",
+            global_budget
+        );
         let config = PoolManagerConfig {
             base_url: base_url_from_full(&database_url),
+            global_max_connections: global_budget,
             ..PoolManagerConfig::default()
         };
         let pm = Arc::new(DatabasePoolManager::new(config));
@@ -1823,6 +1904,14 @@ pub async fn run(host: String, port: u16, _workers: Option<usize>) -> Result<()>
         }
     };
 
+    // File/attachment storage backend ([files] in vortex.toml).
+    // Fail fast on bad config: silently storing tenant files in the
+    // wrong place is worse than refusing to start.
+    let files_config = parse_files_config()?;
+    let files = vortex_framework::files::from_config(&files_config)
+        .map_err(|e| anyhow::anyhow!("file storage init failed: {e}"))?;
+    info!("File storage backend: {}", files.backend_name());
+
     // Create app state
     let state = Arc::new(AppState {
         db,
@@ -1841,6 +1930,7 @@ pub async fn run(host: String, port: u16, _workers: Option<usize>) -> Result<()>
         scheduler: scheduler.clone(),
         reports: reports.clone(),
         i18n,
+        files,
     });
 
     // Spawn the scheduler supervisor now that AppState exists.
@@ -2030,6 +2120,10 @@ fn build_router(state: Arc<AppState>) -> Router {
         // User report hub + runner
         .route("/reports", get(reports_hub))
         .route("/reports/run/{id}", get(report_run))
+        .route("/reports/queue/{id}", post(report_queue))
+        .route("/reports/runs", get(report_runs_page))
+        .route("/reports/runs/{id}/download", get(report_run_download))
+        .route("/reports/runs/{id}/retry", post(report_run_retry))
         // Localization master data (countries / states)
         .route("/settings/countries", get(countries_list))
         .route("/settings/countries", post(country_create))
@@ -2228,12 +2322,10 @@ async fn api_notifications(
     }))
 }
 
-async fn login_page(State(state): State<Arc<AppState>>) -> Html<String> {
-    let databases = if state.multi_db {
-        list_active_databases(state.master_db.as_ref().unwrap()).await
-    } else {
-        vec![state.default_db.clone()]
-    };
+async fn login_page(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Html<String> {
+    // Host-scoped: on gaia.vortex.com this is just ["gaia"], so the
+    // picker disappears and other tenants' names never reach the page.
+    let databases = login_databases(&state, &headers).await;
     let show_selector = databases.len() > 1;
 
     let db_selector_html = if show_selector {
@@ -2277,23 +2369,98 @@ async fn list_active_databases(master_db: &PgPool) -> Vec<String> {
     .unwrap_or_default()
 }
 
-/// Resolve which database to use for a login attempt.
-fn resolve_database(state: &AppState, headers: &HeaderMap, form_db: Option<&str>) -> String {
-    // If subdomain filtering is configured, try to match
-    if let Some(filter) = &state.db_filter {
-        if let Some(host) = headers.get(header::HOST).and_then(|h| h.to_str().ok()) {
-            let subdomain = host.split('.').next().unwrap_or("");
-            let pattern = filter.replace("%h", subdomain).replace("%d", host);
-            // Simple exact-match filter (for more complex patterns, use regex)
-            if !pattern.is_empty() && pattern != "^$" {
-                return subdomain.to_string();
-            }
+/// Request host, lowercased, with any `:port` suffix (or IPv6 brackets)
+/// stripped. `None` when the Host header is absent or empty.
+fn request_host(headers: &HeaderMap) -> Option<String> {
+    let raw = headers.get(header::HOST)?.to_str().ok()?.trim();
+    let host = if let Some(v6) = raw.strip_prefix('[') {
+        v6.split(']').next().unwrap_or("")
+    } else {
+        raw.split(':').next().unwrap_or("")
+    };
+    let host = host.to_ascii_lowercase();
+    (!host.is_empty()).then_some(host)
+}
+
+/// Loopback-style hosts get ops treatment under `db_filter`: the full
+/// database picker instead of host-locked tenant resolution. Public
+/// traffic always arrives through the reverse proxy with a real domain,
+/// so anything the proxy would never send counts as local.
+fn is_local_host(host: &str) -> bool {
+    host == "localhost" || host == "127.0.0.1" || host == "::1" || host.ends_with(".localhost")
+}
+
+/// Databases out of `databases` that `host` selects under the `db_filter`
+/// regex. `%h` expands to the host's first DNS label and `%d` to the full
+/// host, both regex-escaped — so `"^%h$"` maps gaia.vortex.com → database
+/// `gaia`, and `"^vortex_%h$"` maps it to `vortex_gaia` (matching a
+/// `db_name_prefix`). An unparseable filter selects nothing.
+fn host_filtered_databases(filter: &str, host: &str, databases: &[String]) -> Vec<String> {
+    let subdomain = host.split('.').next().unwrap_or("");
+    let pattern = filter
+        .replace("%h", &regex::escape(subdomain))
+        .replace("%d", &regex::escape(host));
+    match regex::Regex::new(&pattern) {
+        Ok(re) => databases.iter().filter(|d| re.is_match(d)).cloned().collect(),
+        Err(e) => {
+            warn!("db_filter expanded to invalid regex {:?}: {}", pattern, e);
+            Vec::new()
         }
     }
-    // Use form-submitted database or fall back to default
-    if let Some(db) = form_db {
-        if !db.is_empty() {
+}
+
+/// Databases this request is allowed to log into, which is also exactly
+/// what the login page may list — tenant names must not leak across
+/// subdomains.
+///
+/// - `db_filter` set and the host matches ≥1 active database → only the
+///   matches (usually one; the picker disappears and login is host-locked).
+/// - `db_filter` set, no match, loopback host → every active database
+///   (ops/testing access on the box itself).
+/// - `db_filter` set, no match, public host → the default database only.
+/// - no `db_filter` → every active database (legacy behavior).
+async fn login_databases(state: &AppState, headers: &HeaderMap) -> Vec<String> {
+    let all = match (&state.master_db, state.multi_db) {
+        (Some(master), true) => list_active_databases(master).await,
+        _ => vec![state.default_db.clone()],
+    };
+    let Some(filter) = &state.db_filter else {
+        return all;
+    };
+    if let Some(host) = request_host(headers) {
+        let matches = host_filtered_databases(filter, &host, &all);
+        if !matches.is_empty() {
+            return matches;
+        }
+        if is_local_host(&host) {
+            return all;
+        }
+    }
+    vec![state.default_db.clone()]
+}
+
+/// Resolve which database to use for a login attempt. The form value is
+/// honored only when it's in the host's allowed set, so a crafted POST
+/// can't log into another tenant through this host; with `db_filter`
+/// configured, an unmatched public host falls back to the default
+/// database instead of erroring on a garbage pool name.
+async fn resolve_database(state: &AppState, headers: &HeaderMap, form_db: Option<&str>) -> String {
+    let allowed = login_databases(state, headers).await;
+    if let Some(db) = form_db.filter(|s| !s.is_empty()) {
+        if allowed.iter().any(|d| d == db) {
             return db.to_string();
+        }
+    }
+    // Host-locked: the (first) match is the tenant. On loopback the
+    // allowed set is the full list, where "no form choice" keeps
+    // meaning the default database.
+    if state.db_filter.is_some() {
+        if let Some(host) = request_host(headers) {
+            if !is_local_host(&host) {
+                if let Some(first) = allowed.first() {
+                    return first.clone();
+                }
+            }
         }
     }
     state.default_db.clone()
@@ -2312,7 +2479,7 @@ async fn login_submit(
     Form(form): Form<LoginForm>,
 ) -> Response {
     // Resolve target database
-    let db_name = resolve_database(&state, &headers, form.database.as_deref());
+    let db_name = resolve_database(&state, &headers, form.database.as_deref()).await;
 
     // Get pool for that database
     let pool = match state.pool_manager.get_pool(&db_name).await {
@@ -7957,9 +8124,7 @@ async fn get_next_sequence(
 // ============================================================================
 
 use axum::extract::Multipart;
-use std::path::PathBuf;
 
-const UPLOAD_DIR: &str = "./uploads";
 
 async fn list_attachments(
     State(state): State<Arc<AppState>>,
@@ -7991,19 +8156,27 @@ async fn list_attachments(
     Json(result).into_response()
 }
 
+/// Storage key for a fresh upload: server-generated UUID + sanitized
+/// extension from the client filename. Extensions outside
+/// `[A-Za-z0-9]{1,10}` collapse to "bin" so client input can never
+/// shape the key beyond a benign suffix.
+fn new_store_key(prefix: &str, file_name: &str) -> String {
+    let ext = std::path::Path::new(file_name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .filter(|e| e.len() <= 10 && e.chars().all(|c| c.is_ascii_alphanumeric()))
+        .unwrap_or("bin");
+    format!("{}{}.{}", prefix, uuid::Uuid::new_v4(), ext.to_ascii_lowercase())
+}
+
 async fn upload_attachment(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
     Path((model, record_id)): Path<(String, uuid::Uuid)>,
     mut multipart: Multipart,
 ) -> Response {
-    // Ensure upload directory exists
-    let upload_path = PathBuf::from(UPLOAD_DIR);
-    if let Err(e) = tokio::fs::create_dir_all(&upload_path).await {
-        return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create upload dir: {}", e)).into_response();
-    }
-
     while let Ok(Some(field)) = multipart.next_field().await {
         let file_name = field.file_name().unwrap_or("unknown").to_string();
         let content_type = field.content_type().map(|s| s.to_string());
@@ -8015,14 +8188,7 @@ async fn upload_attachment(
         };
 
         let file_size = data.len() as i64;
-
-        // Generate unique filename
-        let ext = std::path::Path::new(&file_name)
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("bin");
-        let store_fname = format!("{}.{}", uuid::Uuid::new_v4(), ext);
-        let file_path = upload_path.join(&store_fname);
+        let store_fname = new_store_key("", &file_name);
 
         // Compute checksum
         use sha2::{Sha256, Digest};
@@ -8030,9 +8196,14 @@ async fn upload_attachment(
         hasher.update(&data);
         let checksum = hex::encode(hasher.finalize());
 
-        // Save file to disk
-        if let Err(e) = tokio::fs::write(&file_path, &data).await {
-            return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to save file: {}", e)).into_response();
+        // Persist the blob under the tenant's namespace
+        if let Err(e) = state
+            .files
+            .put(&db_ctx.db_name, &store_fname, &data, content_type.as_deref())
+            .await
+        {
+            error!("attachment store failed: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to store file".to_string()).into_response();
         }
 
         // Insert record
@@ -8062,8 +8233,8 @@ async fn upload_attachment(
                 })).into_response();
             }
             Err(e) => {
-                // Clean up file on error
-                let _ = tokio::fs::remove_file(&file_path).await;
+                // Clean up blob on error so no orphan survives
+                let _ = state.files.delete(&db_ctx.db_name, &store_fname).await;
                 return (StatusCode::INTERNAL_SERVER_ERROR, format!("Database error: {}", e)).into_response();
             }
         }
@@ -8075,6 +8246,7 @@ async fn upload_attachment(
 async fn download_attachment(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
+    Extension(db_ctx): Extension<DatabaseContext>,
     Path(id): Path<uuid::Uuid>,
 ) -> Response {
     let attachment = sqlx::query(
@@ -8095,13 +8267,16 @@ async fn download_attachment(
     let mimetype: Option<String> = att.get("mimetype");
 
     let Some(fname) = store_fname else {
-        return (StatusCode::NOT_FOUND, "File not found on disk").into_response();
+        return (StatusCode::NOT_FOUND, "File not found in storage").into_response();
     };
 
-    let file_path = PathBuf::from(UPLOAD_DIR).join(&fname);
-    let data = match tokio::fs::read(&file_path).await {
-        Ok(d) => d,
-        Err(_) => return (StatusCode::NOT_FOUND, "File not found on disk").into_response(),
+    let data = match state.files.get(&db_ctx.db_name, &fname).await {
+        Ok(Some(d)) => d,
+        Ok(None) => return (StatusCode::NOT_FOUND, "File not found in storage").into_response(),
+        Err(e) => {
+            error!("attachment fetch failed: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Storage error").into_response();
+        }
     };
 
     let content_type = mimetype.unwrap_or_else(|| "application/octet-stream".to_string());
@@ -8120,9 +8295,10 @@ async fn delete_attachment(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
     Extension(_user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
     Path(id): Path<uuid::Uuid>,
 ) -> Response {
-    // Get filename first
+    // Get storage key first
     let attachment = sqlx::query("SELECT store_fname FROM ir_attachment WHERE id = $1")
         .bind(id)
         .fetch_optional(&db)
@@ -8133,8 +8309,7 @@ async fn delete_attachment(
     if let Some(att) = attachment {
         let store_fname: Option<String> = att.get("store_fname");
         if let Some(fname) = store_fname {
-            let file_path = PathBuf::from(UPLOAD_DIR).join(&fname);
-            let _ = tokio::fs::remove_file(&file_path).await;
+            let _ = state.files.delete(&db_ctx.db_name, &fname).await;
         }
     }
 
@@ -9620,12 +9795,12 @@ async fn chatter_complete_and_schedule(
 // Chatter Attachments
 // ============================================================================
 
-const CHATTER_UPLOAD_DIR: &str = "./uploads/chatter";
 
 async fn chatter_upload_attachment(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
     Path((model, record_id)): Path<(String, uuid::Uuid)>,
     mut multipart: Multipart,
 ) -> Response {
@@ -9638,12 +9813,6 @@ async fn chatter_upload_attachment(
         Ok(cid) => cid,
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, Html("Error getting company")).into_response(),
     };
-
-    // Ensure upload directory exists
-    let upload_path = std::path::PathBuf::from(CHATTER_UPLOAD_DIR);
-    if let Err(e) = tokio::fs::create_dir_all(&upload_path).await {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Html(format!("Failed to create upload dir: {}", e))).into_response();
-    }
 
     // Collect form fields - file and is_secure checkbox
     let mut file_data: Option<(String, Option<String>, Vec<u8>)> = None;
@@ -9671,14 +9840,10 @@ async fn chatter_upload_attachment(
 
     let file_size: i64 = data.len() as i64;
 
-    // Generate unique filename
-    let ext = std::path::Path::new(&file_name)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("bin");
-    let store_fname = format!("{}.{}", uuid::Uuid::new_v4(), ext);
-    let file_path = upload_path.join(&store_fname);
-    let relative_path = format!("chatter/{}", store_fname);
+    // Storage key doubles as the chatter "file path" column value —
+    // it's a FileStore key now, not a filesystem path.
+    let store_key = new_store_key("chatter/", &file_name);
+    let store_fname = store_key.rsplit('/').next().unwrap_or(&store_key).to_string();
 
     // Compute checksum
     use sha2::{Sha256, Digest};
@@ -9686,9 +9851,14 @@ async fn chatter_upload_attachment(
     hasher.update(&data);
     let checksum = hex::encode(hasher.finalize());
 
-    // Save file to disk
-    if let Err(e) = tokio::fs::write(&file_path, &data).await {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Html(format!("Failed to save file: {}", e))).into_response();
+    // Persist the blob under the tenant's namespace
+    if let Err(e) = state
+        .files
+        .put(&db_ctx.db_name, &store_key, &data, content_type.as_deref())
+        .await
+    {
+        error!("chatter attachment store failed: {e}");
+        return (StatusCode::INTERNAL_SERVER_ERROR, Html("Failed to store file".to_string())).into_response();
     }
 
     // Insert record with is_secure flag
@@ -9698,7 +9868,7 @@ async fn chatter_upload_attachment(
     )
     .bind(&file_name)
     .bind(&store_fname)
-    .bind(&relative_path)
+    .bind(&store_key)
     .bind(file_size)
     .bind(&content_type)
     .bind(&checksum)
@@ -9711,8 +9881,8 @@ async fn chatter_upload_attachment(
     .await;
 
     if let Err(e) = result {
-        // Clean up file on error
-        let _ = tokio::fs::remove_file(&file_path).await;
+        // Clean up blob on error so no orphan survives
+        let _ = state.files.delete(&db_ctx.db_name, &store_key).await;
         return (StatusCode::INTERNAL_SERVER_ERROR, Html(format!("Database error: {}", e))).into_response();
     }
 
@@ -9723,6 +9893,7 @@ async fn chatter_upload_attachment(
 async fn chatter_download_attachment(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
+    Extension(db_ctx): Extension<DatabaseContext>,
     Path(id): Path<uuid::Uuid>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
@@ -9751,10 +9922,13 @@ async fn chatter_download_attachment(
         return (StatusCode::FORBIDDEN, "Secure documents cannot be downloaded").into_response();
     }
 
-    let full_path = std::path::PathBuf::from("./uploads").join(&file_path);
-    let data = match tokio::fs::read(&full_path).await {
-        Ok(d) => d,
-        Err(_) => return (StatusCode::NOT_FOUND, "File not found on disk").into_response(),
+    let data = match state.files.get(&db_ctx.db_name, &file_path).await {
+        Ok(Some(d)) => d,
+        Ok(None) => return (StatusCode::NOT_FOUND, "File not found in storage").into_response(),
+        Err(e) => {
+            error!("chatter attachment fetch failed: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Storage error").into_response();
+        }
     };
 
     let content_type = mimetype.unwrap_or_else(|| "application/octet-stream".to_string());
@@ -9799,6 +9973,7 @@ async fn chatter_delete_attachment(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
     Path(id): Path<uuid::Uuid>,
 ) -> Response {
     // Get the attachment info first
@@ -9836,9 +10011,9 @@ async fn chatter_delete_attachment(
         return (StatusCode::INTERNAL_SERVER_ERROR, format!("Error: {}", e)).into_response();
     }
 
-    // Optionally delete file from disk
-    let full_path = std::path::PathBuf::from("./uploads").join(&file_path);
-    let _ = tokio::fs::remove_file(&full_path).await;
+    // Remove the blob from storage (row is only soft-deleted above,
+    // but the file itself is gone — matches previous behavior)
+    let _ = state.files.delete(&db_ctx.db_name, &file_path).await;
 
     // Return updated chatter panel
     chatter_partial(State(state), Db(db.clone()), Extension(user), Path((model, record_id))).await
@@ -15382,12 +15557,18 @@ async fn reports_hub(
         let desc: Option<String> = r.try_get("description").ok().flatten();
         let model: String = r.get("model_name");
         let rtype: String = r.get("report_type");
+        let csv_btn = if rtype == "tabular" {
+            format!(r##"<form method="post" action="/reports/queue/{id}?format=csv" class="inline"><button class="btn btn-xs btn-ghost" title="Generate CSV in the background">⏱ CSV</button></form>"##)
+        } else { String::new() };
         cards.push_str(&format!(
-            r##"<a href="/reports/run/{id}" target="_blank" class="card bg-base-100 shadow hover:shadow-lg transition"><div class="card-body p-4">
-            <h3 class="card-title text-base">{name} <span class="badge badge-ghost badge-sm">{rtype}</span></h3>
-            <p class="text-sm opacity-60">{desc}</p><p class="text-xs opacity-40"><code>{model}</code></p></div></a>"##,
+            r##"<div class="card bg-base-100 shadow hover:shadow-lg transition"><div class="card-body p-4">
+            <h3 class="card-title text-base"><a href="/reports/run/{id}" target="_blank" class="link link-hover">{name}</a> <span class="badge badge-ghost badge-sm">{rtype}</span></h3>
+            <p class="text-sm opacity-60">{desc}</p><p class="text-xs opacity-40"><code>{model}</code></p>
+            <div class="card-actions items-center mt-1"><a href="/reports/run/{id}" target="_blank" class="btn btn-xs btn-outline">▶ Run</a>
+            <form method="post" action="/reports/queue/{id}?format=pdf" class="inline"><button class="btn btn-xs btn-ghost" title="Generate PDF in the background">⏱ PDF</button></form>{csv_btn}</div>
+            </div></div>"##,
             id = id, name = html_escape(&name), rtype = html_escape(&rtype),
-            desc = html_escape(desc.as_deref().unwrap_or("")), model = html_escape(&model),
+            desc = html_escape(desc.as_deref().unwrap_or("")), model = html_escape(&model), csv_btn = csv_btn,
         ));
     }
     if cards.is_empty() {
@@ -15399,7 +15580,8 @@ async fn reports_hub(
     let installed = db_ctx.installed_modules.clone();
     let sidebar = build_sidebar("reports", display_name, &initials, &installed, user.is_admin(), &state.plugin_registry, &user.roles);
     let content = format!(
-        r##"<div class="flex justify-between items-center mb-6"><div><h1 class="text-2xl font-bold">Reports</h1><p class="text-base-content/60 text-sm">Run a report</p></div>{author_btn}</div>
+        r##"<div class="flex justify-between items-center mb-6"><div><h1 class="text-2xl font-bold">Reports</h1><p class="text-base-content/60 text-sm">Run now, or queue in the background (⏱) and pick it up from Generated Reports</p></div>
+        <div class="flex gap-2"><a href="/reports/runs" class="btn btn-sm btn-outline">🗂 Generated Reports</a>{author_btn}</div></div>
         <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">{cards}</div>"##,
         author_btn = author_btn, cards = cards,
     );
@@ -15484,6 +15666,227 @@ async fn report_run(
     }
 
     Html(printable).into_response()
+}
+
+/// POST /reports/queue/{id}?format=pdf|html|csv — run a report in the
+/// background: enqueue a `report.render` job, then send the user to
+/// the Generated Reports inbox. Heavy reports (multi-year GL) go this
+/// way instead of holding an HTTP request open.
+async fn report_queue(
+    State(state): State<Arc<AppState>>, Db(db): Db, Extension(user): Extension<AuthUser>, Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<uuid::Uuid>, Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    use vortex_framework::user_reports as ur;
+    let Some(def) = ur::load(&db, id).await else {
+        return (StatusCode::NOT_FOUND, Html("Report not found")).into_response();
+    };
+    if !def.can_run(&user.roles, user.is_admin()) {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page(&def.name))).into_response();
+    }
+    let format = q.get("format").map(|s| s.as_str()).unwrap_or("pdf");
+
+    let entry = AuditEntry::new(AuditAction::BulkExport, AuditSeverity::Info)
+        .with_user(vortex_common::UserId(user.id)).with_username(&user.username)
+        .with_database(&db_ctx.db_name).with_resource("ir_report", def.code.clone()).with_resource_name(&def.name)
+        .with_details(serde_json::json!({"action":"queue","format":format}));
+    let _ = state.audit.log(entry).await;
+
+    match vortex_framework::report_jobs::enqueue_run(
+        &state.db, &db, &db_ctx.db_name, &def, format, user.id, &user.username,
+    ).await {
+        Ok(_) => Redirect::to("/reports/runs").into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, Html(format!("Could not queue report: {}", html_escape(&e)))).into_response(),
+    }
+}
+
+/// GET /reports/runs — the Generated Reports inbox: every background
+/// run you requested (admins see the whole tenant), with status,
+/// download links for finished artifacts, and retry for failures.
+async fn report_runs_page(
+    State(state): State<Arc<AppState>>, Db(db): Db, Extension(user): Extension<AuthUser>, Extension(db_ctx): Extension<DatabaseContext>,
+) -> Response {
+    let rows = if user.is_admin() {
+        sqlx::query(
+            "SELECT id, report_name, format, status, error, file_size, requested_by_name, created_at, started_at, finished_at \
+             FROM report_runs ORDER BY created_at DESC LIMIT 200",
+        ).fetch_all(&db).await
+    } else {
+        sqlx::query(
+            "SELECT id, report_name, format, status, error, file_size, requested_by_name, created_at, started_at, finished_at \
+             FROM report_runs WHERE requested_by = $1 ORDER BY created_at DESC LIMIT 200",
+        ).bind(user.id).fetch_all(&db).await
+    }.unwrap_or_default();
+
+    let mut trs = String::new();
+    let mut any_active = false;
+    for r in &rows {
+        let id: uuid::Uuid = r.get("id");
+        let name: String = r.get("report_name");
+        let format: String = r.get("format");
+        let status: String = r.get("status");
+        let error: Option<String> = r.try_get("error").ok().flatten();
+        let size: Option<i64> = r.try_get("file_size").ok().flatten();
+        let who: Option<String> = r.try_get("requested_by_name").ok().flatten();
+        let created: chrono::DateTime<chrono::Utc> = r.get("created_at");
+        let started: Option<chrono::DateTime<chrono::Utc>> = r.try_get("started_at").ok().flatten();
+        let finished: Option<chrono::DateTime<chrono::Utc>> = r.try_get("finished_at").ok().flatten();
+
+        let (badge, result) = match status.as_str() {
+            "done" => {
+                let dur = match (started, finished) {
+                    (Some(s), Some(f)) => format!(" in {}s", (f - s).num_seconds().max(0)),
+                    _ => String::new(),
+                };
+                let size_h = size.map(human_size).unwrap_or_default();
+                (
+                    format!(r#"<span class="badge badge-success badge-sm">done{dur}</span>"#),
+                    format!(r#"<a class="btn btn-xs btn-primary" href="/reports/runs/{id}/download">⬇ Download {fmt} {size_h}</a>"#,
+                        id = id, fmt = html_escape(&format.to_uppercase()), size_h = size_h),
+                )
+            }
+            "failed" => (
+                format!(r#"<span class="badge badge-error badge-sm" title="{}">failed</span>"#,
+                    html_escape(error.as_deref().unwrap_or(""))),
+                format!(
+                    r#"<span class="text-xs text-error">{err}</span>
+                       <form method="post" action="/reports/runs/{id}/retry" class="inline"><button class="btn btn-xs btn-outline">Retry</button></form>"#,
+                    err = html_escape(&truncate_chars(error.as_deref().unwrap_or("error"), 80)), id = id,
+                ),
+            ),
+            "running" => { any_active = true; (r#"<span class="badge badge-info badge-sm">running…</span>"#.into(), "—".into()) }
+            _ => { any_active = true; (r#"<span class="badge badge-ghost badge-sm">queued</span>"#.into(), "—".into()) }
+        };
+        let who_html = if user.is_admin() {
+            format!("<td class=\"text-xs opacity-60\">{}</td>", html_escape(who.as_deref().unwrap_or("")))
+        } else { String::new() };
+        trs.push_str(&format!(
+            r#"<tr><td>{name}</td><td class="uppercase text-xs">{fmt}</td><td class="text-xs opacity-60">{created}</td>{who}<td>{badge}</td><td>{result}</td></tr>"#,
+            name = html_escape(&name), fmt = html_escape(&format),
+            created = created.format("%Y-%m-%d %H:%M"), who = who_html, badge = badge, result = result,
+        ));
+    }
+    if trs.is_empty() {
+        trs = r#"<tr><td colspan="6" class="text-center opacity-60 py-8">No generated reports yet. Queue one from the Reports page.</td></tr>"#.into();
+    }
+    let who_th = if user.is_admin() { "<th>Requested by</th>" } else { "" };
+    // Light auto-refresh while anything is queued/running.
+    let refresh = if any_active { r#"<meta http-equiv="refresh" content="10">"# } else { "" };
+
+    let display_name = user.full_name.as_deref().unwrap_or(&user.username);
+    let initials = get_initials(display_name);
+    let installed = db_ctx.installed_modules.clone();
+    let sidebar = build_sidebar("reports", display_name, &initials, &installed, user.is_admin(), &state.plugin_registry, &user.roles);
+    let content = format!(
+        r##"<div class="flex justify-between items-center mb-6"><div><h1 class="text-2xl font-bold">Generated Reports</h1>
+        <p class="text-base-content/60 text-sm">Background report runs — artifacts are kept for {days} days</p></div>
+        <a href="/reports" class="btn btn-sm btn-outline">← Reports</a></div>
+        <div class="card bg-base-100 shadow"><div class="card-body p-4 overflow-x-auto">
+        <table class="table table-sm"><thead><tr><th>Report</th><th>Format</th><th>Requested</th>{who_th}<th>Status</th><th>Result</th></tr></thead>
+        <tbody>{trs}</tbody></table></div></div>"##,
+        days = vortex_framework::report_jobs::retention_days(), who_th = who_th, trs = trs,
+    );
+    let html = format!(
+        r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><title>Generated Reports - Remicle</title>{refresh}
+<meta name="viewport" content="width=device-width, initial-scale=1.0"><link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/><script src="https://cdn.tailwindcss.com"></script></head>
+<body class="min-h-screen bg-base-200"><div class="flex">{sidebar}<main class="flex-1 p-4 lg:p-6 min-w-0">{content}</main></div></body></html>"#,
+        refresh = refresh, sidebar = sidebar, content = content,
+    );
+    Html(html).into_response()
+}
+
+/// GET /reports/runs/{id}/download — serve a finished artifact from
+/// the FileStore. Only the requester (or an admin) may fetch it.
+async fn report_run_download(
+    State(state): State<Arc<AppState>>, Db(db): Db, Extension(user): Extension<AuthUser>, Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<uuid::Uuid>,
+) -> Response {
+    let row = sqlx::query(
+        "SELECT report_code, report_name, status, store_key, mime, requested_by FROM report_runs WHERE id = $1",
+    ).bind(id).fetch_optional(&db).await.ok().flatten();
+    let Some(row) = row else {
+        return (StatusCode::NOT_FOUND, "Report run not found").into_response();
+    };
+    let requested_by: uuid::Uuid = row.get("requested_by");
+    if requested_by != user.id && !user.is_admin() {
+        return (StatusCode::FORBIDDEN, "This report was generated by another user").into_response();
+    }
+    let status: String = row.get("status");
+    let store_key: Option<String> = row.try_get("store_key").ok().flatten();
+    let (Some(key), "done") = (store_key, status.as_str()) else {
+        return (StatusCode::NOT_FOUND, "Report is not ready").into_response();
+    };
+    let data = match state.files.get(&db_ctx.db_name, &key).await {
+        Ok(Some(d)) => d,
+        Ok(None) => return (StatusCode::NOT_FOUND, "Artifact no longer in storage (expired?)").into_response(),
+        Err(e) => {
+            error!("report artifact fetch failed: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Storage error").into_response();
+        }
+    };
+    let code: String = row.get("report_code");
+    let name: String = row.get("report_name");
+    let mime: String = row.try_get::<Option<String>, _>("mime").ok().flatten()
+        .unwrap_or_else(|| "application/octet-stream".into());
+    let ext = key.rsplit('.').next().unwrap_or("bin");
+
+    let entry = AuditEntry::new(AuditAction::BulkExport, AuditSeverity::Info)
+        .with_user(vortex_common::UserId(user.id)).with_username(&user.username)
+        .with_database(&db_ctx.db_name).with_resource("report_run", id.to_string()).with_resource_name(&name)
+        .with_details(serde_json::json!({"action":"download_generated","format":ext}));
+    let _ = state.audit.log(entry).await;
+
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, mime),
+            (header::CONTENT_DISPOSITION, format!("attachment; filename=\"{}.{}\"", code, ext)),
+        ],
+        data,
+    ).into_response()
+}
+
+/// POST /reports/runs/{id}/retry — re-queue a failed run.
+async fn report_run_retry(
+    State(state): State<Arc<AppState>>, Db(db): Db, Extension(user): Extension<AuthUser>, Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<uuid::Uuid>,
+) -> Response {
+    let row = sqlx::query("SELECT status, requested_by FROM report_runs WHERE id = $1")
+        .bind(id).fetch_optional(&db).await.ok().flatten();
+    let Some(row) = row else {
+        return (StatusCode::NOT_FOUND, "Report run not found").into_response();
+    };
+    let requested_by: uuid::Uuid = row.get("requested_by");
+    if requested_by != user.id && !user.is_admin() {
+        return (StatusCode::FORBIDDEN, "This report was generated by another user").into_response();
+    }
+    let status: String = row.get("status");
+    if status != "failed" {
+        return (StatusCode::BAD_REQUEST, "Only failed runs can be retried").into_response();
+    }
+    let _ = sqlx::query("UPDATE report_runs SET status = 'queued', error = NULL WHERE id = $1")
+        .bind(id).execute(&db).await;
+    let job = vortex_framework::jobs::NewJob::new(
+        vortex_framework::report_jobs::JOB_KIND,
+        serde_json::json!({ "run_id": id }),
+    ).for_db(&db_ctx.db_name).trace("report_run", &id.to_string()).max_attempts(2);
+    if let Err(e) = vortex_framework::jobs::enqueue(&state.db, job).await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Html(format!("Could not re-queue: {}", html_escape(&e)))).into_response();
+    }
+    Redirect::to("/reports/runs").into_response()
+}
+
+/// Human-readable byte size for the runs table.
+fn human_size(bytes: i64) -> String {
+    let b = bytes as f64;
+    if b >= 1_048_576.0 { format!("({:.1} MB)", b / 1_048_576.0) }
+    else if b >= 1024.0 { format!("({:.0} KB)", b / 1024.0) }
+    else { format!("({bytes} B)") }
+}
+
+/// First `n` characters, with an ellipsis when cut.
+fn truncate_chars(s: &str, n: usize) -> String {
+    if s.chars().count() <= n { s.to_string() }
+    else { format!("{}…", s.chars().take(n).collect::<String>()) }
 }
 
 /// Wrap report HTML in a printable page with toolbar + export links.
@@ -15949,4 +16352,65 @@ async fn api_states(State(state): State<Arc<AppState>>, Db(db): Db, Path(country
     }).collect();
 
     axum::Json(data).into_response()
+}
+
+#[cfg(test)]
+mod tenant_host_tests {
+    use super::*;
+
+    fn hdrs(host: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(header::HOST, host.parse().unwrap());
+        h
+    }
+
+    fn dbs(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn request_host_strips_port_and_lowercases() {
+        assert_eq!(request_host(&hdrs("Gaia.Vortex.Com:443")), Some("gaia.vortex.com".into()));
+        assert_eq!(request_host(&hdrs("localhost:3000")), Some("localhost".into()));
+        assert_eq!(request_host(&hdrs("[::1]:3000")), Some("::1".into()));
+        assert_eq!(request_host(&HeaderMap::new()), None);
+    }
+
+    #[test]
+    fn local_hosts_detected() {
+        assert!(is_local_host("localhost"));
+        assert!(is_local_host("127.0.0.1"));
+        assert!(is_local_host("::1"));
+        assert!(is_local_host("gaia.localhost"));
+        assert!(!is_local_host("gaia.vortex.com"));
+        assert!(!is_local_host("192.168.1.5"));
+    }
+
+    #[test]
+    fn subdomain_filter_matches_tenant() {
+        let all = dbs(&["gaia", "remicle", "vortex"]);
+        assert_eq!(host_filtered_databases("^%h$", "gaia.vortex.com", &all), dbs(&["gaia"]));
+        assert_eq!(host_filtered_databases("^%h$", "remicle.vortex.com", &all), dbs(&["remicle"]));
+        // Unknown subdomain and bare IPs match nothing
+        assert!(host_filtered_databases("^%h$", "nope.vortex.com", &all).is_empty());
+        assert!(host_filtered_databases("^%h$", "192.168.1.5", &all).is_empty());
+    }
+
+    #[test]
+    fn prefix_filter_supports_db_name_prefix() {
+        let all = dbs(&["vortex_gaia", "vortex_remicle"]);
+        assert_eq!(
+            host_filtered_databases("^vortex_%h$", "gaia.vortex.com", &all),
+            dbs(&["vortex_gaia"])
+        );
+    }
+
+    #[test]
+    fn hostile_host_values_cannot_widen_the_regex() {
+        let all = dbs(&["gaia", "remicle"]);
+        // A crafted Host whose first label is a regex wildcard must not
+        // match every database once %h is escaped.
+        assert!(host_filtered_databases("^%h$", ".*.vortex.com", &all).is_empty());
+        assert!(host_filtered_databases("^%h$", "gaia|remicle.vortex.com", &all).is_empty());
+    }
 }

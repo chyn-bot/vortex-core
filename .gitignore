@@ -1,7 +1,7 @@
 # Rust
 /target/
 **/*.rs.bk
-Cargo.lock
+# Cargo.lock is COMMITTED (binary project): reproducible builds + supply-chain pinning
 
 # IDE
 .idea/

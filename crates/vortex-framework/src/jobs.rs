@@ -318,8 +318,10 @@ async fn run_one(
 
 // ─── Core handlers ───────────────────────────────────────────────────────
 
-/// Register the built-in handlers (currently: `mail.send`). Call at startup.
+/// Register the built-in handlers (`mail.send`, `report.render`).
+/// Call at startup.
 pub fn register_core_handlers(reg: &mut JobRegistry) {
+    crate::report_jobs::register(reg);
     reg.register("mail.send", |ctx| async move {
         let p = &ctx.payload;
         let to = p.get("to").and_then(|v| v.as_str()).unwrap_or_default().to_string();

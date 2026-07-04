@@ -131,15 +131,20 @@ pub fn decrypt_str(blob: &[u8], key: &[u8]) -> Result<String, CryptoError> {
     String::from_utf8(bytes).map_err(|_| CryptoError::Decrypt)
 }
 
+/// Raw HMAC-SHA256 of `message` under `key`. Chainable — AWS SigV4-style
+/// derived-key schemes feed one tag in as the next key.
+pub fn hmac_sha256(key: &[u8], message: &[u8]) -> Vec<u8> {
+    use ring::hmac;
+    let k = hmac::Key::new(hmac::HMAC_SHA256, key);
+    hmac::sign(&k, message).as_ref().to_vec()
+}
+
 /// HMAC-SHA256 of `message` under `key`, hex-encoded. Used to sign outbound
 /// webhook payloads so receivers can verify authenticity and integrity
 /// (`X-Vortex-Signature: sha256=<hex>`). Not reversible — a keyed digest, not
 /// encryption.
 pub fn hmac_sha256_hex(key: &[u8], message: &[u8]) -> String {
-    use ring::hmac;
-    let k = hmac::Key::new(hmac::HMAC_SHA256, key);
-    let tag = hmac::sign(&k, message);
-    hex::encode(tag.as_ref())
+    hex::encode(hmac_sha256(key, message))
 }
 
 #[cfg(test)]
