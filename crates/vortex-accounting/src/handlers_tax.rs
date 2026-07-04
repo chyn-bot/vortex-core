@@ -29,6 +29,8 @@ pub fn tax_routes() -> Router<Arc<AppState>> {
             "/accounting/tax-profiles/by-contact/{contact_id}/search-tin",
             post(search_tin_inline),
         )
+        .route("/accounting/partner-banks/{contact_id}/add", post(add_partner_bank))
+        .route("/accounting/partner-banks/{bank_id}/delete", post(delete_partner_bank))
         .route("/accounting/tax-profiles/{id}", get(edit_tax_profile))
         .route("/accounting/tax-profiles/{id}", post(save_tax_profile))
         .route("/accounting/tax-profiles/{id}/search-tin", post(search_tin_action))
@@ -864,6 +866,104 @@ async fn search_tin_inline(
         ))
         .into_response(),
     }
+}
+
+/// Add a bank account from the contact page's Accounting panel. The
+/// button submits the whole record-form, so the accounting/tax fields
+/// are saved too before adding the bank row — nothing typed is lost.
+async fn add_partner_bank(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(contact_id): Path<Uuid>,
+    Form(pairs): Form<Vec<(String, String)>>,
+) -> Response {
+    if pairs.iter().any(|(k, _)| k == "__acc_tax_panel") {
+        if let Err(e) = upsert_profile_fields(&db, contact_id, &pairs).await {
+            error!("profile save during bank add failed: {e}");
+        }
+    }
+    let get = |k: &str| {
+        pairs
+            .iter()
+            .rev()
+            .find(|(pk, _)| pk == k)
+            .map(|(_, v)| v.trim())
+            .filter(|v| !v.is_empty())
+    };
+    let (Some(bank_name), Some(account_number)) = (get("bank_name"), get("bank_account_number"))
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Bank name and account number are required",
+        )
+            .into_response();
+    };
+    if let Err(e) = vortex_plugin_sdk::sqlx::query(
+        "INSERT INTO acc_partner_bank \
+            (contact_id, bank_name, account_number, account_holder, swift_code, created_by) \
+         VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(contact_id)
+    .bind(bank_name)
+    .bind(account_number)
+    .bind(get("bank_account_holder"))
+    .bind(get("bank_swift"))
+    .bind(user.id)
+    .execute(&db)
+    .await
+    {
+        error!("partner bank insert failed: {e}");
+        return (StatusCode::INTERNAL_SERVER_ERROR, "Save failed").into_response();
+    }
+    // Contact history: show what was added.
+    let entry = AuditEntry::new(AuditAction::RecordUpdated, AuditSeverity::Info)
+        .with_user(UserId(user.id))
+        .with_username(&user.username)
+        .with_database(&db_ctx.db_name)
+        .with_resource("contact", contact_id.to_string())
+        .with_details(vortex_plugin_sdk::serde_json::json!({ "changes": [{
+            "field": "Bank Account",
+            "from": "",
+            "to": format!("{bank_name} {account_number}"),
+        }]}));
+    let _ = state.audit.log(entry).await;
+    Redirect::to(&format!("/contacts/{contact_id}")).into_response()
+}
+
+async fn delete_partner_bank(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(bank_id): Path<Uuid>,
+) -> Response {
+    let row = vortex_plugin_sdk::sqlx::query(
+        "DELETE FROM acc_partner_bank WHERE id = $1 \
+         RETURNING contact_id, bank_name, account_number",
+    )
+    .bind(bank_id)
+    .fetch_optional(&db)
+    .await
+    .ok()
+    .flatten();
+    let Some(row) = row else {
+        return (StatusCode::NOT_FOUND, "Bank account not found").into_response();
+    };
+    let contact_id: Uuid = row.get("contact_id");
+    let entry = AuditEntry::new(AuditAction::RecordUpdated, AuditSeverity::Info)
+        .with_user(UserId(user.id))
+        .with_username(&user.username)
+        .with_database(&db_ctx.db_name)
+        .with_resource("contact", contact_id.to_string())
+        .with_details(vortex_plugin_sdk::serde_json::json!({ "changes": [{
+            "field": "Bank Account",
+            "from": format!("{} {}", row.get::<String, _>("bank_name"), row.get::<String, _>("account_number")),
+            "to": "",
+        }]}));
+    let _ = state.audit.log(entry).await;
+    Redirect::to(&format!("/contacts/{contact_id}")).into_response()
 }
 
 // ─── Shared ──────────────────────────────────────────────────────────────

@@ -29,6 +29,8 @@ const MIG_009_STATEMENTS_CLOSE: &str =
     include_str!("../migrations/009_statements_close/postgres.sql");
 const MIG_010_PARTNER_ACCOUNTS: &str =
     include_str!("../migrations/010_partner_accounts/postgres.sql");
+const MIG_011_PARTNER_BANKS: &str =
+    include_str!("../migrations/011_partner_banks/postgres.sql");
 
 pub struct AccountingPlugin;
 
@@ -335,6 +337,12 @@ impl Plugin for AccountingPlugin {
                 down_sql: None,
                 requires_core_migration: Some("119_commerce_primitives"),
             },
+            PluginMigration {
+                name: "011_partner_banks",
+                up_sql: MIG_011_PARTNER_BANKS,
+                down_sql: None,
+                requires_core_migration: Some("119_commerce_primitives"),
+            },
         ]
     }
 
@@ -395,8 +403,7 @@ impl Plugin for AccountingPlugin {
                 let esc = vortex_plugin_sdk::framework::html_escape;
                 let row = vortex_plugin_sdk::sqlx::query(
                     "SELECT tin, id_type, id_value, sst_registration, msic_code, \
-                            einvoice_email, einvoice_optout, \
-                            receivable_account_id, payable_account_id \
+                            einvoice_email, einvoice_optout \
                      FROM acc_partner_tax_profile WHERE contact_id = $1",
                 )
                 .bind(contact_id)
@@ -405,59 +412,6 @@ impl Plugin for AccountingPlugin {
                 .map_err(|e| {
                     vortex_plugin_sdk::common::VortexError::QueryExecution(e.to_string())
                 })?;
-                // Control-account pickers: reconcilable AR/AP accounts.
-                let account_select = |name: &str,
-                                      label: &str,
-                                      account_type: &str,
-                                      selected: Option<vortex_plugin_sdk::uuid::Uuid>,
-                                      accounts: &[(vortex_plugin_sdk::uuid::Uuid, String, String)]| {
-                    let mut opts =
-                        String::from("<option value=\"\">Company default</option>");
-                    for (id, code, aname) in accounts {
-                        let sel = if selected == Some(*id) { " selected" } else { "" };
-                        opts.push_str(&format!(
-                            "<option value=\"{id}\"{sel}>{} {}</option>",
-                            esc(code),
-                            esc(aname),
-                        ));
-                    }
-                    let _ = account_type;
-                    format!(
-                        "<label class=\"form-control\"><span class=\"label-text text-xs mb-1\">{}</span>\
-                         <select name=\"{name}\" form=\"record-form\" class=\"select select-bordered select-sm\">{opts}</select></label>",
-                        esc(label),
-                    )
-                };
-                let load_accounts = |t: &'static str| {
-                    let db = db.clone();
-                    async move {
-                        vortex_plugin_sdk::sqlx::query(
-                            "SELECT id, code, name FROM acc_account \
-                             WHERE active AND reconcile AND account_type = $1 ORDER BY code",
-                        )
-                        .bind(t)
-                        .fetch_all(&db)
-                        .await
-                        .unwrap_or_default()
-                        .iter()
-                        .map(|r| {
-                            (
-                                r.get::<vortex_plugin_sdk::uuid::Uuid, _>("id"),
-                                r.get::<String, _>("code"),
-                                r.get::<String, _>("name"),
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                    }
-                };
-                let ar_accounts = load_accounts("asset_receivable").await;
-                let ap_accounts = load_accounts("liability_payable").await;
-                let ar_selected = row
-                    .as_ref()
-                    .and_then(|r| r.get::<Option<vortex_plugin_sdk::uuid::Uuid>, _>("receivable_account_id"));
-                let ap_selected = row
-                    .as_ref()
-                    .and_then(|r| r.get::<Option<vortex_plugin_sdk::uuid::Uuid>, _>("payable_account_id"));
                 // Inline editable — saving stays on the contact page.
                 let val = |k: &str| -> String {
                     row.as_ref()
@@ -496,7 +450,6 @@ impl Plugin for AccountingPlugin {
 <option value="ARMY"{sel_army}>Army ID</option>
 </select></label>
 {id_value}{sst}{msic}{email}
-{ar_select}{ap_select}
 <label class="label cursor-pointer justify-start gap-2 mt-5">
 <input type="checkbox" name="einvoice_optout" form="record-form" class="checkbox checkbox-sm"{optout_checked}/>
 <span class="label-text text-xs">Consolidated e-invoice only</span></label>
@@ -515,20 +468,6 @@ impl Plugin for AccountingPlugin {
                     sel_pass = sel("PASSPORT"),
                     sel_army = sel("ARMY"),
                     optout_checked = if optout { " checked" } else { "" },
-                    ar_select = account_select(
-                        "receivable_account_id",
-                        "Receivable Account (control)",
-                        "asset_receivable",
-                        ar_selected,
-                        &ar_accounts,
-                    ),
-                    ap_select = account_select(
-                        "payable_account_id",
-                        "Payable Account (control)",
-                        "liability_payable",
-                        ap_selected,
-                        &ap_accounts,
-                    ),
                 ))
             },
         )
@@ -623,7 +562,139 @@ impl Plugin for AccountingPlugin {
                 }
             }
             Ok(())
-        })]
+        }),
+        RecordPanel::new(
+            RecordPanelDef {
+                model: "contacts",
+                title: "Accounting",
+                priority: 60,
+            },
+            |_state, db, contact_id| async move {
+                use vortex_plugin_sdk::sqlx::Row;
+                let esc = vortex_plugin_sdk::framework::html_escape;
+                // Control-account overrides (saved by the single Save
+                // via the tax panel's hook — same record-form).
+                let profile = vortex_plugin_sdk::sqlx::query(
+                    "SELECT receivable_account_id, payable_account_id \
+                     FROM acc_partner_tax_profile WHERE contact_id = $1",
+                )
+                .bind(contact_id)
+                .fetch_optional(&db)
+                .await
+                .map_err(|e| {
+                    vortex_plugin_sdk::common::VortexError::QueryExecution(e.to_string())
+                })?;
+                let selected = |col: &str| {
+                    profile
+                        .as_ref()
+                        .and_then(|r| r.get::<Option<vortex_plugin_sdk::uuid::Uuid>, _>(col))
+                };
+                let load_accounts = |t: &'static str| {
+                    let db = db.clone();
+                    async move {
+                        vortex_plugin_sdk::sqlx::query(
+                            "SELECT id, code, name FROM acc_account \
+                             WHERE active AND reconcile AND account_type = $1 ORDER BY code",
+                        )
+                        .bind(t)
+                        .fetch_all(&db)
+                        .await
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|r| {
+                            (
+                                r.get::<vortex_plugin_sdk::uuid::Uuid, _>("id"),
+                                r.get::<String, _>("code"),
+                                r.get::<String, _>("name"),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                    }
+                };
+                let account_select =
+                    |name: &str,
+                     label: &str,
+                     sel: Option<vortex_plugin_sdk::uuid::Uuid>,
+                     accounts: &[(vortex_plugin_sdk::uuid::Uuid, String, String)]| {
+                        let mut opts = String::from("<option value=\"\">Company default</option>");
+                        for (id, code, aname) in accounts {
+                            let s = if sel == Some(*id) { " selected" } else { "" };
+                            opts.push_str(&format!(
+                                "<option value=\"{id}\"{s}>{} {}</option>",
+                                esc(code),
+                                esc(aname),
+                            ));
+                        }
+                        format!(
+                            "<label class=\"form-control\"><span class=\"label-text text-xs mb-1\">{}</span>\
+                             <select name=\"{name}\" form=\"record-form\" class=\"select select-bordered select-sm\">{opts}</select></label>",
+                            esc(label),
+                        )
+                    };
+                let ar = account_select(
+                    "receivable_account_id",
+                    "Receivable Account (control)",
+                    selected("receivable_account_id"),
+                    &load_accounts("asset_receivable").await,
+                );
+                let ap = account_select(
+                    "payable_account_id",
+                    "Payable Account (control)",
+                    selected("payable_account_id"),
+                    &load_accounts("liability_payable").await,
+                );
+
+                // Bank accounts list + add row.
+                let banks = vortex_plugin_sdk::sqlx::query(
+                    "SELECT id, bank_name, account_number, account_holder, swift_code \
+                     FROM acc_partner_bank WHERE contact_id = $1 ORDER BY created_at",
+                )
+                .bind(contact_id)
+                .fetch_all(&db)
+                .await
+                .unwrap_or_default();
+                let mut bank_rows = String::new();
+                for b in &banks {
+                    let bid: vortex_plugin_sdk::uuid::Uuid = b.get("id");
+                    bank_rows.push_str(&format!(
+                        "<tr><td>{}</td><td class=\"font-mono\">{}</td><td>{}</td><td>{}</td>\
+                         <td><button form=\"record-form\" formmethod=\"post\" \
+                         formaction=\"/accounting/partner-banks/{bid}/delete\" \
+                         class=\"btn btn-xs btn-ghost text-error\" \
+                         onclick=\"return confirm('Remove this bank account?')\">✕</button></td></tr>",
+                        esc(&b.get::<String, _>("bank_name")),
+                        esc(&b.get::<String, _>("account_number")),
+                        esc(b.get::<Option<String>, _>("account_holder").as_deref().unwrap_or("—")),
+                        esc(b.get::<Option<String>, _>("swift_code").as_deref().unwrap_or("—")),
+                    ));
+                }
+                let bank_table = if banks.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "<table class=\"table table-sm mt-3\"><thead><tr><th>Bank</th>\
+                         <th>Account No.</th><th>Holder</th><th>SWIFT</th><th></th></tr></thead>\
+                         <tbody>{bank_rows}</tbody></table>"
+                    )
+                };
+                Ok(format!(
+                    r#"<div class="grid grid-cols-2 md:grid-cols-4 gap-3">{ar}{ap}</div>
+<div class="divider text-xs opacity-60 my-2">Bank Accounts</div>
+{bank_table}
+<div class="grid grid-cols-2 md:grid-cols-5 gap-3 mt-2 items-end">
+<label class="form-control"><span class="label-text text-xs mb-1">Bank</span>
+<input name="bank_name" form="record-form" placeholder="Maybank" class="input input-bordered input-sm"/></label>
+<label class="form-control"><span class="label-text text-xs mb-1">Account No.</span>
+<input name="bank_account_number" form="record-form" placeholder="512345678901" class="input input-bordered input-sm"/></label>
+<label class="form-control"><span class="label-text text-xs mb-1">Holder</span>
+<input name="bank_account_holder" form="record-form" class="input input-bordered input-sm"/></label>
+<label class="form-control"><span class="label-text text-xs mb-1">SWIFT</span>
+<input name="bank_swift" form="record-form" placeholder="MBBEMYKL" class="input input-bordered input-sm"/></label>
+<button form="record-form" formmethod="post" formaction="/accounting/partner-banks/{contact_id}/add" class="btn btn-sm btn-outline" title="Also saves the accounting fields above">Add Bank Account</button>
+</div>"#,
+                ))
+            },
+        )]
     }
 
     fn translations(&self) -> Vec<Translation> {
