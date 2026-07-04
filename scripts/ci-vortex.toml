@@ -1,0 +1,16 @@
+# CI/smoke configuration — single-database mode, local file storage.
+[server]
+host = "127.0.0.1"
+port = 3003
+
+[database]
+min_connections = 2
+max_connections = 90
+
+[files]
+backend = "local"
+[files.local]
+path = "uploads"
+
+[database_manager]
+enabled = false

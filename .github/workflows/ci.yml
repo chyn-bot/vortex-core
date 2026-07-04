@@ -1,12 +1,16 @@
-# Vortex Core CI — build, test, and supply-chain audit on every push.
+# Vortex Core CI — build, test, integration smoke, and supply-chain
+# audit on every push.
 #
-# Deliberately starts with a guaranteed-green baseline: build + tests +
-# cargo-audit. Tighten in this order once the existing warnings are
-# cleaned up:
+# The smoke job provisions a fresh tenant against a real Postgres,
+# boots the server, crawls every reachable page (nothing may 5xx) and
+# exercises the attachment/chatter/report lifecycles end to end —
+# scripts/smoke.sh. It exists because unit tests cannot catch
+# schema/handler drift.
+#
+# Tighten further once the existing warnings are cleaned up:
 #   1. add `cargo fmt --all --check`
 #   2. add `cargo clippy --workspace --all-targets -- -D warnings`
-#   3. add a postgres service container and run the DB-gated
-#      (#[ignore]) integration tests
+#   3. run the DB-gated (#[ignore]) unit tests against the smoke DB
 name: CI
 
 on:
@@ -29,6 +33,50 @@ jobs:
         run: cargo build --workspace --locked
       - name: Run tests
         run: cargo test --workspace --locked
+
+  smoke:
+    name: Integration smoke
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: vortex
+          POSTGRES_PASSWORD: vortex
+          POSTGRES_DB: vortex_smoke
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U vortex"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://vortex:vortex@localhost:5432/vortex_smoke
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install argon2 + psql
+        run: sudo apt-get update -q && sudo apt-get install -y -q argon2 postgresql-client
+      - name: Build server
+        run: cargo build -p vortex-cli --locked
+      - name: Provision fresh tenant
+        run: ./target/debug/vortex db migrate
+      - name: Start server
+        run: |
+          cp scripts/ci-vortex.toml vortex.toml
+          VORTEX_SECRET_KEY=$(openssl rand -base64 32) \
+            nohup ./target/debug/vortex server --port 3003 > smoke-server.log 2>&1 &
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:3003/health >/dev/null && exit 0
+            sleep 1
+          done
+          echo "server did not become healthy"; tail -50 smoke-server.log; exit 1
+      - name: Run smoke suite
+        run: SMOKE_BASE_URL=http://127.0.0.1:3003 bash scripts/smoke.sh
+      - name: Server log (on failure)
+        if: failure()
+        run: tail -100 smoke-server.log
 
   audit:
     name: Supply-chain audit
