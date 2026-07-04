@@ -187,8 +187,11 @@ async fn new_contact_form(
         &state.plugin_registry, &user.roles,
     );
 
-    // Country dropdown, same source as the edit form. States load on demand
-    // via /api/states/{country_id} once a country is picked.
+    // Country dropdown, same source as the edit form. Malaysia is
+    // preselected (home market) with its states preloaded, so the
+    // natural entry order street → postcode → city → state works
+    // without first scrolling to the country; picking another country
+    // reloads states via /api/states/{country_id}.
     let countries_rows = vortex_plugin_sdk::sqlx::query(
         "SELECT id, code, alpha3, name FROM countries WHERE active = true ORDER BY name",
     )
@@ -196,17 +199,42 @@ async fn new_contact_form(
     .await
     .unwrap_or_default();
 
+    let default_country: Option<Uuid> = countries_rows
+        .iter()
+        .find(|cr| cr.try_get::<String, _>("alpha3").ok().as_deref() == Some("MYS"))
+        .map(|cr| cr.get("id"));
     let mut country_options = String::from(r#"<option value="">-- Select Country --</option>"#);
     for cr in &countries_rows {
         let cid: Uuid = cr.get("id");
         let cname: String = cr.get("name");
         let ccode: Option<String> = cr.try_get("alpha3").ok();
+        let sel = if default_country == Some(cid) { " selected" } else { "" };
         country_options.push_str(&format!(
-            r#"<option value="{id}">{name} ({code})</option>"#,
+            r#"<option value="{id}"{sel}>{name} ({code})</option>"#,
             id = cid,
+            sel = sel,
             name = vortex_plugin_sdk::framework::html_escape(&cname),
             code = vortex_plugin_sdk::framework::html_escape(ccode.as_deref().unwrap_or("")),
         ));
+    }
+    // Preload the default country's states server-side.
+    let mut state_options = String::from(r#"<option value="">-- Select State --</option>"#);
+    if let Some(country) = default_country {
+        let state_rows = vortex_plugin_sdk::sqlx::query(
+            "SELECT id, code, name FROM states WHERE country_id = $1 AND active = true ORDER BY name",
+        )
+        .bind(country)
+        .fetch_all(&db)
+        .await
+        .unwrap_or_default();
+        for sr in &state_rows {
+            state_options.push_str(&format!(
+                r#"<option value="{}">{} ({})</option>"#,
+                sr.get::<Uuid, _>("id"),
+                vortex_plugin_sdk::framework::html_escape(&sr.get::<String, _>("name")),
+                vortex_plugin_sdk::framework::html_escape(&sr.get::<String, _>("code")),
+            ));
+        }
     }
 
     let content = format!(
@@ -263,15 +291,15 @@ async fn new_contact_form(
 <h2 class="card-title text-lg mb-4">Contact Info</h2>
 <div class="form-control mb-3">
 <label class="label"><span class="label-text">Email</span></label>
-<input name="email" type="email" class="input input-bordered input-sm"/>
+<input name="email" type="email" autocomplete="email" class="input input-bordered input-sm"/>
 </div>
 <div class="form-control mb-3">
 <label class="label"><span class="label-text">Phone</span></label>
-<input name="phone" class="input input-bordered input-sm"/>
+<input name="phone" type="tel" inputmode="tel" class="input input-bordered input-sm"/>
 </div>
 <div class="form-control mb-3">
 <label class="label"><span class="label-text">Mobile</span></label>
-<input name="mobile" class="input input-bordered input-sm"/>
+<input name="mobile" type="tel" inputmode="tel" class="input input-bordered input-sm"/>
 </div>
 </div>
 </div>
@@ -281,9 +309,25 @@ async fn new_contact_form(
 <h2 class="card-title text-lg mb-4">Address</h2>
 <div class="form-control mb-3">
 <label class="label"><span class="label-text">Street</span></label>
-<input name="street" class="input input-bordered input-sm" placeholder="Address line 1"/>
-<input name="street2" class="input input-bordered input-sm mt-1" placeholder="Address line 2"/>
-<input name="street3" class="input input-bordered input-sm mt-1" placeholder="Address line 3"/>
+<input name="street" autocomplete="address-line1" class="input input-bordered input-sm" placeholder="Address line 1"/>
+<input name="street2" autocomplete="address-line2" class="input input-bordered input-sm mt-1" placeholder="Address line 2"/>
+<input name="street3" autocomplete="address-line3" class="input input-bordered input-sm mt-1" placeholder="Address line 3"/>
+</div>
+<div class="grid grid-cols-3 gap-3">
+<div class="form-control mb-3">
+<label class="label"><span class="label-text">Postcode</span></label>
+<input name="zip" autocomplete="postal-code" inputmode="numeric" class="input input-bordered input-sm" placeholder="50450"/>
+</div>
+<div class="form-control mb-3 col-span-2">
+<label class="label"><span class="label-text">City</span></label>
+<input name="city" autocomplete="address-level2" class="input input-bordered input-sm"/>
+</div>
+</div>
+<div class="form-control mb-3">
+<label class="label"><span class="label-text">State / Province</span></label>
+<select name="state_id" id="state-select" autocomplete="address-level1" class="select select-bordered select-sm">
+{state_options}
+</select>
 </div>
 <div class="form-control mb-3">
 <label class="label"><span class="label-text">Country</span></label>
@@ -291,22 +335,6 @@ async fn new_contact_form(
   onchange="loadStates(this.value)">
 {country_options}
 </select>
-</div>
-<div class="form-control mb-3">
-<label class="label"><span class="label-text">State / Province</span></label>
-<select name="state_id" id="state-select" class="select select-bordered select-sm">
-<option value="">-- Select State --</option>
-</select>
-</div>
-<div class="grid grid-cols-2 gap-3">
-<div class="form-control mb-3">
-<label class="label"><span class="label-text">City</span></label>
-<input name="city" class="input input-bordered input-sm"/>
-</div>
-<div class="form-control mb-3">
-<label class="label"><span class="label-text">ZIP</span></label>
-<input name="zip" class="input input-bordered input-sm"/>
-</div>
 </div>
 <script>
 async function loadStates(countryId) {{
@@ -709,15 +737,15 @@ async fn edit_contact(
 <h2 class="card-title text-lg mb-4">Contact Info</h2>
 <div class="form-control mb-3">
 <label class="label"><span class="label-text">Email</span></label>
-<input name="email" type="email" class="input input-bordered input-sm" value="{email_val}"/>
+<input name="email" type="email" autocomplete="email" class="input input-bordered input-sm" value="{email_val}"/>
 </div>
 <div class="form-control mb-3">
 <label class="label"><span class="label-text">Phone</span></label>
-<input name="phone" class="input input-bordered input-sm" value="{phone_val}"/>
+<input name="phone" type="tel" inputmode="tel" class="input input-bordered input-sm" value="{phone_val}"/>
 </div>
 <div class="form-control mb-3">
 <label class="label"><span class="label-text">Mobile</span></label>
-<input name="mobile" class="input input-bordered input-sm" value="{mobile_val}"/>
+<input name="mobile" type="tel" inputmode="tel" class="input input-bordered input-sm" value="{mobile_val}"/>
 </div>
 </div>
 </div>
@@ -727,9 +755,25 @@ async fn edit_contact(
 <h2 class="card-title text-lg mb-4">Address</h2>
 <div class="form-control mb-3">
 <label class="label"><span class="label-text">Street</span></label>
-<input name="street" class="input input-bordered input-sm" value="{street_val}" placeholder="Address line 1"/>
-<input name="street2" class="input input-bordered input-sm mt-1" value="{street2_val}" placeholder="Address line 2"/>
-<input name="street3" class="input input-bordered input-sm mt-1" value="{street3_val}" placeholder="Address line 3"/>
+<input name="street" autocomplete="address-line1" class="input input-bordered input-sm" value="{street_val}" placeholder="Address line 1"/>
+<input name="street2" autocomplete="address-line2" class="input input-bordered input-sm mt-1" value="{street2_val}" placeholder="Address line 2"/>
+<input name="street3" autocomplete="address-line3" class="input input-bordered input-sm mt-1" value="{street3_val}" placeholder="Address line 3"/>
+</div>
+<div class="grid grid-cols-3 gap-3">
+<div class="form-control mb-3">
+<label class="label"><span class="label-text">Postcode</span></label>
+<input name="zip" autocomplete="postal-code" inputmode="numeric" class="input input-bordered input-sm" value="{zip_val}" placeholder="50450"/>
+</div>
+<div class="form-control mb-3 col-span-2">
+<label class="label"><span class="label-text">City</span></label>
+<input name="city" autocomplete="address-level2" class="input input-bordered input-sm" value="{city_val}"/>
+</div>
+</div>
+<div class="form-control mb-3">
+<label class="label"><span class="label-text">State / Province</span></label>
+<select name="state_id" id="state-select" autocomplete="address-level1" class="select select-bordered select-sm">
+{state_options}
+</select>
 </div>
 <div class="form-control mb-3">
 <label class="label"><span class="label-text">Country</span></label>
@@ -737,22 +781,6 @@ async fn edit_contact(
   onchange="loadStates(this.value)">
 {country_options}
 </select>
-</div>
-<div class="form-control mb-3">
-<label class="label"><span class="label-text">State / Province</span></label>
-<select name="state_id" id="state-select" class="select select-bordered select-sm">
-{state_options}
-</select>
-</div>
-<div class="grid grid-cols-2 gap-3">
-<div class="form-control mb-3">
-<label class="label"><span class="label-text">City</span></label>
-<input name="city" class="input input-bordered input-sm" value="{city_val}"/>
-</div>
-<div class="form-control mb-3">
-<label class="label"><span class="label-text">ZIP</span></label>
-<input name="zip" class="input input-bordered input-sm" value="{zip_val}"/>
-</div>
 </div>
 <script>
 async function loadStates(countryId) {{
