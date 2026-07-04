@@ -396,47 +396,58 @@ impl Plugin for AccountingPlugin {
                 .map_err(|e| {
                     vortex_plugin_sdk::common::VortexError::QueryExecution(e.to_string())
                 })?;
-                let field = |label: &str, value: Option<String>| {
+                // Inline editable — saving stays on the contact page.
+                let val = |k: &str| -> String {
+                    row.as_ref()
+                        .and_then(|r| r.get::<Option<String>, _>(k))
+                        .map(|v| esc(&v))
+                        .unwrap_or_default()
+                };
+                let id_type = row
+                    .as_ref()
+                    .and_then(|r| r.get::<Option<String>, _>("id_type"))
+                    .unwrap_or_default();
+                let optout = row.as_ref().map(|r| r.get::<bool, _>("einvoice_optout")).unwrap_or(false);
+                let sel = |v: &str| if id_type == v { " selected" } else { "" };
+                let text_input = |name: &str, label: &str, value: String, placeholder: &str| {
                     format!(
-                        "<div><div class=\"text-base-content/50 text-xs\">{}</div>\
-                         <div class=\"font-medium\">{}</div></div>",
+                        "<label class=\"form-control\"><span class=\"label-text text-xs mb-1\">{}</span>\
+                         <input name=\"{name}\" value=\"{value}\" placeholder=\"{placeholder}\" \
+                         class=\"input input-bordered input-sm\"/></label>",
                         esc(label),
-                        esc(value.filter(|v| !v.is_empty()).as_deref().unwrap_or("—")),
                     )
                 };
-                let body = match &row {
-                    Some(r) => {
-                        let id_label = format!(
-                            "{} No.",
-                            r.get::<Option<String>, _>("id_type").as_deref().unwrap_or("BRN/NRIC")
-                        );
-                        format!(
-                            "<div class=\"grid grid-cols-2 md:grid-cols-4 gap-3 text-sm\">{}{}{}{}{}{}</div>",
-                            field("TIN", r.get("tin")),
-                            field(&id_label, r.get("id_value")),
-                            field("SST Registration", r.get("sst_registration")),
-                            field("MSIC Code", r.get("msic_code")),
-                            field("e-Invoice Email", r.get("einvoice_email")),
-                            field(
-                                "e-Invoice",
-                                Some(
-                                    if r.get::<bool, _>("einvoice_optout") {
-                                        "consolidated only".to_string()
-                                    } else {
-                                        "individual".to_string()
-                                    },
-                                ),
-                            ),
-                        )
-                    }
-                    None => "<p class=\"text-sm opacity-60\">No tax profile yet — required for \
-                             MyInvois e-invoicing and SST reporting.</p>"
-                        .to_string(),
-                };
                 Ok(format!(
-                    "{body}<div class=\"mt-3\"><a href=\"/accounting/tax-profiles/by-contact/{contact_id}\" \
-                     class=\"btn btn-sm btn-outline\">{} Tax Profile</a></div>",
-                    if row.is_some() { "Edit" } else { "Create" },
+                    r#"<form method="post" action="/accounting/tax-profiles/by-contact/{contact_id}/save">
+<div class="grid grid-cols-2 md:grid-cols-4 gap-3">
+{tin}
+<label class="form-control"><span class="label-text text-xs mb-1">ID Type</span>
+<select name="id_type" class="select select-bordered select-sm">
+<option value="BRN"{sel_brn}>BRN — Business Reg.</option>
+<option value="NRIC"{sel_nric}>NRIC</option>
+<option value="PASSPORT"{sel_pass}>Passport</option>
+<option value="ARMY"{sel_army}>Army ID</option>
+</select></label>
+{id_value}{sst}{msic}{email}
+<label class="label cursor-pointer justify-start gap-2 mt-5">
+<input type="checkbox" name="einvoice_optout" class="checkbox checkbox-sm"{optout_checked}/>
+<span class="label-text text-xs">Consolidated e-invoice only</span></label>
+</div>
+<div class="flex gap-2 mt-3">
+<button class="btn btn-sm btn-primary">Save</button>
+<button formaction="/accounting/tax-profiles/by-contact/{contact_id}/search-tin" class="btn btn-sm btn-outline" title="Look up the TIN at LHDN using the ID type + value (saves the form first)">Search TIN (LHDN)</button>
+<a href="/accounting/tax-profiles/by-contact/{contact_id}" class="btn btn-sm btn-ghost">Full profile &amp; TIN validation</a>
+</div></form>"#,
+                    tin = text_input("tin", "TIN", val("tin"), "C1234567890 / IG12345678901"),
+                    id_value = text_input("id_value", "BRN / NRIC No.", val("id_value"), "201901012345"),
+                    sst = text_input("sst_registration", "SST Registration", val("sst_registration"), ""),
+                    msic = text_input("msic_code", "MSIC Code", val("msic_code"), "62010"),
+                    email = text_input("einvoice_email", "e-Invoice Email", val("einvoice_email"), ""),
+                    sel_brn = sel("BRN"),
+                    sel_nric = sel("NRIC"),
+                    sel_pass = sel("PASSPORT"),
+                    sel_army = sel("ARMY"),
+                    optout_checked = if optout { " checked" } else { "" },
                 ))
             },
         )]

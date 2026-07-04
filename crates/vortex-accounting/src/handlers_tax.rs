@@ -24,6 +24,11 @@ pub fn tax_routes() -> Router<Arc<AppState>> {
         .route("/accounting/settings/{id}", post(save_settings))
         .route("/accounting/tax-profiles", get(list_tax_profiles))
         .route("/accounting/tax-profiles/by-contact/{contact_id}", get(profile_by_contact))
+        .route("/accounting/tax-profiles/by-contact/{contact_id}/save", post(save_profile_inline))
+        .route(
+            "/accounting/tax-profiles/by-contact/{contact_id}/search-tin",
+            post(search_tin_inline),
+        )
         .route("/accounting/tax-profiles/{id}", get(edit_tax_profile))
         .route("/accounting/tax-profiles/{id}", post(save_tax_profile))
         .route("/accounting/tax-profiles/{id}/search-tin", post(search_tin_action))
@@ -709,7 +714,20 @@ async fn save_tax_profile(
     match execute_form_save(&db, &tax_profile_form(), &pairs, Some(id)).await {
         Ok(SaveOutcome::Saved(_)) => {
             audit_setup(&state, &user, &db_ctx, "acc_partner_tax_profile", id).await;
-            Redirect::to("/accounting/tax-profiles").into_response()
+            // Land back on the customer, not on an accounting list —
+            // the profile is an extension of the contact record.
+            let contact: Option<Uuid> = vortex_plugin_sdk::sqlx::query_scalar(
+                "SELECT contact_id FROM acc_partner_tax_profile WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_optional(&db)
+            .await
+            .ok()
+            .flatten();
+            match contact {
+                Some(c) => Redirect::to(&format!("/contacts/{c}")).into_response(),
+                None => Redirect::to("/accounting/tax-profiles").into_response(),
+            }
         }
         Ok(SaveOutcome::Invalid { values, errors }) => {
             let form = render_form(
@@ -723,6 +741,119 @@ async fn save_tax_profile(
             error!("tax profile save failed: {e}");
             (StatusCode::INTERNAL_SERVER_ERROR, "Save failed").into_response()
         }
+    }
+}
+
+/// Upsert the profile row for a contact and write the inline-panel
+/// fields. Returns the profile id.
+async fn upsert_profile_fields(
+    db: &vortex_plugin_sdk::sqlx::PgPool,
+    contact_id: Uuid,
+    pairs: &[(String, String)],
+) -> Result<Uuid, String> {
+    let get = |k: &str| {
+        pairs
+            .iter()
+            .rev()
+            .find(|(pk, _)| pk == k)
+            .map(|(_, v)| v.trim())
+            .filter(|v| !v.is_empty())
+    };
+    let id_type = get("id_type").filter(|t| matches!(*t, "BRN" | "NRIC" | "PASSPORT" | "ARMY"));
+    let optout = pairs.iter().any(|(k, _)| k == "einvoice_optout");
+    // The unique key is (contact_id, company_id) with nullable company,
+    // so ON CONFLICT can't target contact_id — insert-if-missing, then
+    // update (same pattern as profile_by_contact).
+    vortex_plugin_sdk::sqlx::query(
+        "INSERT INTO acc_partner_tax_profile (contact_id) \
+         SELECT $1 WHERE NOT EXISTS \
+            (SELECT 1 FROM acc_partner_tax_profile WHERE contact_id = $1)",
+    )
+    .bind(contact_id)
+    .execute(db)
+    .await
+    .map_err(|e| e.to_string())?;
+    let id: Uuid = vortex_plugin_sdk::sqlx::query_scalar(
+        "UPDATE acc_partner_tax_profile SET \
+            tin = $2, id_type = $3, id_value = $4, sst_registration = $5, \
+            msic_code = $6, einvoice_email = $7, einvoice_optout = $8 \
+         WHERE contact_id = $1 RETURNING id",
+    )
+    .bind(contact_id)
+    .bind(get("tin"))
+    .bind(id_type)
+    .bind(get("id_value"))
+    .bind(get("sst_registration"))
+    .bind(get("msic_code"))
+    .bind(get("einvoice_email"))
+    .bind(optout)
+    .fetch_one(db)
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(id)
+}
+
+/// POST from the inline panel on the contact page: save and stay there.
+async fn save_profile_inline(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(contact_id): Path<Uuid>,
+    Form(pairs): Form<Vec<(String, String)>>,
+) -> Response {
+    match upsert_profile_fields(&db, contact_id, &pairs).await {
+        Ok(id) => {
+            audit_setup(&state, &user, &db_ctx, "acc_partner_tax_profile", id).await;
+            Redirect::to(&format!("/contacts/{contact_id}")).into_response()
+        }
+        Err(e) => {
+            error!("inline tax profile save failed: {e}");
+            (StatusCode::UNPROCESSABLE_ENTITY, "Save failed").into_response()
+        }
+    }
+}
+
+/// Inline "Search TIN": save the form first (the button submits the
+/// same fields), then look up LHDN and store the TIN. Success returns
+/// to the contact; failures land on the full profile page, which
+/// renders the explanation banner.
+async fn search_tin_inline(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(contact_id): Path<Uuid>,
+    Form(pairs): Form<Vec<(String, String)>>,
+) -> Response {
+    let profile = match upsert_profile_fields(&db, contact_id, &pairs).await {
+        Ok(p) => p,
+        Err(e) => {
+            error!("inline tax profile save failed: {e}");
+            return (StatusCode::UNPROCESSABLE_ENTITY, "Save failed").into_response();
+        }
+    };
+    match crate::einvois::flow::search_tin_for_profile(&db, profile).await {
+        Ok(Some(tin)) => {
+            let _ = vortex_plugin_sdk::sqlx::query(
+                "UPDATE acc_partner_tax_profile SET tin = $2 WHERE id = $1",
+            )
+            .bind(profile)
+            .bind(&tin)
+            .execute(&db)
+            .await;
+            audit_setup(&state, &user, &db_ctx, "acc_tin_found", profile).await;
+            Redirect::to(&format!("/contacts/{contact_id}")).into_response()
+        }
+        Ok(None) => Redirect::to(&format!(
+            "/accounting/tax-profiles/{profile}?tin_check=notfound"
+        ))
+        .into_response(),
+        Err(e) => Redirect::to(&format!(
+            "/accounting/tax-profiles/{profile}?tin_error={}",
+            urlencoding_lite(&e)
+        ))
+        .into_response(),
     }
 }
 
