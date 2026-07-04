@@ -455,17 +455,90 @@ impl Plugin for AccountingPlugin {
                 ))
             },
         )
-        .with_save(|_state, db, contact_id, pairs| async move {
+        .with_save(|state, db, contact_id, pairs, ctx| async move {
             // Only act on submissions that actually carried the panel
             // (the hidden __acc_tax_panel marker) — other contact
             // update paths must not blank the tax fields.
             if !pairs.iter().any(|(k, _)| k == "__acc_tax_panel") {
                 return Ok(());
             }
+            use vortex_plugin_sdk::sqlx::Row;
+            // Snapshot → save → diff, so the CONTACT's history shows
+            // exactly which tax fields changed (same entry shape the
+            // field tracker writes).
+            const FIELDS: [(&str, &str); 7] = [
+                ("tin", "TIN"),
+                ("id_type", "ID Type"),
+                ("id_value", "BRN/NRIC No."),
+                ("sst_registration", "SST Registration"),
+                ("msic_code", "MSIC Code"),
+                ("einvoice_email", "e-Invoice Email"),
+                ("einvoice_optout", "Consolidated e-Invoice Only"),
+            ];
+            let snapshot = |row: Option<&vortex_plugin_sdk::sqlx::postgres::PgRow>| {
+                FIELDS
+                    .iter()
+                    .map(|(col, _)| {
+                        let v = match *col {
+                            "einvoice_optout" => row
+                                .map(|r| r.get::<bool, _>("einvoice_optout"))
+                                .unwrap_or(false)
+                                .then_some("Yes".to_string())
+                                .unwrap_or_else(|| "No".to_string()),
+                            _ => row
+                                .and_then(|r| r.get::<Option<String>, _>(*col))
+                                .unwrap_or_default(),
+                        };
+                        v
+                    })
+                    .collect::<Vec<String>>()
+            };
+            let select = "SELECT tin, id_type, id_value, sst_registration, msic_code, \
+                          einvoice_email, einvoice_optout \
+                          FROM acc_partner_tax_profile WHERE contact_id = $1";
+            let before_row = vortex_plugin_sdk::sqlx::query(select)
+                .bind(contact_id)
+                .fetch_optional(&db)
+                .await
+                .map_err(|e| {
+                    vortex_plugin_sdk::common::VortexError::QueryExecution(e.to_string())
+                })?;
+            let before = snapshot(before_row.as_ref());
             crate::handlers_tax::upsert_profile_fields(&db, contact_id, &pairs)
                 .await
-                .map(|_| ())
-                .map_err(vortex_plugin_sdk::common::VortexError::ValidationFailed)
+                .map_err(vortex_plugin_sdk::common::VortexError::ValidationFailed)?;
+            let after_row = vortex_plugin_sdk::sqlx::query(select)
+                .bind(contact_id)
+                .fetch_optional(&db)
+                .await
+                .map_err(|e| {
+                    vortex_plugin_sdk::common::VortexError::QueryExecution(e.to_string())
+                })?;
+            let after = snapshot(after_row.as_ref());
+            let changes: Vec<vortex_plugin_sdk::serde_json::Value> = FIELDS
+                .iter()
+                .zip(before.iter().zip(after.iter()))
+                .filter(|(_, (b, a))| b != a)
+                .map(|((_, label), (b, a))| {
+                    vortex_plugin_sdk::serde_json::json!({
+                        "field": format!("{label} (tax)"),
+                        "from": b,
+                        "to": a,
+                    })
+                })
+                .collect();
+            if !changes.is_empty() {
+                let entry = AuditEntry::new(AuditAction::RecordUpdated, AuditSeverity::Info)
+                    .with_user(UserId(ctx.user_id))
+                    .with_username(&ctx.username)
+                    .with_database(&ctx.db_name)
+                    .with_resource("contact", contact_id.to_string())
+                    .with_details(vortex_plugin_sdk::serde_json::json!({ "changes": changes }));
+                if let Err(e) = state.audit.log(entry).await {
+                    vortex_plugin_sdk::tracing::error!("tax panel audit write failed: {e}");
+                }
+            }
+            Ok(())
         })]
     }
 

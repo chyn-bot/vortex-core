@@ -1049,8 +1049,15 @@ async fn update_contact(
     // hand the submission to contributing plugins' save hooks.
     let pairs: Vec<(String, String)> =
         form.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-    vortex_plugin_sdk::framework::handle_record_panel_saves(&state, &db, "contacts", id, &pairs)
-        .await;
+    let panel_ctx = vortex_plugin_sdk::framework::PanelSaveCtx {
+        user_id: user.id,
+        username: user.username.clone(),
+        db_name: db_ctx.db_name.clone(),
+    };
+    vortex_plugin_sdk::framework::handle_record_panel_saves(
+        &state, &db, "contacts", id, &pairs, &panel_ctx,
+    )
+    .await;
 
     info!(id = %id, name = %name, "contact updated");
     // Stay on the record — one Save now persists contact + panel

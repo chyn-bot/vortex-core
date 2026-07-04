@@ -56,15 +56,25 @@ pub type PanelHandler = Arc<
         + Sync,
 >;
 
+/// Who performed the save and on which tenant — passed through so
+/// panel saves can write attributed, field-level history entries.
+#[derive(Debug, Clone)]
+pub struct PanelSaveCtx {
+    pub user_id: Uuid,
+    pub username: String,
+    pub db_name: String,
+}
+
 /// Boxed async save hook: `(state, tenant db, record id, submitted
-/// form pairs)`. Receives the OWNER form's full submission — pick out
-/// your own fields and ignore the rest.
+/// form pairs, actor context)`. Receives the OWNER form's full
+/// submission — pick out your own fields and ignore the rest.
 pub type PanelSaveHandler = Arc<
     dyn Fn(
             Arc<AppState>,
             PgPool,
             Uuid,
             Vec<(String, String)>,
+            PanelSaveCtx,
         ) -> Pin<Box<dyn Future<Output = VortexResult<()>> + Send>>
         + Send
         + Sync,
@@ -100,11 +110,14 @@ impl RecordPanel {
     /// Save button will persist them through this hook.
     pub fn with_save<F, Fut>(mut self, save: F) -> Self
     where
-        F: Fn(Arc<AppState>, PgPool, Uuid, Vec<(String, String)>) -> Fut + Send + Sync + 'static,
+        F: Fn(Arc<AppState>, PgPool, Uuid, Vec<(String, String)>, PanelSaveCtx) -> Fut
+            + Send
+            + Sync
+            + 'static,
         Fut: Future<Output = VortexResult<()>> + Send + 'static,
     {
-        self.save = Some(Arc::new(move |state, db, id, pairs| {
-            Box::pin(save(state, db, id, pairs))
+        self.save = Some(Arc::new(move |state, db, id, pairs, ctx| {
+            Box::pin(save(state, db, id, pairs, ctx))
         }));
         self
     }
@@ -120,6 +133,7 @@ pub async fn handle_record_panel_saves(
     model: &str,
     record_id: Uuid,
     pairs: &[(String, String)],
+    ctx: &PanelSaveCtx,
 ) {
     let contributed: Vec<Vec<RecordPanel>> = state
         .plugin_registry
@@ -132,8 +146,14 @@ pub async fn handle_record_panel_saves(
                 continue;
             }
             if let Some(save) = &panel.save {
-                if let Err(e) =
-                    save(state.clone(), db.clone(), record_id, pairs.to_vec()).await
+                if let Err(e) = save(
+                    state.clone(),
+                    db.clone(),
+                    record_id,
+                    pairs.to_vec(),
+                    ctx.clone(),
+                )
+                .await
                 {
                     warn!(model, title = panel.def.title, "record panel save failed: {e}");
                 }

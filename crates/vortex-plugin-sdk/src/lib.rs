@@ -96,8 +96,8 @@ pub mod prelude {
 
     // ── Record panels (cross-plugin detail-page contributions) ──
     pub use vortex_framework::{
-        handle_record_panel_saves, render_record_panels, RecordPanel, RecordPanelDef,
-        HOST_FORM_ID,
+        handle_record_panel_saves, render_record_panels, PanelSaveCtx, RecordPanel,
+        RecordPanelDef, HOST_FORM_ID,
     };
 
     // ── Reports ──
