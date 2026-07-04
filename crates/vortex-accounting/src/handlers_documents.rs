@@ -292,6 +292,25 @@ async fn new_document_form(
         })
         .collect();
 
+    let currency_rows = vortex_plugin_sdk::sqlx::query(
+        "SELECT code, name FROM currencies WHERE active ORDER BY (code <> 'MYR'), code",
+    )
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default();
+    let currency_options: String = currency_rows
+        .iter()
+        .map(|r| {
+            let code: String = r.get("code");
+            let name: String = r.get("name");
+            format!(
+                r#"<option value="{code}">{code} — {name}</option>"#,
+                code = vortex_plugin_sdk::framework::html_escape(&code),
+                name = vortex_plugin_sdk::framework::html_escape(&name),
+            )
+        })
+        .collect();
+
     let content = format!(
         r#"<div class="max-w-xl">
 <a href="{family_url}" class="btn btn-ghost btn-sm mb-4">← Back to {family_title}</a>
@@ -316,6 +335,10 @@ async fn new_document_form(
 <input name="due_date" type="date" class="input input-bordered input-sm"/>
 </div>
 </div>
+<div class="form-control mb-3">
+<label class="label"><span class="label-text">Currency</span></label>
+<select name="currency_code" class="select select-bordered select-sm">{currency_options}</select>
+</div>
 <button type="submit" class="btn btn-primary btn-sm">Create Draft</button>
 </div></div>
 </form>
@@ -326,6 +349,7 @@ async fn new_document_form(
         label = doc_type_label(kind),
         type_options = type_options,
         partners = partners,
+        currency_options = currency_options,
     );
     Html(page_shell(&sidebar, "New Document", &content)).into_response()
 }
@@ -384,11 +408,26 @@ async fn create_document(
         }
     };
 
+    // Optional non-MYR currency from the form.
+    let currency_id: Option<Uuid> = match form.get("currency_code").map(String::as_str) {
+        Some(code) if !code.is_empty() && code != "MYR" => {
+            vortex_plugin_sdk::sqlx::query_scalar(
+                "SELECT id FROM currencies WHERE code = $1 AND active",
+            )
+            .bind(code)
+            .fetch_optional(&db)
+            .await
+            .ok()
+            .flatten()
+        }
+        _ => None,
+    };
+
     let created: Result<Uuid, _> = vortex_plugin_sdk::sqlx::query_scalar(
         "INSERT INTO acc_move \
             (journal_id, move_date, move_type, partner_id, invoice_date, due_date, \
-             company_id, created_by, updated_by) \
-         VALUES ($1, $2, $3, $4, $2, $5, $6, $7, $7) \
+             company_id, created_by, updated_by, currency_id) \
+         VALUES ($1, $2, $3, $4, $2, $5, $6, $7, $7, $8) \
          RETURNING id",
     )
     .bind(journal_id)
@@ -398,6 +437,7 @@ async fn create_document(
     .bind(due_date)
     .bind(company_id)
     .bind(user.id)
+    .bind(currency_id)
     .fetch_one(&db)
     .await;
 
@@ -854,6 +894,7 @@ async fn pay_document(
             partner_id,
             direction,
             journal_code,
+            currency_code: None,
             amount,
             payment_date: today,
             memo: opt_str(&form, "memo"),

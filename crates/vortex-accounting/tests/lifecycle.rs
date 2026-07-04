@@ -258,6 +258,7 @@ async fn full_gl_and_document_lifecycle() {
             partner_id,
             direction: PaymentDirection::Inbound,
             journal_code: "BNK",
+            currency_code: None,
             amount: dec!(2000.00),
             payment_date: today,
             memo: Some("First instalment"),
@@ -281,6 +282,7 @@ async fn full_gl_and_document_lifecycle() {
             partner_id,
             direction: PaymentDirection::Inbound,
             journal_code: "BNK",
+            currency_code: None,
             amount: dec!(1550.00),
             payment_date: today,
             memo: Some("Balance"),
@@ -655,4 +657,201 @@ async fn einvoice_payload_and_lifecycle() {
     .execute(&db)
     .await
     .unwrap();
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+// Phase 3: Multi-currency (MFRS 121)
+// ═════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn multicurrency_fx_lifecycle() {
+    let Some((db, seq_pool, user_id, partner_id)) = setup().await else {
+        return;
+    };
+    let today = Utc::now().date_naive();
+    let doc_date = today + vortex_plugin_sdk::chrono::Duration::days(2);
+    let pay_date = today + vortex_plugin_sdk::chrono::Duration::days(4);
+
+    // USD currency + rates: 1 USD = RM 4.70 on doc date, RM 4.60 on pay date.
+    // Commerce stores units-per-MYR: 1/4.70 and 1/4.60.
+    let usd: Uuid = match vortex_plugin_sdk::sqlx::query_scalar::<_, Uuid>(
+        "SELECT id FROM currencies WHERE code = 'USD'",
+    )
+    .fetch_optional(&db)
+    .await
+    .unwrap()
+    {
+        Some(id) => id,
+        None => vortex_plugin_sdk::sqlx::query_scalar(
+            "INSERT INTO currencies (code, name, symbol, decimal_places, rounding, active) \
+             VALUES ('USD', 'US Dollar', '$', 2, 0.01, TRUE) RETURNING id",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap(),
+    };
+    for (date, myr_per_usd) in [(doc_date, "4.70"), (pay_date, "4.60")] {
+        vortex_plugin_sdk::sqlx::query(
+            "INSERT INTO currency_rates (currency_id, rate, rate_date) \
+             VALUES ($1, 1.0 / $2::numeric, $3) \
+             ON CONFLICT (currency_id, rate_date) DO UPDATE SET rate = EXCLUDED.rate",
+        )
+        .bind(usd)
+        .bind(date_rate(myr_per_usd))
+        .bind(date)
+        .execute(&db)
+        .await
+        .unwrap();
+    }
+
+    // USD 1,000 invoice → MYR 4,700 booked.
+    let inv = documents::create_invoice(
+        &db,
+        user_id,
+        &NewInvoice {
+            move_type: "customer_invoice",
+            partner_id,
+            invoice_date: doc_date,
+            due_date: None,
+            journal_code: None,
+            currency_id: Some(usd),
+            origin_ref: Some("test_fx:1"),
+            narration: None,
+            company_id: None,
+            lines: vec![InvoiceLine::new("Export consulting", dec!(1), dec!(1000.00))],
+        },
+    )
+    .await
+    .unwrap();
+    documents::post_invoice(&db, &seq_pool, inv, user_id).await.unwrap();
+
+    let head = vortex_plugin_sdk::sqlx::query(
+        "SELECT total_amount, amount_residual, amount_residual_currency, currency_rate \
+         FROM acc_move WHERE id = $1",
+    )
+    .bind(inv)
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert_eq!(head.get::<Decimal, _>("total_amount"), dec!(1000.00), "header in USD");
+    assert_eq!(head.get::<Decimal, _>("amount_residual"), dec!(4700.00), "MYR residual");
+    assert_eq!(
+        head.get::<Option<Decimal>, _>("amount_residual_currency"),
+        Some(dec!(1000.0000)),
+        "USD residual"
+    );
+    let rate: Decimal = head.get::<Option<Decimal>, _>("currency_rate").unwrap();
+    assert_eq!(rate.round_dp(2), dec!(4.70));
+
+    // GL lines are MYR and carry amount_currency.
+    let (d, c, _) = line_sums(&db, inv).await;
+    assert_eq!(d, dec!(4700.00));
+    assert_eq!(d, c);
+
+    // Full payment of USD 1,000 at 4.60 → realized LOSS of MYR 100.
+    documents::register_payment(
+        &db,
+        &seq_pool,
+        user_id,
+        &NewPayment {
+            partner_id,
+            direction: PaymentDirection::Inbound,
+            journal_code: "BNK",
+            currency_code: Some("USD"),
+            amount: dec!(1000.00),
+            payment_date: pay_date,
+            memo: Some("USD wire"),
+            company_id: None,
+            allocate_to: vec![inv],
+        },
+    )
+    .await
+    .unwrap();
+
+    let head = vortex_plugin_sdk::sqlx::query(
+        "SELECT payment_state, amount_residual, amount_residual_currency FROM acc_move WHERE id = $1",
+    )
+    .bind(inv)
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert_eq!(head.get::<String, _>("payment_state"), "paid");
+    assert_eq!(head.get::<Option<Decimal>, _>("amount_residual_currency"), Some(dec!(0.0000)));
+
+    // The realized-FX move exists, is linked, and books a 100 MYR loss.
+    let fx = vortex_plugin_sdk::sqlx::query(
+        "SELECT pr.exchange_move_id, \
+                (SELECT SUM(l.debit) FROM acc_move_line l \
+                 JOIN acc_account a ON a.id = l.account_id \
+                 WHERE l.move_id = pr.exchange_move_id AND a.code = '6950') AS loss_debit \
+         FROM acc_partial_reconcile pr \
+         WHERE pr.exchange_move_id IS NOT NULL \
+         ORDER BY pr.created_at DESC LIMIT 1",
+    )
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert!(fx.get::<Option<Uuid>, _>("exchange_move_id").is_some());
+    assert_eq!(fx.get::<Option<Decimal>, _>("loss_debit"), Some(dec!(100.00)));
+
+    // Revaluation: a second open USD invoice, rate moves, revalue.
+    let inv2 = documents::create_invoice(
+        &db,
+        user_id,
+        &NewInvoice {
+            move_type: "customer_invoice",
+            partner_id,
+            invoice_date: doc_date,
+            due_date: None,
+            journal_code: None,
+            currency_id: Some(usd),
+            origin_ref: Some("test_fx:2"),
+            narration: None,
+            company_id: None,
+            lines: vec![InvoiceLine::new("Second export", dec!(1), dec!(500.00))],
+        },
+    )
+    .await
+    .unwrap();
+    documents::post_invoice(&db, &seq_pool, inv2, user_id).await.unwrap();
+
+    let result = vortex_accounting::currency::revalue_open_items(
+        &db, &seq_pool, user_id, None, pay_date,
+    )
+    .await
+    .unwrap();
+    let (reval, reversal) = result.expect("open USD item to revalue");
+    // 500 USD booked at 4.70 = 2350; at 4.60 = 2300 → unrealized loss 50.
+    let loss: Option<Decimal> = vortex_plugin_sdk::sqlx::query_scalar(
+        "SELECT SUM(l.debit) FROM acc_move_line l \
+         JOIN acc_account a ON a.id = l.account_id \
+         WHERE l.move_id = $1 AND a.code = '6960'",
+    )
+    .bind(reval)
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert_eq!(loss, Some(dec!(50.00)));
+    // The reversal exists and is posted.
+    let rev_state: String =
+        vortex_plugin_sdk::sqlx::query_scalar("SELECT state FROM acc_move WHERE id = $1")
+            .bind(reversal)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(rev_state, "posted");
+
+    // Guard: amount_currency on a posted line is immutable.
+    let tamper = vortex_plugin_sdk::sqlx::query(
+        "UPDATE acc_move_line SET amount_currency = 999 \
+         WHERE move_id = $1 AND amount_currency IS NOT NULL",
+    )
+    .bind(inv2)
+    .execute(&db)
+    .await;
+    assert!(tamper.is_err(), "posted amount_currency must be immutable");
+}
+
+fn date_rate(s: &str) -> Decimal {
+    s.parse().unwrap()
 }

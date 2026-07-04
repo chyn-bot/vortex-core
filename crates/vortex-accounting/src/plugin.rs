@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use vortex_plugin_sdk::prelude::*;
 
-use crate::{handlers, handlers_documents, handlers_einvoice, handlers_tax};
+use crate::{handlers, handlers_currency, handlers_documents, handlers_einvoice, handlers_tax};
 
 const MIG_001_ACCOUNTING: &str = include_str!("../migrations/001_accounting/postgres.sql");
 const MIG_002_DOCUMENTS: &str =
@@ -15,6 +15,8 @@ const MIG_004_MALAYSIAN_TAX: &str =
     include_str!("../migrations/004_malaysian_tax/postgres.sql");
 const MIG_005_EINVOICE: &str =
     include_str!("../migrations/005_einvoice/postgres.sql");
+const MIG_006_MULTICURRENCY: &str =
+    include_str!("../migrations/006_multicurrency/postgres.sql");
 
 pub struct AccountingPlugin;
 
@@ -74,6 +76,7 @@ impl Plugin for AccountingPlugin {
             .merge(handlers_documents::document_routes())
             .merge(handlers_tax::tax_routes())
             .merge(handlers_einvoice::einvoice_routes())
+            .merge(handlers_currency::currency_routes())
     }
 
     fn menu_entries(&self) -> Vec<MenuEntry> {
@@ -158,6 +161,20 @@ impl Plugin for AccountingPlugin {
             )
             .under("accounting.config"),
             MenuEntry::new(
+                "accounting.config.rates",
+                "Currency Rates",
+                "/accounting/currency-rates",
+                MenuGroup::Operations,
+            )
+            .under("accounting.config"),
+            MenuEntry::new(
+                "accounting.config.revaluation",
+                "FX Revaluation",
+                "/accounting/revaluation",
+                MenuGroup::Operations,
+            )
+            .under("accounting.config"),
+            MenuEntry::new(
                 "accounting.config.settings",
                 "Settings",
                 "/accounting/settings",
@@ -200,6 +217,12 @@ impl Plugin for AccountingPlugin {
             PluginMigration {
                 name: "005_einvoice",
                 up_sql: MIG_005_EINVOICE,
+                down_sql: None,
+                requires_core_migration: Some("119_commerce_primitives"),
+            },
+            PluginMigration {
+                name: "006_multicurrency",
+                up_sql: MIG_006_MULTICURRENCY,
                 down_sql: None,
                 requires_core_migration: Some("119_commerce_primitives"),
             },

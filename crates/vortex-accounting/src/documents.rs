@@ -27,6 +27,7 @@
 //!     partner_id: tenant_contact,
 //!     direction: PaymentDirection::Inbound,
 //!     journal_code: "BNK",
+//!     currency_code: None,
 //!     amount: dec!(3500.00),
 //!     payment_date: today,
 //!     memo: Some("TNC/2026/00007 July rent"),
@@ -114,6 +115,10 @@ pub struct NewPayment<'a> {
     pub direction: PaymentDirection,
     /// A bank or cash journal code, e.g. `"BNK"`.
     pub journal_code: &'a str,
+    /// Payment currency code (None or "MYR" = company currency). FX
+    /// payments allocate against documents of the SAME currency; the
+    /// MYR difference posts automatically as realized gain/loss.
+    pub currency_code: Option<&'a str>,
     pub amount: Decimal,
     pub payment_date: NaiveDate,
     pub memo: Option<&'a str>,
@@ -424,20 +429,59 @@ pub async fn post_invoice(
     .await
     .map_err(|e| VortexError::QueryExecution(e.to_string()))?;
 
-    let mut seq = 10i32;
-    // (account, partner, name, debit, credit, tax_id, tax_base_amount)
-    type GlLine = (Uuid, Option<Uuid>, String, Decimal, Decimal, Option<Uuid>, Option<Decimal>);
-    let mut insert_line = Vec::<GlLine>::new();
+    // Multi-currency: header totals stay in document currency; GL
+    // debit/credit are MYR at the invoice-date rate; each line carries
+    // its signed amount_currency. Company-currency docs pass through
+    // with rate 1 and NULL currency columns.
+    let currency_row = vortex_plugin_sdk::sqlx::query(
+        "SELECT c.id, c.code FROM acc_move m JOIN currencies c ON c.id = m.currency_id \
+         WHERE m.id = $1",
+    )
+    .bind(move_id)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| VortexError::QueryExecution(e.to_string()))?;
+    let (fx_currency, fx_rate): (Option<Uuid>, Decimal) = match currency_row {
+        Some(r) => {
+            let code: String = r.get("code");
+            if code == "MYR" {
+                (None, Decimal::ONE)
+            } else {
+                let invoice_date: NaiveDate = vortex_plugin_sdk::sqlx::query_scalar(
+                    "SELECT COALESCE(invoice_date, move_date) FROM acc_move WHERE id = $1",
+                )
+                .bind(move_id)
+                .fetch_one(db)
+                .await
+                .map_err(|e| VortexError::QueryExecution(e.to_string()))?;
+                (Some(r.get("id")), crate::currency::myr_rate(db, &code, invoice_date).await?)
+            }
+        }
+        None => (None, Decimal::ONE),
+    };
+    let conv = |amount: Decimal| crate::currency::to_myr(amount, fx_rate);
+    // Signed amount_currency: positive on the debit side.
+    let signed = |amount: Decimal, is_debit: bool| if is_debit { amount } else { -amount };
 
-    // 1) counterpart (AR/AP) line for the full total, on the partner
+    let mut seq = 10i32;
+    // (account, partner, name, debit, credit, tax_id, tax_base_amount, amount_currency)
+    type GlLine =
+        (Uuid, Option<Uuid>, String, Decimal, Decimal, Option<Uuid>, Option<Decimal>, Option<Decimal>);
+    let mut insert_line = Vec::<GlLine>::new();
+    // Counterpart MYR = sum of the converted component lines so the
+    // move balances exactly regardless of per-line rounding.
+    let mut counterpart_myr = Decimal::ZERO;
+
+    // 1) counterpart (AR/AP) placeholder — amounts patched below
     insert_line.push((
         counterpart_account,
         partner_id,
         move_type.replace('_', " "),
-        if counterpart_is_debit { total_amount } else { Decimal::ZERO },
-        if counterpart_is_debit { Decimal::ZERO } else { total_amount },
+        Decimal::ZERO,
+        Decimal::ZERO,
         None,
         None,
+        fx_currency.map(|_| signed(total_amount, counterpart_is_debit)),
     ));
 
     // 2) one income/expense line per document line (net of tax), while
@@ -470,14 +514,17 @@ pub async fn post_invoice(
                 "no {line_role} account for line '{description}' — set one on the line or in acc_config"
             )));
         };
+        let base_myr = conv(base);
+        counterpart_myr += base_myr;
         insert_line.push((
             account,
             None,
             description,
-            if counterpart_is_debit { Decimal::ZERO } else { base },
-            if counterpart_is_debit { base } else { Decimal::ZERO },
+            if counterpart_is_debit { Decimal::ZERO } else { base_myr },
+            if counterpart_is_debit { base_myr } else { Decimal::ZERO },
             None,
             None,
+            fx_currency.map(|_| signed(base, !counterpart_is_debit)),
         ));
     }
 
@@ -499,27 +546,39 @@ pub async fn post_invoice(
                 bucket.tax_name
             )));
         };
+        let tax_myr = conv(bucket.tax);
+        counterpart_myr += tax_myr;
         insert_line.push((
             tax_acc,
             None,
             bucket.tax_name.clone(),
-            if counterpart_is_debit { Decimal::ZERO } else { bucket.tax },
-            if counterpart_is_debit { bucket.tax } else { Decimal::ZERO },
+            if counterpart_is_debit { Decimal::ZERO } else { tax_myr },
+            if counterpart_is_debit { tax_myr } else { Decimal::ZERO },
             Some(bucket.tax_id),
             Some(bucket.base),
+            fx_currency.map(|_| signed(bucket.tax, !counterpart_is_debit)),
         ));
+    }
+
+    // Patch the counterpart with the summed MYR value.
+    if counterpart_is_debit {
+        insert_line[0].3 = counterpart_myr;
+    } else {
+        insert_line[0].4 = counterpart_myr;
     }
 
     let mut tx = db
         .begin()
         .await
         .map_err(|e| VortexError::QueryExecution(e.to_string()))?;
-    for (account, line_partner, name, debit, credit, line_tax, tax_base) in insert_line {
+    for (account, line_partner, name, debit, credit, line_tax, tax_base, amount_currency) in
+        insert_line
+    {
         vortex_plugin_sdk::sqlx::query(
             "INSERT INTO acc_move_line \
                 (move_id, sequence, account_id, partner_id, name, debit, credit, company_id, \
-                 tax_id, tax_base_amount) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+                 tax_id, tax_base_amount, currency_id, amount_currency) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
         )
         .bind(move_id)
         .bind(seq)
@@ -531,10 +590,23 @@ pub async fn post_invoice(
         .bind(company_id)
         .bind(line_tax)
         .bind(tax_base)
+        .bind(fx_currency)
+        .bind(amount_currency)
         .execute(&mut *tx)
         .await
         .map_err(|e| VortexError::QueryExecution(e.to_string()))?;
         seq += 10;
+    }
+    // Fix the posting rate while still draft (immutable once posted).
+    if fx_currency.is_some() {
+        vortex_plugin_sdk::sqlx::query(
+            "UPDATE acc_move SET currency_rate = $2 WHERE id = $1",
+        )
+        .bind(move_id)
+        .bind(fx_rate)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| VortexError::QueryExecution(e.to_string()))?;
     }
     tx.commit()
         .await
@@ -542,7 +614,24 @@ pub async fn post_invoice(
 
     // Hand over to the standard posting engine (balance, lock date, number,
     // amount_residual = total for documents).
-    service::post_move(db, seq_pool, move_id, user_id).await
+    let number = service::post_move(db, seq_pool, move_id, user_id).await?;
+
+    // FX documents: MYR residual is the converted counterpart; the
+    // document-currency residual drives settlement. Both columns are
+    // on the guard's mutable allow-list.
+    if fx_currency.is_some() {
+        vortex_plugin_sdk::sqlx::query(
+            "UPDATE acc_move SET amount_residual = $2, amount_residual_currency = $3 \
+             WHERE id = $1",
+        )
+        .bind(move_id)
+        .bind(counterpart_myr)
+        .bind(total_amount)
+        .execute(db)
+        .await
+        .map_err(|e| VortexError::QueryExecution(e.to_string()))?;
+    }
+    Ok(number)
 }
 
 // ─── Payments & reconciliation ───────────────────────────────────────────
@@ -578,16 +667,71 @@ async fn open_counterpart_line(
 
 /// Recompute a document's residual / payment_state from its reconciliations.
 pub async fn refresh_payment_state(db: &PgPool, document_move_id: Uuid) -> VortexResult<()> {
-    let Some((_, open, _)) = open_counterpart_line(db, document_move_id).await? else {
+    let Some((line_id, mut open, _)) = open_counterpart_line(db, document_move_id).await? else {
         return Ok(());
     };
-    let total: Decimal = vortex_plugin_sdk::sqlx::query_scalar(
-        "SELECT total_amount FROM acc_move WHERE id = $1",
+    let head = vortex_plugin_sdk::sqlx::query(
+        "SELECT total_amount, currency_rate FROM acc_move WHERE id = $1",
     )
     .bind(document_move_id)
     .fetch_one(db)
     .await
     .map_err(|e| VortexError::QueryExecution(e.to_string()))?;
+    let mut total: Decimal = head.get("total_amount");
+    let fx_rate: Option<Decimal> = head.get("currency_rate");
+
+    // FX documents settle in DOCUMENT currency: residual comes from the
+    // partial reconciles' currency amounts, with the MYR residual
+    // derived at the booked rate for display/reports.
+    let mut residual_currency: Option<Decimal> = None;
+    if let Some(rate) = fx_rate {
+        let settled_cur: Decimal = vortex_plugin_sdk::sqlx::query_scalar(
+            "SELECT COALESCE(SUM(debit_amount_currency), 0) FROM acc_partial_reconcile \
+             WHERE debit_line_id = $1 OR credit_line_id = $1",
+        )
+        .bind(line_id)
+        .fetch_one(db)
+        .await
+        .map_err(|e| VortexError::QueryExecution(e.to_string()))?;
+        // `total` is already in document currency for FX documents.
+        let open_cur = (total - settled_cur).max(Decimal::ZERO);
+        residual_currency = Some(open_cur);
+        open = crate::currency::to_myr(open_cur, rate);
+        // Keep the state thresholds in currency terms.
+        total = total; // document-currency total drives the comparison below
+        let payment_state = if open_cur <= Decimal::ZERO {
+            "paid"
+        } else if open_cur < total {
+            "partial"
+        } else {
+            "not_paid"
+        };
+        vortex_plugin_sdk::sqlx::query(
+            "UPDATE acc_move SET amount_residual = $2, amount_residual_currency = $3, \
+                    payment_state = $4 WHERE id = $1",
+        )
+        .bind(document_move_id)
+        .bind(open.max(Decimal::ZERO))
+        .bind(open_cur)
+        .bind(payment_state)
+        .execute(db)
+        .await
+        .map_err(|e| VortexError::QueryExecution(e.to_string()))?;
+        if open_cur <= Decimal::ZERO {
+            vortex_plugin_sdk::sqlx::query(
+                "UPDATE acc_move_line l SET reconciled = TRUE \
+                 FROM acc_account a \
+                 WHERE l.move_id = $1 AND a.id = l.account_id AND a.reconcile",
+            )
+            .bind(document_move_id)
+            .execute(db)
+            .await
+            .map_err(|e| VortexError::QueryExecution(e.to_string()))?;
+        }
+        return Ok(());
+    }
+    let _ = residual_currency;
+
     let payment_state = if open <= Decimal::ZERO {
         "paid"
     } else if open < total {
@@ -676,19 +820,53 @@ pub async fn register_payment(
         )));
     };
 
+    // FX: convert to MYR at the payment-date rate; lines carry the
+    // signed document-currency amounts.
+    let fx = match pay.currency_code {
+        Some(code) if code != "MYR" => {
+            let currency_id: Option<Uuid> = vortex_plugin_sdk::sqlx::query_scalar(
+                "SELECT id FROM currencies WHERE code = $1 AND active",
+            )
+            .bind(code)
+            .fetch_optional(db)
+            .await
+            .map_err(|e| VortexError::QueryExecution(e.to_string()))?;
+            let Some(currency_id) = currency_id else {
+                return Err(VortexError::ValidationFailed(format!("unknown currency {code}")));
+            };
+            let rate = crate::currency::myr_rate(db, code, pay.payment_date).await?;
+            Some((currency_id, rate))
+        }
+        _ => None,
+    };
+    let amount_myr = match fx {
+        Some((_, rate)) => crate::currency::to_myr(pay.amount, rate),
+        None => pay.amount,
+    };
+    let with_ccy = |line: service::MoveLine, signed_amount: Decimal| match fx {
+        Some((cid, _)) => line.with_currency(cid, signed_amount),
+        None => line,
+    };
+
     // Inbound: debit bank, credit AR. Outbound: debit AP, credit bank.
     let memo = pay.memo.unwrap_or("Payment");
     let lines = if inbound {
         vec![
-            service::MoveLine::debit(liquidity, pay.amount, Some(memo)),
-            service::MoveLine::credit(counterpart, pay.amount, Some(memo))
-                .with_partner(pay.partner_id),
+            with_ccy(service::MoveLine::debit(liquidity, amount_myr, Some(memo)), pay.amount),
+            with_ccy(
+                service::MoveLine::credit(counterpart, amount_myr, Some(memo))
+                    .with_partner(pay.partner_id),
+                -pay.amount,
+            ),
         ]
     } else {
         vec![
-            service::MoveLine::debit(counterpart, pay.amount, Some(memo))
-                .with_partner(pay.partner_id),
-            service::MoveLine::credit(liquidity, pay.amount, Some(memo)),
+            with_ccy(
+                service::MoveLine::debit(counterpart, amount_myr, Some(memo))
+                    .with_partner(pay.partner_id),
+                pay.amount,
+            ),
+            with_ccy(service::MoveLine::credit(liquidity, amount_myr, Some(memo)), -pay.amount),
         ]
     };
 
@@ -719,41 +897,138 @@ pub async fn register_payment(
         ));
     };
 
-    // Allocate oldest-first across the requested documents.
+    // Allocate oldest-first across the requested documents. FX
+    // payments match in DOCUMENT currency against same-currency
+    // documents; the MYR delta posts as realized gain/loss.
+    let mut payment_open_currency = pay.amount;
     for doc_id in &pay.allocate_to {
-        if payment_open <= Decimal::ZERO {
-            break;
+        match fx {
+            None => {
+                if payment_open <= Decimal::ZERO {
+                    break;
+                }
+                let Some((doc_line_id, doc_open, doc_is_debit)) =
+                    open_counterpart_line(db, *doc_id).await?
+                else {
+                    continue;
+                };
+                if doc_open <= Decimal::ZERO || doc_is_debit == payment_is_debit {
+                    continue;
+                }
+                // Company-currency docs only on this path.
+                let doc_rate: Option<Decimal> = vortex_plugin_sdk::sqlx::query_scalar(
+                    "SELECT currency_rate FROM acc_move WHERE id = $1",
+                )
+                .bind(*doc_id)
+                .fetch_one(db)
+                .await
+                .map_err(|e| VortexError::QueryExecution(e.to_string()))?;
+                if doc_rate.is_some() {
+                    continue; // FX document needs an FX payment in its currency
+                }
+                let matched = payment_open.min(doc_open);
+                let (debit_line, credit_line) = if doc_is_debit {
+                    (doc_line_id, payment_line_id)
+                } else {
+                    (payment_line_id, doc_line_id)
+                };
+                vortex_plugin_sdk::sqlx::query(
+                    "INSERT INTO acc_partial_reconcile \
+                        (debit_line_id, credit_line_id, amount, company_id, created_by) \
+                     VALUES ($1, $2, $3, $4, $5)",
+                )
+                .bind(debit_line)
+                .bind(credit_line)
+                .bind(matched)
+                .bind(pay.company_id)
+                .bind(user_id)
+                .execute(db)
+                .await
+                .map_err(|e| VortexError::QueryExecution(e.to_string()))?;
+                payment_open -= matched;
+                refresh_payment_state(db, *doc_id).await?;
+            }
+            Some((currency_id, pay_rate)) => {
+                if payment_open_currency <= Decimal::ZERO {
+                    break;
+                }
+                let doc = vortex_plugin_sdk::sqlx::query(
+                    "SELECT currency_id, currency_rate, amount_residual_currency, partner_id, \
+                            company_id \
+                     FROM acc_move WHERE id = $1 AND state = 'posted'",
+                )
+                .bind(*doc_id)
+                .fetch_optional(db)
+                .await
+                .map_err(|e| VortexError::QueryExecution(e.to_string()))?;
+                let Some(doc) = doc else { continue };
+                if doc.get::<Option<Uuid>, _>("currency_id") != Some(currency_id) {
+                    continue; // currency mismatch
+                }
+                let Some(doc_rate) = doc.get::<Option<Decimal>, _>("currency_rate") else {
+                    continue;
+                };
+                let doc_open_cur: Decimal =
+                    doc.get::<Option<Decimal>, _>("amount_residual_currency").unwrap_or_default();
+                if doc_open_cur <= Decimal::ZERO {
+                    continue;
+                }
+                let Some((doc_line_id, _, doc_is_debit)) =
+                    open_counterpart_line(db, *doc_id).await?
+                else {
+                    continue;
+                };
+                if doc_is_debit == payment_is_debit {
+                    continue;
+                }
+                let matched_cur = payment_open_currency.min(doc_open_cur);
+                let doc_side_myr = crate::currency::to_myr(matched_cur, doc_rate);
+                let (debit_line, credit_line) = if doc_is_debit {
+                    (doc_line_id, payment_line_id)
+                } else {
+                    (payment_line_id, doc_line_id)
+                };
+                let pr_id: Uuid = vortex_plugin_sdk::sqlx::query_scalar(
+                    "INSERT INTO acc_partial_reconcile \
+                        (debit_line_id, credit_line_id, amount, company_id, created_by, \
+                         debit_amount_currency, credit_amount_currency) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $6) RETURNING id",
+                )
+                .bind(debit_line)
+                .bind(credit_line)
+                .bind(doc_side_myr)
+                .bind(pay.company_id)
+                .bind(user_id)
+                .bind(matched_cur)
+                .fetch_one(db)
+                .await
+                .map_err(|e| VortexError::QueryExecution(e.to_string()))?;
+
+                // Realized FX: settled-vs-booked MYR on the matched slice.
+                // Inbound (AR): delta = settled − booked; outbound (AP)
+                // needs the opposite sign to square the counterpart.
+                let settled_myr = crate::currency::to_myr(matched_cur, pay_rate);
+                let raw_delta = (settled_myr - doc_side_myr).round_dp(2);
+                let delta = if inbound { raw_delta } else { -raw_delta };
+                let doc_partner: Option<Uuid> = doc.get("partner_id");
+                let doc_company: Option<Uuid> = doc.get("company_id");
+                crate::currency::post_realized_fx(
+                    db,
+                    seq_pool,
+                    user_id,
+                    doc_company,
+                    doc_partner,
+                    counterpart,
+                    pr_id,
+                    delta,
+                    pay.payment_date,
+                )
+                .await?;
+
+                payment_open_currency -= matched_cur;
+                refresh_payment_state(db, *doc_id).await?;
+            }
         }
-        let Some((doc_line_id, doc_open, doc_is_debit)) =
-            open_counterpart_line(db, *doc_id).await?
-        else {
-            continue;
-        };
-        if doc_open <= Decimal::ZERO || doc_is_debit == payment_is_debit {
-            // Nothing open, or same side (can't reconcile debit with debit).
-            continue;
-        }
-        let matched = payment_open.min(doc_open);
-        let (debit_line, credit_line) = if doc_is_debit {
-            (doc_line_id, payment_line_id)
-        } else {
-            (payment_line_id, doc_line_id)
-        };
-        vortex_plugin_sdk::sqlx::query(
-            "INSERT INTO acc_partial_reconcile \
-                (debit_line_id, credit_line_id, amount, company_id, created_by) \
-             VALUES ($1, $2, $3, $4, $5)",
-        )
-        .bind(debit_line)
-        .bind(credit_line)
-        .bind(matched)
-        .bind(pay.company_id)
-        .bind(user_id)
-        .execute(db)
-        .await
-        .map_err(|e| VortexError::QueryExecution(e.to_string()))?;
-        payment_open -= matched;
-        refresh_payment_state(db, *doc_id).await?;
     }
     refresh_payment_state(db, payment_id).await?;
 
