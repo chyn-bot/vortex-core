@@ -31,6 +31,8 @@ const MIG_010_PARTNER_ACCOUNTS: &str =
     include_str!("../migrations/010_partner_accounts/postgres.sql");
 const MIG_011_PARTNER_BANKS: &str =
     include_str!("../migrations/011_partner_banks/postgres.sql");
+const MIG_012_BANK_MASTER: &str =
+    include_str!("../migrations/012_bank_master/postgres.sql");
 
 pub struct AccountingPlugin;
 
@@ -213,6 +215,13 @@ impl Plugin for AccountingPlugin {
             )
             .under("accounting.config"),
             MenuEntry::new(
+                "accounting.config.banks",
+                "Banks",
+                "/accounting/banks",
+                MenuGroup::Operations,
+            )
+            .under("accounting.config"),
+            MenuEntry::new(
                 "accounting.config.dimensions",
                 "Dimensions",
                 "/accounting/dimensions",
@@ -340,6 +349,12 @@ impl Plugin for AccountingPlugin {
             PluginMigration {
                 name: "011_partner_banks",
                 up_sql: MIG_011_PARTNER_BANKS,
+                down_sql: None,
+                requires_core_migration: Some("119_commerce_primitives"),
+            },
+            PluginMigration {
+                name: "012_bank_master",
+                up_sql: MIG_012_BANK_MASTER,
                 down_sql: None,
                 requires_core_migration: Some("119_commerce_primitives"),
             },
@@ -644,7 +659,23 @@ impl Plugin for AccountingPlugin {
                     &load_accounts("liability_payable").await,
                 );
 
-                // Bank accounts list + add row.
+                // Bank accounts list + add row. The bank itself comes
+                // from the user-configurable master (Setup ▸ Banks).
+                let bank_options: String = vortex_plugin_sdk::sqlx::query(
+                    "SELECT id, name FROM acc_bank WHERE active ORDER BY name",
+                )
+                .fetch_all(&db)
+                .await
+                .unwrap_or_default()
+                .iter()
+                .map(|r| {
+                    format!(
+                        "<option value=\"{}\">{}</option>",
+                        r.get::<vortex_plugin_sdk::uuid::Uuid, _>("id"),
+                        esc(&r.get::<String, _>("name")),
+                    )
+                })
+                .collect();
                 let banks = vortex_plugin_sdk::sqlx::query(
                     "SELECT id, bank_name, account_number, account_holder, swift_code \
                      FROM acc_partner_bank WHERE contact_id = $1 ORDER BY created_at",
@@ -681,17 +712,17 @@ impl Plugin for AccountingPlugin {
                     r#"<div class="grid grid-cols-2 md:grid-cols-4 gap-3">{ar}{ap}</div>
 <div class="divider text-xs opacity-60 my-2">Bank Accounts</div>
 {bank_table}
-<div class="grid grid-cols-2 md:grid-cols-5 gap-3 mt-2 items-end">
+<div class="grid grid-cols-2 md:grid-cols-4 gap-3 mt-2 items-end">
 <label class="form-control"><span class="label-text text-xs mb-1">Bank</span>
-<input name="bank_name" form="record-form" placeholder="Maybank" class="input input-bordered input-sm"/></label>
+<select name="bank_id" form="record-form" class="select select-bordered select-sm">
+<option value="">-- Select bank --</option>{bank_options}</select></label>
 <label class="form-control"><span class="label-text text-xs mb-1">Account No.</span>
-<input name="bank_account_number" form="record-form" placeholder="512345678901" class="input input-bordered input-sm"/></label>
+<input name="bank_account_number" form="record-form" inputmode="numeric" placeholder="512345678901" class="input input-bordered input-sm"/></label>
 <label class="form-control"><span class="label-text text-xs mb-1">Holder</span>
 <input name="bank_account_holder" form="record-form" class="input input-bordered input-sm"/></label>
-<label class="form-control"><span class="label-text text-xs mb-1">SWIFT</span>
-<input name="bank_swift" form="record-form" placeholder="MBBEMYKL" class="input input-bordered input-sm"/></label>
 <button form="record-form" formmethod="post" formaction="/accounting/partner-banks/{contact_id}/add" class="btn btn-sm btn-outline" title="Also saves the accounting fields above">Add Bank Account</button>
-</div>"#,
+</div>
+<p class="text-xs opacity-50 mt-1">SWIFT fills in from the bank master — manage the list under Accounting Setup ▸ Banks.</p>"#,
                 ))
             },
         )]

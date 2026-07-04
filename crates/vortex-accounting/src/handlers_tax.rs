@@ -31,6 +31,9 @@ pub fn tax_routes() -> Router<Arc<AppState>> {
         )
         .route("/accounting/partner-banks/{contact_id}/add", post(add_partner_bank))
         .route("/accounting/partner-banks/{bank_id}/delete", post(delete_partner_bank))
+        .route("/accounting/banks", get(banks_page))
+        .route("/accounting/banks", post(bank_create))
+        .route("/accounting/banks/{id}/toggle", post(bank_toggle))
         .route("/accounting/tax-profiles/{id}", get(edit_tax_profile))
         .route("/accounting/tax-profiles/{id}", post(save_tax_profile))
         .route("/accounting/tax-profiles/{id}/search-tin", post(search_tin_action))
@@ -892,24 +895,39 @@ async fn add_partner_bank(
             .map(|(_, v)| v.trim())
             .filter(|v| !v.is_empty())
     };
-    let (Some(bank_name), Some(account_number)) = (get("bank_name"), get("bank_account_number"))
-    else {
+    let bank_id: Option<Uuid> = get("bank_id").and_then(|s| s.parse().ok());
+    let (Some(bank_id), Some(account_number)) = (bank_id, get("bank_account_number")) else {
         return (
             StatusCode::BAD_REQUEST,
-            "Bank name and account number are required",
+            "Pick a bank and enter the account number",
         )
             .into_response();
     };
+    // Name + SWIFT flow from the bank master (Setup ▸ Banks).
+    let bank = vortex_plugin_sdk::sqlx::query(
+        "SELECT name, swift_code FROM acc_bank WHERE id = $1 AND active",
+    )
+    .bind(bank_id)
+    .fetch_optional(&db)
+    .await
+    .ok()
+    .flatten();
+    let Some(bank) = bank else {
+        return (StatusCode::BAD_REQUEST, "Unknown or inactive bank").into_response();
+    };
+    let bank_name: String = bank.get("name");
+    let swift: Option<String> = bank.get("swift_code");
     if let Err(e) = vortex_plugin_sdk::sqlx::query(
         "INSERT INTO acc_partner_bank \
-            (contact_id, bank_name, account_number, account_holder, swift_code, created_by) \
-         VALUES ($1, $2, $3, $4, $5, $6)",
+            (contact_id, bank_id, bank_name, account_number, account_holder, swift_code, created_by) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
     )
     .bind(contact_id)
-    .bind(bank_name)
+    .bind(bank_id)
+    .bind(&bank_name)
     .bind(account_number)
     .bind(get("bank_account_holder"))
-    .bind(get("bank_swift"))
+    .bind(swift)
     .bind(user.id)
     .execute(&db)
     .await
@@ -964,6 +982,120 @@ async fn delete_partner_bank(
         }]}));
     let _ = state.audit.log(entry).await;
     Redirect::to(&format!("/contacts/{contact_id}")).into_response()
+}
+
+// ─── Bank master ─────────────────────────────────────────────────────────
+
+async fn banks_page(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+) -> Response {
+    let esc = vortex_plugin_sdk::framework::html_escape;
+    let rows = vortex_plugin_sdk::sqlx::query(
+        "SELECT b.id, b.name, b.swift_code, b.active, \
+                (SELECT COUNT(*) FROM acc_partner_bank pb WHERE pb.bank_id = b.id) AS in_use \
+         FROM acc_bank b ORDER BY b.name",
+    )
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default();
+    let mut trs = String::new();
+    for r in &rows {
+        let id: Uuid = r.get("id");
+        let active: bool = r.get("active");
+        trs.push_str(&format!(
+            "<tr><td>{}</td><td class=\"font-mono\">{}</td><td>{}</td>\
+             <td><span class=\"badge badge-sm {}\">{}</span></td>\
+             <td><form method=\"post\" action=\"/accounting/banks/{id}/toggle\">\
+             <button class=\"btn btn-xs btn-ghost\">{}</button></form></td></tr>",
+            esc(&r.get::<String, _>("name")),
+            esc(r.get::<Option<String>, _>("swift_code").as_deref().unwrap_or("—")),
+            r.get::<i64, _>("in_use"),
+            if active { "badge-success" } else { "badge-ghost" },
+            if active { "active" } else { "inactive" },
+            if active { "Deactivate" } else { "Activate" },
+        ));
+    }
+    let content = format!(
+        r##"<h1 class="text-2xl font-bold mb-6">Banks</h1>
+<div class="card bg-base-100 shadow mb-4"><div class="card-body p-4">
+<form method="post" action="/accounting/banks" class="flex gap-3 items-end flex-wrap">
+<label class="form-control"><span class="label-text mb-1">Name</span>
+<input name="name" required class="input input-bordered input-sm" placeholder="Bank of Nova Scotia"/></label>
+<label class="form-control"><span class="label-text mb-1">SWIFT / BIC</span>
+<input name="swift_code" class="input input-bordered input-sm" placeholder="NOSCMYKL"/></label>
+<button class="btn btn-primary btn-sm">Add Bank</button>
+</form>
+<p class="text-xs opacity-60 mt-2">The bank picker on contact records lists active banks; the SWIFT code fills in automatically. Malaysian banks are pre-seeded.</p>
+</div></div>
+<div class="card bg-base-100 shadow"><div class="card-body p-4">
+<table class="table table-sm"><thead><tr><th>Bank</th><th>SWIFT</th><th>In use</th><th>Status</th><th></th></tr></thead>
+<tbody>{trs}</tbody></table></div></div>"##,
+    );
+    let sidebar = render_sidebar(&state, &user, &db_ctx);
+    Html(page_shell(&sidebar, "Banks", &content)).into_response()
+}
+
+async fn bank_create(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Form(pairs): Form<Vec<(String, String)>>,
+) -> Response {
+    let get = |k: &str| {
+        pairs
+            .iter()
+            .rev()
+            .find(|(pk, _)| pk == k)
+            .map(|(_, v)| v.trim())
+            .filter(|v| !v.is_empty())
+    };
+    let Some(name) = get("name") else {
+        return (StatusCode::BAD_REQUEST, "name required").into_response();
+    };
+    match vortex_plugin_sdk::sqlx::query_scalar::<_, Uuid>(
+        "INSERT INTO acc_bank (name, swift_code) VALUES ($1, $2) \
+         ON CONFLICT (name) DO UPDATE SET active = TRUE, \
+            swift_code = COALESCE(EXCLUDED.swift_code, acc_bank.swift_code) \
+         RETURNING id",
+    )
+    .bind(name)
+    .bind(get("swift_code"))
+    .fetch_one(&db)
+    .await
+    {
+        Ok(id) => {
+            audit_setup(&state, &user, &db_ctx, "acc_bank", id).await;
+            Redirect::to("/accounting/banks").into_response()
+        }
+        Err(e) => {
+            error!("bank create failed: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "Save failed").into_response()
+        }
+    }
+}
+
+async fn bank_toggle(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<Uuid>,
+) -> Response {
+    if let Err(e) =
+        vortex_plugin_sdk::sqlx::query("UPDATE acc_bank SET active = NOT active WHERE id = $1")
+            .bind(id)
+            .execute(&db)
+            .await
+    {
+        error!("bank toggle failed: {e}");
+        return (StatusCode::INTERNAL_SERVER_ERROR, "Toggle failed").into_response();
+    }
+    audit_setup(&state, &user, &db_ctx, "acc_bank", id).await;
+    Redirect::to("/accounting/banks").into_response()
 }
 
 // ─── Shared ──────────────────────────────────────────────────────────────
