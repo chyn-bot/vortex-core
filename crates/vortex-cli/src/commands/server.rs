@@ -4050,8 +4050,8 @@ async fn users_new_form(
         return (StatusCode::FORBIDDEN, Html(forbidden_page("Create User"))).into_response();
     }
 
-    // Fetch available roles as dropdown
-    let role_dropdown = generate_role_dropdown(&db, None).await;
+    // Fetch available roles as a multi-select checkbox group
+    let role_dropdown = generate_role_checkboxes(&db, &[]).await;
 
     let template = include_str!("../../templates/users_form.html");
     let html = template
@@ -4078,33 +4078,52 @@ async fn users_new_form(
     Html(html).into_response()
 }
 
-#[derive(serde::Deserialize)]
-struct CreateUserForm {
-    username: String,
-    email: String,
-    full_name: Option<String>,
-    password: String,
-    role: uuid::Uuid,
+/// Last-wins scalar lookup over urlencoded form pairs.
+fn form_scalar<'a>(pairs: &'a [(String, String)], key: &str) -> Option<&'a str> {
+    pairs.iter().rev().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+}
+
+/// Collect repeated checkbox values (e.g. `roles`) as UUIDs.
+fn form_multi_uuids(pairs: &[(String, String)], key: &str) -> Vec<uuid::Uuid> {
+    pairs
+        .iter()
+        .filter(|(k, _)| k == key)
+        .filter_map(|(_, v)| v.parse::<uuid::Uuid>().ok())
+        .collect()
 }
 
 async fn users_create(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
     Extension(auth_user): Extension<AuthUser>,
-    Form(form): Form<CreateUserForm>,
+    Form(pairs): Form<Vec<(String, String)>>,
 ) -> Response {
     // Only admins can create users
     if !auth_user.is_system_admin() && !auth_user.has_role("Administrator") {
         return (StatusCode::FORBIDDEN, Html(forbidden_page("Create User"))).into_response();
     }
 
+    let username = form_scalar(&pairs, "username").unwrap_or("").trim().to_string();
+    let email = form_scalar(&pairs, "email").unwrap_or("").trim().to_string();
+    let full_name = form_scalar(&pairs, "full_name").map(|s| s.to_string()).filter(|s| !s.is_empty());
+    let password = form_scalar(&pairs, "password").unwrap_or("").to_string();
+    let roles = form_multi_uuids(&pairs, "roles");
+
+    if username.is_empty() || email.is_empty() {
+        return error_response("Username and email are required");
+    }
+    // A user must have at least one role (otherwise they can do nothing).
+    if roles.is_empty() {
+        return error_response("Select at least one role");
+    }
+
     // Validate password
-    if form.password.len() < 12 {
+    if password.len() < 12 {
         return error_response("Password must be at least 12 characters");
     }
 
     // Hash password
-    let password_hash = hash_password(&form.password);
+    let password_hash = hash_password(&password);
 
     // Get default company
     let company_id: uuid::Uuid = sqlx::query_scalar("SELECT id FROM companies LIMIT 1")
@@ -4121,32 +4140,34 @@ async fn users_create(
         "#
     )
     .bind(&company_id)
-    .bind(&form.username)
-    .bind(&form.email)
+    .bind(&username)
+    .bind(&email)
     .bind(&password_hash)
-    .bind(&form.full_name)
+    .bind(&full_name)
     .bind(&auth_user.id)
     .fetch_one(&db)
     .await;
 
     match new_user_id {
         Ok(user_id) => {
-            // Assign role
-            let _ = sqlx::query("INSERT INTO user_roles (user_id, role_id) VALUES ($1, $2)")
-                .bind(&user_id)
-                .bind(&form.role)
-                .execute(&db)
-                .await;
+            // Assign every selected role.
+            for role_id in &roles {
+                let _ = sqlx::query("INSERT INTO user_roles (user_id, role_id) VALUES ($1, $2) ON CONFLICT (user_id, role_id) DO NOTHING")
+                    .bind(&user_id)
+                    .bind(role_id)
+                    .execute(&db)
+                    .await;
+            }
 
             // Log the action through the WORM ledger.
             let audit_entry = AuditEntry::new(AuditAction::UserCreated, AuditSeverity::Info)
                 .with_user(vortex_common::UserId(auth_user.id))
                 .with_username(&auth_user.username)
                 .with_resource("user", user_id.to_string())
-                .with_resource_name(&form.username)
+                .with_resource_name(&username)
                 .with_details(serde_json::json!({
-                    "new_username": form.username,
-                    "role_id": form.role.to_string(),
+                    "new_username": username,
+                    "role_ids": roles.iter().map(|r| r.to_string()).collect::<Vec<_>>(),
                 }));
             if let Err(e) = state.audit.log(audit_entry).await {
                 error!("WORM audit write failed for UserCreated: {}", e);
@@ -4186,18 +4207,17 @@ async fn users_edit_form(
 
     match user {
         Ok(Some(user)) => {
-            // Get user's current role (first one, since we now use single role)
-            let current_role: Option<uuid::Uuid> = sqlx::query_scalar(
-                "SELECT role_id FROM user_roles WHERE user_id = $1 LIMIT 1"
+            // Get all of the user's current roles (a user may hold several).
+            let current_roles: Vec<uuid::Uuid> = sqlx::query_scalar(
+                "SELECT role_id FROM user_roles WHERE user_id = $1"
             )
             .bind(&user_id)
-            .fetch_optional(&db)
+            .fetch_all(&db)
             .await
-            .ok()
-            .flatten();
+            .unwrap_or_default();
 
-            // Generate role dropdown with current selection
-            let role_dropdown = generate_role_dropdown(&db, current_role).await;
+            // Generate the role checkbox group with current selections checked
+            let role_dropdown = generate_role_checkboxes(&db, &current_roles).await;
 
             let status_section = format!(
                 r#"
@@ -4253,22 +4273,18 @@ async fn users_edit_form(
     }
 }
 
-#[derive(serde::Deserialize)]
-struct UpdateUserForm {
-    email: String,
-    full_name: Option<String>,
-    password: Option<String>,
-    active: Option<String>,
-    role: uuid::Uuid,
-}
-
 async fn users_update(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
     Extension(auth_user): Extension<AuthUser>,
     Path(user_id): Path<uuid::Uuid>,
-    Form(form): Form<UpdateUserForm>,
+    Form(pairs): Form<Vec<(String, String)>>,
 ) -> Response {
+    let email = form_scalar(&pairs, "email").unwrap_or("").trim().to_string();
+    let full_name = form_scalar(&pairs, "full_name").map(|s| s.to_string()).filter(|s| !s.is_empty());
+    let password = form_scalar(&pairs, "password").map(|s| s.to_string()).filter(|s| !s.is_empty());
+    let active = form_scalar(&pairs, "active").is_some();
+    let roles = form_multi_uuids(&pairs, "roles");
     // ─── Policy check (Phase 0.2) ──────────────────────────────────
     // Ask the Cedar policy engine instead of the hard-coded role check.
     // The seeded `admins_can_manage_users` policy grants update to
@@ -4338,11 +4354,15 @@ async fn users_update(
         }
     }
 
-    let active = form.active.is_some();
-    let password_changed = form.password.as_deref().map_or(false, |p| !p.is_empty());
+    let password_changed = password.is_some();
+
+    // At least one role is required (don't silently strip a user's access).
+    if roles.is_empty() {
+        return error_response("Select at least one role");
+    }
 
     // Update user
-    let result = if let Some(password) = form.password.filter(|p| !p.is_empty()) {
+    let result = if let Some(password) = password {
         if password.len() < 12 {
             return error_response("Password must be at least 12 characters");
         }
@@ -4355,8 +4375,8 @@ async fn users_update(
             WHERE id = $6
             "#
         )
-        .bind(&form.email)
-        .bind(&form.full_name)
+        .bind(&email)
+        .bind(&full_name)
         .bind(&password_hash)
         .bind(active)
         .bind(&auth_user.id)
@@ -4371,8 +4391,8 @@ async fn users_update(
             WHERE id = $5
             "#
         )
-        .bind(&form.email)
-        .bind(&form.full_name)
+        .bind(&email)
+        .bind(&full_name)
         .bind(active)
         .bind(&auth_user.id)
         .bind(&user_id)
@@ -4382,17 +4402,19 @@ async fn users_update(
 
     match result {
         Ok(_) => {
-            // Update role - delete existing and insert new
+            // Replace the user's role set with the selected roles.
             let _ = sqlx::query("DELETE FROM user_roles WHERE user_id = $1")
                 .bind(&user_id)
                 .execute(&db)
                 .await;
 
-            let _ = sqlx::query("INSERT INTO user_roles (user_id, role_id) VALUES ($1, $2)")
-                .bind(&user_id)
-                .bind(&form.role)
-                .execute(&db)
-                .await;
+            for role_id in &roles {
+                let _ = sqlx::query("INSERT INTO user_roles (user_id, role_id) VALUES ($1, $2) ON CONFLICT (user_id, role_id) DO NOTHING")
+                    .bind(&user_id)
+                    .bind(role_id)
+                    .execute(&db)
+                    .await;
+            }
 
             // Log the action through the WORM ledger.
             let audit_entry = AuditEntry::new(AuditAction::UserUpdated, AuditSeverity::Info)
@@ -4401,9 +4423,9 @@ async fn users_update(
                 .with_resource("user", user_id.to_string())
                 .with_details(serde_json::json!({
                     "target_user_id": user_id.to_string(),
-                    "new_email": form.email,
+                    "new_email": email,
                     "active": active,
-                    "role_id": form.role.to_string(),
+                    "role_ids": roles.iter().map(|r| r.to_string()).collect::<Vec<_>>(),
                     "password_changed": password_changed,
                 }));
             if let Err(e) = state.audit.log(audit_entry).await {
@@ -4559,7 +4581,10 @@ struct RoleRow {
 }
 
 /// Generate HTML select dropdown for role selection
-async fn generate_role_dropdown(db: &PgPool, selected_role: Option<uuid::Uuid>) -> String {
+/// Render the role picker as a multi-select checkbox group. A user may hold
+/// any number of roles (e.g. System Administrator *and* EAM Manager); the
+/// `user_roles` table is many-to-many and the login path aggregates them all.
+async fn generate_role_checkboxes(db: &PgPool, selected_roles: &[uuid::Uuid]) -> String {
     let roles = sqlx::query_as::<_, RoleRow>(
         "SELECT id, name, description FROM roles ORDER BY name"
     )
@@ -4571,24 +4596,35 @@ async fn generate_role_dropdown(db: &PgPool, selected_role: Option<uuid::Uuid>) 
         return r#"<p class="text-sm text-base-content/60">No roles available</p>"#.to_string();
     }
 
-    let options: String = roles
+    let items: String = roles
         .iter()
         .map(|role| {
-            let selected = if selected_role == Some(role.id) { "selected" } else { "" };
+            let checked = if selected_roles.contains(&role.id) { "checked" } else { "" };
+            let desc = role
+                .description
+                .as_deref()
+                .filter(|d| !d.is_empty())
+                .map(|d| format!(r#"<span class="label-text-alt opacity-60 ml-1">— {}</span>"#, html_escape(d)))
+                .unwrap_or_default();
             format!(
-                r#"<option value="{}" {}>{}</option>"#,
-                role.id, selected, role.name
+                r#"<label class="label cursor-pointer justify-start gap-3 py-1">
+                    <input type="checkbox" name="roles" value="{}" class="checkbox checkbox-primary checkbox-sm" {} />
+                    <span class="label-text">{}</span>{}
+                </label>"#,
+                role.id,
+                checked,
+                html_escape(&role.name),
+                desc
             )
         })
         .collect::<Vec<_>>()
         .join("\n");
 
     format!(
-        r#"<select name="role" class="select select-bordered w-full text-base" required>
-            <option value="" disabled>Select a role</option>
+        r#"<div class="flex flex-col gap-1 rounded-box border border-base-300 p-3 max-h-72 overflow-y-auto">
             {}
-        </select>"#,
-        options
+        </div>"#,
+        items
     )
 }
 
