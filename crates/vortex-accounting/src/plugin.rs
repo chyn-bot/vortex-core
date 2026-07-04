@@ -98,65 +98,100 @@ impl Plugin for AccountingPlugin {
             .merge(handlers_closing::closing_routes())
     }
 
+    /// Menu mirrors the sub-ledger mental model (AutoCount/SQL style):
+    /// Receivables / Payables / Banking / General Ledger / Setup —
+    /// not one flat "Journal Entries" bucket.
     fn menu_entries(&self) -> Vec<MenuEntry> {
         vec![
+            // ── Receivables (AR) ────────────────────────────────
             MenuEntry::new(
-                "accounting.moves",
-                "Journal Entries",
-                "/accounting",
+                "accounting.ar",
+                "Receivables",
+                "/accounting/invoices",
                 MenuGroup::Operations,
             )
-            .with_icon("scale")
             .with_priority(40),
             MenuEntry::new(
-                "accounting.invoices",
+                "accounting.ar.invoices",
                 "Customer Invoices",
                 "/accounting/invoices",
                 MenuGroup::Operations,
             )
-            .under("accounting.moves"),
+            .under("accounting.ar"),
             MenuEntry::new(
-                "accounting.bills",
+                "accounting.ar.einvoice",
+                "e-Invoices (MyInvois)",
+                "/accounting/einvoice",
+                MenuGroup::Operations,
+            )
+            .under("accounting.ar"),
+            // ── Payables (AP) ───────────────────────────────────
+            MenuEntry::new(
+                "accounting.ap",
+                "Payables",
+                "/accounting/bills",
+                MenuGroup::Operations,
+            )
+            .with_priority(41),
+            MenuEntry::new(
+                "accounting.ap.bills",
                 "Vendor Bills",
                 "/accounting/bills",
                 MenuGroup::Operations,
             )
-            .under("accounting.moves"),
+            .under("accounting.ap"),
             MenuEntry::new(
-                "accounting.payments",
-                "Payments",
-                "/accounting/payments",
-                MenuGroup::Operations,
-            )
-            .under("accounting.moves"),
-            MenuEntry::new(
-                "accounting.einvoice",
-                "e-Invoices",
-                "/accounting/einvoice",
-                MenuGroup::Operations,
-            )
-            .under("accounting.moves"),
-            MenuEntry::new(
-                "accounting.banking",
-                "Bank Reconciliation",
-                "/accounting/bank-statements",
-                MenuGroup::Operations,
-            )
-            .under("accounting.moves"),
-            MenuEntry::new(
-                "accounting.pdc",
-                "Post-dated Cheques",
-                "/accounting/pdc",
-                MenuGroup::Operations,
-            )
-            .under("accounting.moves"),
-            MenuEntry::new(
-                "accounting.contra",
+                "accounting.ap.contra",
                 "AR/AP Contra",
                 "/accounting/contra",
                 MenuGroup::Operations,
             )
-            .under("accounting.moves"),
+            .under("accounting.ap"),
+            // ── Banking ─────────────────────────────────────────
+            MenuEntry::new(
+                "accounting.bank",
+                "Banking",
+                "/accounting/payments",
+                MenuGroup::Operations,
+            )
+            .with_priority(42),
+            MenuEntry::new(
+                "accounting.bank.payments",
+                "Receipts & Payments",
+                "/accounting/payments",
+                MenuGroup::Operations,
+            )
+            .under("accounting.bank"),
+            MenuEntry::new(
+                "accounting.bank.recon",
+                "Bank Reconciliation",
+                "/accounting/bank-statements",
+                MenuGroup::Operations,
+            )
+            .under("accounting.bank"),
+            MenuEntry::new(
+                "accounting.bank.pdc",
+                "Post-dated Cheques",
+                "/accounting/pdc",
+                MenuGroup::Operations,
+            )
+            .under("accounting.bank"),
+            // ── General Ledger ──────────────────────────────────
+            MenuEntry::new(
+                "accounting.gl",
+                "General Ledger",
+                "/accounting",
+                MenuGroup::Operations,
+            )
+            .with_icon("scale")
+            .with_priority(43),
+            MenuEntry::new(
+                "accounting.gl.moves",
+                "Journal Entries",
+                "/accounting",
+                MenuGroup::Operations,
+            )
+            .under("accounting.gl"),
             MenuEntry::new(
                 "accounting.config",
                 "Accounting Setup",
@@ -164,7 +199,7 @@ impl Plugin for AccountingPlugin {
                 MenuGroup::Operations,
             )
             .with_icon("settings")
-            .with_priority(41),
+            .with_priority(45),
             MenuEntry::new(
                 "accounting.config.accounts",
                 "Chart of Accounts",
@@ -180,26 +215,26 @@ impl Plugin for AccountingPlugin {
             )
             .under("accounting.config"),
             MenuEntry::new(
-                "accounting.assets",
-                "Fixed Assets",
-                "/accounting/assets",
-                MenuGroup::Operations,
-            )
-            .under("accounting.moves"),
-            MenuEntry::new(
-                "accounting.budgets",
-                "Budgets",
-                "/accounting/budgets",
-                MenuGroup::Operations,
-            )
-            .under("accounting.moves"),
-            MenuEntry::new(
-                "accounting.recurring",
+                "accounting.gl.recurring",
                 "Recurring Entries",
                 "/accounting/recurring",
                 MenuGroup::Operations,
             )
-            .under("accounting.moves"),
+            .under("accounting.gl"),
+            MenuEntry::new(
+                "accounting.gl.budgets",
+                "Budgets",
+                "/accounting/budgets",
+                MenuGroup::Operations,
+            )
+            .under("accounting.gl"),
+            MenuEntry::new(
+                "accounting.gl.assets",
+                "Fixed Assets",
+                "/accounting/assets",
+                MenuGroup::Operations,
+            )
+            .under("accounting.gl"),
             MenuEntry::new(
                 "accounting.config.year_end",
                 "Year-End Close",
