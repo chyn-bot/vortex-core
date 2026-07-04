@@ -144,6 +144,7 @@ fn page_shell(title: &str, sidebar: &str) -> (String, &'static str) {
         r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><title>{}</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
+<link href="/static/vortex.css" rel="stylesheet"/>
 <script src="/static/vendor/tailwind.js"></script></head>
 <body class="min-h-screen bg-base-200">
 <div class="flex">{}<main class="flex-1 p-4 lg:p-6 min-w-0">"#,

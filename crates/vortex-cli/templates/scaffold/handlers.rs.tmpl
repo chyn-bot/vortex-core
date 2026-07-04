@@ -49,6 +49,7 @@ fn page_shell(sidebar: &str, title: &str, content: &str) -> String {
 <title>{title} - Vortex</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
+<link href="/static/vortex.css" rel="stylesheet"/>
 <script src="/static/vendor/tailwind.js"></script>
 <script src="/static/vendor/htmx.min.js"></script>
 </head>
@@ -362,7 +363,8 @@ async fn public_board(Db(db): Db, Extension(db_ctx): Extension<DatabaseContext>)
     Html(format!(
         r##"<!DOCTYPE html><html data-theme="dark"><head><title>__DISPLAY__ — Public Board</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<link href="/static/vendor/daisyui.min.css" rel="stylesheet"/><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
+<link href="/static/vortex.css" rel="stylesheet"/><script src="/static/vendor/tailwind.js"></script>
 </head><body class="min-h-screen bg-base-200 flex items-center justify-center">
 <div class="card bg-base-100 shadow-xl"><div class="card-body text-center">
 <h1 class="text-2xl font-bold">__DISPLAY__</h1>
