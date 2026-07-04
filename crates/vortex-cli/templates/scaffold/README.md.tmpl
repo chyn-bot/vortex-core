@@ -5,11 +5,13 @@ in the workspace and the host — build and it runs:
 
 ```
 cargo build -p vortex-cli
-DATABASE_URL=<tenant-url> ./target/debug/vortex db migrate   # applies migrations/001_init per tenant
+DATABASE_URL=<tenant-url> ./target/debug/vortex db migrate       # applies migrations/001_init per tenant
+DATABASE_URL=<tenant-url> ./target/debug/vortex module install __SNAKE__   # install is an operator decision
 ```
 
-Then open `/__KEBAB__` (the sidebar entry appears once the module is
-installed for the tenant — Settings ▸ Modules ▸ Update Apps List).
+(Or install from the UI: Settings ▸ Modules ▸ Update Apps List ▸
+Install.) Then open `/__KEBAB__`; the anonymous public board is at
+`/p/__KEBAB__` and 404s for tenants without the module installed.
 
 ## What you got
 

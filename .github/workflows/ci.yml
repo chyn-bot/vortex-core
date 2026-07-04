@@ -68,7 +68,12 @@ jobs:
           ./target/debug/vortex scaffold plugin citest
           cargo build -p vortex-cli
       - name: Provision fresh tenant
-        run: ./target/debug/vortex db migrate
+        run: |
+          ./target/debug/vortex db migrate
+          # New modules register as 'uninstalled' by design (install is
+          # an operator decision) — install the scaffolded one so its
+          # portal/module gate can be asserted below.
+          ./target/debug/vortex module install citest
       - name: Start server
         run: |
           cp scripts/ci-vortex.toml vortex.toml
