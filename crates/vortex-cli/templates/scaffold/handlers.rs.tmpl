@@ -1,6 +1,6 @@
-//! __DISPLAY__ HTTP handlers — list (list framework), create form,
-//! and a record page wearing the platform widgets: status bar,
-//! chatter, audit-logged transitions.
+//! __DISPLAY__ HTTP handlers — list (list framework), create/edit
+//! (form engine), and a record page wearing the platform widgets:
+//! status bar, chatter, audit-logged transitions.
 
 use std::sync::Arc;
 
@@ -27,7 +27,18 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/__KEBAB__/new", get(new_item_form))
         .route("/__KEBAB__/create", post(create_item))
         .route("/__KEBAB__/{id}", get(item_page))
+        .route("/__KEBAB__/{id}", post(update_item))
+        .route("/__KEBAB__/{id}/edit", get(edit_item_form))
         .route("/__KEBAB__/{id}/status/{state}", post(change_status))
+}
+
+/// The form, declared once — rendering, validation, and persistence
+/// all derive from this. Add a field here and it exists everywhere.
+fn item_form() -> FormConfig {
+    FormConfig::new("__DISPLAY__ Item", "__SNAKE___item", "/__KEBAB__")
+        .section("Details")
+        .field(FormField::text("name", "Name").required().placeholder("A descriptive name"))
+        .field(FormField::textarea("description", "Description"))
 }
 
 /// Platform HTML shell: sidebar, vendored assets, mobile layout.
@@ -113,81 +124,112 @@ async fn list_items(
     Html(page_shell(&sidebar, "__DISPLAY__", &content)).into_response()
 }
 
-/// GET /__KEBAB__/new — create form.
+/// GET /__KEBAB__/new — create form, rendered by the form engine.
 async fn new_item_form(
     State(state): State<Arc<AppState>>,
+    Db(db): Db,
     Extension(user): Extension<AuthUser>,
     Extension(db_ctx): Extension<DatabaseContext>,
 ) -> Response {
-    let content = r##"<div class="max-w-xl">
-<h1 class="text-2xl font-bold mb-6">New __DISPLAY__ item</h1>
-<form method="post" action="/__KEBAB__/create" class="card bg-base-100 shadow"><div class="card-body gap-4">
-  <label class="form-control"><span class="label-text mb-1">Name *</span>
-    <input name="name" required maxlength="255" class="input input-bordered"/></label>
-  <label class="form-control"><span class="label-text mb-1">Description</span>
-    <textarea name="description" class="textarea textarea-bordered"></textarea></label>
-  <div class="card-actions justify-end">
-    <a href="/__KEBAB__" class="btn btn-ghost">Cancel</a>
-    <button class="btn btn-primary">Create</button></div>
-</div></form></div>"##;
+    let form = render_form(
+        &db, &item_form(), FormMode::Create, None, &Default::default(), &[],
+    )
+    .await;
     let sidebar = sidebar_for(&state, &user, &db_ctx);
-    Html(page_shell(&sidebar, "New - __DISPLAY__", content)).into_response()
+    Html(page_shell(&sidebar, "New - __DISPLAY__", &form)).into_response()
 }
 
-/// POST /__KEBAB__/create — sequence code, insert, audit, redirect.
+/// POST /__KEBAB__/create — validate + insert via the form engine,
+/// then stamp the sequence code, audit, redirect.
 async fn create_item(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
     Extension(db_ctx): Extension<DatabaseContext>,
-    vortex_plugin_sdk::axum::extract::Form(form): vortex_plugin_sdk::axum::extract::Form<
-        std::collections::HashMap<String, String>,
-    >,
+    Form(pairs): Form<Vec<(String, String)>>,
 ) -> Response {
-    let name = form.get("name").map(|s| s.trim()).unwrap_or("");
-    if name.is_empty() {
-        return (StatusCode::BAD_REQUEST, "Name is required").into_response();
-    }
-    let description = form.get("description").map(|s| s.trim()).filter(|s| !s.is_empty());
-    let code = match vortex_plugin_sdk::orm::sequence::next(&db_ctx.pool, &ITEM_SEQ).await {
-        Ok(c) => c,
+    match execute_form_save(&db, &item_form(), &pairs, None).await {
+        Ok(SaveOutcome::Saved(id)) => {
+            // Post-create enrichments the form doesn't own: sequence
+            // code and creator.
+            let code = vortex_plugin_sdk::orm::sequence::next(&db_ctx.pool, &ITEM_SEQ)
+                .await
+                .unwrap_or_else(|_| id.to_string());
+            let _ = vortex_plugin_sdk::sqlx::query(
+                "UPDATE __SNAKE___item SET code = $2, created_by = $3 WHERE id = $1",
+            )
+            .bind(id)
+            .bind(&code)
+            .bind(user.id)
+            .execute(&db)
+            .await;
+
+            audit_item(&state, &user, &db_ctx, id, AuditAction::RecordCreated, json!({"code": code})).await;
+            Redirect::to(&format!("/__KEBAB__/{id}")).into_response()
+        }
+        Ok(SaveOutcome::Invalid { values, errors }) => {
+            let form = render_form(&db, &item_form(), FormMode::Create, None, &values, &errors).await;
+            let sidebar = sidebar_for(&state, &user, &db_ctx);
+            Html(page_shell(&sidebar, "New - __DISPLAY__", &form)).into_response()
+        }
         Err(e) => {
-            error!("sequence failed: {e}");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "Could not allocate code").into_response();
+            error!("create failed: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "Create failed").into_response()
+        }
+    }
+}
+
+/// GET /__KEBAB__/{id}/edit — edit form, pre-filled by the engine.
+async fn edit_item_form(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<Uuid>,
+) -> Response {
+    let values = match load_record(&db, &item_form(), id).await {
+        Ok(Some(v)) => v,
+        Ok(None) => return (StatusCode::NOT_FOUND, "Not found").into_response(),
+        Err(e) => {
+            error!("load failed: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Load failed").into_response();
         }
     };
-
-    let id: Uuid = match vortex_plugin_sdk::sqlx::query_scalar(
-        "INSERT INTO __SNAKE___item (code, name, description, created_by)
-         VALUES ($1, $2, $3, $4) RETURNING id",
+    let form = render_form(
+        &db, &item_form(), FormMode::Edit, Some(&id.to_string()), &values, &[],
     )
-    .bind(&code)
-    .bind(name)
-    .bind(description)
-    .bind(user.id)
-    .fetch_one(&db)
-    .await
-    {
-        Ok(id) => id,
-        Err(e) => {
-            error!("insert failed: {e}");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "Create failed").into_response();
+    .await;
+    let sidebar = sidebar_for(&state, &user, &db_ctx);
+    Html(page_shell(&sidebar, "Edit - __DISPLAY__", &form)).into_response()
+}
+
+/// POST /__KEBAB__/{id} — validate + update via the form engine.
+async fn update_item(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<Uuid>,
+    Form(pairs): Form<Vec<(String, String)>>,
+) -> Response {
+    match execute_form_save(&db, &item_form(), &pairs, Some(id)).await {
+        Ok(SaveOutcome::Saved(_)) => {
+            audit_item(&state, &user, &db_ctx, id, AuditAction::RecordUpdated, json!({"via": "form"})).await;
+            Redirect::to(&format!("/__KEBAB__/{id}")).into_response()
         }
-    };
-
-    // Evidence on the WORM ledger — every state change is recorded.
-    let entry = AuditEntry::new(AuditAction::RecordCreated, AuditSeverity::Info)
-        .with_user(UserId(user.id))
-        .with_username(&user.username)
-        .with_database(&db_ctx.db_name)
-        .with_resource("__SNAKE___item", id.to_string())
-        .with_resource_name(name)
-        .with_details(json!({ "code": code }));
-    if let Err(e) = state.audit.log(entry).await {
-        error!("audit write failed: {e}");
+        Ok(SaveOutcome::Invalid { values, errors }) => {
+            let form = render_form(
+                &db, &item_form(), FormMode::Edit, Some(&id.to_string()), &values, &errors,
+            )
+            .await;
+            let sidebar = sidebar_for(&state, &user, &db_ctx);
+            Html(page_shell(&sidebar, "Edit - __DISPLAY__", &form)).into_response()
+        }
+        Err(e) => {
+            error!("update failed: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "Update failed").into_response()
+        }
     }
-
-    Redirect::to(&format!("/__KEBAB__/{id}")).into_response()
 }
 
 /// GET /__KEBAB__/{id} — record page: status bar + fields + chatter.
@@ -209,7 +251,7 @@ async fn item_page(
         Ok(Some(r)) => r,
         _ => return (StatusCode::NOT_FOUND, "Not found").into_response(),
     };
-    let code: String = row.get("code");
+    let code: Option<String> = row.try_get("code").ok().flatten();
     let name: String = row.get("name");
     let description: Option<String> = row.try_get("description").ok().flatten();
     let record_state: String = row.get("record_state");
@@ -229,7 +271,8 @@ async fn item_page(
   <div class="flex justify-between items-start flex-wrap gap-4">
     <div><h1 class="text-2xl font-bold">{name}</h1>
     <p class="opacity-60"><code>{code}</code></p></div>
-    {bar}
+    <div class="flex items-center gap-3">{bar}
+    <a href="/__KEBAB__/{id}/edit" class="btn btn-sm btn-outline">Edit</a></div>
   </div>
   <p class="mt-4">{description}</p>
 </div></div>
@@ -238,7 +281,7 @@ async fn item_page(
   <span class="loading loading-dots loading-sm"></span>
 </div>"##,
         name = esc(&name),
-        code = esc(&code),
+        code = esc(code.as_deref().unwrap_or("—")),
         bar = bar,
         description = esc(description.as_deref().unwrap_or("")),
         id = id,
@@ -280,17 +323,28 @@ async fn change_status(
         return (StatusCode::INTERNAL_SERVER_ERROR, "Update failed").into_response();
     }
 
-    let entry = AuditEntry::new(AuditAction::RecordUpdated, AuditSeverity::Info)
+    audit_item(&state, &user, &db_ctx, id, AuditAction::RecordUpdated, json!({"record_state": new_state})).await;
+    Redirect::to(&format!("/__KEBAB__/{id}")).into_response()
+}
+
+/// Evidence on the WORM ledger — every state change is recorded.
+async fn audit_item(
+    state: &AppState,
+    user: &AuthUser,
+    db_ctx: &DatabaseContext,
+    id: Uuid,
+    action: AuditAction,
+    details: vortex_plugin_sdk::serde_json::Value,
+) {
+    let entry = AuditEntry::new(action, AuditSeverity::Info)
         .with_user(UserId(user.id))
         .with_username(&user.username)
         .with_database(&db_ctx.db_name)
         .with_resource("__SNAKE___item", id.to_string())
-        .with_details(json!({ "record_state": new_state }));
+        .with_details(details);
     if let Err(e) = state.audit.log(entry).await {
         error!("audit write failed: {e}");
     }
-
-    Redirect::to(&format!("/__KEBAB__/{id}")).into_response()
 }
 
 /// GET /p/__KEBAB__ — anonymous public board: aggregate counts only,

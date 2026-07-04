@@ -7,7 +7,9 @@
 
 CREATE TABLE IF NOT EXISTS __SNAKE___item (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    code VARCHAR(32) UNIQUE NOT NULL,
+    -- stamped from the sequence right after insert (nullable so the
+    -- form engine's INSERT doesn't need to know about it)
+    code VARCHAR(32) UNIQUE,
     name VARCHAR(255) NOT NULL,
     description TEXT,
     record_state VARCHAR(32) NOT NULL DEFAULT 'draft',

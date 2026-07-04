@@ -37,6 +37,7 @@ pub mod approval;
 pub mod audit_trail;
 pub mod auth;
 pub mod files;
+pub mod form;
 pub mod i18n;
 pub mod jobs;
 pub mod list;

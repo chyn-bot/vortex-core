@@ -113,6 +113,12 @@ pub mod prelude {
     // ── Webhooks ── (emit events via `framework::webhooks::emit`)
     pub use vortex_framework::WebhookEndpoint;
 
+    // ── Form engine ── (declare once: render + validate + save)
+    pub use vortex_framework::form::{
+        execute_form_save, load_record, render_form, FieldKind, FormConfig, FormField, FormMode,
+        SaveOutcome,
+    };
+
     // ── Audit ledger ── (every state change: `state.audit.log(...)`)
     pub use vortex_security::audit::{AuditAction, AuditEntry, AuditSeverity};
 

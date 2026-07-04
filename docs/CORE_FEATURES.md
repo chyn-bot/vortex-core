@@ -107,6 +107,7 @@ it probably already exists, audited and tested.
 | Commerce types | Currencies, units of measure, taxes — don't reinvent | `vortex_orm::commerce` |
 | Sequences | Per-tenant, per-year document numbering (`SAL/2026/00042`) | sequence service |
 | List framework | Declarative list views: pagination (clamped), filters, group-by, aggregates — one definition, full UI | `vortex_framework::list` |
+| Form engine | Declare a form once (`FormConfig`/`FormField`) → rendering, widget inference by field kind (text/number/date/checkbox/select/many2one), server-side validation with error round-trip, and type-safe INSERT/UPDATE. Handlers shrink to authorize → save → audit | `vortex_framework::form` |
 | Record UX | Field-change tracking (`Tracker`), Odoo-style status bar, rendered audit trail, chatter (messages + secure attachments) on any record | `vortex_framework` + `vortex-chatter` |
 
 ### Process

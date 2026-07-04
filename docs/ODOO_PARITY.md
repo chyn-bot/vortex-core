@@ -33,20 +33,20 @@ Vortex's core doesn't give them yet?**
 
 ## The real gaps, ranked
 
-### 1. Declarative view layer — the blocker-grade gap
+### 1. Declarative view layer — partially closed
 Odoo: define fields once → form/kanban/pivot/graph/calendar views
-derive from them, with XML view inheritance. Vortex: list views are
-declarative; **every form is hand-written HTML** and kanban/pivot
-don't exist. This is the single largest difference in
-module-developer cost — a vertical with 30 record types hand-writes
-30 forms today.
+derive from them, with XML view inheritance.
 
-Plan (already agreed): unify `#[derive(Model)]` with the `ir_model`
-registry as the single source of truth, then `FormConfig` (widgets
-inferred from field types, saves through the API's validated write
-path, statusbar/chatter auto-mounted), then kanban, then pivot over
-the existing aggregation engine. Odoo-style *view inheritance* is
-phase two.
+**Form engine: DONE** (`vortex_framework::form`, 2026-07-04) —
+`FormConfig`/`FormField` declare once; the engine renders widgets by
+field kind, validates server-side with an error round-trip, and
+persists via type-safe generated INSERT/UPDATE. The scaffold
+generates form-engine modules, so CI proves it continuously.
+
+Still open, in order: `#[derive(Model)]` ↔ `ir_model` registry
+unification (kinds default from the registry), kanban view, pivot
+over the existing aggregation engine, and Odoo-style *view
+inheritance* (ecosystem stage).
 
 ### 2. Generic data import — `base_import` equivalent
 Every real deployment starts with "here's our Excel." Odoo ships
