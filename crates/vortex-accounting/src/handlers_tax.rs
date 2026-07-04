@@ -86,6 +86,10 @@ fn settings_form() -> FormConfig {
         .section("Period Control")
         .field(FormField::date("lock_date", "Lock Date")
             .help("Posting on or before this date is rejected"))
+        .field(FormField::date("tax_lock_date", "Tax Lock Date")
+            .help("Documents (invoices/bills) on or before this date cannot post — freeze after SST-02 filing"))
+        .field(FormField::number("fiscal_year_end_month", "Fiscal Year-End Month")
+            .default("12").help("1-12; 12 = December year end"))
         .section("Credit & Ageing")
         .field(FormField::select("credit_limit_policy", "Credit Limit Policy", &[
             ("off", "Off"),

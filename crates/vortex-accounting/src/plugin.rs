@@ -6,8 +6,8 @@ use std::time::Duration;
 use vortex_plugin_sdk::prelude::*;
 
 use crate::{
-    handlers, handlers_assets, handlers_banking, handlers_currency, handlers_documents,
-    handlers_einvoice, handlers_tax,
+    handlers, handlers_assets, handlers_banking, handlers_closing, handlers_currency,
+    handlers_documents, handlers_einvoice, handlers_tax,
 };
 
 const MIG_001_ACCOUNTING: &str = include_str!("../migrations/001_accounting/postgres.sql");
@@ -25,6 +25,8 @@ const MIG_007_BANKING_ARAP: &str =
     include_str!("../migrations/007_banking_arap/postgres.sql");
 const MIG_008_DIMENSIONS_ASSETS: &str =
     include_str!("../migrations/008_dimensions_assets/postgres.sql");
+const MIG_009_STATEMENTS_CLOSE: &str =
+    include_str!("../migrations/009_statements_close/postgres.sql");
 
 pub struct AccountingPlugin;
 
@@ -87,6 +89,7 @@ impl Plugin for AccountingPlugin {
             .merge(handlers_currency::currency_routes())
             .merge(handlers_banking::banking_routes())
             .merge(handlers_assets::asset_routes())
+            .merge(handlers_closing::closing_routes())
     }
 
     fn menu_entries(&self) -> Vec<MenuEntry> {
@@ -192,6 +195,20 @@ impl Plugin for AccountingPlugin {
             )
             .under("accounting.moves"),
             MenuEntry::new(
+                "accounting.config.year_end",
+                "Year-End Close",
+                "/accounting/year-end",
+                MenuGroup::Operations,
+            )
+            .under("accounting.config"),
+            MenuEntry::new(
+                "accounting.config.groups",
+                "Statement Groups",
+                "/accounting/account-groups",
+                MenuGroup::Operations,
+            )
+            .under("accounting.config"),
+            MenuEntry::new(
                 "accounting.config.dimensions",
                 "Dimensions",
                 "/accounting/dimensions",
@@ -294,6 +311,12 @@ impl Plugin for AccountingPlugin {
             PluginMigration {
                 name: "008_dimensions_assets",
                 up_sql: MIG_008_DIMENSIONS_ASSETS,
+                down_sql: None,
+                requires_core_migration: Some("119_commerce_primitives"),
+            },
+            PluginMigration {
+                name: "009_statements_close",
+                up_sql: MIG_009_STATEMENTS_CLOSE,
                 down_sql: None,
                 requires_core_migration: Some("119_commerce_primitives"),
             },

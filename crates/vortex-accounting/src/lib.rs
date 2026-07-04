@@ -26,12 +26,14 @@
 
 pub mod assets;
 pub mod banking;
+pub mod closing;
 pub mod currency;
 pub mod documents;
 pub mod einvois;
 pub mod handlers;
 pub mod handlers_assets;
 pub mod handlers_banking;
+pub mod handlers_closing;
 pub mod handlers_currency;
 pub mod handlers_documents;
 pub mod handlers_einvoice;

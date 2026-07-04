@@ -377,6 +377,34 @@ pub async fn post_invoice(
     let partner_id: Option<Uuid> = head.get("partner_id");
     let company_id: Option<Uuid> = head.get("company_id");
 
+    // Two-tier lock: the TAX lock freezes documents (SST/e-invoice
+    // relevant) independently of the general lock in post_move.
+    let tax_lock: Option<vortex_plugin_sdk::chrono::NaiveDate> =
+        vortex_plugin_sdk::sqlx::query_scalar(
+            "SELECT tax_lock_date FROM acc_config ORDER BY company_id NULLS LAST LIMIT 1",
+        )
+        .fetch_optional(db)
+        .await
+        .map_err(|e| VortexError::QueryExecution(e.to_string()))?
+        .flatten();
+    if let Some(lock) = tax_lock {
+        let doc_date: Option<vortex_plugin_sdk::chrono::NaiveDate> =
+            vortex_plugin_sdk::sqlx::query_scalar(
+                "SELECT move_date FROM acc_move WHERE id = $1",
+            )
+            .bind(move_id)
+            .fetch_one(db)
+            .await
+            .ok();
+        if let Some(d) = doc_date {
+            if d <= lock {
+                return Err(VortexError::ValidationFailed(format!(
+                    "document date {d} is on or before the tax lock date {lock}"
+                )));
+            }
+        }
+    }
+
     // Refresh totals from lines, then load them back.
     refresh_document_totals(db, move_id).await?;
     let totals = vortex_plugin_sdk::sqlx::query(

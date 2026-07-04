@@ -94,7 +94,354 @@ pub fn report_defs() -> Vec<ReportDef> {
         bank_reconciliation(),
         asset_register(),
         pl_by_dimension(),
+        sofp(),
+        sopl(),
+        socie(),
+        cashflow(),
     ]
+}
+
+// ─── MFRS statement pack ─────────────────────────────────────────────────
+//
+// All four statements render a comparative column (same window, one
+// year earlier). Section data comes from closing::section_balances
+// over the migration-009 account groups.
+
+fn year_earlier(d: vortex_plugin_sdk::chrono::NaiveDate) -> vortex_plugin_sdk::chrono::NaiveDate {
+    use vortex_plugin_sdk::chrono::Datelike;
+    vortex_plugin_sdk::chrono::NaiveDate::from_ymd_opt(d.year() - 1, d.month(), d.day().min(28))
+        .unwrap_or(d)
+}
+
+fn param_date(params: &ReportParams, key: &str, default: vortex_plugin_sdk::chrono::NaiveDate) -> vortex_plugin_sdk::chrono::NaiveDate {
+    params
+        .get(key)
+        .unwrap_or("")
+        .parse()
+        .unwrap_or(default)
+}
+
+fn fy_start(to: vortex_plugin_sdk::chrono::NaiveDate) -> vortex_plugin_sdk::chrono::NaiveDate {
+    use vortex_plugin_sdk::chrono::Datelike;
+    vortex_plugin_sdk::chrono::NaiveDate::from_ymd_opt(to.year(), 1, 1).unwrap()
+}
+
+/// Sum the balances of the given sections, with an optional sign flip
+/// (liabilities/equity/income carry credit balances).
+fn section_sum(
+    data: &[crate::closing::SectionBalance],
+    sections: &[&str],
+    flip: bool,
+) -> Vec<(String, Decimal)> {
+    data.iter()
+        .filter(|(s, _, _, _)| sections.contains(&s.as_str()))
+        .map(|(_, name, _, bal)| (name.clone(), if flip { -bal } else { *bal }))
+        .collect()
+}
+
+fn two_col_rows(
+    label: &str,
+    cur: &[(String, Decimal)],
+    prev: &[(String, Decimal)],
+) -> (String, Decimal, Decimal) {
+    let mut rows = format!("<tr class=\"section\"><th colspan=\"3\">{}</th></tr>", esc(label));
+    let mut tc = Decimal::ZERO;
+    let mut tp = Decimal::ZERO;
+    for (name, bal) in cur {
+        let prev_bal = prev
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, b)| *b)
+            .unwrap_or_default();
+        tc += bal;
+        tp += prev_bal;
+        rows.push_str(&format!(
+            "<tr><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td></tr>",
+            esc(name),
+            money(*bal),
+            money(prev_bal),
+        ));
+    }
+    rows.push_str(&format!(
+        "<tr class=\"total\"><td>Total {}</td><td class=\"num\">{}</td><td class=\"num\">{}</td></tr>",
+        esc(label),
+        money(tc),
+        money(tp),
+    ));
+    (rows, tc, tp)
+}
+
+/// Statement of Financial Position (MFRS SOFP). Params: `to`.
+fn sofp() -> ReportDef {
+    ReportDef::new(
+        "accounting.sofp",
+        "Statement of Financial Position",
+        "MFRS SOFP with comparative column (one year earlier)",
+        vec![ReportFormat::Html],
+        |state, params| async move {
+            let to = param_date(&params, "to", vortex_plugin_sdk::chrono::Utc::now().date_naive());
+            let prev_to = year_earlier(to);
+            let cur = crate::closing::section_balances(&state.db, None, to).await?;
+            let prev = crate::closing::section_balances(&state.db, None, prev_to).await?;
+            // Undistributed P&L rolls into equity until the year closes.
+            let earn_cur: Decimal = cur
+                .iter()
+                .filter(|(s, _, _, _)| {
+                    matches!(s.as_str(), "revenue" | "other_income" | "cost_of_sales" | "expenses" | "depreciation")
+                })
+                .map(|(_, _, _, b)| -b)
+                .sum();
+            let earn_prev: Decimal = prev
+                .iter()
+                .filter(|(s, _, _, _)| {
+                    matches!(s.as_str(), "revenue" | "other_income" | "cost_of_sales" | "expenses" | "depreciation")
+                })
+                .map(|(_, _, _, b)| -b)
+                .sum();
+
+            let (a1, ta1c, ta1p) = two_col_rows(
+                "Non-current Assets",
+                &section_sum(&cur, &["non_current_assets"], false),
+                &section_sum(&prev, &["non_current_assets"], false),
+            );
+            let (a2, ta2c, ta2p) = two_col_rows(
+                "Current Assets",
+                &section_sum(&cur, &["current_assets"], false),
+                &section_sum(&prev, &["current_assets"], false),
+            );
+            let mut eq_cur = section_sum(&cur, &["equity"], true);
+            eq_cur.push(("Undistributed earnings".into(), earn_cur));
+            let mut eq_prev = section_sum(&prev, &["equity"], true);
+            eq_prev.push(("Undistributed earnings".into(), earn_prev));
+            let (e1, te1c, te1p) = two_col_rows("Equity", &eq_cur, &eq_prev);
+            let (l1, tl1c, tl1p) = two_col_rows(
+                "Non-current Liabilities",
+                &section_sum(&cur, &["non_current_liabilities"], true),
+                &section_sum(&prev, &["non_current_liabilities"], true),
+            );
+            let (l2, tl2c, tl2p) = two_col_rows(
+                "Current Liabilities",
+                &section_sum(&cur, &["current_liabilities"], true),
+                &section_sum(&prev, &["current_liabilities"], true),
+            );
+            let table = format!(
+                "<table><tr><th></th><th class=\"num\">{to}</th><th class=\"num\">{prev_to}</th></tr>\
+                 {a1}{a2}\
+                 <tr class=\"total\"><td>TOTAL ASSETS</td><td class=\"num\">{}</td><td class=\"num\">{}</td></tr>\
+                 {e1}{l1}{l2}\
+                 <tr class=\"total\"><td>TOTAL EQUITY AND LIABILITIES</td><td class=\"num\">{}</td><td class=\"num\">{}</td></tr></table>",
+                money(ta1c + ta2c),
+                money(ta1p + ta2p),
+                money(te1c + tl1c + tl2c),
+                money(te1p + tl1p + tl2p),
+            );
+            Ok(ReportOutput::html(
+                "sofp.html",
+                html_page("Statement of Financial Position", &format!("as at {to}"), &table),
+            ))
+        },
+    )
+}
+
+/// Statement of Profit or Loss (MFRS SOPL). Params: `from`, `to`
+/// (default: calendar year to date).
+fn sopl() -> ReportDef {
+    ReportDef::new(
+        "accounting.sopl",
+        "Statement of Profit or Loss",
+        "MFRS SOPL with gross profit and comparative period",
+        vec![ReportFormat::Html],
+        |state, params| async move {
+            let to = param_date(&params, "to", vortex_plugin_sdk::chrono::Utc::now().date_naive());
+            let from = param_date(&params, "from", fy_start(to));
+            let (pf, pt) = (year_earlier(from), year_earlier(to));
+            let cur = crate::closing::section_balances(&state.db, Some(from), to).await?;
+            let prev = crate::closing::section_balances(&state.db, Some(pf), pt).await?;
+            let get = |data: &[crate::closing::SectionBalance], s: &str| -> Decimal {
+                data.iter()
+                    .filter(|(sec, _, _, _)| sec == s)
+                    .map(|(_, _, _, b)| if s == "revenue" || s == "other_income" { -b } else { *b })
+                    .sum()
+            };
+            let row = |label: &str, c: Decimal, p: Decimal, total: bool| {
+                format!(
+                    "<tr{}><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td></tr>",
+                    if total { " class=\"total\"" } else { "" },
+                    esc(label),
+                    money(c),
+                    money(p),
+                )
+            };
+            let (rev_c, rev_p) = (get(&cur, "revenue"), get(&prev, "revenue"));
+            let (cos_c, cos_p) = (get(&cur, "cost_of_sales"), get(&prev, "cost_of_sales"));
+            let (oi_c, oi_p) = (get(&cur, "other_income"), get(&prev, "other_income"));
+            let (ex_c, ex_p) = (get(&cur, "expenses"), get(&prev, "expenses"));
+            let (dep_c, dep_p) = (get(&cur, "depreciation"), get(&prev, "depreciation"));
+            let gp_c = rev_c - cos_c;
+            let gp_p = rev_p - cos_p;
+            let np_c = gp_c + oi_c - ex_c - dep_c;
+            let np_p = gp_p + oi_p - ex_p - dep_p;
+            let table = format!(
+                "<table><tr><th></th><th class=\"num\">{from} – {to}</th><th class=\"num\">{pf} – {pt}</th></tr>{}{}{}{}{}{}{}{}</table>",
+                row("Revenue", rev_c, rev_p, false),
+                row("Cost of sales", -cos_c, -cos_p, false),
+                row("Gross profit", gp_c, gp_p, true),
+                row("Other income", oi_c, oi_p, false),
+                row("Operating expenses", -ex_c, -ex_p, false),
+                row("Depreciation & amortisation", -dep_c, -dep_p, false),
+                row("Profit for the period", np_c, np_p, true),
+                "",
+            );
+            Ok(ReportOutput::html(
+                "sopl.html",
+                html_page("Statement of Profit or Loss", &format!("{from} to {to}"), &table),
+            ))
+        },
+    )
+}
+
+/// Statement of Changes in Equity (MFRS SOCIE). Params: `from`, `to`.
+fn socie() -> ReportDef {
+    ReportDef::new(
+        "accounting.socie",
+        "Statement of Changes in Equity",
+        "MFRS SOCIE: opening equity, profit for the period, other movements, closing",
+        vec![ReportFormat::Html],
+        |state, params| async move {
+            let to = param_date(&params, "to", vortex_plugin_sdk::chrono::Utc::now().date_naive());
+            let from = param_date(&params, "from", fy_start(to));
+            let opening_cutoff = from - vortex_plugin_sdk::chrono::Duration::days(1);
+            // Equity here = booked equity accounts + cumulative P&L
+            // (undistributed earnings behave as equity until closed).
+            let equity_at = |d: vortex_plugin_sdk::chrono::NaiveDate| {
+                let db = state.db.clone();
+                async move {
+                    let data = crate::closing::section_balances(&db, None, d).await?;
+                    let booked: Decimal = data
+                        .iter()
+                        .filter(|(s, _, _, _)| s == "equity")
+                        .map(|(_, _, _, b)| -b)
+                        .sum();
+                    let earnings: Decimal = data
+                        .iter()
+                        .filter(|(s, _, _, _)| {
+                            matches!(s.as_str(), "revenue" | "other_income" | "cost_of_sales" | "expenses" | "depreciation")
+                        })
+                        .map(|(_, _, _, b)| -b)
+                        .sum();
+                    Ok::<_, vortex_plugin_sdk::common::VortexError>(booked + earnings)
+                }
+            };
+            let opening = equity_at(opening_cutoff).await?;
+            let closing = equity_at(to).await?;
+            let profit = crate::closing::period_profit(&state.db, from, to).await?;
+            let other = closing - opening - profit; // capital injections, dividends…
+            let table = format!(
+                "<table><tr><th></th><th class=\"num\">MYR</th></tr>\
+                 <tr><td>Equity at {opening_cutoff}</td><td class=\"num\">{}</td></tr>\
+                 <tr><td>Profit for the period</td><td class=\"num\">{}</td></tr>\
+                 <tr><td>Other movements (capital, dividends)</td><td class=\"num\">{}</td></tr>\
+                 <tr class=\"total\"><td>Equity at {to}</td><td class=\"num\">{}</td></tr></table>",
+                money(opening),
+                money(profit),
+                money(other),
+                money(closing),
+            );
+            Ok(ReportOutput::html(
+                "socie.html",
+                html_page("Statement of Changes in Equity", &format!("{from} to {to}"), &table),
+            ))
+        },
+    )
+}
+
+/// Cash flow statement, indirect method. Params: `from`, `to`.
+/// Construction guarantees the tie-out: operating + investing +
+/// financing == Δ(cash and bank GL) over the period.
+fn cashflow() -> ReportDef {
+    ReportDef::new(
+        "accounting.cashflow",
+        "Statement of Cash Flows",
+        "Indirect method: profit + depreciation add-back + working-capital deltas; ties to the cash GL delta",
+        vec![ReportFormat::Html],
+        |state, params| async move {
+            let to = param_date(&params, "to", vortex_plugin_sdk::chrono::Utc::now().date_naive());
+            let from = param_date(&params, "from", fy_start(to));
+            // Signed debit-positive balance movement per account type
+            // over the period.
+            let delta = |types: &'static [&'static str]| {
+                let db = state.db.clone();
+                async move {
+                    let list = types.iter().map(|t| format!("'{t}'")).collect::<Vec<_>>().join(",");
+                    let sql = format!(
+                        "SELECT COALESCE(SUM(l.debit - l.credit), 0) \
+                         FROM acc_move_line l \
+                         JOIN acc_move m ON m.id = l.move_id AND m.state = 'posted' \
+                             AND m.move_date BETWEEN $1 AND $2 \
+                         JOIN acc_account a ON a.id = l.account_id \
+                         WHERE a.account_type IN ({list})"
+                    );
+                    vortex_plugin_sdk::sqlx::query_scalar::<_, Decimal>(&sql)
+                        .bind(from)
+                        .bind(to)
+                        .fetch_one(&db)
+                        .await
+                        .map_err(|e| VortexError::QueryExecution(e.to_string()))
+                }
+            };
+            let profit = crate::closing::period_profit(&state.db, from, to).await?;
+            let dep_addback = delta(&["expense_depreciation"]).await?;
+            let d_receivables = delta(&["asset_receivable"]).await?;
+            let d_other_current = delta(&["asset_current"]).await?;
+            let d_payables = delta(&["liability_payable"]).await?; // debit-positive: payment reduces
+            let d_other_liab = delta(&["liability_current"]).await?;
+            let d_fixed = delta(&["asset_fixed", "asset_non_current"]).await?;
+            let d_equity = delta(&["equity"]).await?;
+            let d_ncl = delta(&["liability_non_current"]).await?;
+            let d_cash = delta(&["asset_cash", "asset_bank"]).await?;
+
+            let operating =
+                profit + dep_addback - d_receivables - d_other_current - d_payables - d_other_liab;
+            // Depreciation credited the contra-asset inside d_fixed;
+            // removing the add-back leaves capex/disposal cash only.
+            let investing = -d_fixed - dep_addback;
+            let financing = -d_equity - d_ncl;
+            let net = operating + investing + financing;
+            let row = |label: &str, v: Decimal, total: bool| {
+                format!(
+                    "<tr{}><td>{}</td><td class=\"num\">{}</td></tr>",
+                    if total { " class=\"total\"" } else { "" },
+                    esc(label),
+                    money(v),
+                )
+            };
+            let tie = if net == d_cash { "ties to cash GL ✓" } else { "DOES NOT TIE ✗" };
+            let table = format!(
+                "<table><tr><th></th><th class=\"num\">MYR</th></tr>\
+                 <tr class=\"section\"><th colspan=\"2\">Operating activities</th></tr>{}{}{}{}{}{}{}\
+                 <tr class=\"section\"><th colspan=\"2\">Investing activities</th></tr>{}\
+                 <tr class=\"section\"><th colspan=\"2\">Financing activities</th></tr>{}{}{}\
+                 {}{}</table>",
+                row("Profit for the period", profit, false),
+                row("Depreciation & amortisation add-back", dep_addback, false),
+                row("(Increase)/decrease in receivables", -d_receivables, false),
+                row("(Increase)/decrease in other current assets", -d_other_current, false),
+                row("Increase/(decrease) in payables", -d_payables, false),
+                row("Increase/(decrease) in other current liabilities", -d_other_liab, false),
+                row("Net cash from operating activities", operating, true),
+                row("Net cash used in investing activities", investing, true),
+                row("Movements in borrowings", -d_ncl, false),
+                row("Movements in share capital / equity", -d_equity, false),
+                row("Net cash from financing activities", financing, true),
+                row("NET CHANGE IN CASH AND CASH EQUIVALENTS", net, true),
+                row(&format!("Change in cash & bank per GL ({tie})"), d_cash, true),
+            );
+            Ok(ReportOutput::html(
+                "cashflow.html",
+                html_page("Statement of Cash Flows", &format!("{from} to {to} (indirect)"), &table),
+            ))
+        },
+    )
 }
 
 /// Fixed Asset Register in MFRS 116 note format: cost b/f, additions,

@@ -870,6 +870,186 @@ fn date_rate(s: &str) -> Decimal {
     s.parse().unwrap()
 }
 
+/// Phase 6: year-end close — P&L zeroed into Retained Earnings,
+/// closed year blocks posting, reopen reverses the closing entry.
+/// The statement engine (section balances) is asserted along the way.
+#[tokio::test]
+async fn year_end_close_lifecycle() {
+    let Some((db, seq_pool, user_id, _partner_id)) = setup().await else {
+        return;
+    };
+    use vortex_accounting::closing;
+    let today = Utc::now().date_naive();
+    // A far-future, isolated fiscal window. Randomized per run so
+    // reruns against a reused DB never see a stale window's entries.
+    // Keep the resulting year < 9999 (chrono's +YYYYY format breaks
+    // Postgres date literals beyond that).
+    let salt = (Uuid::new_v4().as_u128() % 100_000) as i64;
+    let fy_from = today + vortex_plugin_sdk::chrono::Duration::days(5000 + salt * 7);
+    let fy_to = fy_from + vortex_plugin_sdk::chrono::Duration::days(6);
+    let post_at = fy_from + vortex_plugin_sdk::chrono::Duration::days(2);
+    let suffix = Uuid::new_v4().simple().to_string()[..6].to_string();
+    let fy: Uuid = vortex_plugin_sdk::sqlx::query_scalar(
+        "INSERT INTO acc_fiscal_year (code, date_from, date_to, state) \
+         VALUES ($1, $2, $3, 'open') RETURNING id",
+    )
+    .bind(format!("FYC{suffix}"))
+    .bind(fy_from)
+    .bind(fy_to)
+    .fetch_one(&db)
+    .await
+    .expect("seed open fiscal year");
+
+    let acc = |code: &'static str| {
+        let db = db.clone();
+        async move {
+            vortex_plugin_sdk::sqlx::query_scalar::<_, Uuid>(
+                "SELECT id FROM acc_account WHERE code = $1",
+            )
+            .bind(code)
+            .fetch_one(&db)
+            .await
+            .unwrap()
+        }
+    };
+    let (bank, sales, opex) = (acc("1100").await, acc("4000").await, acc("6000").await);
+    let mut post_entry = |lines: Vec<MoveLine>, date| {
+        let db = db.clone();
+        let seq_pool = seq_pool.clone();
+        async move {
+            service::create_and_post(
+                &db,
+                &seq_pool,
+                user_id,
+                &NewMove {
+                    journal_code: "GEN",
+                    move_date: date,
+                    move_type: "entry",
+                    ref_: Some("close test"),
+                    narration: None,
+                    partner_id: None,
+                    origin_ref: None,
+                    company_id: None,
+                    lines,
+                },
+            )
+            .await
+        }
+    };
+    post_entry(
+        vec![
+            MoveLine::debit(bank, dec!(1000.00), Some("Cash sale")),
+            MoveLine::credit(sales, dec!(1000.00), Some("Cash sale")),
+        ],
+        post_at,
+    )
+    .await
+    .expect("post revenue");
+    post_entry(
+        vec![
+            MoveLine::debit(opex, dec!(400.00), Some("Expense")),
+            MoveLine::credit(bank, dec!(400.00), Some("Expense")),
+        ],
+        post_at,
+    )
+    .await
+    .expect("post expense");
+
+    // Profit in the window = 600 before closing.
+    let profit = closing::period_profit(&db, fy_from, fy_to).await.unwrap();
+    assert_eq!(profit, dec!(600.00));
+    // Statement engine sees the revenue in its section.
+    let sections = closing::section_balances(&db, Some(fy_from), fy_to).await.unwrap();
+    let revenue: Decimal = sections
+        .iter()
+        .filter(|(s, _, _, _)| s == "revenue")
+        .map(|(_, _, _, b)| -b)
+        .sum();
+    assert_eq!(revenue, dec!(1000.00));
+
+    // Draft inside the window blocks the close.
+    let draft = service::create_move(
+        &db,
+        user_id,
+        &NewMove {
+            journal_code: "GEN",
+            move_date: post_at,
+            move_type: "entry",
+            ref_: Some("straggler draft"),
+            narration: None,
+            partner_id: None,
+            origin_ref: None,
+            company_id: None,
+            lines: vec![
+                MoveLine::debit(opex, dec!(1.00), None),
+                MoveLine::credit(bank, dec!(1.00), None),
+            ],
+        },
+    )
+    .await
+    .expect("create draft");
+    closing::close_fiscal_year(&db, &seq_pool, user_id, fy, false)
+        .await
+        .expect_err("drafts in the window must block the close");
+    vortex_plugin_sdk::sqlx::query("DELETE FROM acc_move WHERE id = $1")
+        .bind(draft)
+        .execute(&db)
+        .await
+        .unwrap();
+
+    // Close: P&L in the window nets to zero, RE gets the profit.
+    let closing_move = closing::close_fiscal_year(&db, &seq_pool, user_id, fy, false)
+        .await
+        .expect("close fiscal year")
+        .expect("closing move for a profitable year");
+    assert_eq!(closing::period_profit(&db, fy_from, fy_to).await.unwrap(), dec!(0.00));
+    let re_credit: Option<Decimal> = vortex_plugin_sdk::sqlx::query_scalar(
+        "SELECT SUM(l.credit - l.debit) FROM acc_move_line l \
+         JOIN acc_account a ON a.id = l.account_id \
+         WHERE l.move_id = $1 AND a.code = '3900'",
+    )
+    .bind(closing_move)
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert_eq!(re_credit, Some(dec!(600.00)), "profit lands in retained earnings");
+    let (d, c, _) = line_sums(&db, closing_move).await;
+    assert_eq!(d, c, "closing move balanced");
+
+    // Closed year rejects new postings.
+    post_entry(
+        vec![
+            MoveLine::debit(bank, dec!(5.00), None),
+            MoveLine::credit(sales, dec!(5.00), None),
+        ],
+        post_at,
+    )
+    .await
+    .expect_err("closed fiscal year must reject postings");
+
+    // Reopen: closing entry reversed, posting allowed again.
+    closing::reopen_fiscal_year(&db, &seq_pool, user_id, fy)
+        .await
+        .expect("reopen");
+    let fy_state: String = vortex_plugin_sdk::sqlx::query_scalar(
+        "SELECT state FROM acc_fiscal_year WHERE id = $1",
+    )
+    .bind(fy)
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert_eq!(fy_state, "open");
+    post_entry(
+        vec![
+            MoveLine::debit(bank, dec!(5.00), None),
+            MoveLine::credit(sales, dec!(5.00), None),
+        ],
+        post_at,
+    )
+    .await
+    .expect("reopened year accepts postings");
+}
+
 /// Phase 5: dimensions on GL lines (tag + posted immutability),
 /// fixed-asset confirm → depreciate → dispose, recurring generation.
 #[tokio::test]
