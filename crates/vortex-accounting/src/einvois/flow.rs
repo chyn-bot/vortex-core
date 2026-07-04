@@ -646,3 +646,68 @@ pub async fn cancel_via_api(
 pub fn portal_base(production: bool) -> &'static str {
     if production { client::PRODUCTION_PORTAL } else { client::SANDBOX_PORTAL }
 }
+
+// ─── Taxpayer TIN lookup (Search TIN / Validate TIN) ─────────────────────
+
+/// Build an API client from the tenant's e-invoice settings, or say
+/// exactly what is missing. Used by the on-demand TIN actions.
+pub async fn api_client_from_settings(db: &PgPool) -> Result<client::LhdnClient, String> {
+    let settings = settings(db).await.map_err(|e| e.to_string())?;
+    if settings.mode != "api" {
+        return Err("e-invoice mode is 'portal' — switch to API mode in e-Invoice Settings".into());
+    }
+    let (Some(id), Some(secret)) = (settings.client_id.clone(), settings.client_secret.clone())
+    else {
+        return Err("MyInvois client ID / secret not configured".into());
+    };
+    client::LhdnClient::new(settings.production, id, secret)
+}
+
+/// Search LHDN for the TIN matching a partner tax profile's ID
+/// (BRN/NRIC/passport/army) and name. Returns the TIN when found.
+pub async fn search_tin_for_profile(db: &PgPool, profile_id: Uuid) -> Result<Option<String>, String> {
+    let row = vortex_plugin_sdk::sqlx::query(
+        "SELECT p.id_type, p.id_value, ct.name FROM acc_partner_tax_profile p \
+         JOIN contacts ct ON ct.id = p.contact_id WHERE p.id = $1",
+    )
+    .bind(profile_id)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| e.to_string())?
+    .ok_or("profile not found")?;
+    let id_type: Option<String> = row.get("id_type");
+    let id_value: Option<String> = row.get("id_value");
+    let name: String = row.get("name");
+    let (Some(id_type), Some(id_value)) = (
+        id_type.filter(|s| !s.is_empty()),
+        id_value.filter(|s| !s.is_empty()),
+    ) else {
+        return Err("fill in ID type and ID value (BRN/NRIC) first — LHDN searches by them".into());
+    };
+    let api = api_client_from_settings(db).await?;
+    api.search_tin(&id_type, &id_value, Some(&name)).await
+}
+
+/// Validate the profile's stored TIN against its ID pair per LHDN.
+pub async fn validate_tin_for_profile(db: &PgPool, profile_id: Uuid) -> Result<bool, String> {
+    let row = vortex_plugin_sdk::sqlx::query(
+        "SELECT tin, id_type, id_value FROM acc_partner_tax_profile WHERE id = $1",
+    )
+    .bind(profile_id)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| e.to_string())?
+    .ok_or("profile not found")?;
+    let tin: Option<String> = row.get("tin");
+    let id_type: Option<String> = row.get("id_type");
+    let id_value: Option<String> = row.get("id_value");
+    let (Some(tin), Some(id_type), Some(id_value)) = (
+        tin.filter(|s| !s.is_empty()),
+        id_type.filter(|s| !s.is_empty()),
+        id_value.filter(|s| !s.is_empty()),
+    ) else {
+        return Err("TIN, ID type and ID value must all be filled to validate".into());
+    };
+    let api = api_client_from_settings(db).await?;
+    api.validate_tin(&tin, &id_type, &id_value).await
+}

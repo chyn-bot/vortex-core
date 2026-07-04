@@ -26,6 +26,8 @@ pub fn tax_routes() -> Router<Arc<AppState>> {
         .route("/accounting/tax-profiles/by-contact/{contact_id}", get(profile_by_contact))
         .route("/accounting/tax-profiles/{id}", get(edit_tax_profile))
         .route("/accounting/tax-profiles/{id}", post(save_tax_profile))
+        .route("/accounting/tax-profiles/{id}/search-tin", post(search_tin_action))
+        .route("/accounting/tax-profiles/{id}/validate-tin", post(validate_tin_action))
 }
 
 // ─── Forms (declared once — render + validate + save derive) ────────────
@@ -574,6 +576,7 @@ async fn edit_tax_profile(
     Extension(user): Extension<AuthUser>,
     Extension(db_ctx): Extension<DatabaseContext>,
     Path(id): Path<Uuid>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     let partner: Option<String> = vortex_plugin_sdk::sqlx::query_scalar(
         "SELECT ct.name FROM acc_partner_tax_profile p \
@@ -594,13 +597,105 @@ async fn edit_tax_profile(
     let form =
         render_form(&db, &tax_profile_form(), FormMode::Edit, Some(&id.to_string()), &values, &[])
             .await;
+    // Banner from a just-run LHDN TIN action (?tin_check=…).
+    let esc = vortex_plugin_sdk::framework::html_escape;
+    let banner = match q.get("tin_check").map(String::as_str) {
+        Some("found") => r#"<div class="alert alert-success mb-3">TIN found at LHDN and filled in below — save to keep it.</div>"#.to_string(),
+        Some("notfound") => r#"<div class="alert alert-warning mb-3">LHDN has no TIN matching this ID / name.</div>"#.to_string(),
+        Some("valid") => r#"<div class="alert alert-success mb-3">LHDN confirms this TIN belongs to this ID.</div>"#.to_string(),
+        Some("invalid") => r#"<div class="alert alert-error mb-3">LHDN says this TIN does NOT match this ID — check both.</div>"#.to_string(),
+        _ => q
+            .get("tin_error")
+            .map(|m| format!(r#"<div class="alert alert-error mb-3">{}</div>"#, esc(m)))
+            .unwrap_or_default(),
+    };
+    let lhdn_actions = format!(
+        r#"<div class="card bg-base-100 shadow mt-4 max-w-2xl"><div class="card-body p-4">
+<h2 class="font-bold mb-1">LHDN Taxpayer Lookup</h2>
+<p class="text-xs opacity-60 mb-2">Uses the MyInvois API credentials from e-Invoice Settings. Save the profile first — the lookup reads the stored ID type + value.</p>
+<div class="flex gap-2">
+<form method="post" action="/accounting/tax-profiles/{id}/search-tin"><button class="btn btn-sm btn-outline">Search TIN by ID</button></form>
+<form method="post" action="/accounting/tax-profiles/{id}/validate-tin"><button class="btn btn-sm btn-outline">Validate stored TIN</button></form>
+</div></div></div>"#,
+    );
     let content = format!(
         "<div class=\"mb-2\"><a href=\"/accounting/tax-profiles\" class=\"link link-hover text-sm\">← Partner Tax Profiles</a></div>\
-         <p class=\"text-lg font-semibold mb-2\">{}</p>{form}",
-        vortex_plugin_sdk::framework::html_escape(&partner),
+         <p class=\"text-lg font-semibold mb-2\">{}</p>{banner}{form}{lhdn_actions}",
+        esc(&partner),
     );
     let sidebar = render_sidebar(&state, &user, &db_ctx);
     Html(page_shell(&sidebar, "Partner Tax Profile", &content)).into_response()
+}
+
+async fn search_tin_action(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<Uuid>,
+) -> Response {
+    match crate::einvois::flow::search_tin_for_profile(&db, id).await {
+        Ok(Some(tin)) => {
+            if let Err(e) = vortex_plugin_sdk::sqlx::query(
+                "UPDATE acc_partner_tax_profile SET tin = $2 WHERE id = $1",
+            )
+            .bind(id)
+            .bind(&tin)
+            .execute(&db)
+            .await
+            {
+                error!("tin save failed: {e}");
+                return Redirect::to(&format!(
+                    "/accounting/tax-profiles/{id}?tin_error=found+but+saving+failed"
+                ))
+                .into_response();
+            }
+            audit_setup(&state, &user, &db_ctx, "acc_tin_found", id).await;
+            Redirect::to(&format!("/accounting/tax-profiles/{id}?tin_check=found")).into_response()
+        }
+        Ok(None) => {
+            Redirect::to(&format!("/accounting/tax-profiles/{id}?tin_check=notfound")).into_response()
+        }
+        Err(e) => Redirect::to(&format!(
+            "/accounting/tax-profiles/{id}?tin_error={}",
+            urlencoding_lite(&e)
+        ))
+        .into_response(),
+    }
+}
+
+async fn validate_tin_action(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<Uuid>,
+) -> Response {
+    match crate::einvois::flow::validate_tin_for_profile(&db, id).await {
+        Ok(true) => {
+            audit_setup(&state, &user, &db_ctx, "acc_tin_validated", id).await;
+            Redirect::to(&format!("/accounting/tax-profiles/{id}?tin_check=valid")).into_response()
+        }
+        Ok(false) => {
+            Redirect::to(&format!("/accounting/tax-profiles/{id}?tin_check=invalid")).into_response()
+        }
+        Err(e) => Redirect::to(&format!(
+            "/accounting/tax-profiles/{id}?tin_error={}",
+            urlencoding_lite(&e)
+        ))
+        .into_response(),
+    }
+}
+
+/// Percent-encode enough for a query-string value (no external dep).
+fn urlencoding_lite(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' => (b as char).to_string(),
+            b' ' => "+".to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
 }
 
 async fn save_tax_profile(

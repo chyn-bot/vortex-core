@@ -58,6 +58,21 @@ pub trait MyInvoisApi: Send + Sync {
     async fn document_details(&self, lhdn_uuid: &str) -> Result<Value, String>;
     /// Cancel within LHDN's 72-hour window.
     async fn cancel(&self, lhdn_uuid: &str, reason: &str) -> Result<(), String>;
+    /// Look up a taxpayer's TIN by registration identity (and/or
+    /// name). `Ok(None)` when LHDN has no match.
+    async fn search_tin(
+        &self,
+        id_type: &str,
+        id_value: &str,
+        taxpayer_name: Option<&str>,
+    ) -> Result<Option<String>, String>;
+    /// Check that a TIN and ID pair belong together per LHDN.
+    async fn validate_tin(
+        &self,
+        tin: &str,
+        id_type: &str,
+        id_value: &str,
+    ) -> Result<bool, String>;
 }
 
 pub struct LhdnClient {
@@ -256,6 +271,57 @@ impl MyInvoisApi for LhdnClient {
             Ok(())
         } else {
             Err(format!("cancel failed: {}", resp.status()))
+        }
+    }
+
+    async fn search_tin(
+        &self,
+        id_type: &str,
+        id_value: &str,
+        taxpayer_name: Option<&str>,
+    ) -> Result<Option<String>, String> {
+        let tok = self.bearer().await?;
+        let mut query: Vec<(&str, &str)> = vec![("idType", id_type), ("idValue", id_value)];
+        if let Some(name) = taxpayer_name.filter(|n| !n.trim().is_empty()) {
+            query.push(("taxpayerName", name));
+        }
+        let resp = self
+            .http
+            .get(format!("{}/api/v1.0/taxpayer/search/tin", self.base))
+            .query(&query)
+            .bearer_auth(&tok)
+            .send()
+            .await
+            .map_err(|e| format!("tin search request: {e}"))?;
+        match resp.status().as_u16() {
+            200 => {
+                let body: Value = resp.json().await.map_err(|e| format!("tin search body: {e}"))?;
+                Ok(body.get("tin").and_then(|v| v.as_str()).map(str::to_string))
+            }
+            404 => Ok(None),
+            code => Err(format!("tin search failed: HTTP {code}")),
+        }
+    }
+
+    async fn validate_tin(
+        &self,
+        tin: &str,
+        id_type: &str,
+        id_value: &str,
+    ) -> Result<bool, String> {
+        let tok = self.bearer().await?;
+        let resp = self
+            .http
+            .get(format!("{}/api/v1.0/taxpayer/validate/{tin}", self.base))
+            .query(&[("idType", id_type), ("idValue", id_value)])
+            .bearer_auth(&tok)
+            .send()
+            .await
+            .map_err(|e| format!("tin validate request: {e}"))?;
+        match resp.status().as_u16() {
+            200 => Ok(true),
+            400 | 404 => Ok(false),
+            code => Err(format!("tin validate failed: HTTP {code}")),
         }
     }
 }
