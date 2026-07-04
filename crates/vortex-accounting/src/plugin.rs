@@ -251,6 +251,13 @@ impl Plugin for AccountingPlugin {
             )
             .under("accounting.config"),
             MenuEntry::new(
+                "accounting.config.einvoice",
+                "e-Invoice (MyInvois)",
+                "/accounting/einvoice/settings",
+                MenuGroup::Operations,
+            )
+            .under("accounting.config"),
+            MenuEntry::new(
                 "accounting.config.settings",
                 "Settings",
                 "/accounting/settings",
