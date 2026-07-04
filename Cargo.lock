@@ -4530,6 +4530,7 @@ dependencies = [
 name = "vortex-purchase"
 version = "0.1.0"
 dependencies = [
+ "vortex-accounting",
  "vortex-inventory",
  "vortex-plugin-sdk",
 ]

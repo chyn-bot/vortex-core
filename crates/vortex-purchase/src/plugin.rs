@@ -8,6 +8,7 @@ use crate::handlers;
 
 const MIG_001_PURCHASE: &str = include_str!("../migrations/001_purchase/postgres.sql");
 const MIG_002_REGISTRY: &str = include_str!("../migrations/002_purchase_registry/postgres.sql");
+const MIG_003_VENDOR_BILL: &str = include_str!("../migrations/003_vendor_bill/postgres.sql");
 
 pub struct PurchasePlugin;
 
@@ -92,6 +93,12 @@ impl Plugin for PurchasePlugin {
                 up_sql: MIG_002_REGISTRY,
                 down_sql: None,
                 requires_core_migration: Some("122_model_registry"),
+            },
+            PluginMigration {
+                name: "003_vendor_bill",
+                up_sql: MIG_003_VENDOR_BILL,
+                down_sql: None,
+                requires_core_migration: Some("119_commerce_primitives"),
             },
         ]
     }

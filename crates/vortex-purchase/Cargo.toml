@@ -14,3 +14,4 @@ description = "Purchasing plugin — vendors → purchase orders → receipts, p
 [dependencies]
 vortex-plugin-sdk = { workspace = true }
 vortex-inventory = { workspace = true }
+vortex-accounting = { workspace = true }

@@ -29,6 +29,7 @@ pub fn purchase_routes() -> Router<Arc<AppState>> {
         .route("/purchase/orders/{id}/cancel", post(cancel_order))
         .route("/purchase/orders/{id}/receive", get(receive_form))
         .route("/purchase/orders/{id}/receive", post(process_receipt))
+        .route("/purchase/orders/{id}/create-bill", post(create_vendor_bill))
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -605,6 +606,25 @@ async fn edit_order(
         }
         _ => {}
     }
+    // Accounting bridge: bill a confirmed/received order once.
+    if has_lines && matches!(po_state.as_str(), "confirmed" | "received") {
+        let bill: Option<Uuid> = vortex_plugin_sdk::sqlx::query_scalar(
+            "SELECT vendor_bill_move_id FROM purchase_order WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(&db)
+        .await
+        .ok()
+        .flatten();
+        match bill {
+            Some(bill_id) => actions.push_str(&format!(
+                r#"<a href="/accounting/documents/{bill_id}" class="btn btn-outline btn-sm ml-2">View Vendor Bill</a>"#
+            )),
+            None => actions.push_str(&format!(
+                r#"<form method="POST" action="/purchase/orders/{id}/create-bill" class="inline ml-2"><button class="btn btn-outline btn-sm">Create Vendor Bill</button></form>"#
+            )),
+        }
+    }
 
     let content = format!(
         r#"<div class="flex items-center justify-between mb-4">
@@ -1112,4 +1132,139 @@ async fn process_receipt(
     audit_po(&state, &db_ctx, &db, user.id, &user.username, id, "received").await;
     info!(number = %number, "purchase receipt posted");
     vortex_plugin_sdk::axum::response::Redirect::to(&format!("/purchase/orders/{id}")).into_response()
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Accounting bridge — vendor bill from a purchase order
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Create (and post) an accounting vendor bill from a confirmed or
+/// received order. Idempotent: refuses when the PO is already billed.
+/// Line taxes map by matching the PO line's tax_percent against an
+/// active purchase tax; unmatched rates bill untaxed with the amount
+/// already folded into the PO total (flagged in the bill narration).
+async fn create_vendor_bill(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<Uuid>,
+) -> Response {
+    use vortex_accounting::documents::{self, InvoiceLine, NewInvoice};
+
+    let po = vortex_plugin_sdk::sqlx::query(
+        "SELECT number, state, vendor_id, order_date, company_id, vendor_bill_move_id \
+         FROM purchase_order WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&db)
+    .await
+    .ok()
+    .flatten();
+    let Some(po) = po else {
+        return (vortex_plugin_sdk::axum::http::StatusCode::NOT_FOUND, "Order not found").into_response();
+    };
+    let number: String = po.get("number");
+    let po_state: String = po.get("state");
+    if !matches!(po_state.as_str(), "confirmed" | "received") {
+        return (vortex_plugin_sdk::axum::http::StatusCode::CONFLICT, "Only confirmed or received orders can be billed").into_response();
+    }
+    if po.get::<Option<Uuid>, _>("vendor_bill_move_id").is_some() {
+        return (vortex_plugin_sdk::axum::http::StatusCode::CONFLICT, "This order already has a vendor bill").into_response();
+    }
+    let vendor_id: Uuid = po.get("vendor_id");
+    let company_id: Option<Uuid> = po.try_get("company_id").ok().flatten();
+    let order_date: vortex_plugin_sdk::chrono::NaiveDate = po
+        .try_get("order_date")
+        .unwrap_or_else(|_| vortex_plugin_sdk::chrono::Utc::now().date_naive());
+
+    let line_rows = vortex_plugin_sdk::sqlx::query(
+        "SELECT COALESCE(NULLIF(l.description, ''), p.name) AS name, \
+                l.quantity, l.unit_price, l.tax_percent \
+         FROM purchase_order_line l JOIN stock_product p ON p.id = l.product_id \
+         WHERE l.order_id = $1 ORDER BY l.sequence",
+    )
+    .bind(id)
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default();
+    if line_rows.is_empty() {
+        return (vortex_plugin_sdk::axum::http::StatusCode::PRECONDITION_FAILED, "Order has no lines").into_response();
+    }
+
+    let mut lines = Vec::new();
+    let mut unmatched_rates = Vec::new();
+    for r in &line_rows {
+        let name: String = r.get("name");
+        let quantity: Decimal = r.get("quantity");
+        let unit_price: Decimal = r.get("unit_price");
+        let tax_percent: Decimal = r.get("tax_percent");
+        let mut line = InvoiceLine::new(&name, quantity, unit_price);
+        if tax_percent > Decimal::ZERO {
+            let tax: Option<Uuid> = vortex_plugin_sdk::sqlx::query_scalar(
+                "SELECT id FROM taxes WHERE active AND type_tax_use IN ('purchase', 'both') \
+                   AND amount_type = 'percent' AND amount = $1 \
+                 ORDER BY name LIMIT 1",
+            )
+            .bind(tax_percent)
+            .fetch_optional(&db)
+            .await
+            .ok()
+            .flatten();
+            match tax {
+                Some(t) => line = line.with_tax(t),
+                None => unmatched_rates.push(tax_percent.normalize().to_string()),
+            }
+        }
+        lines.push(line);
+    }
+    let narration = if unmatched_rates.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "PO tax rate(s) {}% had no matching purchase tax — billed untaxed; review before posting SST.",
+            unmatched_rates.join("%, ")
+        ))
+    };
+
+    let origin = format!("purchase_order:{id}");
+    let bill = match documents::create_invoice(
+        &db,
+        user.id,
+        &NewInvoice {
+            move_type: "vendor_bill",
+            partner_id: vendor_id,
+            invoice_date: order_date,
+            due_date: None,
+            journal_code: None,
+            currency_id: None,
+            origin_ref: Some(&origin),
+            narration: narration.as_deref(),
+            company_id,
+            lines,
+        },
+    )
+    .await
+    {
+        Ok(b) => b,
+        Err(e) => {
+            error!(error = %e, "vendor bill create failed");
+            return (vortex_plugin_sdk::axum::http::StatusCode::UNPROCESSABLE_ENTITY, format!("Failed to create bill: {e}")).into_response();
+        }
+    };
+    if let Err(e) = vortex_plugin_sdk::sqlx::query(
+        "UPDATE purchase_order SET vendor_bill_move_id = $2, updated_by = $3, updated_at = NOW() \
+         WHERE id = $1 AND vendor_bill_move_id IS NULL",
+    )
+    .bind(id)
+    .bind(bill)
+    .bind(user.id)
+    .execute(&db)
+    .await
+    {
+        error!(error = %e, "vendor bill link failed");
+    }
+    audit_po(&state, &db_ctx, &db, user.id, &user.username, id, "billed").await;
+    info!(number = %number, bill = %bill, "vendor bill created from purchase order");
+    vortex_plugin_sdk::axum::response::Redirect::to(&format!("/accounting/documents/{bill}")).into_response()
 }
