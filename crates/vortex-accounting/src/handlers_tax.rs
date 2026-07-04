@@ -746,7 +746,7 @@ async fn save_tax_profile(
 
 /// Upsert the profile row for a contact and write the inline-panel
 /// fields. Returns the profile id.
-async fn upsert_profile_fields(
+pub(crate) async fn upsert_profile_fields(
     db: &vortex_plugin_sdk::sqlx::PgPool,
     contact_id: Uuid,
     pairs: &[(String, String)],

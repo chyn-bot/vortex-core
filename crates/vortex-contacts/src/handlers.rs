@@ -651,7 +651,7 @@ async fn edit_contact(
 
 {approval_panel}
 
-<form method="POST" action="/contacts/{id}">
+<form method="POST" action="/contacts/{id}" id="record-form">
 <fieldset class="contents"{form_disabled}>
 <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
 
@@ -1043,8 +1043,17 @@ async fn update_contact(
         )
         .await;
 
+    // Panel fields ride in on the same form (form="record-form") —
+    // hand the submission to contributing plugins' save hooks.
+    let pairs: Vec<(String, String)> =
+        form.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    vortex_plugin_sdk::framework::handle_record_panel_saves(&state, &db, "contacts", id, &pairs)
+        .await;
+
     info!(id = %id, name = %name, "contact updated");
-    vortex_plugin_sdk::axum::response::Redirect::to("/contacts").into_response()
+    // Stay on the record — one Save now persists contact + panel
+    // fields, and returning here makes that visible.
+    vortex_plugin_sdk::axum::response::Redirect::to(&format!("/contacts/{id}")).into_response()
 }
 
 /// POST /contacts/:id/archive — archive a contact (soft delete: active = false).

@@ -56,9 +56,29 @@ pub type PanelHandler = Arc<
         + Sync,
 >;
 
+/// Boxed async save hook: `(state, tenant db, record id, submitted
+/// form pairs)`. Receives the OWNER form's full submission — pick out
+/// your own fields and ignore the rest.
+pub type PanelSaveHandler = Arc<
+    dyn Fn(
+            Arc<AppState>,
+            PgPool,
+            Uuid,
+            Vec<(String, String)>,
+        ) -> Pin<Box<dyn Future<Output = VortexResult<()>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// The `id` a host detail page gives its `<form>` element so panel
+/// inputs can join it via the HTML `form="…"` attribute — one Save
+/// button submits host fields and panel fields together.
+pub const HOST_FORM_ID: &str = "record-form";
+
 pub struct RecordPanel {
     pub def: RecordPanelDef,
     pub handler: PanelHandler,
+    pub save: Option<PanelSaveHandler>,
 }
 
 impl RecordPanel {
@@ -71,6 +91,53 @@ impl RecordPanel {
         Self {
             def,
             handler: Arc::new(move |state, db, id| Box::pin(handler(state, db, id))),
+            save: None,
+        }
+    }
+
+    /// Attach a save hook. Render the panel's inputs with
+    /// `form="record-form"` ([`HOST_FORM_ID`]) and the owner's single
+    /// Save button will persist them through this hook.
+    pub fn with_save<F, Fut>(mut self, save: F) -> Self
+    where
+        F: Fn(Arc<AppState>, PgPool, Uuid, Vec<(String, String)>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = VortexResult<()>> + Send + 'static,
+    {
+        self.save = Some(Arc::new(move |state, db, id, pairs| {
+            Box::pin(save(state, db, id, pairs))
+        }));
+        self
+    }
+}
+
+/// Run every registered panel's save hook for `model` with the owner
+/// form's submission. Called by the owning module's update handler
+/// AFTER its own save. A failing hook is logged and does not abort the
+/// others — the owner's save has already committed.
+pub async fn handle_record_panel_saves(
+    state: &Arc<AppState>,
+    db: &PgPool,
+    model: &str,
+    record_id: Uuid,
+    pairs: &[(String, String)],
+) {
+    let contributed: Vec<Vec<RecordPanel>> = state
+        .plugin_registry
+        .plugins_iter()
+        .map(|p| p.record_panels())
+        .collect();
+    for list in &contributed {
+        for panel in list {
+            if panel.def.model != model {
+                continue;
+            }
+            if let Some(save) = &panel.save {
+                if let Err(e) =
+                    save(state.clone(), db.clone(), record_id, pairs.to_vec()).await
+                {
+                    warn!(model, title = panel.def.title, "record panel save failed: {e}");
+                }
+            }
         }
     }
 }

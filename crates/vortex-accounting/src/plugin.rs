@@ -413,16 +413,21 @@ impl Plugin for AccountingPlugin {
                     format!(
                         "<label class=\"form-control\"><span class=\"label-text text-xs mb-1\">{}</span>\
                          <input name=\"{name}\" value=\"{value}\" placeholder=\"{placeholder}\" \
-                         class=\"input input-bordered input-sm\"/></label>",
+                         form=\"record-form\" class=\"input input-bordered input-sm\"/></label>",
                         esc(label),
                     )
                 };
+                // The inputs join the contact page's own <form> via
+                // form="record-form" — its single Save button persists
+                // contact + tax fields together (the with_save hook
+                // below receives the submission). The hidden marker
+                // keeps other update paths from blanking the fields.
                 Ok(format!(
-                    r#"<form method="post" action="/accounting/tax-profiles/by-contact/{contact_id}/save">
+                    r#"<input type="hidden" name="__acc_tax_panel" value="1" form="record-form"/>
 <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
 {tin}
 <label class="form-control"><span class="label-text text-xs mb-1">ID Type</span>
-<select name="id_type" class="select select-bordered select-sm">
+<select name="id_type" form="record-form" class="select select-bordered select-sm">
 <option value="BRN"{sel_brn}>BRN — Business Reg.</option>
 <option value="NRIC"{sel_nric}>NRIC</option>
 <option value="PASSPORT"{sel_pass}>Passport</option>
@@ -430,14 +435,13 @@ impl Plugin for AccountingPlugin {
 </select></label>
 {id_value}{sst}{msic}{email}
 <label class="label cursor-pointer justify-start gap-2 mt-5">
-<input type="checkbox" name="einvoice_optout" class="checkbox checkbox-sm"{optout_checked}/>
+<input type="checkbox" name="einvoice_optout" form="record-form" class="checkbox checkbox-sm"{optout_checked}/>
 <span class="label-text text-xs">Consolidated e-invoice only</span></label>
 </div>
 <div class="flex gap-2 mt-3">
-<button class="btn btn-sm btn-primary">Save</button>
-<button formaction="/accounting/tax-profiles/by-contact/{contact_id}/search-tin" class="btn btn-sm btn-outline" title="Look up the TIN at LHDN using the ID type + value (saves the form first)">Search TIN (LHDN)</button>
+<button form="record-form" formaction="/accounting/tax-profiles/by-contact/{contact_id}/search-tin" formmethod="post" class="btn btn-sm btn-outline" title="Saves the tax fields, then looks up the TIN at LHDN by the ID type + value">Search TIN (LHDN)</button>
 <a href="/accounting/tax-profiles/by-contact/{contact_id}" class="btn btn-sm btn-ghost">Full profile &amp; TIN validation</a>
-</div></form>"#,
+</div>"#,
                     tin = text_input("tin", "TIN", val("tin"), "C1234567890 / IG12345678901"),
                     id_value = text_input("id_value", "BRN / NRIC No.", val("id_value"), "201901012345"),
                     sst = text_input("sst_registration", "SST Registration", val("sst_registration"), ""),
@@ -450,7 +454,19 @@ impl Plugin for AccountingPlugin {
                     optout_checked = if optout { " checked" } else { "" },
                 ))
             },
-        )]
+        )
+        .with_save(|_state, db, contact_id, pairs| async move {
+            // Only act on submissions that actually carried the panel
+            // (the hidden __acc_tax_panel marker) — other contact
+            // update paths must not blank the tax fields.
+            if !pairs.iter().any(|(k, _)| k == "__acc_tax_panel") {
+                return Ok(());
+            }
+            crate::handlers_tax::upsert_profile_fields(&db, contact_id, &pairs)
+                .await
+                .map(|_| ())
+                .map_err(vortex_plugin_sdk::common::VortexError::ValidationFailed)
+        })]
     }
 
     fn translations(&self) -> Vec<Translation> {

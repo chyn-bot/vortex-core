@@ -87,7 +87,9 @@ pub use reports::{
     render_report, reports_routes, ReportDef, ReportFormat, ReportOutput, ReportParams,
     ReportRegistry,
 };
-pub use record_panel::{render_record_panels, RecordPanel, RecordPanelDef};
+pub use record_panel::{
+    handle_record_panel_saves, render_record_panels, RecordPanel, RecordPanelDef, HOST_FORM_ID,
+};
 pub use scheduler::{Schedule, ScheduledAction, ScheduledActionDef, Scheduler};
 pub use sidebar::build_sidebar;
 pub use state::{AppState, DatabaseContext};
