@@ -168,6 +168,32 @@ pub trait Plugin: Send + Sync {
         Router::new()
     }
 
+    /// Routes served WITHOUT authentication — the plugin's public
+    /// portal surface (public status boards, customer-facing trackers,
+    /// information pages).
+    ///
+    /// Zero-trust still applies at the edges the host controls:
+    ///
+    /// - **Tenant-resolved**: handlers receive a [`crate::state::DatabaseContext`]
+    ///   for the tenant named by the request Host (subdomain → tenant
+    ///   when `db_filter` is configured; the default database
+    ///   otherwise), so a portal page on `gaia.vortex.com` reads
+    ///   gaia's data and nothing else.
+    /// - **Module-gated**: the routes 404 for tenants that have not
+    ///   installed this plugin.
+    /// - Security headers apply; there is **no `AuthUser`** — do not
+    ///   extract it here, and treat every input as hostile.
+    ///
+    /// Convention: prefix your public paths with `/p/<technical_name>`
+    /// to avoid colliding with core routes (collisions panic at
+    /// startup, by design). Public pages must expose only data that is
+    /// truly public for the tenant — when in doubt, it is not.
+    ///
+    /// Default: empty — most plugins have no anonymous surface.
+    fn public_routes(&self) -> Router<Arc<AppState>> {
+        Router::new()
+    }
+
     /// Return stateless sub-services the plugin wants nested at a
     /// specific path prefix. Each entry is `(prefix, router)` and is
     /// nested into the host with `Router::nest_service`.

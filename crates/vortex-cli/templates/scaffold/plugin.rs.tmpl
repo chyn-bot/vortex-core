@@ -41,6 +41,12 @@ impl Plugin for __PASCAL__Plugin {
         handlers::routes()
     }
 
+    /// Anonymous portal surface — tenant-resolved from the request
+    /// Host and 404 for tenants without this module installed.
+    fn public_routes(&self) -> Router<Arc<AppState>> {
+        handlers::public_routes()
+    }
+
     fn menu_entries(&self) -> Vec<MenuEntry> {
         vec![MenuEntry::new(
             "__SNAKE__.list",

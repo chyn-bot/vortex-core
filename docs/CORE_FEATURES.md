@@ -124,6 +124,7 @@ it probably already exists, audited and tested.
 | Webhooks | Signed (HMAC-SHA256) outbound events with queue-grade delivery guarantees | emit events; endpoints are tenant-configured |
 | Public REST API | Generic record CRUD over every registered model, scoped bearer tokens | register your model; API access is automatic |
 | Mobile/field auth | Access+refresh tokens designed for offline-first field apps; your plugin's `/api/v1` routes become app-reachable | `vortex_framework::mobile_auth` |
+| Public portal | Anonymous routes for public-facing pages — tenant-resolved from the request Host, 404 unless the plugin is installed for that tenant, security headers applied. Convention: `/p/<plugin>` paths. No `AuthUser` exists here | `Plugin::public_routes()` |
 
 ### Files & documents
 | Primitive | What it gives you | Entry point |

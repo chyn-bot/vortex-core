@@ -81,6 +81,12 @@ jobs:
           echo "server did not become healthy"; tail -50 smoke-server.log; exit 1
       - name: Run smoke suite
         run: SMOKE_BASE_URL=http://127.0.0.1:3003 bash scripts/smoke.sh
+      # The scaffolded plugin's public portal must serve anonymously
+      # (no cookie) while its protected routes still demand auth.
+      - name: Public portal check
+        run: |
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3003/p/citest)" = "200"
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3003/citest)" = "303"
       - name: Server log (on failure)
         if: failure()
         run: tail -100 smoke-server.log

@@ -15,6 +15,12 @@ const ITEM_SEQ: vortex_plugin_sdk::orm::sequence::SequenceSpec =
     vortex_plugin_sdk::orm::sequence::SequenceSpec::new("__SNAKE__.item", "__SEQ__")
         .with_padding(6);
 
+/// Public portal routes — served WITHOUT authentication. Only expose
+/// data that is truly public for the tenant. No AuthUser here.
+pub fn public_routes() -> Router<Arc<AppState>> {
+    Router::new().route("/p/__KEBAB__", get(public_board))
+}
+
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/__KEBAB__", get(list_items))
@@ -285,4 +291,34 @@ async fn change_status(
     }
 
     Redirect::to(&format!("/__KEBAB__/{id}")).into_response()
+}
+
+/// GET /p/__KEBAB__ — anonymous public board: aggregate counts only,
+/// no record detail. The tenant comes from the request Host.
+async fn public_board(Db(db): Db, Extension(db_ctx): Extension<DatabaseContext>) -> Response {
+    let (total, done): (i64, i64) = vortex_plugin_sdk::sqlx::query_as(
+        "SELECT COUNT(*), COUNT(*) FILTER (WHERE record_state = 'done')
+         FROM __SNAKE___item WHERE active",
+    )
+    .fetch_one(&db)
+    .await
+    .unwrap_or((0, 0));
+
+    let esc = vortex_plugin_sdk::framework::ui::html_escape;
+    Html(format!(
+        r##"<!DOCTYPE html><html data-theme="dark"><head><title>__DISPLAY__ — Public Board</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link href="/static/vendor/daisyui.min.css" rel="stylesheet"/><script src="/static/vendor/tailwind.js"></script>
+</head><body class="min-h-screen bg-base-200 flex items-center justify-center">
+<div class="card bg-base-100 shadow-xl"><div class="card-body text-center">
+<h1 class="text-2xl font-bold">__DISPLAY__</h1>
+<p class="opacity-60 text-sm">Public status board — {tenant}</p>
+<div class="stats mt-4"><div class="stat"><div class="stat-title">Items</div>
+<div class="stat-value">{total}</div></div>
+<div class="stat"><div class="stat-title">Done</div>
+<div class="stat-value text-success">{done}</div></div></div>
+</div></div></body></html>"##,
+        tenant = esc(&db_ctx.db_name), total = total, done = done,
+    ))
+    .into_response()
 }

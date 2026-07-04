@@ -39,6 +39,62 @@ use vortex_orm::pool_manager::{DatabasePoolManager, PoolManagerConfig};
 // Using `pub use` rather than a local redefinition keeps the types
 // identical across crate boundaries so plugins can share `AppState`.
 
+/// Middleware for plugin PUBLIC routes (`Plugin::public_routes`) —
+/// anonymous, but never tenant-blind: resolves the tenant from the
+/// request Host exactly like the login flow does (subdomain → tenant
+/// under `db_filter`, else the default database) and injects the
+/// `DatabaseContext` so `Db`/pool extractors work. No `AuthUser` is
+/// inserted — public handlers must not extract one.
+async fn public_context_middleware(
+    State(state): State<Arc<AppState>>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let db_name = resolve_database(&state, request.headers(), None).await;
+    let pool = match state.pool_manager.get_pool(&db_name).await {
+        Ok(p) => p,
+        Err(e) => {
+            error!("public route: pool for '{}' unavailable: {}", db_name, e);
+            return (StatusCode::SERVICE_UNAVAILABLE, "Service unavailable").into_response();
+        }
+    };
+    let installed_modules: HashSet<String> = sqlx::query_scalar(
+        "SELECT technical_name FROM installed_modules WHERE state = 'installed'",
+    )
+    .fetch_all(pool.pool())
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .collect();
+
+    request.extensions_mut().insert(pool.clone());
+    request.extensions_mut().insert(DatabaseContext {
+        db_name,
+        pool,
+        installed_modules,
+    });
+    next.run(request).await
+}
+
+/// Per-plugin gate on public routes: 404 unless the plugin is
+/// installed for the tenant the request resolved to. Runs inside
+/// `public_context_middleware`, so the `DatabaseContext` is present.
+async fn public_module_gate(
+    plugin_name: &'static str,
+    request: Request,
+    next: Next,
+) -> Response {
+    let installed = request
+        .extensions()
+        .get::<DatabaseContext>()
+        .map(|ctx| ctx.installed_modules.contains(plugin_name))
+        .unwrap_or(false);
+    if !installed {
+        return (StatusCode::NOT_FOUND, "Not found").into_response();
+    }
+    next.run(request).await
+}
+
 /// Auth middleware - verifies session and injects AuthUser + DatabaseContext
 async fn auth_middleware(
     State(state): State<Arc<AppState>>,
@@ -2209,6 +2265,35 @@ fn build_router(state: Arc<AppState>) -> Router {
         // Auth middleware wraps everything
         .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
 
+    // ─── Plugin public portal routes ──────────────────────────────
+    // `Plugin::public_routes()` — anonymous surface. Each plugin's
+    // router is wrapped in its module gate (404 unless installed for
+    // the tenant), then the merged set gets the public context
+    // middleware (Host-based tenant resolution + DatabaseContext).
+    // Layer order: context outermost, gate inside it, handler last.
+    let mut public_plugin_routes = Router::new();
+    for plugin in state.plugin_registry.plugins_iter() {
+        let plugin_name = plugin.technical_name();
+        let public = plugin.public_routes();
+        // route_layer on an empty router panics — most plugins have
+        // no public surface, so skip them.
+        if !public.has_routes() {
+            continue;
+        }
+        let gated = public.route_layer(middleware::from_fn(
+            move |request: Request, next: Next| public_module_gate(plugin_name, request, next),
+        ));
+        public_plugin_routes = public_plugin_routes.merge(gated);
+    }
+    let public_plugin_routes = if public_plugin_routes.has_routes() {
+        public_plugin_routes.route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            public_context_middleware,
+        ))
+    } else {
+        public_plugin_routes
+    };
+
     // Login-specific rate limiter: 5 attempts per 60 seconds per IP
     let login_limiter = RateLimiter::new(RateLimitConfig {
         max_requests: 5,
@@ -2279,6 +2364,10 @@ fn build_router(state: Arc<AppState>) -> Router {
 
         // Public mobile auth (login + refresh), rate-limited
         .merge(mobile_auth_public)
+
+        // Plugin public portal routes (anonymous, tenant-resolved,
+        // module-gated) — Plugin::public_routes()
+        .merge(public_plugin_routes)
 
         // Database manager (public, master-password protected)
         .nest("/web/database/manager", super::db_manager::db_manager_routes())
