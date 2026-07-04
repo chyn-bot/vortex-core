@@ -2001,6 +2001,10 @@ pub async fn run(host: String, port: u16, _workers: Option<usize>) -> Result<()>
         let mut job_registry = vortex_framework::jobs::JobRegistry::new();
         vortex_framework::jobs::register_core_handlers(&mut job_registry);
         vortex_framework::webhooks::register_handler(&mut job_registry);
+        // Plugin-contributed job handlers (Plugin::register_jobs)
+        for plugin in state.plugin_registry.plugins_iter() {
+            plugin.register_jobs(&mut job_registry);
+        }
         vortex_framework::jobs::JobWorker::new(job_registry).start(state.clone());
     }
 

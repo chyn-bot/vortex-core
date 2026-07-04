@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use vortex_plugin_sdk::prelude::*;
 
-use crate::{handlers, handlers_documents, handlers_tax};
+use crate::{handlers, handlers_documents, handlers_einvoice, handlers_tax};
 
 const MIG_001_ACCOUNTING: &str = include_str!("../migrations/001_accounting/postgres.sql");
 const MIG_002_DOCUMENTS: &str =
@@ -13,6 +13,8 @@ const MIG_003_REGISTRY: &str =
     include_str!("../migrations/003_accounting_registry/postgres.sql");
 const MIG_004_MALAYSIAN_TAX: &str =
     include_str!("../migrations/004_malaysian_tax/postgres.sql");
+const MIG_005_EINVOICE: &str =
+    include_str!("../migrations/005_einvoice/postgres.sql");
 
 pub struct AccountingPlugin;
 
@@ -71,6 +73,7 @@ impl Plugin for AccountingPlugin {
         handlers::accounting_routes()
             .merge(handlers_documents::document_routes())
             .merge(handlers_tax::tax_routes())
+            .merge(handlers_einvoice::einvoice_routes())
     }
 
     fn menu_entries(&self) -> Vec<MenuEntry> {
@@ -101,6 +104,13 @@ impl Plugin for AccountingPlugin {
                 "accounting.payments",
                 "Payments",
                 "/accounting/payments",
+                MenuGroup::Operations,
+            )
+            .under("accounting.moves"),
+            MenuEntry::new(
+                "accounting.einvoice",
+                "e-Invoices",
+                "/accounting/einvoice",
                 MenuGroup::Operations,
             )
             .under("accounting.moves"),
@@ -187,11 +197,22 @@ impl Plugin for AccountingPlugin {
                 down_sql: None,
                 requires_core_migration: Some("119_commerce_primitives"),
             },
+            PluginMigration {
+                name: "005_einvoice",
+                up_sql: MIG_005_EINVOICE,
+                down_sql: None,
+                requires_core_migration: Some("119_commerce_primitives"),
+            },
         ]
     }
 
     fn reports(&self) -> Vec<ReportDef> {
         crate::reports::report_defs()
+    }
+
+    /// Durable jobs: MyInvois submit/poll + LHDN code-table sync.
+    fn register_jobs(&self, registry: &mut vortex_plugin_sdk::framework::jobs::JobRegistry) {
+        crate::einvois::jobs::register(registry);
     }
 
     fn translations(&self) -> Vec<Translation> {

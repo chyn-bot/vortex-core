@@ -89,6 +89,7 @@ pub fn report_defs() -> Vec<ReportDef> {
         balance_sheet(),
         sst02(),
         tax_detail(),
+        einvoice_register(),
     ]
 }
 
@@ -827,4 +828,79 @@ mod sst_period_tests {
     fn march_gets_jan_feb() {
         assert_eq!(last_sst_period(d(2026, 3, 1)), (d(2026, 1, 1), d(2026, 2, 28)));
     }
+}
+
+/// e-Invoice submission register — document ↔ LHDN UUID ↔ status ↔ SST,
+/// the audit artifact reconciled against SST-02. Params: from, to.
+fn einvoice_register() -> ReportDef {
+    ReportDef::new(
+        "accounting.einvoice_register",
+        "e-Invoice Register",
+        "Every e-invoice with its LHDN identifiers, status, and tax amount",
+        vec![ReportFormat::Html, ReportFormat::Csv],
+        |state, params| async move {
+            let (date_sql, date_label) = date_clause(&params);
+            let sql = format!(
+                "SELECT m.number, m.move_date, c.name AS partner, m.total_amount, m.tax_amount, \
+                        e.status, e.doc_type_code, e.lhdn_uuid, e.submitted_at, e.validated_at \
+                 FROM acc_einvoice e \
+                 JOIN acc_move m ON m.id = e.move_id AND m.state = 'posted'{date_sql} \
+                 LEFT JOIN contacts c ON c.id = m.partner_id \
+                 ORDER BY m.move_date, m.number"
+            );
+            let rows = vortex_plugin_sdk::sqlx::query(&sql)
+                .fetch_all(&state.db)
+                .await
+                .map_err(|e| VortexError::QueryExecution(e.to_string()))?;
+            match params.format {
+                ReportFormat::Csv => {
+                    let mut csv = String::from(
+                        "number,date,partner,total,tax,doc_type,status,lhdn_uuid,submitted_at,validated_at\n",
+                    );
+                    for r in &rows {
+                        csv.push_str(&format!(
+                            "{},{},{},{},{},{},{},{},{},{}\n",
+                            csv_escape(r.get::<Option<String>, _>("number").as_deref().unwrap_or("/")),
+                            r.get::<vortex_plugin_sdk::chrono::NaiveDate, _>("move_date"),
+                            csv_escape(r.get::<Option<String>, _>("partner").as_deref().unwrap_or("")),
+                            money(r.get("total_amount")),
+                            money(r.get("tax_amount")),
+                            r.get::<String, _>("doc_type_code"),
+                            r.get::<String, _>("status"),
+                            r.get::<Option<String>, _>("lhdn_uuid").as_deref().unwrap_or(""),
+                            r.get::<Option<vortex_plugin_sdk::chrono::DateTime<vortex_plugin_sdk::chrono::Utc>>, _>("submitted_at").map(|d| d.to_rfc3339()).unwrap_or_default(),
+                            r.get::<Option<vortex_plugin_sdk::chrono::DateTime<vortex_plugin_sdk::chrono::Utc>>, _>("validated_at").map(|d| d.to_rfc3339()).unwrap_or_default(),
+                        ));
+                    }
+                    Ok(ReportOutput::csv("einvoice-register.csv", csv.into_bytes()))
+                }
+                _ => {
+                    let mut table = String::from(
+                        "<table><tr><th>Number</th><th>Date</th><th>Partner</th>\
+                         <th class=\"num\">Total</th><th class=\"num\">Tax</th>\
+                         <th>Type</th><th>Status</th><th>LHDN UUID</th></tr>",
+                    );
+                    for r in &rows {
+                        table.push_str(&format!(
+                            "<tr><td>{}</td><td>{}</td><td>{}</td><td class=\"num\">{}</td>\
+                             <td class=\"num\">{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                            esc(r.get::<Option<String>, _>("number").as_deref().unwrap_or("/")),
+                            r.get::<vortex_plugin_sdk::chrono::NaiveDate, _>("move_date"),
+                            esc(r.get::<Option<String>, _>("partner").as_deref().unwrap_or("")),
+                            money(r.get("total_amount")),
+                            money(r.get("tax_amount")),
+                            esc(&r.get::<String, _>("doc_type_code")),
+                            esc(&r.get::<String, _>("status")),
+                            esc(r.get::<Option<String>, _>("lhdn_uuid").as_deref().unwrap_or("")),
+                        ));
+                    }
+                    table.push_str("</table>");
+                    Ok(ReportOutput::html(
+                        "einvoice-register.html",
+                        html_page("e-Invoice Register", &date_label, &table),
+                    ))
+                }
+            }
+        },
+    )
 }

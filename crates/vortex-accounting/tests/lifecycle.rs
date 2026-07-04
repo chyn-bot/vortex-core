@@ -526,3 +526,133 @@ async fn malaysian_tax_engine() {
     .await
     .expect("posting into an open year succeeds");
 }
+
+// ═════════════════════════════════════════════════════════════════════════
+// Phase 2: MyInvois e-invoicing (portal path, DB-only — no LHDN creds)
+// ═════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn einvoice_payload_and_lifecycle() {
+    let Some((db, seq_pool, user_id, partner_id)) = setup().await else {
+        return;
+    };
+    let today = Utc::now().date_naive();
+    let doc_date = today + vortex_plugin_sdk::chrono::Duration::days(1);
+
+    // Company + partner tax identity (what Settings/Profiles capture).
+    vortex_plugin_sdk::sqlx::query(
+        "UPDATE acc_config SET company_tin = 'C1234567890', company_id_type = 'BRN', \
+                company_id_value = '202301012345', company_msic_code = '62010', \
+                company_business_activity = 'Software', company_city = 'Kuala Lumpur', \
+                company_postcode = '50480', company_state_code = '14' \
+         WHERE company_id IS NULL",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    vortex_plugin_sdk::sqlx::query(
+        "INSERT INTO acc_partner_tax_profile (contact_id, tin, id_type, id_value, state_code) \
+         VALUES ($1, 'C9876543210', 'BRN', '201501054321', '10') \
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(partner_id)
+    .execute(&db)
+    .await
+    .unwrap();
+
+    let st8: Uuid = vortex_plugin_sdk::sqlx::query_scalar(
+        "SELECT id FROM taxes WHERE name = 'Service Tax 8%'",
+    )
+    .fetch_one(&db)
+    .await
+    .unwrap();
+
+    let inv = documents::create_invoice(
+        &db,
+        user_id,
+        &NewInvoice {
+            move_type: "customer_invoice",
+            partner_id,
+            invoice_date: doc_date,
+            due_date: None,
+            journal_code: None,
+            currency_id: None,
+            origin_ref: Some("test_einvoice:1"),
+            narration: None,
+            company_id: None,
+            lines: vec![InvoiceLine::new("Consulting", dec!(1), dec!(1000.00)).with_tax(st8)],
+        },
+    )
+    .await
+    .unwrap();
+    let number = documents::post_invoice(&db, &seq_pool, inv, user_id).await.unwrap();
+
+    // ensure → row in 'ready'
+    let einv = vortex_accounting::einvois::flow::ensure_einvoice(&db, inv)
+        .await
+        .unwrap()
+        .expect("customer invoice is e-invoiceable");
+    let status: String = vortex_plugin_sdk::sqlx::query_scalar(
+        "SELECT status FROM acc_einvoice WHERE id = $1",
+    )
+    .bind(einv)
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert_eq!(status, "ready");
+
+    // payload → UBL XML with the ledger's numbers and identities
+    let (_, doc) = vortex_accounting::einvois::flow::payload_for(&db, inv).await.unwrap();
+    assert_eq!(doc.doc_type_code, "01");
+    assert_eq!(doc.number, number);
+    assert_eq!(doc.supplier.tin, "C1234567890");
+    assert_eq!(doc.buyer.tin, "C9876543210");
+    assert_eq!(doc.tax_subtotals.len(), 1);
+    assert_eq!(doc.tax_subtotals[0].code, "02"); // service tax
+    let xml = vortex_accounting::einvois::ubl::build_xml(&doc);
+    assert!(xml.contains(&format!("<cbc:ID>{number}</cbc:ID>")));
+    assert!(xml.contains(r#"listVersionID="1.0""#));
+    assert!(xml.contains(r#"<cbc:TaxInclusiveAmount currencyID="MYR">1080.00</cbc:TaxInclusiveAmount>"#));
+    // documentHash convention: sha256 hex of the raw bytes
+    let hash = vortex_accounting::einvois::sha256_hex(xml.as_bytes());
+    assert_eq!(hash.len(), 64);
+
+    // Partner opt-out routes to consolidated (no individual e-invoice)
+    vortex_plugin_sdk::sqlx::query(
+        "UPDATE acc_partner_tax_profile SET einvoice_optout = true WHERE contact_id = $1",
+    )
+    .bind(partner_id)
+    .execute(&db)
+    .await
+    .unwrap();
+    let inv2 = documents::create_invoice(
+        &db,
+        user_id,
+        &NewInvoice {
+            move_type: "customer_invoice",
+            partner_id,
+            invoice_date: doc_date,
+            due_date: None,
+            journal_code: None,
+            currency_id: None,
+            origin_ref: Some("test_einvoice:2"),
+            narration: None,
+            company_id: None,
+            lines: vec![InvoiceLine::new("Opt-out sale", dec!(1), dec!(50.00))],
+        },
+    )
+    .await
+    .unwrap();
+    documents::post_invoice(&db, &seq_pool, inv2, user_id).await.unwrap();
+    let none = vortex_accounting::einvois::flow::ensure_einvoice(&db, inv2).await.unwrap();
+    assert!(none.is_none(), "opted-out partners get no individual e-invoice");
+
+    // restore for other tests
+    vortex_plugin_sdk::sqlx::query(
+        "UPDATE acc_partner_tax_profile SET einvoice_optout = false WHERE contact_id = $1",
+    )
+    .bind(partner_id)
+    .execute(&db)
+    .await
+    .unwrap();
+}

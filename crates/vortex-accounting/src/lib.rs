@@ -25,8 +25,10 @@
 //! docs for an end-to-end example.
 
 pub mod documents;
+pub mod einvois;
 pub mod handlers;
 pub mod handlers_documents;
+pub mod handlers_einvoice;
 pub mod handlers_tax;
 pub mod plugin;
 pub mod reports;

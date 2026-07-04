@@ -310,6 +310,15 @@ pub trait Plugin: Send + Sync {
         Vec::new()
     }
 
+    /// Register durable job-queue handlers (`crate::jobs`). Called once
+    /// at startup while the host assembles the [`crate::jobs::JobRegistry`],
+    /// before the worker starts. Namespace kinds with the plugin's
+    /// technical name — e.g. `accounting.einvoice.submit` — so two
+    /// plugins cannot collide.
+    ///
+    /// Default: no job handlers.
+    fn register_jobs(&self, _registry: &mut crate::jobs::JobRegistry) {}
+
     /// Called once during host startup after the plugin is registered
     /// but before its routes are mounted. Use this for any initial
     /// setup that cannot be done in a synchronous constructor: loading

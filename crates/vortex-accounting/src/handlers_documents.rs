@@ -633,6 +633,7 @@ async fn document_detail(
     };
 
     let history_panel = vortex_plugin_sdk::framework::render_audit_trail(&db, "acc_move", id).await;
+    let einvoice_panel = crate::handlers_einvoice::einvoice_widget(&db, id).await;
 
     let content = format!(
         r#"<div class="max-w-5xl">
@@ -651,6 +652,7 @@ async fn document_detail(
 {origin_block}
 {gl_link}
 </div></div>
+{einvoice_panel}
 <div class="card bg-base-100 shadow mt-4"><div class="card-body py-4">
 <h3 class="font-semibold mb-2">Lines</h3>
 <div class="overflow-x-auto"><table class="table table-sm">
@@ -774,6 +776,14 @@ async fn post_document(
         Ok(number) => {
             audit_move(&state, &db_ctx, &db, user.id, &user.username, id, "posted").await;
             vortex_plugin_sdk::tracing::info!(number = %number, "document posted");
+            // e-Invoice hook: create the LHDN row (auto-submits in API
+            // mode). Best-effort — a mis-set profile must not block
+            // posting; the e-invoice queue surfaces what needs fixing.
+            if let Err(e) =
+                crate::einvois::jobs::after_post(&state, &db, &db_ctx.db_name, id).await
+            {
+                vortex_plugin_sdk::tracing::warn!("einvoice after_post: {e}");
+            }
             redirect(&format!("/accounting/documents/{id}"))
         }
         Err(e) => (
