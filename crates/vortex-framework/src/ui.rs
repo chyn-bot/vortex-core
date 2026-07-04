@@ -199,8 +199,8 @@ pub fn forbidden_page(action: &str) -> String {
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Access Denied - Vortex</title>
-    <link href="https://cdn.jsdelivr.net/npm/daisyui@4.4.24/dist/full.min.css" rel="stylesheet">
-    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
+    <script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200 flex items-center justify-center">
     <div class="card bg-base-100 shadow-xl max-w-md">

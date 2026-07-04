@@ -38,8 +38,8 @@ fn page_shell(sidebar: &str, title: &str, content: &str) -> String {
 <script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script>
 <title>{title} - Vortex</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/>
-<script src="https://cdn.tailwindcss.com"></script>
+<link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
+<script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
 <div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden">

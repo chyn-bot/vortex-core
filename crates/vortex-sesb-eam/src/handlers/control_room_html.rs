@@ -50,8 +50,8 @@ fn build_html(
     let map_script = if tab == "live" {
         let assets_json = vortex_plugin_sdk::serde_json::to_string(&map_assets).unwrap_or_else(|_| "[]".into());
         format!(r#"
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.css"/>
-<script src="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js"></script>
+<link rel="stylesheet" href="/static/vendor/leaflet/leaflet.css"/>
+<script src="/static/vendor/leaflet/leaflet.js"></script>
 <script>
 (function(){{
   var ASSETS = {assets_json};

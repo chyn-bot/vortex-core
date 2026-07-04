@@ -32,8 +32,8 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/sesb-eam/technician-map/locations", get(technician_locations))
 }
 
-const LEAFLET_HEAD: &str = r#"<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.css"/>
-<script src="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js"></script>"#;
+const LEAFLET_HEAD: &str = r#"<link rel="stylesheet" href="/static/vendor/leaflet/leaflet.css"/>
+<script src="/static/vendor/leaflet/leaflet.js"></script>"#;
 
 fn map_css() -> &'static str {
     r#"<style>

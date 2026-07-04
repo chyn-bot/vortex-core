@@ -36,8 +36,8 @@ fn portal_shell(title: &str, body: &str) -> String {
     format!(
         r#"<!DOCTYPE html><html data-theme="dark"><head><meta charset="utf-8"><title>{title} · Field</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<link href="https://cdn.jsdelivr.net/npm/daisyui@4.7.2/dist/full.min.css" rel="stylesheet"/>
-<script src="https://cdn.tailwindcss.com"></script></head>
+<link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
+<script src="/static/vendor/tailwind.js"></script></head>
 <body class="min-h-screen bg-base-200">
 <div class="navbar bg-base-100 shadow sticky top-0 z-30">
 <a href="/sesb-eam/my/dashboard" class="btn btn-ghost text-lg"><span class="text-success">SESB</span> Field</a>
