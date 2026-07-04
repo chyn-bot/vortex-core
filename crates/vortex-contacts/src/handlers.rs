@@ -786,7 +786,6 @@ async function loadStates(countryId) {{
 </div>
 </div>
 <div class="lg:col-span-2">{record_panels}</div>
-{history_panel}
 </div>
 </div>
 
@@ -800,7 +799,9 @@ async function loadStates(countryId) {{
 <a href="/contacts" class="btn btn-ghost btn-sm">Cancel</a>
 </div>
 </fieldset>
-</form>"#,
+</form>
+
+{history_panel}"#,
         id = id,
         name = esc(&name),
         code = esc(code.as_deref().unwrap_or("")),
