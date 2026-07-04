@@ -92,7 +92,232 @@ pub fn report_defs() -> Vec<ReportDef> {
         einvoice_register(),
         statement_of_account(),
         bank_reconciliation(),
+        asset_register(),
+        pl_by_dimension(),
     ]
+}
+
+/// Fixed Asset Register in MFRS 116 note format: cost b/f, additions,
+/// disposals, accumulated depreciation, NBV. Params: `from`, `to`
+/// (default: current calendar year).
+fn asset_register() -> ReportDef {
+    ReportDef::new(
+        "accounting.asset_register",
+        "Fixed Asset Register",
+        "MFRS 116 movement note: cost, additions, disposals, depreciation, net book value",
+        vec![ReportFormat::Html, ReportFormat::Csv],
+        |state, params| async move {
+            use vortex_plugin_sdk::chrono::Datelike;
+            let today = vortex_plugin_sdk::chrono::Utc::now().date_naive();
+            let year_start =
+                vortex_plugin_sdk::chrono::NaiveDate::from_ymd_opt(today.year(), 1, 1).unwrap();
+            let from = params
+                .get("from")
+                .unwrap_or("")
+                .parse::<vortex_plugin_sdk::chrono::NaiveDate>()
+                .unwrap_or(year_start);
+            let to = params
+                .get("to")
+                .unwrap_or("")
+                .parse::<vortex_plugin_sdk::chrono::NaiveDate>()
+                .unwrap_or(today);
+            let rows = vortex_plugin_sdk::sqlx::query(
+                "SELECT a.name, a.reference, a.cost, a.start_date, a.state, \
+                        (SELECT m.move_date FROM acc_move m WHERE m.id = a.disposal_move_id) AS disposal_date, \
+                        COALESCE((SELECT SUM(d.amount) FROM acc_asset_depreciation d \
+                                  WHERE d.asset_id = a.id AND d.state = 'posted' AND d.dep_date < $1), 0) AS dep_bf, \
+                        COALESCE((SELECT SUM(d.amount) FROM acc_asset_depreciation d \
+                                  WHERE d.asset_id = a.id AND d.state = 'posted' \
+                                    AND d.dep_date BETWEEN $1 AND $2), 0) AS dep_period \
+                 FROM acc_asset a WHERE a.state <> 'draft' ORDER BY a.start_date, a.name",
+            )
+            .bind(from)
+            .bind(to)
+            .fetch_all(&state.db)
+            .await
+            .map_err(|e| VortexError::QueryExecution(e.to_string()))?;
+
+            struct Line {
+                name: String,
+                cost_bf: Decimal,
+                additions: Decimal,
+                disposals: Decimal,
+                dep_bf: Decimal,
+                dep_period: Decimal,
+                nbv: Decimal,
+            }
+            let mut lines = Vec::new();
+            for r in &rows {
+                let cost: Decimal = r.get("cost");
+                let start: vortex_plugin_sdk::chrono::NaiveDate = r.get("start_date");
+                let disposal: Option<vortex_plugin_sdk::chrono::NaiveDate> = r.get("disposal_date");
+                let addition = start >= from && start <= to;
+                let disposed_in_period =
+                    disposal.map(|d| d >= from && d <= to).unwrap_or(false);
+                // Fully out before the window: skip.
+                if disposal.map(|d| d < from).unwrap_or(false) {
+                    continue;
+                }
+                let dep_bf: Decimal = r.get("dep_bf");
+                let dep_period: Decimal = r.get("dep_period");
+                let cost_bf = if addition { Decimal::ZERO } else { cost };
+                let additions = if addition { cost } else { Decimal::ZERO };
+                let disposals = if disposed_in_period { cost } else { Decimal::ZERO };
+                let nbv = if disposed_in_period {
+                    Decimal::ZERO
+                } else {
+                    cost - dep_bf - dep_period
+                };
+                let name: String = r.get("name");
+                let reference: Option<String> = r.get("reference");
+                lines.push(Line {
+                    name: reference.map(|x| format!("{name} ({x})")).unwrap_or(name),
+                    cost_bf,
+                    additions,
+                    disposals,
+                    dep_bf,
+                    dep_period,
+                    nbv,
+                });
+            }
+            let subtitle = format!("{from} to {to}");
+            match params.format {
+                ReportFormat::Csv => {
+                    let mut csv = String::from(
+                        "asset,cost_bf,additions,disposals,dep_bf,dep_period,nbv\n",
+                    );
+                    for l in &lines {
+                        csv.push_str(&format!(
+                            "{},{},{},{},{},{},{}\n",
+                            csv_escape(&l.name),
+                            money(l.cost_bf),
+                            money(l.additions),
+                            money(l.disposals),
+                            money(l.dep_bf),
+                            money(l.dep_period),
+                            money(l.nbv),
+                        ));
+                    }
+                    Ok(ReportOutput::csv("asset-register.csv", csv.into_bytes()))
+                }
+                _ => {
+                    let mut table = String::from(
+                        "<table><tr><th>Asset</th><th class=\"num\">Cost b/f</th>\
+                         <th class=\"num\">Additions</th><th class=\"num\">Disposals (cost)</th>\
+                         <th class=\"num\">Acc. dep. b/f</th><th class=\"num\">Depreciation</th>\
+                         <th class=\"num\">NBV</th></tr>",
+                    );
+                    let mut t = [Decimal::ZERO; 6];
+                    for l in &lines {
+                        let vals =
+                            [l.cost_bf, l.additions, l.disposals, l.dep_bf, l.dep_period, l.nbv];
+                        table.push_str(&format!("<tr><td>{}</td>", esc(&l.name)));
+                        for (i, v) in vals.iter().enumerate() {
+                            t[i] += v;
+                            table.push_str(&format!("<td class=\"num\">{}</td>", money(*v)));
+                        }
+                        table.push_str("</tr>");
+                    }
+                    table.push_str("<tr class=\"total\"><td>Total</td>");
+                    for v in t {
+                        table.push_str(&format!("<td class=\"num\">{}</td>", money(v)));
+                    }
+                    table.push_str("</tr></table>");
+                    Ok(ReportOutput::html(
+                        "asset-register.html",
+                        html_page("Fixed Asset Register", &subtitle, &table),
+                    ))
+                }
+            }
+        },
+    )
+}
+
+/// P&L grouped by analytic dimension. Params: `dim` = project |
+/// department (default project), `from`, `to`.
+fn pl_by_dimension() -> ReportDef {
+    ReportDef::new(
+        "accounting.pl_by_dimension",
+        "P&L by Dimension",
+        "Income and expenses per project or department dimension",
+        vec![ReportFormat::Html, ReportFormat::Csv],
+        |state, params| async move {
+            let dim = if params.get("dim") == Some("department") {
+                "department_id"
+            } else {
+                "project_id"
+            };
+            let (date_sql, date_label) = date_clause(&params);
+            let sql = format!(
+                "SELECT COALESCE(d.code || ' ' || d.name, '(untagged)') AS dimension, \
+                        SUM(CASE WHEN a.account_type IN ('income', 'income_other') \
+                            THEN l.credit - l.debit ELSE 0 END) AS income, \
+                        SUM(CASE WHEN a.account_type LIKE 'expense%' \
+                            THEN l.debit - l.credit ELSE 0 END) AS expense \
+                 FROM acc_move_line l \
+                 JOIN acc_move m ON m.id = l.move_id AND m.state = 'posted'{date_sql} \
+                 JOIN acc_account a ON a.id = l.account_id \
+                 LEFT JOIN acc_dimension d ON d.id = l.{dim} \
+                 WHERE a.account_type IN ('income', 'income_other') \
+                    OR a.account_type LIKE 'expense%' \
+                 GROUP BY 1 ORDER BY 1"
+            );
+            let rows = vortex_plugin_sdk::sqlx::query(&sql)
+                .fetch_all(&state.db)
+                .await
+                .map_err(|e| VortexError::QueryExecution(e.to_string()))?;
+            match params.format {
+                ReportFormat::Csv => {
+                    let mut csv = String::from("dimension,income,expense,result\n");
+                    for r in &rows {
+                        let income: Decimal = r.get("income");
+                        let expense: Decimal = r.get("expense");
+                        csv.push_str(&format!(
+                            "{},{},{},{}\n",
+                            csv_escape(&r.get::<String, _>("dimension")),
+                            money(income),
+                            money(expense),
+                            money(income - expense),
+                        ));
+                    }
+                    Ok(ReportOutput::csv("pl-by-dimension.csv", csv.into_bytes()))
+                }
+                _ => {
+                    let mut table = String::from(
+                        "<table><tr><th>Dimension</th><th class=\"num\">Income</th>\
+                         <th class=\"num\">Expenses</th><th class=\"num\">Result</th></tr>",
+                    );
+                    let mut ti = Decimal::ZERO;
+                    let mut te = Decimal::ZERO;
+                    for r in &rows {
+                        let income: Decimal = r.get("income");
+                        let expense: Decimal = r.get("expense");
+                        ti += income;
+                        te += expense;
+                        table.push_str(&format!(
+                            "<tr><td>{}</td><td class=\"num\">{}</td>\
+                             <td class=\"num\">{}</td><td class=\"num\">{}</td></tr>",
+                            esc(&r.get::<String, _>("dimension")),
+                            money(income),
+                            money(expense),
+                            money(income - expense),
+                        ));
+                    }
+                    table.push_str(&format!(
+                        "<tr class=\"total\"><td>Total</td><td class=\"num\">{}</td>\
+                         <td class=\"num\">{}</td><td class=\"num\">{}</td></tr></table>",
+                        money(ti),
+                        money(te),
+                        money(ti - te),
+                    ));
+                    Ok(ReportOutput::html(
+                        "pl-by-dimension.html",
+                        html_page("P&L by Dimension", &date_label, &table),
+                    ))
+                }
+            }
+        },
+    )
 }
 
 /// Ageing bucket upper bounds from `acc_config.aging_buckets`

@@ -24,17 +24,20 @@
 //! [`service::create_move`] / [`service::reverse_move`] — see the module
 //! docs for an end-to-end example.
 
+pub mod assets;
 pub mod banking;
 pub mod currency;
 pub mod documents;
 pub mod einvois;
 pub mod handlers;
+pub mod handlers_assets;
 pub mod handlers_banking;
 pub mod handlers_currency;
 pub mod handlers_documents;
 pub mod handlers_einvoice;
 pub mod handlers_tax;
 pub mod plugin;
+pub mod recurring;
 pub mod reports;
 pub mod service;
 pub mod tax;

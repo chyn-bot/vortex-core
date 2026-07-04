@@ -6,8 +6,8 @@ use std::time::Duration;
 use vortex_plugin_sdk::prelude::*;
 
 use crate::{
-    handlers, handlers_banking, handlers_currency, handlers_documents, handlers_einvoice,
-    handlers_tax,
+    handlers, handlers_assets, handlers_banking, handlers_currency, handlers_documents,
+    handlers_einvoice, handlers_tax,
 };
 
 const MIG_001_ACCOUNTING: &str = include_str!("../migrations/001_accounting/postgres.sql");
@@ -23,6 +23,8 @@ const MIG_006_MULTICURRENCY: &str =
     include_str!("../migrations/006_multicurrency/postgres.sql");
 const MIG_007_BANKING_ARAP: &str =
     include_str!("../migrations/007_banking_arap/postgres.sql");
+const MIG_008_DIMENSIONS_ASSETS: &str =
+    include_str!("../migrations/008_dimensions_assets/postgres.sql");
 
 pub struct AccountingPlugin;
 
@@ -84,6 +86,7 @@ impl Plugin for AccountingPlugin {
             .merge(handlers_einvoice::einvoice_routes())
             .merge(handlers_currency::currency_routes())
             .merge(handlers_banking::banking_routes())
+            .merge(handlers_assets::asset_routes())
     }
 
     fn menu_entries(&self) -> Vec<MenuEntry> {
@@ -164,6 +167,34 @@ impl Plugin for AccountingPlugin {
                 "accounting.config.journals",
                 "Journals",
                 "/accounting/journals",
+                MenuGroup::Operations,
+            )
+            .under("accounting.config"),
+            MenuEntry::new(
+                "accounting.assets",
+                "Fixed Assets",
+                "/accounting/assets",
+                MenuGroup::Operations,
+            )
+            .under("accounting.moves"),
+            MenuEntry::new(
+                "accounting.budgets",
+                "Budgets",
+                "/accounting/budgets",
+                MenuGroup::Operations,
+            )
+            .under("accounting.moves"),
+            MenuEntry::new(
+                "accounting.recurring",
+                "Recurring Entries",
+                "/accounting/recurring",
+                MenuGroup::Operations,
+            )
+            .under("accounting.moves"),
+            MenuEntry::new(
+                "accounting.config.dimensions",
+                "Dimensions",
+                "/accounting/dimensions",
                 MenuGroup::Operations,
             )
             .under("accounting.config"),
@@ -260,20 +291,46 @@ impl Plugin for AccountingPlugin {
                 down_sql: None,
                 requires_core_migration: Some("119_commerce_primitives"),
             },
+            PluginMigration {
+                name: "008_dimensions_assets",
+                up_sql: MIG_008_DIMENSIONS_ASSETS,
+                down_sql: None,
+                requires_core_migration: Some("119_commerce_primitives"),
+            },
         ]
     }
 
-    /// Daily: clear matured post-dated cheques (holding → bank).
+    /// Daily runs: PDC maturity, due depreciation, recurring entries.
     fn scheduled_actions(&self) -> Vec<ScheduledAction> {
-        vec![ScheduledAction::new(
-            ScheduledActionDef {
-                code: "accounting.pdc.mature",
-                name: "Accounting: clear matured post-dated cheques",
-                schedule: Schedule::Every(Duration::from_secs(24 * 60 * 60)),
-                enabled_by_default: true,
-            },
-            |state| async move { crate::banking::run_pdc_maturity(&state).await },
-        )]
+        vec![
+            ScheduledAction::new(
+                ScheduledActionDef {
+                    code: "accounting.pdc.mature",
+                    name: "Accounting: clear matured post-dated cheques",
+                    schedule: Schedule::Every(Duration::from_secs(24 * 60 * 60)),
+                    enabled_by_default: true,
+                },
+                |state| async move { crate::banking::run_pdc_maturity(&state).await },
+            ),
+            ScheduledAction::new(
+                ScheduledActionDef {
+                    code: "accounting.assets.depreciate",
+                    name: "Accounting: post due asset depreciation",
+                    schedule: Schedule::Every(Duration::from_secs(24 * 60 * 60)),
+                    enabled_by_default: true,
+                },
+                |state| async move { crate::assets::run_depreciation(&state).await },
+            ),
+            ScheduledAction::new(
+                ScheduledActionDef {
+                    code: "accounting.recurring.generate",
+                    name: "Accounting: generate due recurring entries",
+                    schedule: Schedule::Every(Duration::from_secs(24 * 60 * 60)),
+                    enabled_by_default: true,
+                },
+                |state| async move { crate::recurring::run_recurring(&state).await },
+            ),
+        ]
     }
 
     fn reports(&self) -> Vec<ReportDef> {

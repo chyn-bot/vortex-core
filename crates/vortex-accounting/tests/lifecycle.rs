@@ -870,6 +870,205 @@ fn date_rate(s: &str) -> Decimal {
     s.parse().unwrap()
 }
 
+/// Phase 5: dimensions on GL lines (tag + posted immutability),
+/// fixed-asset confirm → depreciate → dispose, recurring generation.
+#[tokio::test]
+async fn dimensions_assets_recurring_lifecycle() {
+    let Some((db, seq_pool, user_id, partner_id)) = setup().await else {
+        return;
+    };
+    let _ = partner_id;
+    use vortex_accounting::{assets, recurring};
+    let today = Utc::now().date_naive();
+    let op_date = today + vortex_plugin_sdk::chrono::Duration::days(1);
+    let suffix = Uuid::new_v4().simple().to_string()[..6].to_string();
+
+    // ── Dimension tagging + guard ────────────────────────────────────────
+    let project: Uuid = vortex_plugin_sdk::sqlx::query_scalar(
+        "INSERT INTO acc_dimension (dim_type, code, name) VALUES ('project', $1, 'Test Project') \
+         RETURNING id",
+    )
+    .bind(format!("PRJ{suffix}"))
+    .fetch_one(&db)
+    .await
+    .expect("seed project dimension");
+    let acc_expense: Uuid = vortex_plugin_sdk::sqlx::query_scalar(
+        "SELECT id FROM acc_account WHERE code = '6000'",
+    )
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    let acc_bank: Uuid = vortex_plugin_sdk::sqlx::query_scalar(
+        "SELECT id FROM acc_account WHERE code = '1100'",
+    )
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    let (tagged_move, _) = service::create_and_post(
+        &db,
+        &seq_pool,
+        user_id,
+        &NewMove {
+            journal_code: "GEN",
+            move_date: op_date,
+            move_type: "entry",
+            ref_: Some("dimension tag test"),
+            narration: None,
+            partner_id: None,
+            origin_ref: None,
+            company_id: None,
+            lines: vec![
+                MoveLine::debit(acc_expense, dec!(120.00), Some("Tagged expense"))
+                    .with_dimensions(Some(project), None),
+                MoveLine::credit(acc_bank, dec!(120.00), Some("Tagged expense")),
+            ],
+        },
+    )
+    .await
+    .expect("post tagged entry");
+    let stored: Option<Uuid> = vortex_plugin_sdk::sqlx::query_scalar(
+        "SELECT project_id FROM acc_move_line WHERE move_id = $1 AND debit > 0",
+    )
+    .bind(tagged_move)
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert_eq!(stored, Some(project));
+    let retag = vortex_plugin_sdk::sqlx::query(
+        "UPDATE acc_move_line SET project_id = NULL WHERE move_id = $1",
+    )
+    .bind(tagged_move)
+    .execute(&db)
+    .await;
+    assert!(retag.is_err(), "posted dimension tags must be immutable");
+
+    // ── Fixed asset: confirm → schedule → post periods → dispose ────────
+    let acc_1500: Uuid = vortex_plugin_sdk::sqlx::query_scalar(
+        "SELECT id FROM acc_account WHERE code = '1500'",
+    )
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    let acc_1600: Uuid = vortex_plugin_sdk::sqlx::query_scalar(
+        "SELECT id FROM acc_account WHERE code = '1600'",
+    )
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    let acc_7000: Uuid = vortex_plugin_sdk::sqlx::query_scalar(
+        "SELECT id FROM acc_account WHERE code = '7000'",
+    )
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    // Start tomorrow: period 1 lands at month-end, safely past the
+    // lock_date == today window the sibling test opens.
+    let start = op_date;
+    let asset: Uuid = vortex_plugin_sdk::sqlx::query_scalar(
+        "INSERT INTO acc_asset (name, asset_account_id, depreciation_account_id, \
+             expense_account_id, cost, salvage_value, life_months, start_date, created_by) \
+         VALUES ($1, $2, $3, $4, 12000.00, 0, 24, $5, $6) RETURNING id",
+    )
+    .bind(format!("Test Server {suffix}"))
+    .bind(acc_1500)
+    .bind(acc_1600)
+    .bind(acc_7000)
+    .bind(start)
+    .bind(user_id)
+    .fetch_one(&db)
+    .await
+    .expect("seed asset");
+    let periods = assets::confirm_asset(&db, asset).await.expect("confirm asset");
+    assert_eq!(periods, 24);
+    assets::confirm_asset(&db, asset).await.expect_err("cannot confirm twice");
+    // Post exactly the first period (due at the first month-end).
+    let first_due = assets::month_end(start);
+    let posted = assets::post_due_depreciation(&db, &seq_pool, user_id, first_due)
+        .await
+        .expect("depreciation run");
+    assert!(posted >= 1, "at least one period should post");
+    let (dep_posted, dep_sum): (i64, Decimal) = {
+        let r = vortex_plugin_sdk::sqlx::query(
+            "SELECT COUNT(*) AS n, COALESCE(SUM(amount), 0) AS s \
+             FROM acc_asset_depreciation WHERE asset_id = $1 AND state = 'posted'",
+        )
+        .bind(asset)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        (r.get("n"), r.get("s"))
+    };
+    // `posted` may include leftover assets from earlier runs against a
+    // reused DB; THIS asset has exactly one period due at first_due.
+    assert_eq!(dep_posted, 1);
+    assert_eq!(dep_sum, dec!(500.00), "12000/24 = 500/mo");
+    // Dispose at NBV + 100 → gain of 100 on 4970.
+    let proceeds = dec!(12000.00) - dep_sum + dec!(100.00);
+    let disposal = assets::dispose_asset(&db, &seq_pool, user_id, asset, proceeds, op_date)
+        .await
+        .expect("dispose");
+    let gain: Option<Decimal> = vortex_plugin_sdk::sqlx::query_scalar(
+        "SELECT SUM(l.credit) FROM acc_move_line l \
+         JOIN acc_account a ON a.id = l.account_id \
+         WHERE l.move_id = $1 AND a.code = '4970'",
+    )
+    .bind(disposal)
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert_eq!(gain, Some(dec!(100.00)));
+    let (d, c, _) = line_sums(&db, disposal).await;
+    assert_eq!(d, c, "disposal move balanced");
+    let asset_state: String =
+        vortex_plugin_sdk::sqlx::query_scalar("SELECT state FROM acc_asset WHERE id = $1")
+            .bind(asset)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(asset_state, "disposed");
+    let planned_left: i64 = vortex_plugin_sdk::sqlx::query_scalar(
+        "SELECT COUNT(*) FROM acc_asset_depreciation WHERE asset_id = $1 AND state = 'planned'",
+    )
+    .bind(asset)
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert_eq!(planned_left, 0, "disposal drops remaining planned periods");
+
+    // ── Recurring: auto-post occurrence + advance ────────────────────────
+    let template = vortex_plugin_sdk::serde_json::json!([
+        {"account_code": "6000", "name": "Rent", "debit": 2500, "credit": 0},
+        {"account_code": "1100", "name": "Rent", "debit": 0, "credit": 2500}
+    ]);
+    let rec: Uuid = vortex_plugin_sdk::sqlx::query_scalar(
+        "INSERT INTO acc_recurring (name, interval_months, next_date, auto_post, lines, created_by) \
+         VALUES ($1, 1, $2, TRUE, $3, $4) RETURNING id",
+    )
+    .bind(format!("Rent {suffix}"))
+    .bind(op_date)
+    .bind(&template)
+    .bind(user_id)
+    .fetch_one(&db)
+    .await
+    .expect("seed recurring");
+    let rec_move = recurring::generate_occurrence(&db, &seq_pool, user_id, rec, op_date)
+        .await
+        .expect("generate occurrence");
+    assert_eq!(move_field::<String>(&db, rec_move, "state").await, "posted");
+    let (d, c, n) = line_sums(&db, rec_move).await;
+    assert_eq!(n, 2);
+    assert_eq!(d, dec!(2500.00));
+    assert_eq!(c, dec!(2500.00));
+    let next: vortex_plugin_sdk::chrono::NaiveDate = vortex_plugin_sdk::sqlx::query_scalar(
+        "SELECT next_date FROM acc_recurring WHERE id = $1",
+    )
+    .bind(rec)
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert_eq!(next, recurring::advance_months(op_date, 1));
+}
+
 /// Phase 4: PDC lifecycle, bank statement import → match → finalize,
 /// AR↔AP contra, and credit-limit enforcement.
 #[tokio::test]

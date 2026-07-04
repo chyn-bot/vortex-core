@@ -80,6 +80,9 @@ pub struct MoveLine {
     pub currency_id: Option<Uuid>,
     /// Signed document-currency amount (positive = debit side).
     pub amount_currency: Option<Decimal>,
+    /// Analytic dimensions (acc_dimension); immutable once posted.
+    pub project_id: Option<Uuid>,
+    pub department_id: Option<Uuid>,
 }
 
 impl MoveLine {
@@ -92,6 +95,8 @@ impl MoveLine {
             credit: Decimal::ZERO,
             currency_id: None,
             amount_currency: None,
+            project_id: None,
+            department_id: None,
         }
     }
 
@@ -104,6 +109,8 @@ impl MoveLine {
             credit: amount,
             currency_id: None,
             amount_currency: None,
+            project_id: None,
+            department_id: None,
         }
     }
 
@@ -116,6 +123,13 @@ impl MoveLine {
     pub fn with_currency(mut self, currency_id: Uuid, amount_currency: Decimal) -> Self {
         self.currency_id = Some(currency_id);
         self.amount_currency = Some(amount_currency);
+        self
+    }
+
+    /// Tag analytic dimensions (either may be None).
+    pub fn with_dimensions(mut self, project_id: Option<Uuid>, department_id: Option<Uuid>) -> Self {
+        self.project_id = project_id;
+        self.department_id = department_id;
         self
     }
 }
@@ -337,8 +351,8 @@ pub async fn create_move(db: &PgPool, user_id: Uuid, new: &NewMove<'_>) -> Vorte
         vortex_plugin_sdk::sqlx::query(
             "INSERT INTO acc_move_line \
                 (move_id, sequence, account_id, partner_id, name, debit, credit, company_id, \
-                 currency_id, amount_currency) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+                 currency_id, amount_currency, project_id, department_id) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
         )
         .bind(move_id)
         .bind(((i + 1) * 10) as i32)
@@ -350,6 +364,8 @@ pub async fn create_move(db: &PgPool, user_id: Uuid, new: &NewMove<'_>) -> Vorte
         .bind(new.company_id)
         .bind(line.currency_id)
         .bind(line.amount_currency)
+        .bind(line.project_id)
+        .bind(line.department_id)
         .execute(&mut *tx)
         .await
         .map_err(|e| VortexError::QueryExecution(e.to_string()))?;
@@ -522,7 +538,8 @@ pub async fn reverse_move(
     let origin_ref: Option<String> = orig.get("origin_ref");
 
     let line_rows = vortex_plugin_sdk::sqlx::query(
-        "SELECT account_id, partner_id, name, debit, credit, currency_id, amount_currency \
+        "SELECT account_id, partner_id, name, debit, credit, currency_id, amount_currency, \
+                project_id, department_id \
          FROM acc_move_line WHERE move_id = $1 ORDER BY sequence",
     )
     .bind(move_id)
@@ -541,6 +558,8 @@ pub async fn reverse_move(
             credit: r.get::<Decimal, _>("debit"),
             currency_id: r.get("currency_id"),
             amount_currency: r.get::<Option<Decimal>, _>("amount_currency").map(|a| -a),
+            project_id: r.get("project_id"),
+            department_id: r.get("department_id"),
         })
         .collect();
 
