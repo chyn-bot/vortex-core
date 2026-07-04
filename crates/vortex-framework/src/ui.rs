@@ -201,6 +201,7 @@ pub fn forbidden_page(action: &str) -> String {
     <title>Access Denied - Vortex</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
     <link href="/static/vortex.css" rel="stylesheet">
+    <script src="/static/vortex.js" defer></script>
     <script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200 flex items-center justify-center">

@@ -1333,6 +1333,7 @@ fn module_not_installed_page(module_name: &str) -> String {
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
 <link href="/static/vortex.css" rel="stylesheet"/>
+<script src="/static/vortex.js" defer></script>
 <script src="/static/vendor/tailwind.js"></script></head>
 <body class="min-h-screen bg-base-200 flex items-center justify-center">
 <div class="card bg-base-100 shadow-xl max-w-md w-full">
@@ -2958,6 +2959,7 @@ async fn home_page(
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
 <link href="/static/vortex.css" rel="stylesheet"/>
+<script src="/static/vortex.js" defer></script>
 <script src="/static/vendor/tailwind.js"></script>
 <script src="/static/vendor/htmx.min.js"></script>
 </head>
@@ -3695,6 +3697,7 @@ async fn announcements_list(
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
 <link href="/static/vortex.css" rel="stylesheet"/>
+<script src="/static/vortex.js" defer></script>
 <script src="/static/vendor/tailwind.js"></script></head>
 <body class="min-h-screen bg-base-200">
 <div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a><button onclick="(function(){{var h=document.documentElement,c=h.getAttribute('data-theme')==='dark'?'corporate':'dark';h.setAttribute('data-theme',c);localStorage.setItem('theme',c);document.querySelectorAll('.theme-icon-sun,.theme-icon-moon').forEach(function(e){{e.classList.toggle('hidden')}})}})();" class="btn btn-ghost btn-sm btn-square ml-auto"><svg class="theme-icon-sun w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5" stroke-width="2"/><path stroke-linecap="round" stroke-width="2" d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg><svg class="theme-icon-moon w-5 h-5 hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg></button></div>
@@ -3730,6 +3733,7 @@ async fn announcement_new(
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
 <link href="/static/vortex.css" rel="stylesheet"/>
+<script src="/static/vortex.js" defer></script>
 <script src="/static/vendor/tailwind.js"></script></head>
 <body class="min-h-screen bg-base-200">
 <div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a><button onclick="(function(){{var h=document.documentElement,c=h.getAttribute('data-theme')==='dark'?'corporate':'dark';h.setAttribute('data-theme',c);localStorage.setItem('theme',c);document.querySelectorAll('.theme-icon-sun,.theme-icon-moon').forEach(function(e){{e.classList.toggle('hidden')}})}})();" class="btn btn-ghost btn-sm btn-square ml-auto"><svg class="theme-icon-sun w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5" stroke-width="2"/><path stroke-linecap="round" stroke-width="2" d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg><svg class="theme-icon-moon w-5 h-5 hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg></button></div>
@@ -3844,6 +3848,7 @@ async fn announcement_edit(
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
 <link href="/static/vortex.css" rel="stylesheet"/>
+<script src="/static/vortex.js" defer></script>
 <script src="/static/vendor/tailwind.js"></script></head>
 <body class="min-h-screen bg-base-200">
 <div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a><button onclick="(function(){{var h=document.documentElement,c=h.getAttribute('data-theme')==='dark'?'corporate':'dark';h.setAttribute('data-theme',c);localStorage.setItem('theme',c);document.querySelectorAll('.theme-icon-sun,.theme-icon-moon').forEach(function(e){{e.classList.toggle('hidden')}})}})();" class="btn btn-ghost btn-sm btn-square ml-auto"><svg class="theme-icon-sun w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5" stroke-width="2"/><path stroke-linecap="round" stroke-width="2" d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg><svg class="theme-icon-moon w-5 h-5 hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg></button></div>
@@ -6708,6 +6713,7 @@ async fn generic_list_view(
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
 <link href="/static/vortex.css" rel="stylesheet"/>
+<script src="/static/vortex.js" defer></script>
 <script src="/static/vendor/tailwind.js"></script>
 <style>
 body {{ background: oklch(var(--b2)); color: oklch(var(--bc)); }}
@@ -7000,6 +7006,7 @@ async fn generic_kanban_view(
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
 <link href="/static/vortex.css" rel="stylesheet"/>
+<script src="/static/vortex.js" defer></script>
 <script src="/static/vendor/tailwind.js"></script>
 <style>
 body {{ background: oklch(var(--b2)); color: oklch(var(--bc)); }}
@@ -7146,6 +7153,7 @@ async fn generic_graph_view(
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
 <link href="/static/vortex.css" rel="stylesheet"/>
+<script src="/static/vortex.js" defer></script>
 <script src="/static/vendor/tailwind.js"></script>
 <script src="/static/vendor/chart.umd.js"></script>
 <style>
@@ -7417,6 +7425,7 @@ async fn generic_calendar_view(
     <title>{} - Calendar</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
 <link href="/static/vortex.css" rel="stylesheet"/>
+<script src="/static/vortex.js" defer></script>
     <script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
@@ -7948,6 +7957,7 @@ async fn generic_pivot_view(
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
 <link href="/static/vortex.css" rel="stylesheet"/>
+<script src="/static/vortex.js" defer></script>
     <script src="/static/vendor/tailwind.js"></script>
     <style>
         body {{ background: oklch(var(--b2)); color: oklch(var(--bc)); }}
@@ -8531,6 +8541,7 @@ async fn contacts_list(
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
 <link href="/static/vortex.css" rel="stylesheet"/>
+<script src="/static/vortex.js" defer></script>
 <script src="/static/vendor/tailwind.js"></script></head>
 <body class="min-h-screen bg-base-200">
 <div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a><button onclick="(function(){{var h=document.documentElement,c=h.getAttribute('data-theme')==='dark'?'corporate':'dark';h.setAttribute('data-theme',c);localStorage.setItem('theme',c);document.querySelectorAll('.theme-icon-sun,.theme-icon-moon').forEach(function(e){{e.classList.toggle('hidden')}})}})();" class="btn btn-ghost btn-sm btn-square ml-auto"><svg class="theme-icon-sun w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5" stroke-width="2"/><path stroke-linecap="round" stroke-width="2" d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg><svg class="theme-icon-moon w-5 h-5 hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg></button></div>
@@ -8564,7 +8575,8 @@ async fn contacts_new(State(state): State<Arc<AppState>>, Db(db): Db, Extension(
     }
 
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style><title>New Contact</title><meta name="viewport" content="width=device-width, initial-scale=1.0"><link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css" rel="stylesheet"/><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css" rel="stylesheet"/>
+<script src="/static/vortex.js" defer></script><script src="/static/vendor/tailwind.js"></script>
 <style>
 .country-dropdown {{ position: relative; }}
 .country-dropdown .dropdown-content {{ max-height: 300px; overflow-y: auto; width: 100%; }}
@@ -8867,7 +8879,8 @@ async fn contacts_edit(
     };
 
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style><title>Edit Contact</title><meta name="viewport" content="width=device-width, initial-scale=1.0"><link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css" rel="stylesheet"/><script src="/static/vendor/tailwind.js"></script><script src="/static/vendor/htmx.min.js"></script>
+<link href="/static/vortex.css" rel="stylesheet"/>
+<script src="/static/vortex.js" defer></script><script src="/static/vendor/tailwind.js"></script><script src="/static/vendor/htmx.min.js"></script>
 <style>
 .country-dropdown {{ position: relative; }}
 .country-dropdown .dropdown-content {{ max-height: 300px; overflow-y: auto; width: 100%; }}
@@ -10857,6 +10870,7 @@ async fn audit_log_page(
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
 <link href="/static/vortex.css" rel="stylesheet"/>
+<script src="/static/vortex.js" defer></script>
 <script src="/static/vendor/tailwind.js"></script></head>
 <body class="min-h-screen bg-base-200">
 <div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a></div>
@@ -12998,6 +13012,7 @@ async fn approvals_inbox(
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
 <link href="/static/vortex.css" rel="stylesheet"/>
+<script src="/static/vortex.js" defer></script>
 <script src="/static/vendor/tailwind.js"></script></head>
 <body class="min-h-screen bg-base-200">
 <div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a></div>
@@ -15737,7 +15752,8 @@ async fn reports_hub(
     let html = format!(
         r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><title>Reports - Remicle</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0"><link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css" rel="stylesheet"/><script src="/static/vendor/tailwind.js"></script></head>
+<link href="/static/vortex.css" rel="stylesheet"/>
+<script src="/static/vortex.js" defer></script><script src="/static/vendor/tailwind.js"></script></head>
 <body class="min-h-screen bg-base-200"><div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a></div>
 <div id="sidebar-overlay" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
 <div class="flex">{sidebar}<main class="flex-1 p-4 lg:p-6 min-w-0">{content}</main></div></body></html>"#,
@@ -15938,7 +15954,8 @@ async fn report_runs_page(
     let html = format!(
         r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><title>Generated Reports - Remicle</title>{refresh}
 <meta name="viewport" content="width=device-width, initial-scale=1.0"><link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css" rel="stylesheet"/><script src="/static/vendor/tailwind.js"></script></head>
+<link href="/static/vortex.css" rel="stylesheet"/>
+<script src="/static/vortex.js" defer></script><script src="/static/vendor/tailwind.js"></script></head>
 <body class="min-h-screen bg-base-200"><div class="flex">{sidebar}<main class="flex-1 p-4 lg:p-6 min-w-0">{content}</main></div></body></html>"#,
         refresh = refresh, sidebar = sidebar, content = content,
     );

@@ -44,6 +44,7 @@ fn page_shell(sidebar: &str, title: &str, content: &str) -> String {
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
 <link href="/static/vortex.css" rel="stylesheet"/>
+<script src="/static/vortex.js" defer></script>
 <script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">

@@ -145,3 +145,31 @@ aside .menu a.active::before {
     box-shadow: none;
   }
 }
+
+/* 11 ▸ Dirty-form guard pill (populated by /static/vortex.js). */
+#vortex-dirty-pill {
+  position: fixed;
+  right: 1.25rem;
+  bottom: 1.25rem;
+  z-index: 60;
+  padding: 0.4rem 0.9rem;
+  border-radius: 999px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  background: #f59e0b;
+  color: #1c1400;
+  box-shadow: 0 4px 14px rgb(0 0 0 / 0.25);
+  opacity: 0;
+  transform: translateY(6px);
+  pointer-events: none;
+  transition: opacity 0.15s ease, transform 0.15s ease;
+}
+#vortex-dirty-pill.show {
+  opacity: 1;
+  transform: translateY(0);
+}
+@media print {
+  #vortex-dirty-pill { display: none !important; }
+}
