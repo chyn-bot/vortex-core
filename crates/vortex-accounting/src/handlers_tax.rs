@@ -124,6 +124,11 @@ fn tax_profile_form() -> FormConfig {
         .section("e-Invoice")
         .field(FormField::text("einvoice_email", "e-Invoice Email"))
         .field(FormField::checkbox("einvoice_optout", "Consolidated only (no individual e-invoice)"))
+        .section("Control Accounts")
+        .field(FormField::many2one("receivable_account_id", "Receivable Account", "acc_account")
+            .help("Partner-specific AR control account (e.g. 1210 Non-trade Receivables); empty = company default"))
+        .field(FormField::many2one("payable_account_id", "Payable Account", "acc_account")
+            .help("Partner-specific AP control account (e.g. 2010 Non-trade Payables); empty = company default"))
 }
 
 // ─── Taxes ───────────────────────────────────────────────────────────────
@@ -773,10 +778,12 @@ pub(crate) async fn upsert_profile_fields(
     .execute(db)
     .await
     .map_err(|e| e.to_string())?;
+    let uuid = |k: &str| get(k).and_then(|s| s.parse::<Uuid>().ok());
     let id: Uuid = vortex_plugin_sdk::sqlx::query_scalar(
         "UPDATE acc_partner_tax_profile SET \
             tin = $2, id_type = $3, id_value = $4, sst_registration = $5, \
-            msic_code = $6, einvoice_email = $7, einvoice_optout = $8 \
+            msic_code = $6, einvoice_email = $7, einvoice_optout = $8, \
+            receivable_account_id = $9, payable_account_id = $10 \
          WHERE contact_id = $1 RETURNING id",
     )
     .bind(contact_id)
@@ -787,6 +794,8 @@ pub(crate) async fn upsert_profile_fields(
     .bind(get("msic_code"))
     .bind(get("einvoice_email"))
     .bind(optout)
+    .bind(uuid("receivable_account_id"))
+    .bind(uuid("payable_account_id"))
     .fetch_one(db)
     .await
     .map_err(|e| e.to_string())?;

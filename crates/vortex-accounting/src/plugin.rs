@@ -27,6 +27,8 @@ const MIG_008_DIMENSIONS_ASSETS: &str =
     include_str!("../migrations/008_dimensions_assets/postgres.sql");
 const MIG_009_STATEMENTS_CLOSE: &str =
     include_str!("../migrations/009_statements_close/postgres.sql");
+const MIG_010_PARTNER_ACCOUNTS: &str =
+    include_str!("../migrations/010_partner_accounts/postgres.sql");
 
 pub struct AccountingPlugin;
 
@@ -327,6 +329,12 @@ impl Plugin for AccountingPlugin {
                 down_sql: None,
                 requires_core_migration: Some("119_commerce_primitives"),
             },
+            PluginMigration {
+                name: "010_partner_accounts",
+                up_sql: MIG_010_PARTNER_ACCOUNTS,
+                down_sql: None,
+                requires_core_migration: Some("119_commerce_primitives"),
+            },
         ]
     }
 
@@ -387,7 +395,8 @@ impl Plugin for AccountingPlugin {
                 let esc = vortex_plugin_sdk::framework::html_escape;
                 let row = vortex_plugin_sdk::sqlx::query(
                     "SELECT tin, id_type, id_value, sst_registration, msic_code, \
-                            einvoice_email, einvoice_optout \
+                            einvoice_email, einvoice_optout, \
+                            receivable_account_id, payable_account_id \
                      FROM acc_partner_tax_profile WHERE contact_id = $1",
                 )
                 .bind(contact_id)
@@ -396,6 +405,59 @@ impl Plugin for AccountingPlugin {
                 .map_err(|e| {
                     vortex_plugin_sdk::common::VortexError::QueryExecution(e.to_string())
                 })?;
+                // Control-account pickers: reconcilable AR/AP accounts.
+                let account_select = |name: &str,
+                                      label: &str,
+                                      account_type: &str,
+                                      selected: Option<vortex_plugin_sdk::uuid::Uuid>,
+                                      accounts: &[(vortex_plugin_sdk::uuid::Uuid, String, String)]| {
+                    let mut opts =
+                        String::from("<option value=\"\">Company default</option>");
+                    for (id, code, aname) in accounts {
+                        let sel = if selected == Some(*id) { " selected" } else { "" };
+                        opts.push_str(&format!(
+                            "<option value=\"{id}\"{sel}>{} {}</option>",
+                            esc(code),
+                            esc(aname),
+                        ));
+                    }
+                    let _ = account_type;
+                    format!(
+                        "<label class=\"form-control\"><span class=\"label-text text-xs mb-1\">{}</span>\
+                         <select name=\"{name}\" form=\"record-form\" class=\"select select-bordered select-sm\">{opts}</select></label>",
+                        esc(label),
+                    )
+                };
+                let load_accounts = |t: &'static str| {
+                    let db = db.clone();
+                    async move {
+                        vortex_plugin_sdk::sqlx::query(
+                            "SELECT id, code, name FROM acc_account \
+                             WHERE active AND reconcile AND account_type = $1 ORDER BY code",
+                        )
+                        .bind(t)
+                        .fetch_all(&db)
+                        .await
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|r| {
+                            (
+                                r.get::<vortex_plugin_sdk::uuid::Uuid, _>("id"),
+                                r.get::<String, _>("code"),
+                                r.get::<String, _>("name"),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                    }
+                };
+                let ar_accounts = load_accounts("asset_receivable").await;
+                let ap_accounts = load_accounts("liability_payable").await;
+                let ar_selected = row
+                    .as_ref()
+                    .and_then(|r| r.get::<Option<vortex_plugin_sdk::uuid::Uuid>, _>("receivable_account_id"));
+                let ap_selected = row
+                    .as_ref()
+                    .and_then(|r| r.get::<Option<vortex_plugin_sdk::uuid::Uuid>, _>("payable_account_id"));
                 // Inline editable — saving stays on the contact page.
                 let val = |k: &str| -> String {
                     row.as_ref()
@@ -434,6 +496,7 @@ impl Plugin for AccountingPlugin {
 <option value="ARMY"{sel_army}>Army ID</option>
 </select></label>
 {id_value}{sst}{msic}{email}
+{ar_select}{ap_select}
 <label class="label cursor-pointer justify-start gap-2 mt-5">
 <input type="checkbox" name="einvoice_optout" form="record-form" class="checkbox checkbox-sm"{optout_checked}/>
 <span class="label-text text-xs">Consolidated e-invoice only</span></label>
@@ -452,6 +515,20 @@ impl Plugin for AccountingPlugin {
                     sel_pass = sel("PASSPORT"),
                     sel_army = sel("ARMY"),
                     optout_checked = if optout { " checked" } else { "" },
+                    ar_select = account_select(
+                        "receivable_account_id",
+                        "Receivable Account (control)",
+                        "asset_receivable",
+                        ar_selected,
+                        &ar_accounts,
+                    ),
+                    ap_select = account_select(
+                        "payable_account_id",
+                        "Payable Account (control)",
+                        "liability_payable",
+                        ap_selected,
+                        &ap_accounts,
+                    ),
                 ))
             },
         )
@@ -466,7 +543,7 @@ impl Plugin for AccountingPlugin {
             // Snapshot → save → diff, so the CONTACT's history shows
             // exactly which tax fields changed (same entry shape the
             // field tracker writes).
-            const FIELDS: [(&str, &str); 7] = [
+            const FIELDS: [(&str, &str); 9] = [
                 ("tin", "TIN"),
                 ("id_type", "ID Type"),
                 ("id_value", "BRN/NRIC No."),
@@ -474,6 +551,8 @@ impl Plugin for AccountingPlugin {
                 ("msic_code", "MSIC Code"),
                 ("einvoice_email", "e-Invoice Email"),
                 ("einvoice_optout", "Consolidated e-Invoice Only"),
+                ("receivable_account", "Receivable Account"),
+                ("payable_account", "Payable Account"),
             ];
             let snapshot = |row: Option<&vortex_plugin_sdk::sqlx::postgres::PgRow>| {
                 FIELDS
@@ -493,9 +572,14 @@ impl Plugin for AccountingPlugin {
                     })
                     .collect::<Vec<String>>()
             };
-            let select = "SELECT tin, id_type, id_value, sst_registration, msic_code, \
-                          einvoice_email, einvoice_optout \
-                          FROM acc_partner_tax_profile WHERE contact_id = $1";
+            let select = "SELECT p.tin, p.id_type, p.id_value, p.sst_registration, p.msic_code, \
+                          p.einvoice_email, p.einvoice_optout, \
+                          COALESCE(ar.code || ' ' || ar.name, '') AS receivable_account, \
+                          COALESCE(ap.code || ' ' || ap.name, '') AS payable_account \
+                          FROM acc_partner_tax_profile p \
+                          LEFT JOIN acc_account ar ON ar.id = p.receivable_account_id \
+                          LEFT JOIN acc_account ap ON ap.id = p.payable_account_id \
+                          WHERE p.contact_id = $1";
             let before_row = vortex_plugin_sdk::sqlx::query(select)
                 .bind(contact_id)
                 .fetch_optional(&db)

@@ -271,6 +271,42 @@ pub async fn default_account(
     account_by_type(db, company_id, account_type).await
 }
 
+/// The AR/AP control account for a specific partner: the contact's
+/// own override (non-trade customers, utility vendors, …) when one is
+/// set on its tax/accounting profile, else the company default.
+/// Non-partner roles fall straight through to [`default_account`].
+pub async fn partner_account(
+    db: &PgPool,
+    company_id: Option<Uuid>,
+    partner_id: Option<Uuid>,
+    role: &str,
+) -> VortexResult<Option<Uuid>> {
+    if matches!(role, "receivable" | "payable") {
+        if let Some(partner) = partner_id {
+            let col = if role == "receivable" {
+                "receivable_account_id"
+            } else {
+                "payable_account_id"
+            };
+            let sql = format!(
+                "SELECT p.{col} FROM acc_partner_tax_profile p \
+                 JOIN acc_account a ON a.id = p.{col} AND a.active \
+                 WHERE p.contact_id = $1"
+            );
+            let override_acc: Option<Uuid> = vortex_plugin_sdk::sqlx::query_scalar(&sql)
+                .bind(partner)
+                .fetch_optional(db)
+                .await
+                .map_err(|e| VortexError::QueryExecution(e.to_string()))?
+                .flatten();
+            if override_acc.is_some() {
+                return Ok(override_acc);
+            }
+        }
+    }
+    default_account(db, company_id, role).await
+}
+
 /// First active account of a given `account_type`.
 pub async fn account_by_type(
     db: &PgPool,

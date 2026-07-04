@@ -443,7 +443,8 @@ pub async fn post_invoice(
     let line_role = if customer { "income" } else { "expense" };
     let counterpart_is_debit = customer ^ credit_note;
 
-    let Some(counterpart_account) = service::default_account(db, company_id, counterpart_role).await?
+    let Some(counterpart_account) =
+        service::partner_account(db, company_id, partner_id, counterpart_role).await?
     else {
         return Err(VortexError::ValidationFailed(format!(
             "no {counterpart_role} account configured — set one in acc_config or the chart"
@@ -847,7 +848,9 @@ pub async fn register_payment(
         })?,
     };
     let counterpart_role = if inbound { "receivable" } else { "payable" };
-    let Some(counterpart) = service::default_account(db, pay.company_id, counterpart_role).await?
+    let Some(counterpart) =
+        service::partner_account(db, pay.company_id, Some(pay.partner_id), counterpart_role)
+            .await?
     else {
         return Err(VortexError::ValidationFailed(format!(
             "no {counterpart_role} account configured"

@@ -318,7 +318,8 @@ pub async fn record_pdc(
     let (pdc_received, pdc_issued) = pdc_accounts(db, company_id).await?;
     let received = direction == "received";
     let counterpart_role = if received { "receivable" } else { "payable" };
-    let Some(counterpart) = service::default_account(db, company_id, counterpart_role).await?
+    let Some(counterpart) =
+        service::partner_account(db, company_id, Some(partner_id), counterpart_role).await?
     else {
         return Err(VortexError::ValidationFailed(format!("no {counterpart_role} account")));
     };
@@ -556,10 +557,10 @@ pub async fn contra(
             "nothing to contra — need open AR and AP for this partner".into(),
         ));
     }
-    let receivable = service::default_account(db, company_id, "receivable")
+    let receivable = service::partner_account(db, company_id, Some(partner_id), "receivable")
         .await?
         .ok_or_else(|| VortexError::ValidationFailed("no receivable account".into()))?;
-    let payable = service::default_account(db, company_id, "payable")
+    let payable = service::partner_account(db, company_id, Some(partner_id), "payable")
         .await?
         .ok_or_else(|| VortexError::ValidationFailed("no payable account".into()))?;
     let (contra_move, _) = service::create_and_post(
