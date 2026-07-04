@@ -444,7 +444,7 @@ impl Plugin for AccountingPlugin {
                     format!(
                         "<label class=\"form-control\"><span class=\"label-text text-xs mb-1\">{}</span>\
                          <input name=\"{name}\" value=\"{value}\" placeholder=\"{placeholder}\" \
-                         form=\"record-form\" class=\"input input-bordered input-sm\"/></label>",
+                         form=\"record-form\" class=\"input input-bordered input-sm w-full\"/></label>",
                         esc(label),
                     )
                 };
@@ -458,7 +458,7 @@ impl Plugin for AccountingPlugin {
 <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
 {tin}
 <label class="form-control"><span class="label-text text-xs mb-1">ID Type</span>
-<select name="id_type" form="record-form" class="select select-bordered select-sm">
+<select name="id_type" form="record-form" class="select select-bordered select-sm w-full">
 <option value="BRN"{sel_brn}>BRN — Business Reg.</option>
 <option value="NRIC"{sel_nric}>NRIC</option>
 <option value="PASSPORT"{sel_pass}>Passport</option>
@@ -642,7 +642,7 @@ impl Plugin for AccountingPlugin {
                         }
                         format!(
                             "<label class=\"form-control\"><span class=\"label-text text-xs mb-1\">{}</span>\
-                             <select name=\"{name}\" form=\"record-form\" class=\"select select-bordered select-sm\">{opts}</select></label>",
+                             <select name=\"{name}\" form=\"record-form\" class=\"select select-bordered select-sm w-full\">{opts}</select></label>",
                             esc(label),
                         )
                     };
@@ -714,12 +714,12 @@ impl Plugin for AccountingPlugin {
 {bank_table}
 <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mt-2 items-end">
 <label class="form-control"><span class="label-text text-xs mb-1">Bank</span>
-<select name="bank_id" form="record-form" class="select select-bordered select-sm">
+<select name="bank_id" form="record-form" class="select select-bordered select-sm w-full">
 <option value="">-- Select bank --</option>{bank_options}</select></label>
 <label class="form-control"><span class="label-text text-xs mb-1">Account No.</span>
-<input name="bank_account_number" form="record-form" inputmode="numeric" placeholder="512345678901" class="input input-bordered input-sm"/></label>
+<input name="bank_account_number" form="record-form" inputmode="numeric" placeholder="512345678901" class="input input-bordered input-sm w-full"/></label>
 <label class="form-control"><span class="label-text text-xs mb-1">Holder</span>
-<input name="bank_account_holder" form="record-form" class="input input-bordered input-sm"/></label>
+<input name="bank_account_holder" form="record-form" class="input input-bordered input-sm w-full"/></label>
 <button form="record-form" formmethod="post" formaction="/accounting/partner-banks/{contact_id}/add" class="btn btn-sm btn-outline" title="Also saves the accounting fields above">Add Bank Account</button>
 </div>
 <p class="text-xs opacity-50 mt-1">SWIFT fills in from the bank master — manage the list under Accounting Setup ▸ Banks.</p>"#,
