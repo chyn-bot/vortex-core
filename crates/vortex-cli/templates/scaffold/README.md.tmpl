@@ -1,0 +1,30 @@
+# __DISPLAY__ (vortex-__KEBAB__)
+
+Scaffolded by `vortex scaffold plugin __KEBAB__`. Already registered
+in the workspace and the host — build and it runs:
+
+```
+cargo build -p vortex-cli
+DATABASE_URL=<tenant-url> ./target/debug/vortex db migrate   # applies migrations/001_init per tenant
+```
+
+Then open `/__KEBAB__` (the sidebar entry appears once the module is
+installed for the tenant — Settings ▸ Modules ▸ Update Apps List).
+
+## What you got
+
+- **List view** with search/sort/filter/pagination (`handlers.rs::list_items`)
+- **Create form** with sequence-generated codes (`__SEQ__/000001`)
+- **Record page** with the status bar (stages editable in Settings ▸
+  Stages), chatter (messages/activities/attachments), and
+  WORM-audited status transitions
+- **Model registry entries** — your model is already visible to the
+  user report builder and the public REST API (`/api/v1`)
+
+## Where to go next
+
+- Extend the schema in `migrations/` (add `002_...`, never edit an
+  applied migration)
+- Add scheduled actions, reports, translations in `plugin.rs`
+- Compose the base modules: inventory (`post_move`), accounting
+  (`create_and_post`), approvals — see `docs/CORE_FEATURES.md`

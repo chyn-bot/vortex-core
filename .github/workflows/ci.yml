@@ -60,6 +60,13 @@ jobs:
         run: sudo apt-get update -q && sudo apt-get install -y -q argon2 postgresql-client
       - name: Build server
         run: cargo build -p vortex-cli --locked
+      # The scaffolder's output must always compile and run — generate
+      # a plugin, rebuild with it wired in, and let the crawl below
+      # walk its pages. Guards the templates against API drift.
+      - name: Scaffold check
+        run: |
+          ./target/debug/vortex scaffold plugin citest
+          cargo build -p vortex-cli
       - name: Provision fresh tenant
         run: ./target/debug/vortex db migrate
       - name: Start server

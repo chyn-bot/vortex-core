@@ -1,0 +1,288 @@
+//! __DISPLAY__ HTTP handlers — list (list framework), create form,
+//! and a record page wearing the platform widgets: status bar,
+//! chatter, audit-logged transitions.
+
+use std::sync::Arc;
+
+use vortex_plugin_sdk::prelude::*;
+use vortex_plugin_sdk::sqlx::Row;
+use vortex_plugin_sdk::serde_json::json;
+use vortex_plugin_sdk::tracing::error;
+use vortex_plugin_sdk::uuid::Uuid;
+
+/// Auto-generated record codes: __SEQ__/000001
+const ITEM_SEQ: vortex_plugin_sdk::orm::sequence::SequenceSpec =
+    vortex_plugin_sdk::orm::sequence::SequenceSpec::new("__SNAKE__.item", "__SEQ__")
+        .with_padding(6);
+
+pub fn routes() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/__KEBAB__", get(list_items))
+        .route("/__KEBAB__/new", get(new_item_form))
+        .route("/__KEBAB__/create", post(create_item))
+        .route("/__KEBAB__/{id}", get(item_page))
+        .route("/__KEBAB__/{id}/status/{state}", post(change_status))
+}
+
+/// Platform HTML shell: sidebar, vendored assets, mobile layout.
+fn page_shell(sidebar: &str, title: &str, content: &str) -> String {
+    format!(
+        r##"<!DOCTYPE html><html data-theme="dark"><head>
+<script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script>
+<title>{title} - Vortex</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
+<script src="/static/vendor/tailwind.js"></script>
+<script src="/static/vendor/htmx.min.js"></script>
+</head>
+<body class="min-h-screen bg-base-200"><div class="flex">{sidebar}
+<main class="flex-1 p-4 lg:p-6 min-w-0">{content}</main>
+</div></body></html>"##,
+        title = title, sidebar = sidebar, content = content,
+    )
+}
+
+fn sidebar_for(state: &AppState, user: &AuthUser, db_ctx: &DatabaseContext) -> String {
+    let display_name = user.full_name.as_deref().unwrap_or(&user.username);
+    let initials = vortex_plugin_sdk::framework::get_initials(display_name);
+    vortex_plugin_sdk::framework::build_sidebar(
+        "__SNAKE__",
+        display_name,
+        &initials,
+        &db_ctx.installed_modules,
+        user.is_admin(),
+        &state.plugin_registry,
+        &user.roles,
+    )
+}
+
+/// GET /__KEBAB__ — list view: search, sort, filters, pagination all
+/// come from the list framework; you only declare columns.
+async fn list_items(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Query(query): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    use vortex_plugin_sdk::framework::list::{
+        execute_list, render_list, ListColumn, ListConfig, ListParams,
+    };
+
+    let config = ListConfig::new("__DISPLAY__", "__SNAKE___item")
+        .detail_url("/__KEBAB__/{id}")
+        .create("+ New", "/__KEBAB__/new")
+        .column(ListColumn::new("code", "Code").sortable().code())
+        .column(ListColumn::new("name", "Name").sortable().searchable())
+        .column(
+            ListColumn::new("record_state", "State")
+                .filterable(&[
+                    ("draft", "Draft"),
+                    ("confirmed", "Confirmed"),
+                    ("done", "Done"),
+                    ("cancelled", "Cancelled"),
+                ])
+                .badge(&[
+                    ("draft", "Draft", "badge-neutral"),
+                    ("confirmed", "Confirmed", "badge-info"),
+                    ("done", "Done", "badge-success"),
+                    ("cancelled", "Cancelled", "badge-error"),
+                ]),
+        )
+        .column(ListColumn::new("created_at", "Created").sortable());
+
+    let params = ListParams::from_query(&query);
+    let table = match execute_list(&db, &config, &params).await {
+        Ok(result) => render_list(&config, &result, &params, "/__KEBAB__"),
+        Err(e) => {
+            error!("__SNAKE__ list failed: {e}");
+            format!("<div class=\"alert alert-error\">List error: {e}</div>")
+        }
+    };
+
+    let content = format!(
+        r##"<h1 class="text-2xl font-bold mb-6">__DISPLAY__</h1>{table}"##,
+    );
+    let sidebar = sidebar_for(&state, &user, &db_ctx);
+    Html(page_shell(&sidebar, "__DISPLAY__", &content)).into_response()
+}
+
+/// GET /__KEBAB__/new — create form.
+async fn new_item_form(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+) -> Response {
+    let content = r##"<div class="max-w-xl">
+<h1 class="text-2xl font-bold mb-6">New __DISPLAY__ item</h1>
+<form method="post" action="/__KEBAB__/create" class="card bg-base-100 shadow"><div class="card-body gap-4">
+  <label class="form-control"><span class="label-text mb-1">Name *</span>
+    <input name="name" required maxlength="255" class="input input-bordered"/></label>
+  <label class="form-control"><span class="label-text mb-1">Description</span>
+    <textarea name="description" class="textarea textarea-bordered"></textarea></label>
+  <div class="card-actions justify-end">
+    <a href="/__KEBAB__" class="btn btn-ghost">Cancel</a>
+    <button class="btn btn-primary">Create</button></div>
+</div></form></div>"##;
+    let sidebar = sidebar_for(&state, &user, &db_ctx);
+    Html(page_shell(&sidebar, "New - __DISPLAY__", content)).into_response()
+}
+
+/// POST /__KEBAB__/create — sequence code, insert, audit, redirect.
+async fn create_item(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    vortex_plugin_sdk::axum::extract::Form(form): vortex_plugin_sdk::axum::extract::Form<
+        std::collections::HashMap<String, String>,
+    >,
+) -> Response {
+    let name = form.get("name").map(|s| s.trim()).unwrap_or("");
+    if name.is_empty() {
+        return (StatusCode::BAD_REQUEST, "Name is required").into_response();
+    }
+    let description = form.get("description").map(|s| s.trim()).filter(|s| !s.is_empty());
+    let code = match vortex_plugin_sdk::orm::sequence::next(&db_ctx.pool, &ITEM_SEQ).await {
+        Ok(c) => c,
+        Err(e) => {
+            error!("sequence failed: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Could not allocate code").into_response();
+        }
+    };
+
+    let id: Uuid = match vortex_plugin_sdk::sqlx::query_scalar(
+        "INSERT INTO __SNAKE___item (code, name, description, created_by)
+         VALUES ($1, $2, $3, $4) RETURNING id",
+    )
+    .bind(&code)
+    .bind(name)
+    .bind(description)
+    .bind(user.id)
+    .fetch_one(&db)
+    .await
+    {
+        Ok(id) => id,
+        Err(e) => {
+            error!("insert failed: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Create failed").into_response();
+        }
+    };
+
+    // Evidence on the WORM ledger — every state change is recorded.
+    let entry = AuditEntry::new(AuditAction::RecordCreated, AuditSeverity::Info)
+        .with_user(UserId(user.id))
+        .with_username(&user.username)
+        .with_database(&db_ctx.db_name)
+        .with_resource("__SNAKE___item", id.to_string())
+        .with_resource_name(name)
+        .with_details(json!({ "code": code }));
+    if let Err(e) = state.audit.log(entry).await {
+        error!("audit write failed: {e}");
+    }
+
+    Redirect::to(&format!("/__KEBAB__/{id}")).into_response()
+}
+
+/// GET /__KEBAB__/{id} — record page: status bar + fields + chatter.
+async fn item_page(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<Uuid>,
+) -> Response {
+    let row = match vortex_plugin_sdk::sqlx::query(
+        "SELECT code, name, description, record_state, created_at
+         FROM __SNAKE___item WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&db)
+    .await
+    {
+        Ok(Some(r)) => r,
+        _ => return (StatusCode::NOT_FOUND, "Not found").into_response(),
+    };
+    let code: String = row.get("code");
+    let name: String = row.get("name");
+    let description: Option<String> = row.try_get("description").ok().flatten();
+    let record_state: String = row.get("record_state");
+
+    // Status bar: stages come from the DB (admins edit them in
+    // Settings ▸ Stages); clicking a stage POSTs to /status/{state}.
+    let bar = vortex_plugin_sdk::framework::status::StatusBar::from_db(
+        &db, "__SNAKE___item", "__SNAKE___item", "record_state",
+    )
+    .await
+    .render(&record_state, &format!("/__KEBAB__/{id}/status"));
+
+    let esc = vortex_plugin_sdk::framework::ui::html_escape;
+    let content = format!(
+        r##"<div class="mb-4"><a href="/__KEBAB__" class="link link-hover text-sm">← __DISPLAY__</a></div>
+<div class="card bg-base-100 shadow mb-6"><div class="card-body">
+  <div class="flex justify-between items-start flex-wrap gap-4">
+    <div><h1 class="text-2xl font-bold">{name}</h1>
+    <p class="opacity-60"><code>{code}</code></p></div>
+    {bar}
+  </div>
+  <p class="mt-4">{description}</p>
+</div></div>
+<!-- Chatter: messages, activities, attachments — one include. -->
+<div hx-get="/partials/chatter/__SNAKE___item/{id}" hx-trigger="load" hx-swap="innerHTML">
+  <span class="loading loading-dots loading-sm"></span>
+</div>"##,
+        name = esc(&name),
+        code = esc(&code),
+        bar = bar,
+        description = esc(description.as_deref().unwrap_or("")),
+        id = id,
+    );
+    let sidebar = sidebar_for(&state, &user, &db_ctx);
+    Html(page_shell(&sidebar, &name, &content)).into_response()
+}
+
+/// POST /__KEBAB__/{id}/status/{state} — audited stage transition.
+async fn change_status(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path((id, new_state)): Path<(Uuid, String)>,
+) -> Response {
+    // Only states that exist as stages for this model are legal.
+    let legal: Option<String> = vortex_plugin_sdk::sqlx::query_scalar(
+        "SELECT code FROM record_stages WHERE model = '__SNAKE___item' AND code = $1",
+    )
+    .bind(&new_state)
+    .fetch_optional(&db)
+    .await
+    .ok()
+    .flatten();
+    if legal.is_none() {
+        return (StatusCode::BAD_REQUEST, "Unknown state").into_response();
+    }
+
+    if let Err(e) = vortex_plugin_sdk::sqlx::query(
+        "UPDATE __SNAKE___item SET record_state = $2, updated_at = NOW() WHERE id = $1",
+    )
+    .bind(id)
+    .bind(&new_state)
+    .execute(&db)
+    .await
+    {
+        error!("status update failed: {e}");
+        return (StatusCode::INTERNAL_SERVER_ERROR, "Update failed").into_response();
+    }
+
+    let entry = AuditEntry::new(AuditAction::RecordUpdated, AuditSeverity::Info)
+        .with_user(UserId(user.id))
+        .with_username(&user.username)
+        .with_database(&db_ctx.db_name)
+        .with_resource("__SNAKE___item", id.to_string())
+        .with_details(json!({ "record_state": new_state }));
+    if let Err(e) = state.audit.log(entry).await {
+        error!("audit write failed: {e}");
+    }
+
+    Redirect::to(&format!("/__KEBAB__/{id}")).into_response()
+}

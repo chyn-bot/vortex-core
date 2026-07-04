@@ -113,13 +113,17 @@ pub mod prelude {
     // ── Webhooks ── (emit events via `framework::webhooks::emit`)
     pub use vortex_framework::WebhookEndpoint;
 
+    // ── Audit ledger ── (every state change: `state.audit.log(...)`)
+    pub use vortex_security::audit::{AuditAction, AuditEntry, AuditSeverity};
+
     // ── Async trait ──
     pub use async_trait::async_trait;
 
     // ── Axum re-exports (route building) ──
     pub use axum::{
-        extract::{Extension, Path, Query, State},
-        response::{Html, IntoResponse, Response},
+        extract::{Extension, Form, Path, Query, State},
+        http::StatusCode,
+        response::{Html, IntoResponse, Redirect, Response},
         routing::{get, post},
         Router,
     };

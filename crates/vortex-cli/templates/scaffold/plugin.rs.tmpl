@@ -1,0 +1,66 @@
+//! [`__PASCAL__Plugin`] — the Plugin impl. Everything is declarative:
+//! state what you have, the host wires it.
+
+use std::sync::Arc;
+
+use vortex_plugin_sdk::prelude::*;
+
+use crate::handlers;
+
+const MIG_001_INIT: &str = include_str!("../migrations/001_init/postgres.sql");
+
+pub struct __PASCAL__Plugin;
+
+impl __PASCAL__Plugin {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for __PASCAL__Plugin {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl Plugin for __PASCAL__Plugin {
+    fn technical_name(&self) -> &'static str {
+        "__SNAKE__"
+    }
+
+    fn display_name(&self) -> &'static str {
+        "__DISPLAY__"
+    }
+
+    fn version(&self) -> &'static str {
+        "0.1.0"
+    }
+
+    fn routes(&self) -> Router<Arc<AppState>> {
+        handlers::routes()
+    }
+
+    fn menu_entries(&self) -> Vec<MenuEntry> {
+        vec![MenuEntry::new(
+            "__SNAKE__.list",
+            "__DISPLAY__",
+            "/__KEBAB__",
+            MenuGroup::Operations,
+        )
+        .with_icon("box")
+        .with_priority(50)]
+    }
+
+    /// Plugin-owned schema, applied per tenant on install.
+    fn migrations(&self) -> Vec<PluginMigration> {
+        vec![PluginMigration {
+            name: "001_init",
+            up_sql: MIG_001_INIT,
+            down_sql: None,
+            // record_stages (status bar) and the model registry are
+            // core features this migration seeds rows into.
+            requires_core_migration: Some("124_record_stages"),
+        }]
+    }
+}

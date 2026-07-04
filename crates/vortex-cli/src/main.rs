@@ -43,6 +43,12 @@ enum Commands {
         workers: Option<usize>,
     },
 
+    /// Scaffold a new plugin crate (generates code + wires it in)
+    Scaffold {
+        #[command(subcommand)]
+        what: ScaffoldCommands,
+    },
+
     /// Database management commands
     Db {
         #[command(subcommand)]
@@ -261,6 +267,18 @@ enum UserCommands {
     },
 }
 
+#[derive(Subcommand)]
+enum ScaffoldCommands {
+    /// Generate a working vertical plugin (list + form + record page)
+    Plugin {
+        /// Technical name, e.g. "parking" or "highway-ops"
+        name: String,
+        /// Display name shown in menus (default: title-cased name)
+        #[arg(long)]
+        display: Option<String>,
+    },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Load environment variables
@@ -302,6 +320,13 @@ async fn main() -> Result<()> {
         }
         Commands::Completions { shell } => {
             commands::completions::run(shell)
+        }
+        Commands::Scaffold { what } => {
+            match what {
+                ScaffoldCommands::Plugin { name, display } => {
+                    commands::scaffold::run(&name, display)
+                }
+            }
         }
         Commands::Info => {
             commands::info::run().await
