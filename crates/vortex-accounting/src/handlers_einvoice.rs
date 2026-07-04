@@ -200,6 +200,7 @@ async fn edit_einvoice_settings(
     let has_secret: bool = vortex_plugin_sdk::sqlx::query_scalar::<_, bool>(
         "SELECT client_secret_enc IS NOT NULL FROM acc_einvoice_settings WHERE id = $1",
     )
+    .bind(id)
     .fetch_one(&db)
     .await
     .unwrap_or(false);
