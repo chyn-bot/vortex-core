@@ -640,8 +640,10 @@ impl Plugin for AccountingPlugin {
                                 esc(aname),
                             ));
                         }
+                        // Account names are long — each picker takes
+                        // half the 4-column row.
                         format!(
-                            "<label class=\"form-control\"><span class=\"label-text text-xs mb-1\">{}</span>\
+                            "<label class=\"form-control col-span-2\"><span class=\"label-text text-xs mb-1\">{}</span>\
                              <select name=\"{name}\" form=\"record-form\" class=\"select select-bordered select-sm w-full\">{opts}</select></label>",
                             esc(label),
                         )
