@@ -108,11 +108,29 @@ pub async fn einvoice_widget(db: &vortex_plugin_sdk::sqlx::PgPool, move_id: Uuid
             .map(str::to_string)
             .unwrap_or_else(|| e.to_string())
     });
+    // Profile-shaped failures get a one-tap path to the fix.
+    let fix_link = match err_msg.as_deref() {
+        Some(msg) if msg.contains("TIN") || msg.contains("Tax Profile") => {
+            vortex_plugin_sdk::sqlx::query_scalar::<_, Uuid>(
+                "SELECT partner_id FROM acc_move WHERE id = $1",
+            )
+            .bind(move_id)
+            .fetch_optional(db)
+            .await
+            .ok()
+            .flatten()
+            .map(|pid| format!(
+                r#" <a class="link link-primary" href="/accounting/tax-profiles/by-contact/{pid}">Fix tax profile →</a>"#
+            ))
+            .unwrap_or_default()
+        }
+        _ => String::new(),
+    };
     let err_html = err_msg
         .as_deref()
         .map(|msg| {
             format!(
-                r#"<div class="text-error text-xs mt-1 max-w-xl" title="{t}">⚠ {t}</div>"#,
+                r#"<div class="text-error text-xs mt-1 max-w-xl" title="{t}">⚠ {t}{fix_link}</div>"#,
                 t = esc(msg)
             )
         })

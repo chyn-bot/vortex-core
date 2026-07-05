@@ -1444,7 +1444,9 @@ async fn document_detail(
     } else if doc_state == "posted" && (payment_state == "not_paid" || payment_state == "partial") {
         actions.push_str(&format!(
             r#"<form method="POST" action="/accounting/documents/{id}/pay" class="flex items-center gap-2">
+<span class="vortex-m-label">Amount</span>
 <input name="amount" type="number" step="0.01" min="0.01" value="{residual}" class="input input-bordered input-sm w-32"/>
+<span class="vortex-m-label">Pay via</span>
 <select name="journal_code" class="select select-bordered select-sm w-24">
 <option value="BNK">Bank</option><option value="CSH">Cash</option>
 </select>
@@ -1537,12 +1539,27 @@ onsubmit="return confirm('Reset to draft? You can edit and repost — the docume
         "posted" => r#"<span class="badge badge-success">Posted</span>"#,
         _ => r#"<span class="badge badge-error">Cancelled</span>"#,
     };
+    // Known origin refs render as a human link ("From sales order …"),
+    // anything else keeps the raw technical ref.
     let origin_block = origin_ref
         .map(|o| {
-            format!(
-                r#"<div class="text-xs opacity-60 mt-2">Origin: <span class="font-mono">{}</span></div>"#,
-                esc(&o)
-            )
+            let friendly = o.split_once(':').and_then(|(kind, rest)| {
+                let id_ok = vortex_plugin_sdk::uuid::Uuid::parse_str(rest).is_ok();
+                match kind {
+                    "sales_order" if id_ok => Some(("sales order", format!("/sales/orders/{rest}"))),
+                    "purchase_order" if id_ok => Some(("purchase order", format!("/purchase/orders/{rest}"))),
+                    _ => None,
+                }
+            });
+            match friendly {
+                Some((label, url)) => format!(
+                    r#"<div class="text-xs opacity-60 mt-2">From <a class="link" href="{url}">{label} →</a></div>"#
+                ),
+                None => format!(
+                    r#"<div class="text-xs opacity-60 mt-2">Origin: <span class="font-mono">{}</span></div>"#,
+                    esc(&o)
+                ),
+            }
         })
         .unwrap_or_default();
     let gl_link = if doc_state == "posted" {
@@ -1630,7 +1647,7 @@ onsubmit="return confirm('Reset to draft? You can edit and repost — the docume
 <a href="{family_url}" class="btn btn-ghost btn-sm mb-4">← Back to {family_title}</a>
 <div class="flex items-center justify-between mb-4">
 <h1 class="text-2xl font-bold">{number} <span class="text-base opacity-60 font-normal">{type_label}</span> {state_badge} {payment_badge}</h1>
-<div>{actions}</div>
+<div class="vortex-actions">{actions}</div>
 </div>
 <div class="card bg-base-100 shadow"><div class="card-body py-4">
 {header_block}
