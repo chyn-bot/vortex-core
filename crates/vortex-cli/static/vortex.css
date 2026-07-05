@@ -173,3 +173,27 @@ aside .menu a.active::before {
 @media print {
   #vortex-dirty-pill { display: none !important; }
 }
+
+/* 12 ▸ Flash toasts (one-shot action feedback via vortex.js). */
+.vortex-toast {
+  position: fixed;
+  top: 1rem;
+  right: 1rem;
+  z-index: 70;
+  max-width: 26rem;
+  padding: 0.7rem 1rem;
+  border-radius: 0.6rem;
+  font-size: 0.82rem;
+  font-weight: 500;
+  line-height: 1.35;
+  box-shadow: 0 6px 20px rgb(0 0 0 / 0.30);
+  cursor: pointer;
+  opacity: 0;
+  transform: translateY(-8px);
+  transition: opacity 0.2s ease, transform 0.2s ease;
+}
+.vortex-toast.show { opacity: 1; transform: translateY(0); }
+.vortex-toast-success { background: #16a34a; color: #f0fdf4; }
+.vortex-toast-error   { background: #dc2626; color: #fef2f2; }
+.vortex-toast-info    { background: #2563eb; color: #eff6ff; }
+@media print { .vortex-toast { display: none !important; } }

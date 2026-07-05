@@ -340,21 +340,30 @@ async fn submit_action(
             return (StatusCode::INTERNAL_SERVER_ERROR, "Settings unavailable").into_response();
         }
     };
+    let back = format!("/accounting/documents/{move_id}");
     if settings.mode != "api" {
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Html("<p>API mode is not enabled — set it in e-Invoice Settings, or use Export XML for the portal.</p>".to_string()),
-        )
-            .into_response();
+        return flash_redirect(
+            &back,
+            FlashKind::Error,
+            "Not submitted — API mode is off. Enable it in e-Invoice Settings, or use Export XML for the portal.",
+        );
     }
     match jobs::enqueue_submit(&state.db, &db_ctx.db_name, move_id).await {
         Ok(()) => {
             audit_einvoice(&state, &user, &db_ctx, move_id, "submit_enqueued").await;
-            Redirect::to(&format!("/accounting/documents/{move_id}")).into_response()
+            flash_redirect(
+                &back,
+                FlashKind::Success,
+                "Queued for LHDN submission — the status on this page updates automatically; refresh in a moment. Failures will show here in red.",
+            )
         }
         Err(e) => {
             error!("submit enqueue failed: {e}");
-            (StatusCode::INTERNAL_SERVER_ERROR, "Could not enqueue").into_response()
+            flash_redirect(
+                &back,
+                FlashKind::Error,
+                "Not submitted — the job queue rejected the request. Check the server logs.",
+            )
         }
     }
 }
@@ -391,7 +400,11 @@ async fn cancel_action(
     match flow::cancel_via_api(&db, move_id, "Cancelled by issuer", &api).await {
         Ok(()) => {
             audit_einvoice(&state, &user, &db_ctx, move_id, "cancelled").await;
-            Redirect::to(&format!("/accounting/documents/{move_id}")).into_response()
+            flash_redirect(
+                &format!("/accounting/documents/{move_id}"),
+                FlashKind::Success,
+                "e-Invoice cancelled with LHDN.",
+            )
         }
         Err(e) => (
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -418,11 +431,19 @@ async fn sync_codes_action(
     {
         Ok(_) => {
             audit_einvoice(&state, &user, &db_ctx, Uuid::nil(), "code_sync_enqueued").await;
-            Redirect::to("/accounting/einvoice").into_response()
+            flash_redirect(
+                "/accounting/einvoice",
+                FlashKind::Info,
+                "LHDN code sync queued — catalogues refresh in the background.",
+            )
         }
         Err(e) => {
             error!("code sync enqueue failed: {e}");
-            (StatusCode::INTERNAL_SERVER_ERROR, "Could not enqueue").into_response()
+            flash_redirect(
+                "/accounting/einvoice",
+                FlashKind::Error,
+                "Could not queue the code sync — check the server logs.",
+            )
         }
     }
 }
