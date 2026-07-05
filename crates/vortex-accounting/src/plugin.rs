@@ -33,6 +33,8 @@ const MIG_011_PARTNER_BANKS: &str =
     include_str!("../migrations/011_partner_banks/postgres.sql");
 const MIG_012_BANK_MASTER: &str =
     include_str!("../migrations/012_bank_master/postgres.sql");
+const MIG_013_CLASSIFICATION_CODES: &str =
+    include_str!("../migrations/013_classification_codes/postgres.sql");
 
 pub struct AccountingPlugin;
 
@@ -390,6 +392,12 @@ impl Plugin for AccountingPlugin {
             PluginMigration {
                 name: "012_bank_master",
                 up_sql: MIG_012_BANK_MASTER,
+                down_sql: None,
+                requires_core_migration: Some("119_commerce_primitives"),
+            },
+            PluginMigration {
+                name: "013_classification_codes",
+                up_sql: MIG_013_CLASSIFICATION_CODES,
                 down_sql: None,
                 requires_core_migration: Some("119_commerce_primitives"),
             },

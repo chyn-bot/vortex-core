@@ -550,9 +550,12 @@ async fn document_detail(
     let (family_title, family_url, _) = doc_family(&move_type);
     let use_kind = if move_type.starts_with("customer") { "sale" } else { "purchase" };
 
-    // Document lines
+    // Document lines. Customer documents show the LHDN classification
+    // per line — required on every e-invoice line.
+    let customer_doc = use_kind == "sale";
     let line_rows = vortex_plugin_sdk::sqlx::query(
-        "SELECT l.id, l.description, l.quantity, l.unit_price, t.name AS tax_name \
+        "SELECT l.id, l.description, l.quantity, l.unit_price, l.classification_code, \
+                t.name AS tax_name \
          FROM acc_invoice_line l LEFT JOIN taxes t ON t.id = l.tax_id \
          WHERE l.move_id = $1 ORDER BY l.sequence",
     )
@@ -568,6 +571,14 @@ async fn document_detail(
         let quantity: Decimal = row.get("quantity");
         let unit_price: Decimal = row.get("unit_price");
         let tax_name: Option<String> = row.get("tax_name");
+        let class_cell = if customer_doc {
+            format!(
+                "<td><span class=\"badge badge-ghost badge-sm\" title=\"LHDN classification\">{}</span></td>",
+                esc(row.get::<Option<String>, _>("classification_code").as_deref().unwrap_or("022")),
+            )
+        } else {
+            String::new()
+        };
         let delete_btn = if is_draft {
             format!(
                 r#"<form method="POST" action="/accounting/documents/{id}/lines/{line_id}/delete" style="display:inline">
@@ -578,12 +589,13 @@ async fn document_detail(
         };
         lines_html.push_str(&format!(
             r#"<tr><td>{description}</td><td class="text-right font-mono">{qty}</td>
-<td class="text-right font-mono">{price}</td><td>{tax}</td>
+<td class="text-right font-mono">{price}</td><td>{tax}</td>{class_cell}
 <td class="text-right font-mono">{subtotal}</td><td>{delete_btn}</td></tr>"#,
             description = esc(&description),
             qty = quantity.normalize(),
             price = money(unit_price),
             tax = esc(tax_name.as_deref().unwrap_or("")),
+            class_cell = class_cell,
             subtotal = money((quantity * unit_price).round_dp(2)),
             delete_btn = delete_btn,
         ));
@@ -591,11 +603,42 @@ async fn document_detail(
 
     let add_line_form = if is_draft {
         let taxes = tax_options(&db, use_kind).await;
+        // LHDN classification — required on every e-invoice line, so
+        // it is entered where the line is entered (customer docs).
+        let class_field = if customer_doc {
+            let opts: String = vortex_plugin_sdk::sqlx::query(
+                "SELECT code, description FROM acc_lhdn_code \
+                 WHERE code_type = 'classification' AND active ORDER BY code",
+            )
+            .fetch_all(&db)
+            .await
+            .unwrap_or_default()
+            .iter()
+            .map(|r| {
+                let code: String = r.get("code");
+                let sel = if code == "022" { " selected" } else { "" };
+                format!(
+                    "<option value=\"{code}\"{sel}>{code} — {}</option>",
+                    esc(&r.get::<String, _>("description")),
+                )
+            })
+            .collect();
+            format!(
+                r#"<div class="form-control col-span-3">
+<label class="label py-0"><span class="label-text-alt">LHDN Classification</span></label>
+<select name="classification_code" class="select select-bordered select-sm w-full">{opts}</select>
+</div>"#
+            )
+        } else {
+            String::new()
+        };
+        let desc_span = if customer_doc { "col-span-4" } else { "col-span-5" };
+        let btn_span = if customer_doc { "col-span-12 md:col-span-12" } else { "col-span-2" };
         format!(
             r#"<div class="card bg-base-100 shadow mt-4"><div class="card-body py-4">
 <h3 class="font-semibold mb-2">Add Line</h3>
 <form method="POST" action="/accounting/documents/{id}/lines" class="grid grid-cols-12 gap-2 items-end">
-<div class="form-control col-span-5">
+<div class="form-control {desc_span}">
 <label class="label py-0"><span class="label-text-alt">Description *</span></label>
 <input name="description" class="input input-bordered input-sm" required/>
 </div>
@@ -611,8 +654,9 @@ async fn document_detail(
 <label class="label py-0"><span class="label-text-alt">Tax</span></label>
 <select name="tax_id" class="select select-bordered select-sm">{taxes}</select>
 </div>
-<div class="col-span-2">
-<button class="btn btn-primary btn-sm w-full">Add</button>
+{class_field}
+<div class="{btn_span}">
+<button class="btn btn-primary btn-sm w-full md:w-auto">Add</button>
 </div>
 </form>
 </div></div>"#
@@ -714,6 +758,7 @@ async fn document_detail(
     let history_panel = vortex_plugin_sdk::framework::render_audit_trail(&db, "acc_move", id).await;
     let einvoice_panel = crate::handlers_einvoice::einvoice_widget(&db, id).await;
 
+    let class_header = if customer_doc { "<th>Class</th>" } else { "" };
     let content = format!(
         r#"<div class="max-w-5xl">
 <a href="{family_url}" class="btn btn-ghost btn-sm mb-4">← Back to {family_title}</a>
@@ -735,7 +780,7 @@ async fn document_detail(
 <div class="card bg-base-100 shadow mt-4"><div class="card-body py-4">
 <h3 class="font-semibold mb-2">Lines</h3>
 <div class="overflow-x-auto"><table class="table table-sm">
-<thead><tr><th>Description</th><th class="text-right">Qty</th><th class="text-right">Unit Price</th><th>Tax</th><th class="text-right">Subtotal</th><th></th></tr></thead>
+<thead><tr><th>Description</th><th class="text-right">Qty</th><th class="text-right">Unit Price</th><th>Tax</th>{class_header}<th class="text-right">Subtotal</th><th></th></tr></thead>
 <tbody>{lines}</tbody>
 <tfoot>
 <tr><td colspan="4" class="text-right">Untaxed</td><td class="text-right font-mono">{untaxed}</td><td></td></tr>
@@ -798,12 +843,17 @@ async fn add_doc_line(
         .get("tax_id")
         .filter(|s| !s.is_empty())
         .and_then(|s| s.parse::<Uuid>().ok());
+    let classification = form
+        .get("classification_code")
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty());
     let company_id = default_company(&db).await;
 
     let result = vortex_plugin_sdk::sqlx::query(
         "INSERT INTO acc_invoice_line \
-            (move_id, sequence, description, quantity, unit_price, tax_id, company_id) \
-         SELECT $1, COALESCE(MAX(l.sequence), 0) + 10, $2, $3, $4, $5, $6 \
+            (move_id, sequence, description, quantity, unit_price, tax_id, \
+             classification_code, company_id) \
+         SELECT $1, COALESCE(MAX(l.sequence), 0) + 10, $2, $3, $4, $5, $6, $7 \
          FROM acc_move m LEFT JOIN acc_invoice_line l ON l.move_id = m.id \
          WHERE m.id = $1 AND m.state = 'draft' \
          GROUP BY m.id",
@@ -813,6 +863,7 @@ async fn add_doc_line(
     .bind(quantity)
     .bind(unit_price)
     .bind(tax_id)
+    .bind(classification)
     .bind(company_id)
     .execute(&db)
     .await;
