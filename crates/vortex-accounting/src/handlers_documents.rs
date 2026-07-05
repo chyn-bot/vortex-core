@@ -1024,8 +1024,16 @@ async fn document_detail(
     let einvoice_panel = crate::handlers_einvoice::einvoice_widget(&db, id).await;
 
     let class_header = if customer_doc { "<th>Class</th>" } else { "" };
+    // Fixed column grid: description flexes, everything else is a
+    // stable width, so rows never jiggle as content changes.
+    let colgroup = if customer_doc {
+        r#"<colgroup><col/><col style="width:6rem"/><col style="width:9rem"/><col style="width:12rem"/><col style="width:6rem"/><col style="width:9rem"/><col style="width:3.5rem"/></colgroup>"#
+    } else {
+        r#"<colgroup><col/><col style="width:6rem"/><col style="width:9rem"/><col style="width:12rem"/><col style="width:9rem"/><col style="width:3.5rem"/></colgroup>"#
+    };
+    let foot_span = if customer_doc { 5 } else { 4 };
     let content = format!(
-        r#"<div class="max-w-5xl">
+        r#"<div class="w-full">
 <a href="{family_url}" class="btn btn-ghost btn-sm mb-4">← Back to {family_title}</a>
 <div class="flex items-center justify-between mb-4">
 <h1 class="text-2xl font-bold">{number} <span class="text-base opacity-60 font-normal">{type_label}</span> {state_badge} {payment_badge}</h1>
@@ -1044,13 +1052,14 @@ async fn document_detail(
 {einvoice_panel}
 <div class="card bg-base-100 shadow mt-4"><div class="card-body py-4">
 <h3 class="font-semibold mb-2">Lines</h3>
-<div class="overflow-x-auto"><table class="table table-sm">
+<div class="overflow-x-auto"><table class="table table-sm table-fixed w-full">
+{colgroup}
 <thead><tr><th>Description</th><th class="text-right">Qty</th><th class="text-right">Unit Price</th><th>Tax</th>{class_header}<th class="text-right">Subtotal</th><th></th></tr></thead>
 <tbody>{lines}</tbody>
 <tfoot>
-<tr><td colspan="4" class="text-right">Untaxed</td><td class="text-right font-mono">{untaxed}</td><td></td></tr>
-<tr><td colspan="4" class="text-right">Tax</td><td class="text-right font-mono">{tax}</td><td></td></tr>
-<tr class="font-bold"><td colspan="4" class="text-right">Total</td><td class="text-right font-mono">{total}</td><td></td></tr>
+<tr><td colspan="{foot_span}" class="text-right">Untaxed</td><td class="text-right font-mono">{untaxed}</td><td></td></tr>
+<tr><td colspan="{foot_span}" class="text-right">Tax</td><td class="text-right font-mono">{tax}</td><td></td></tr>
+<tr class="font-bold"><td colspan="{foot_span}" class="text-right">Total</td><td class="text-right font-mono">{total}</td><td></td></tr>
 </tfoot>
 </table></div>
 </div></div>
