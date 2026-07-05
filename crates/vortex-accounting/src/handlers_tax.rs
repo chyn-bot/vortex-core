@@ -89,6 +89,35 @@ fn settings_form() -> FormConfig {
         .field(FormField::textarea("company_business_activity", "Business Activity"))
         .field(FormField::number("sst_period_months", "SST Taxable Period (months)")
             .default("2").help("2 = bi-monthly (standard)"))
+        .section("Registered Address & Contact (appears on e-invoices as the seller)")
+        .field(FormField::text("company_address1", "Address Line 1").placeholder("Level 10, Menara ABC"))
+        .field(FormField::text("company_address2", "Address Line 2").placeholder("Jalan Sultan Ismail"))
+        .field(FormField::text("company_postcode", "Postcode").placeholder("50450"))
+        .field(FormField::text("company_city", "City").placeholder("Kuala Lumpur"))
+        .field(FormField::select("company_state_code", "State (LHDN code)", &[
+            ("01", "01 — Johor"),
+            ("02", "02 — Kedah"),
+            ("03", "03 — Kelantan"),
+            ("04", "04 — Melaka"),
+            ("05", "05 — Negeri Sembilan"),
+            ("06", "06 — Pahang"),
+            ("07", "07 — Pulau Pinang"),
+            ("08", "08 — Perak"),
+            ("09", "09 — Perlis"),
+            ("10", "10 — Selangor"),
+            ("11", "11 — Terengganu"),
+            ("12", "12 — Sabah"),
+            ("13", "13 — Sarawak"),
+            ("14", "14 — W.P. Kuala Lumpur"),
+            ("15", "15 — W.P. Labuan"),
+            ("16", "16 — W.P. Putrajaya"),
+            ("17", "17 — Not applicable"),
+        ]).default("14"))
+        .field(FormField::text("company_country_code", "Country Code").default("MYS")
+            .help("ISO 3166-1 alpha-3, MYS for Malaysia"))
+        .field(FormField::text("company_phone", "Phone").placeholder("0312345678")
+            .help("LHDN requires a contact number on the seller party"))
+        .field(FormField::text("company_email", "Email"))
         .section("Default Accounts")
         .field(FormField::many2one("receivable_account_id", "Receivable", "acc_account"))
         .field(FormField::many2one("payable_account_id", "Payable", "acc_account"))
