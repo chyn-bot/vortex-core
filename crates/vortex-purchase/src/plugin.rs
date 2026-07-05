@@ -9,6 +9,7 @@ use crate::handlers;
 const MIG_001_PURCHASE: &str = include_str!("../migrations/001_purchase/postgres.sql");
 const MIG_002_REGISTRY: &str = include_str!("../migrations/002_purchase_registry/postgres.sql");
 const MIG_003_VENDOR_BILL: &str = include_str!("../migrations/003_vendor_bill/postgres.sql");
+const MIG_004_RFQ: &str = include_str!("../migrations/004_rfq/postgres.sql");
 
 pub struct PurchasePlugin;
 
@@ -66,14 +67,14 @@ impl Plugin for PurchasePlugin {
     }
 
     fn menu_entries(&self) -> Vec<MenuEntry> {
-        vec![MenuEntry::new(
-            "purchase.orders",
-            "Purchase Orders",
-            "/purchase",
-            MenuGroup::Operations,
-        )
-        .with_icon("shopping-cart")
-        .with_priority(30)]
+        vec![
+            MenuEntry::new("purchase.rfqs", "RFQs", "/purchase/rfqs", MenuGroup::Operations)
+                .with_icon("shopping-cart")
+                .with_priority(29),
+            MenuEntry::new("purchase.orders", "Purchase Orders", "/purchase", MenuGroup::Operations)
+                .with_icon("shopping-cart")
+                .with_priority(30),
+        ]
     }
 
     /// Plugin-owned migrations. `001_purchase` depends on the inventory
@@ -99,6 +100,12 @@ impl Plugin for PurchasePlugin {
                 up_sql: MIG_003_VENDOR_BILL,
                 down_sql: None,
                 requires_core_migration: Some("119_commerce_primitives"),
+            },
+            PluginMigration {
+                name: "004_rfq",
+                up_sql: MIG_004_RFQ,
+                down_sql: None,
+                requires_core_migration: Some("122_model_registry"),
             },
         ]
     }

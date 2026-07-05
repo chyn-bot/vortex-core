@@ -15,10 +15,15 @@ use vortex_plugin_sdk::uuid::Uuid;
 /// Purchase-order number sequence — `PO/000001`.
 const PO_SEQ: vortex_plugin_sdk::orm::sequence::SequenceSpec =
     vortex_plugin_sdk::orm::sequence::SequenceSpec::new("purchase.order", "PO").with_padding(6);
+/// RFQ number sequence — assigned at creation; the PO number is only
+/// minted at confirmation.
+const RFQ_SEQ: vortex_plugin_sdk::orm::sequence::SequenceSpec =
+    vortex_plugin_sdk::orm::sequence::SequenceSpec::new("purchase.rfq", "RFQ").with_padding(6);
 
 pub fn purchase_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/purchase", get(list_orders))
+        .route("/purchase/rfqs", get(list_rfqs))
         .route("/purchase/orders/new", get(new_order_form))
         .route("/purchase/orders/create", post(create_order))
         .route("/purchase/orders/{id}", get(edit_order))
@@ -26,6 +31,9 @@ pub fn purchase_routes() -> Router<Arc<AppState>> {
         .route("/purchase/orders/{id}/lines", post(add_line))
         .route("/purchase/orders/{id}/lines/{line_id}/delete", post(delete_line))
         .route("/purchase/orders/{id}/confirm", post(confirm_order))
+        .route("/purchase/orders/{id}/send", post(mark_sent))
+        .route("/purchase/orders/{id}/revise", post(revise_rfq))
+        .route("/purchase/orders/{id}/print-rfq", get(print_rfq))
         .route("/purchase/orders/{id}/cancel", post(cancel_order))
         .route("/purchase/orders/{id}/receive", get(receive_form))
         .route("/purchase/orders/{id}/receive", post(process_receipt))
@@ -43,8 +51,8 @@ fn page_shell(sidebar: &str, title: &str, content: &str) -> String {
 <title>{title} - Vortex</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=2" rel="stylesheet"/>
-<script src="/static/vortex.js?v=2" defer></script>
+<link href="/static/vortex.css?v=4" rel="stylesheet"/>
+<script src="/static/vortex.js?v=4" defer></script>
 <script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
@@ -105,7 +113,9 @@ fn money(d: Decimal) -> String {
 /// Badge markup for a PO state.
 fn state_badge(state: &str) -> &'static str {
     match state {
-        "draft" => r#"<span class="badge badge-ghost">Draft</span>"#,
+        "rfq" => r#"<span class="badge badge-ghost">RFQ</span>"#,
+        "sent" => r#"<span class="badge badge-info badge-outline">Sent</span>"#,
+        "superseded" => r#"<span class="badge badge-ghost badge-outline">Superseded</span>"#,
         "confirmed" => r#"<span class="badge badge-info">Confirmed</span>"#,
         "received" => r#"<span class="badge badge-success">Received</span>"#,
         "cancelled" => r#"<span class="badge badge-error">Cancelled</span>"#,
@@ -232,6 +242,18 @@ async fn recompute_totals(db: &vortex_plugin_sdk::sqlx::PgPool, order_id: Uuid) 
 // Order list + create
 // ─────────────────────────────────────────────────────────────────────────
 
+/// Display identity: PO number once confirmed, the RFQ number (with
+/// revision suffix past rev 1) before that.
+fn doc_identity(number: Option<&str>, rfq_number: Option<&str>, revision: i32) -> String {
+    match number.filter(|n| !n.is_empty()) {
+        Some(n) => n.to_string(),
+        None => {
+            let q = rfq_number.unwrap_or("(unnumbered)");
+            if revision > 1 { format!("{q} (Rev {revision})") } else { q.to_string() }
+        }
+    }
+}
+
 async fn list_orders(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
@@ -243,26 +265,31 @@ async fn list_orders(
 
     let sidebar = render_sidebar(&state, &user, &db_ctx);
 
+    // Confirmed purchases only — the pre-order pipeline lives on the
+    // RFQs list. (Cancelled POs carry a number; cancelled RFQs don't.)
     let config = ListConfig::new("Purchase Orders", "purchase_order")
-        .custom_from("purchase_order po JOIN contacts v ON v.id = po.vendor_id")
+        .custom_from(
+            "(SELECT * FROM purchase_order WHERE state IN ('confirmed','received') \
+              OR (state = 'cancelled' AND number IS NOT NULL)) po \
+             JOIN contacts v ON v.id = po.vendor_id",
+        )
         .custom_select(
-            "po.id, po.number, v.name AS vendor_name, po.order_date::text AS order_date, \
+            "po.id, po.number, po.rfq_number, v.name AS vendor_name, po.order_date::text AS order_date, \
              po.total_amount::text AS total_amount, po.state",
         )
         .column(ListColumn::new("number", "Number").sortable().code().sql_expr("po.number"))
+        .column(ListColumn::new("rfq_number", "RFQ").sortable().code().sql_expr("po.rfq_number"))
         .column(ListColumn::new("vendor_name", "Vendor").sortable().searchable().sql_expr("v.name"))
         .column(ListColumn::new("order_date", "Order Date").sortable().sql_expr("po.order_date"))
         .column(ListColumn::new("total_amount", "Total").sortable().sql_expr("po.total_amount"))
         .column(
             ListColumn::new("state", "Status")
                 .filterable(&[
-                    ("draft", "Draft"),
                     ("confirmed", "Confirmed"),
                     ("received", "Received"),
                     ("cancelled", "Cancelled"),
                 ])
                 .badge(&[
-                    ("draft", "Draft", "badge-ghost"),
                     ("confirmed", "Confirmed", "badge-info"),
                     ("received", "Received", "badge-success"),
                     ("cancelled", "Cancelled", "badge-error"),
@@ -270,7 +297,6 @@ async fn list_orders(
                 .sql_expr("po.state"),
         )
         .detail_url("/purchase/orders/{id}")
-        .create("New Purchase Order", "/purchase/orders/new")
         .pivot_url("/pivot/purchase_order?rows=state")
         .default_sort("number")
         .group_by_options(&[("vendor_name", "Vendor"), ("state", "Status")]);
@@ -288,6 +314,69 @@ async fn list_orders(
     Html(page_shell(&sidebar, "Purchase Orders", &list_html)).into_response()
 }
 
+/// The pre-order pipeline: every RFQ revision from open to cancelled.
+async fn list_rfqs(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    use vortex_plugin_sdk::framework::list::{execute_list, render_list, ListColumn, ListConfig, ListParams};
+
+    let sidebar = render_sidebar(&state, &user, &db_ctx);
+
+    let config = ListConfig::new("RFQs", "purchase_order")
+        .custom_from(
+            "(SELECT * FROM purchase_order WHERE state IN ('rfq','sent','superseded') \
+              OR (state = 'cancelled' AND number IS NULL)) po \
+             JOIN contacts v ON v.id = po.vendor_id",
+        )
+        .custom_select(
+            "po.id, po.rfq_number, po.revision::text AS revision, v.name AS vendor_name, \
+             po.order_date::text AS order_date, po.respond_by::text AS respond_by, \
+             po.total_amount::text AS total_amount, po.state",
+        )
+        .column(ListColumn::new("rfq_number", "Number").sortable().code().sql_expr("po.rfq_number"))
+        .column(ListColumn::new("revision", "Rev").sortable().sql_expr("po.revision"))
+        .column(ListColumn::new("vendor_name", "Vendor").sortable().searchable().sql_expr("v.name"))
+        .column(ListColumn::new("order_date", "Date").sortable().sql_expr("po.order_date"))
+        .column(ListColumn::new("respond_by", "Respond By").sortable().sql_expr("po.respond_by"))
+        .column(ListColumn::new("total_amount", "Est. Total").sortable().sql_expr("po.total_amount"))
+        .column(
+            ListColumn::new("state", "Status")
+                .filterable(&[
+                    ("rfq", "Open"),
+                    ("sent", "Sent"),
+                    ("superseded", "Superseded"),
+                    ("cancelled", "Cancelled"),
+                ])
+                .badge(&[
+                    ("rfq", "Open", "badge-ghost"),
+                    ("sent", "Sent", "badge-info"),
+                    ("superseded", "Superseded", "badge-ghost"),
+                    ("cancelled", "Cancelled", "badge-error"),
+                ])
+                .sql_expr("po.state"),
+        )
+        .detail_url("/purchase/orders/{id}")
+        .create("New RFQ", "/purchase/orders/new")
+        .default_sort("rfq_number")
+        .group_by_options(&[("vendor_name", "Vendor"), ("state", "Status")]);
+
+    let params = ListParams::from_query(&query);
+    let result = match execute_list(&db, &config, &params).await {
+        Ok(r) => r,
+        Err(e) => {
+            error!(error = %e, "RFQ list query failed");
+            return Html("<h1>Failed to load RFQs</h1>").into_response();
+        }
+    };
+
+    let list_html = render_list(&config, &result, &params, "/purchase/rfqs");
+    Html(page_shell(&sidebar, "RFQs", &list_html)).into_response()
+}
+
 async fn new_order_form(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
@@ -301,8 +390,9 @@ async fn new_order_form(
 
     let content = format!(
         r#"<div class="max-w-2xl">
-<a href="/purchase" class="btn btn-ghost btn-sm mb-4">← Back to Purchase Orders</a>
-<h1 class="text-2xl font-bold mb-6">New Purchase Order</h1>
+<a href="/purchase/rfqs" class="btn btn-ghost btn-sm mb-4">← Back to RFQs</a>
+<h1 class="text-2xl font-bold mb-6">New RFQ</h1>
+<p class="text-base-content/60 text-sm mb-4">Every purchase starts as a request for quotation — it gets its PO number when confirmed.</p>
 <form method="POST" action="/purchase/orders/create">
 <div class="card bg-base-100 shadow"><div class="card-body">
 <div class="form-control mb-3">
@@ -319,6 +409,11 @@ async fn new_order_form(
 <label class="label"><span class="label-text">Expected Date</span></label>
 <input name="expected_date" type="date" class="input input-bordered input-sm"/>
 </div>
+</div>
+<div class="form-control mb-3">
+<label class="label"><span class="label-text">Respond By</span></label>
+<input name="respond_by" type="date" class="input input-bordered input-sm"/>
+<label class="label"><span class="label-text-alt text-base-content/50">Optional reply-by date for the supplier's quote.</span></label>
 </div>
 <div class="grid grid-cols-2 gap-3">
 <div class="form-control mb-3">
@@ -346,7 +441,7 @@ async fn new_order_form(
         currencies = currencies,
     );
 
-    Html(page_shell(&sidebar, "New Purchase Order", &content)).into_response()
+    Html(page_shell(&sidebar, "New RFQ", &content)).into_response()
 }
 
 async fn create_order(
@@ -360,11 +455,13 @@ async fn create_order(
         return (vortex_plugin_sdk::axum::http::StatusCode::BAD_REQUEST, "Vendor is required").into_response();
     };
 
-    let number = match vortex_plugin_sdk::orm::sequence::next(&state.pool, &PO_SEQ).await {
+    // Every purchase starts life as an RFQ: RFQ number now, PO number
+    // only at confirmation.
+    let rfq_number = match vortex_plugin_sdk::orm::sequence::next(&state.pool, &RFQ_SEQ).await {
         Ok(n) => n,
         Err(e) => {
-            error!(error = %e, "PO sequence generation failed");
-            return (vortex_plugin_sdk::axum::http::StatusCode::INTERNAL_SERVER_ERROR, "Failed to generate PO number").into_response();
+            error!(error = %e, "RFQ sequence generation failed");
+            return (vortex_plugin_sdk::axum::http::StatusCode::INTERNAL_SERVER_ERROR, "Failed to generate RFQ number").into_response();
         }
     };
     let company_id = default_company(&db).await;
@@ -373,16 +470,19 @@ async fn create_order(
         form.get("order_date").filter(|s| !s.is_empty()).and_then(|s| s.parse().ok());
     let expected_date: Option<vortex_plugin_sdk::chrono::NaiveDate> =
         form.get("expected_date").filter(|s| !s.is_empty()).and_then(|s| s.parse().ok());
+    let respond_by: Option<vortex_plugin_sdk::chrono::NaiveDate> =
+        form.get("respond_by").filter(|s| !s.is_empty()).and_then(|s| s.parse().ok());
 
     let order_id = Uuid::now_v7();
     // order_date column defaults to CURRENT_DATE; pass COALESCE via Option.
     let res = vortex_plugin_sdk::sqlx::query(
         "INSERT INTO purchase_order \
-         (id, number, vendor_id, order_date, expected_date, currency_id, dest_location_id, note, company_id, created_by) \
-         VALUES ($1,$2,$3,COALESCE($4, CURRENT_DATE),$5,$6,$7,$8,$9,$10)",
+         (id, rfq_number, revision, root_rfq_id, respond_by, vendor_id, order_date, \
+          expected_date, currency_id, dest_location_id, note, company_id, created_by) \
+         VALUES ($1,$2,1,$1,$11,$3,COALESCE($4, CURRENT_DATE),$5,$6,$7,$8,$9,$10)",
     )
     .bind(order_id)
-    .bind(&number)
+    .bind(&rfq_number)
     .bind(vendor_id)
     .bind(order_date)
     .bind(expected_date)
@@ -391,12 +491,13 @@ async fn create_order(
     .bind(form.get("note").filter(|s| !s.is_empty()))
     .bind(company_id)
     .bind(user.id)
+    .bind(respond_by)
     .execute(&db)
     .await;
 
     if let Err(e) = res {
-        error!(error = %e, "PO insert failed");
-        return (vortex_plugin_sdk::axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create order: {e}")).into_response();
+        error!(error = %e, "RFQ insert failed");
+        return (vortex_plugin_sdk::axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create RFQ: {e}")).into_response();
     }
 
     let audit_entry = vortex_plugin_sdk::security::AuditEntry::new(
@@ -407,11 +508,11 @@ async fn create_order(
     .with_username(&user.username)
     .with_database(&db_ctx.db_name)
     .with_resource("purchase_order", order_id.to_string())
-    .with_resource_name(&number)
-    .with_details(json!({ "number": number }));
+    .with_resource_name(&rfq_number)
+    .with_details(json!({ "rfq_number": rfq_number }));
     let _ = state.audit.log(audit_entry).await;
 
-    info!(number = %number, "purchase order created");
+    info!(number = %rfq_number, "RFQ created");
     vortex_plugin_sdk::axum::response::Redirect::to(&format!("/purchase/orders/{order_id}")).into_response()
 }
 
@@ -430,7 +531,9 @@ async fn edit_order(
     let esc = vortex_plugin_sdk::framework::html_escape;
 
     let row = match vortex_plugin_sdk::sqlx::query(
-        "SELECT po.number, po.vendor_id, v.name AS vendor_name, \
+        "SELECT po.number, po.rfq_number, po.revision, po.root_rfq_id, \
+                po.respond_by::text AS respond_by, \
+                po.vendor_id, v.name AS vendor_name, \
                 po.order_date::text AS order_date, po.expected_date::text AS expected_date, \
                 po.state, po.currency_id, po.dest_location_id, \
                 dl.name AS dest_name, c.code AS currency_code, po.note, \
@@ -453,7 +556,11 @@ async fn edit_order(
         }
     };
 
-    let number: String = row.get("number");
+    let number: Option<String> = row.try_get("number").ok().flatten();
+    let rfq_number: Option<String> = row.try_get("rfq_number").ok().flatten();
+    let revision: i32 = row.try_get("revision").unwrap_or(1);
+    let root_rfq_id: Option<Uuid> = row.try_get("root_rfq_id").ok().flatten();
+    let respond_by: Option<String> = row.try_get("respond_by").ok().flatten();
     let vendor_id: Uuid = row.get("vendor_id");
     let vendor_name: String = row.get("vendor_name");
     let order_date: Option<String> = row.try_get("order_date").ok();
@@ -467,7 +574,9 @@ async fn edit_order(
     let untaxed: Decimal = row.try_get("untaxed_amount").unwrap_or(Decimal::ZERO);
     let tax: Decimal = row.try_get("tax_amount").unwrap_or(Decimal::ZERO);
     let total: Decimal = row.try_get("total_amount").unwrap_or(Decimal::ZERO);
-    let is_draft = po_state == "draft";
+    let is_draft = po_state == "rfq";
+    let is_rfq_stage = matches!(po_state.as_str(), "rfq" | "sent" | "superseded");
+    let identity = doc_identity(number.as_deref(), rfq_number.as_deref(), revision);
     let cur = currency_code.clone().unwrap_or_default();
 
     // ── Lines table ──
@@ -561,6 +670,8 @@ async fn edit_order(
 <input name="order_date" type="date" value="{order_date}" class="input input-bordered input-sm"/></div>
 <div class="form-control"><label class="label"><span class="label-text">Expected Date</span></label>
 <input name="expected_date" type="date" value="{expected_date}" class="input input-bordered input-sm"/></div>
+<div class="form-control"><label class="label"><span class="label-text">Respond By</span></label>
+<input name="respond_by" type="date" value="{respond_by}" class="input input-bordered input-sm"/></div>
 <div class="form-control"><label class="label"><span class="label-text">Currency</span></label>
 <select name="currency_id" class="select select-bordered select-sm">{currencies}</select></div>
 <div class="form-control"><label class="label"><span class="label-text">Note</span></label>
@@ -574,6 +685,7 @@ async fn edit_order(
             currencies = currencies,
             order_date = esc(order_date.as_deref().unwrap_or("")),
             expected_date = esc(expected_date.as_deref().unwrap_or("")),
+            respond_by = esc(respond_by.as_deref().unwrap_or("")),
             note = esc(note.as_deref().unwrap_or("")),
         )
     } else {
@@ -583,11 +695,18 @@ async fn edit_order(
 <div><div class="text-base-content/50">Order Date</div><div class="font-medium">{order_date}</div></div>
 <div><div class="text-base-content/50">Expected</div><div class="font-medium">{expected}</div></div>
 <div><div class="text-base-content/50">Receiving</div><div class="font-medium">{dest}</div></div>
+<div><div class="text-base-content/50">RFQ</div><div class="font-medium">{rfq_no}</div></div>
+<div><div class="text-base-content/50">Respond By</div><div class="font-medium">{respond}</div></div>
 </div>{note}"#,
             vendor = esc(&vendor_name),
             order_date = esc(order_date.as_deref().unwrap_or("—")),
             expected = esc(expected_date.as_deref().unwrap_or("—")),
             dest = esc(dest_name.as_deref().unwrap_or("—")),
+            rfq_no = {
+                let q = rfq_number.as_deref().unwrap_or("—");
+                if revision > 1 { format!("{} (Rev {})", esc(q), revision) } else { esc(q).to_string() }
+            },
+            respond = esc(respond_by.as_deref().unwrap_or("—")),
             note = note.filter(|n| !n.is_empty()).map(|n| format!(r#"<div class="mt-3 text-sm text-base-content/70">{}</div>"#, esc(&n))).unwrap_or_default(),
         )
     };
@@ -596,11 +715,26 @@ async fn edit_order(
     let has_lines = !line_rows.is_empty();
     let mut actions = String::new();
     match po_state.as_str() {
-        "draft" => {
+        "rfq" => {
+            actions.push_str(&format!(r#"<a href="/purchase/orders/{id}/print-rfq" target="_blank" class="btn btn-outline btn-sm">Print RFQ</a>"#, id = id));
             if has_lines {
-                actions.push_str(&format!(r#"<form method="POST" action="/purchase/orders/{id}/confirm" class="inline"><button class="btn btn-primary btn-sm">Confirm Order</button></form>"#, id = id));
+                actions.push_str(&format!(r#"<form method="POST" action="/purchase/orders/{id}/send" class="inline ml-2"><button class="btn btn-primary btn-sm" title="Freezes this revision — the supplier now holds a copy">Mark as Sent</button></form>"#, id = id));
+                actions.push_str(&format!(r#"<form method="POST" action="/purchase/orders/{id}/confirm" class="inline ml-2"><button class="btn btn-success btn-sm">Confirm Order</button></form>"#, id = id));
             }
-            actions.push_str(&format!(r#"<form method="POST" action="/purchase/orders/{id}/cancel" class="inline ml-2" onsubmit="return confirm('Cancel this order?')"><button class="btn btn-ghost btn-sm">Cancel Order</button></form>"#, id = id));
+            actions.push_str(&format!(r#"<form method="POST" action="/purchase/orders/{id}/cancel" class="inline ml-2" onsubmit="return confirm('Cancel this RFQ?')"><button class="btn btn-ghost btn-sm">Cancel</button></form>"#, id = id));
+        }
+        "sent" => {
+            actions.push_str(&format!(r#"<a href="/purchase/orders/{id}/print-rfq" target="_blank" class="btn btn-outline btn-sm">Print RFQ</a>"#, id = id));
+            actions.push_str(&format!(r#"<form method="POST" action="/purchase/orders/{id}/confirm" class="inline ml-2"><button class="btn btn-primary btn-sm">Confirm Order</button></form>"#, id = id));
+            actions.push_str(&format!(r#"<form method="POST" action="/purchase/orders/{id}/revise" class="inline ml-2"><button class="btn btn-outline btn-sm" title="Creates the next revision; this one stays exactly as the supplier received it">Revise</button></form>"#, id = id));
+            actions.push_str(&format!(r#"<form method="POST" action="/purchase/orders/{id}/cancel" class="inline ml-2" onsubmit="return confirm('Cancel this RFQ?')"><button class="btn btn-ghost btn-sm">Cancel</button></form>"#, id = id));
+        }
+        "cancelled" if number.is_none() => {
+            actions.push_str(&format!(r#"<a href="/purchase/orders/{id}/print-rfq" target="_blank" class="btn btn-outline btn-sm">Print RFQ</a>"#, id = id));
+            actions.push_str(&format!(r#"<form method="POST" action="/purchase/orders/{id}/revise" class="inline ml-2"><button class="btn btn-primary btn-sm">Revise</button></form>"#, id = id));
+        }
+        "superseded" => {
+            actions.push_str(&format!(r#"<a href="/purchase/orders/{id}/print-rfq" target="_blank" class="btn btn-outline btn-sm">Print RFQ</a>"#, id = id));
         }
         "confirmed" => {
             actions.push_str(&format!(r#"<a href="/purchase/orders/{id}/receive" class="btn btn-success btn-sm">Receive Goods</a>"#, id = id));
@@ -628,13 +762,67 @@ async fn edit_order(
         }
     }
 
+    // ── Revision chain ──
+    let revisions_card = if let Some(root) = root_rfq_id {
+        let revs = vortex_plugin_sdk::sqlx::query(
+            "SELECT id, revision, state, number, total_amount FROM purchase_order \
+             WHERE root_rfq_id = $1 ORDER BY revision",
+        )
+        .bind(root)
+        .fetch_all(&db)
+        .await
+        .unwrap_or_default();
+        if revs.len() < 2 {
+            String::new()
+        } else {
+            let mut rows_html = String::new();
+            for r in &revs {
+                let rid: Uuid = r.get("id");
+                let rev: i32 = r.get("revision");
+                let rstate: String = r.get("state");
+                let rnum: Option<String> = r.try_get("number").ok().flatten();
+                let rtotal: Decimal = r.try_get("total_amount").unwrap_or(Decimal::ZERO);
+                let this_marker = if rid == id { r#" <span class="text-xs opacity-60">(this)</span>"# } else { "" };
+                rows_html.push_str(&format!(
+                    r#"<tr><td>Rev {rev}{this_marker}</td><td>{badge}</td><td class="font-mono">{po}</td>
+<td class="text-right font-mono">{total}</td>
+<td class="text-right"><a href="/purchase/orders/{rid}" class="btn btn-ghost btn-xs">Open</a></td></tr>"#,
+                    rev = rev,
+                    this_marker = this_marker,
+                    badge = state_badge(&rstate),
+                    po = rnum.filter(|n| !n.is_empty()).map(|n| esc(&n).to_string()).unwrap_or_else(|| "—".into()),
+                    total = money(rtotal),
+                    rid = rid,
+                ));
+            }
+            format!(
+                r#"<div class="card bg-base-100 shadow mt-6"><div class="card-body">
+<h2 class="card-title text-lg mb-3">Revisions</h2>
+<div class="overflow-x-auto"><table class="table table-sm">
+<thead><tr><th>Revision</th><th>Status</th><th>Purchase Order</th><th class="text-right">Total</th><th class="text-right"></th></tr></thead>
+<tbody>{rows_html}</tbody></table></div>
+</div></div>"#
+            )
+        }
+    } else {
+        String::new()
+    };
+    let rfq_ref = if number.is_some() && rfq_number.is_some() {
+        format!(
+            r#" <span class="text-sm opacity-60 font-normal">from {}</span>"#,
+            esc(rfq_number.as_deref().unwrap_or(""))
+        )
+    } else {
+        String::new()
+    };
+
     let content = format!(
         r#"<div class="flex items-center justify-between mb-4">
 <div>
-<a href="/purchase" class="btn btn-ghost btn-sm mb-2">← Back to Purchase Orders</a>
-<h1 class="text-2xl font-bold">{number} {badge}</h1>
+<a href="{back_url}" class="btn btn-ghost btn-sm mb-2">← Back to {back_label}</a>
+<h1 class="text-2xl font-bold">{number}{rfq_ref} {badge}</h1>
 </div>
-<div>{actions}</div>
+<div class="vortex-actions">{actions}</div>
 </div>
 
 <div class="card bg-base-100 shadow mb-6"><div class="card-body">
@@ -658,8 +846,13 @@ async fn edit_order(
 <tr><td class="font-semibold pr-6">Total</td><td class="text-right font-mono font-semibold">{total} {cur}</td></tr>
 </table>
 </div>
-</div></div>"#,
-        number = esc(&number),
+</div></div>
+
+{revisions_card}"#,
+        back_url = if is_rfq_stage { "/purchase/rfqs" } else { "/purchase" },
+        back_label = if is_rfq_stage { "RFQs" } else { "Purchase Orders" },
+        number = esc(&identity),
+        rfq_ref = rfq_ref,
         badge = state_badge(&po_state),
         actions = actions,
         header = header,
@@ -671,7 +864,7 @@ async fn edit_order(
         cur = esc(&cur),
     );
 
-    Html(page_shell(&sidebar, &format!("PO {}", number), &content)).into_response()
+    Html(page_shell(&sidebar, &identity, &content)).into_response()
 }
 
 async fn update_order(
@@ -682,8 +875,8 @@ async fn update_order(
     Path(id): Path<Uuid>,
     vortex_plugin_sdk::axum::extract::Form(form): vortex_plugin_sdk::axum::extract::Form<HashMap<String, String>>,
 ) -> Response {
-    if !is_state(&db, id, "draft").await {
-        return (vortex_plugin_sdk::axum::http::StatusCode::CONFLICT, "Only draft orders can be edited").into_response();
+    if !is_state(&db, id, "rfq").await {
+        return (vortex_plugin_sdk::axum::http::StatusCode::CONFLICT, "Only open RFQs can be edited").into_response();
     }
     let Some(vendor_id) = opt_uuid(&form, "vendor_id") else {
         return (vortex_plugin_sdk::axum::http::StatusCode::BAD_REQUEST, "Vendor is required").into_response();
@@ -696,9 +889,9 @@ async fn update_order(
     let res = vortex_plugin_sdk::sqlx::query(
         "UPDATE purchase_order SET \
             vendor_id = $1, order_date = COALESCE($2, order_date), expected_date = $3, \
-            currency_id = $4, dest_location_id = $5, note = $6, \
+            currency_id = $4, dest_location_id = $5, note = $6, respond_by = $9, \
             updated_by = $7, updated_at = NOW() \
-         WHERE id = $8 AND state = 'draft'",
+         WHERE id = $8 AND state = 'rfq'",
     )
     .bind(vendor_id)
     .bind(order_date)
@@ -708,6 +901,7 @@ async fn update_order(
     .bind(form.get("note").filter(|s| !s.is_empty()))
     .bind(user.id)
     .bind(id)
+    .bind(form.get("respond_by").filter(|s| !s.is_empty()).and_then(|s| s.parse::<vortex_plugin_sdk::chrono::NaiveDate>().ok()))
     .execute(&db)
     .await;
 
@@ -741,8 +935,8 @@ async fn add_line(
     Path(id): Path<Uuid>,
     vortex_plugin_sdk::axum::extract::Form(form): vortex_plugin_sdk::axum::extract::Form<HashMap<String, String>>,
 ) -> Response {
-    if !is_state(&db, id, "draft").await {
-        return (vortex_plugin_sdk::axum::http::StatusCode::CONFLICT, "Lines can only be edited on draft orders").into_response();
+    if !is_state(&db, id, "rfq").await {
+        return (vortex_plugin_sdk::axum::http::StatusCode::CONFLICT, "Lines can only be edited on open RFQs").into_response();
     }
     let Some(product_id) = opt_uuid(&form, "product_id") else {
         return (vortex_plugin_sdk::axum::http::StatusCode::BAD_REQUEST, "Product is required").into_response();
@@ -786,8 +980,8 @@ async fn delete_line(
     Extension(_db_ctx): Extension<DatabaseContext>,
     Path((id, line_id)): Path<(Uuid, Uuid)>,
 ) -> Response {
-    if !is_state(&db, id, "draft").await {
-        return (vortex_plugin_sdk::axum::http::StatusCode::CONFLICT, "Lines can only be edited on draft orders").into_response();
+    if !is_state(&db, id, "rfq").await {
+        return (vortex_plugin_sdk::axum::http::StatusCode::CONFLICT, "Lines can only be edited on open RFQs").into_response();
     }
     let _ = vortex_plugin_sdk::sqlx::query("DELETE FROM purchase_order_line WHERE id = $1 AND order_id = $2")
         .bind(line_id)
@@ -818,23 +1012,45 @@ async fn confirm_order(
         return (vortex_plugin_sdk::axum::http::StatusCode::BAD_REQUEST, "Add at least one line before confirming").into_response();
     }
 
+    // The confirmed order receives its PO number here; the RFQ keeps
+    // its identity for traceability.
+    let po_number = match vortex_plugin_sdk::orm::sequence::next(&state.pool, &PO_SEQ).await {
+        Ok(n) => n,
+        Err(e) => {
+            error!(error = %e, "PO sequence generation failed");
+            return (vortex_plugin_sdk::axum::http::StatusCode::INTERNAL_SERVER_ERROR, "Failed to generate PO number").into_response();
+        }
+    };
+    // The partial unique index on root_rfq_id backstops this UPDATE.
     let res = vortex_plugin_sdk::sqlx::query(
-        "UPDATE purchase_order SET state = 'confirmed', updated_by = $1, updated_at = NOW() \
-         WHERE id = $2 AND state = 'draft'",
+        "UPDATE purchase_order SET state = 'confirmed', number = $3, updated_by = $1, updated_at = NOW() \
+         WHERE id = $2 AND state IN ('rfq', 'sent')",
+    )
+    .bind(user.id)
+    .bind(id)
+    .bind(&po_number)
+    .execute(&db)
+    .await;
+
+    match res {
+        Ok(r) if r.rows_affected() == 0 => return (vortex_plugin_sdk::axum::http::StatusCode::CONFLICT, "Only open or sent RFQs can be confirmed").into_response(),
+        Ok(_) => {}
+        Err(e) => {
+            error!(error = %e, "PO confirm failed");
+            return (vortex_plugin_sdk::axum::http::StatusCode::CONFLICT, "Failed to confirm — another revision of this RFQ may already be confirmed.").into_response();
+        }
+    }
+
+    // Every other open revision of the family is now superseded.
+    let _ = vortex_plugin_sdk::sqlx::query(
+        "UPDATE purchase_order SET state = 'superseded', updated_by = $1, updated_at = NOW() \
+         WHERE root_rfq_id = (SELECT root_rfq_id FROM purchase_order WHERE id = $2) \
+           AND id <> $2 AND state IN ('rfq', 'sent')",
     )
     .bind(user.id)
     .bind(id)
     .execute(&db)
     .await;
-
-    match res {
-        Ok(r) if r.rows_affected() == 0 => return (vortex_plugin_sdk::axum::http::StatusCode::CONFLICT, "Only draft orders can be confirmed").into_response(),
-        Ok(_) => {}
-        Err(e) => {
-            error!(error = %e, "PO confirm failed");
-            return (vortex_plugin_sdk::axum::http::StatusCode::INTERNAL_SERVER_ERROR, "Failed to confirm").into_response();
-        }
-    }
 
     audit_po(&state, &db_ctx, &db, user.id, &user.username, id, "confirmed").await;
     vortex_plugin_sdk::axum::response::Redirect::to(&format!("/purchase/orders/{id}")).into_response()
@@ -849,7 +1065,7 @@ async fn cancel_order(
 ) -> Response {
     let res = vortex_plugin_sdk::sqlx::query(
         "UPDATE purchase_order SET state = 'cancelled', updated_by = $1, updated_at = NOW() \
-         WHERE id = $2 AND state IN ('draft','confirmed')",
+         WHERE id = $2 AND state IN ('rfq','sent','confirmed')",
     )
     .bind(user.id)
     .bind(id)
@@ -857,7 +1073,7 @@ async fn cancel_order(
     .await;
 
     match res {
-        Ok(r) if r.rows_affected() == 0 => return (vortex_plugin_sdk::axum::http::StatusCode::CONFLICT, "Only draft or confirmed orders can be cancelled").into_response(),
+        Ok(r) if r.rows_affected() == 0 => return (vortex_plugin_sdk::axum::http::StatusCode::CONFLICT, "Only open RFQs or confirmed orders can be cancelled").into_response(),
         Ok(_) => {}
         Err(e) => {
             error!(error = %e, "PO cancel failed");
@@ -902,6 +1118,327 @@ async fn audit_po(
 // Receiving
 // ─────────────────────────────────────────────────────────────────────────
 
+/// rfq → sent: the RFQ is now with the supplier; changes require a
+/// revision.
+async fn mark_sent(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<Uuid>,
+) -> Response {
+    let res = vortex_plugin_sdk::sqlx::query(
+        "UPDATE purchase_order SET state = 'sent', updated_by = $1, updated_at = NOW() \
+         WHERE id = $2 AND state = 'rfq'",
+    )
+    .bind(user.id)
+    .bind(id)
+    .execute(&db)
+    .await;
+    match res {
+        Ok(r) if r.rows_affected() == 0 => return (vortex_plugin_sdk::axum::http::StatusCode::CONFLICT, "Only open RFQs can be marked sent").into_response(),
+        Ok(_) => {}
+        Err(e) => {
+            error!(error = %e, "RFQ send failed");
+            return (vortex_plugin_sdk::axum::http::StatusCode::INTERNAL_SERVER_ERROR, "Failed to mark sent").into_response();
+        }
+    }
+    audit_po(&state, &db_ctx, &db, user.id, &user.username, id, "sent").await;
+    vortex_plugin_sdk::axum::response::Redirect::to(&format!("/purchase/orders/{id}")).into_response()
+}
+
+/// Clone a frozen RFQ into the next revision. The source stays exactly
+/// as the supplier received it (sent → superseded, cancelled keeps its
+/// state); the clone reopens as an editable RFQ.
+async fn revise_rfq(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<Uuid>,
+) -> Response {
+    let src = vortex_plugin_sdk::sqlx::query(
+        "SELECT rfq_number, root_rfq_id, state FROM purchase_order WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&db)
+    .await
+    .ok()
+    .flatten();
+    let Some(src) = src else {
+        return (vortex_plugin_sdk::axum::http::StatusCode::NOT_FOUND, "RFQ not found").into_response();
+    };
+    let src_state: String = src.get("state");
+    if !matches!(src_state.as_str(), "sent" | "cancelled") {
+        return (vortex_plugin_sdk::axum::http::StatusCode::CONFLICT, "Only sent or cancelled RFQs can be revised — open RFQs are edited directly.").into_response();
+    }
+    let root: Uuid = src.get("root_rfq_id");
+    let live: i64 = vortex_plugin_sdk::sqlx::query_scalar(
+        "SELECT COUNT(*) FROM purchase_order WHERE root_rfq_id = $1 \
+         AND state NOT IN ('rfq','sent','superseded','cancelled')",
+    )
+    .bind(root)
+    .fetch_one(&db)
+    .await
+    .unwrap_or(0);
+    if live > 0 {
+        return (vortex_plugin_sdk::axum::http::StatusCode::CONFLICT, "This RFQ already has a confirmed purchase order — revise is not available.").into_response();
+    }
+    let next_rev: i32 = vortex_plugin_sdk::sqlx::query_scalar(
+        "SELECT COALESCE(MAX(revision), 0) + 1 FROM purchase_order WHERE root_rfq_id = $1",
+    )
+    .bind(root)
+    .fetch_one(&db)
+    .await
+    .unwrap_or(2);
+
+    let new_id = Uuid::now_v7();
+    let rfq_number: String = src.get("rfq_number");
+    if let Err(e) = vortex_plugin_sdk::sqlx::query(
+        "INSERT INTO purchase_order \
+         (id, rfq_number, revision, root_rfq_id, respond_by, vendor_id, order_date, \
+          expected_date, currency_id, dest_location_id, note, company_id, created_by) \
+         SELECT $1, rfq_number, $3, root_rfq_id, respond_by, vendor_id, CURRENT_DATE, \
+                expected_date, currency_id, dest_location_id, note, company_id, $4 \
+         FROM purchase_order WHERE id = $2",
+    )
+    .bind(new_id)
+    .bind(id)
+    .bind(next_rev)
+    .bind(user.id)
+    .execute(&db)
+    .await
+    {
+        error!(error = %e, "RFQ revision insert failed");
+        return (vortex_plugin_sdk::axum::http::StatusCode::INTERNAL_SERVER_ERROR, "Failed to create revision").into_response();
+    }
+    let _ = vortex_plugin_sdk::sqlx::query(
+        "INSERT INTO purchase_order_line \
+         (id, order_id, sequence, product_id, description, quantity, unit_price, tax_percent, company_id) \
+         SELECT uuid_generate_v4(), $1, sequence, product_id, description, quantity, unit_price, tax_percent, company_id \
+         FROM purchase_order_line WHERE order_id = $2",
+    )
+    .bind(new_id)
+    .bind(id)
+    .execute(&db)
+    .await;
+    recompute_totals(&db, new_id).await;
+
+    if src_state == "sent" {
+        let _ = vortex_plugin_sdk::sqlx::query(
+            "UPDATE purchase_order SET state = 'superseded', updated_by = $1, updated_at = NOW() WHERE id = $2",
+        )
+        .bind(user.id)
+        .bind(id)
+        .execute(&db)
+        .await;
+    }
+
+    audit_po(&state, &db_ctx, &db, user.id, &user.username, new_id, "revised").await;
+    info!(rfq = %rfq_number, revision = next_rev, "RFQ revised");
+    vortex_plugin_sdk::axum::response::Redirect::to(&format!("/purchase/orders/{new_id}")).into_response()
+}
+
+/// Printable RFQ — deliberately price-free: it asks the supplier to
+/// quote. Quantities, UoM and required-by dates only.
+async fn print_rfq(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(_user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<Uuid>,
+) -> Response {
+    let esc = vortex_plugin_sdk::framework::html_escape;
+    let head = vortex_plugin_sdk::sqlx::query(
+        "SELECT o.rfq_number, o.revision, o.state, o.order_date, o.respond_by, o.expected_date, o.note, \
+                v.name AS vendor_name, v.street, v.street2, v.city, v.zip, \
+                v.phone AS vendor_phone, v.email AS vendor_email \
+         FROM purchase_order o \
+         JOIN contacts v ON v.id = o.vendor_id \
+         WHERE o.id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&db)
+    .await
+    .ok()
+    .flatten();
+    let Some(head) = head else {
+        return (vortex_plugin_sdk::axum::http::StatusCode::NOT_FOUND, "RFQ not found").into_response();
+    };
+    let company = vortex_plugin_sdk::sqlx::query(
+        "SELECT COALESCE(co.name, 'Company') AS name, c.company_address1, c.company_address2, \
+                c.company_city, c.company_postcode, c.company_phone, c.company_email \
+         FROM acc_config c LEFT JOIN companies co ON co.id = c.company_id \
+         ORDER BY c.company_id NULLS LAST LIMIT 1",
+    )
+    .fetch_optional(&db)
+    .await
+    .ok()
+    .flatten();
+    let lines = vortex_plugin_sdk::sqlx::query(
+        "SELECT p.code, COALESCE(NULLIF(l.description, ''), p.name) AS description, \
+                l.quantity, u.code AS uom_code \
+         FROM purchase_order_line l \
+         JOIN stock_product p ON p.id = l.product_id \
+         LEFT JOIN uoms u ON u.id = p.uom_id \
+         WHERE l.order_id = $1 ORDER BY l.sequence, l.created_at",
+    )
+    .bind(id)
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default();
+
+    let hval = |k: &str| -> String {
+        head.try_get::<Option<String>, _>(k).ok().flatten().map(|v| esc(&v)).unwrap_or_default()
+    };
+    let cval = |k: &str| -> String {
+        company
+            .as_ref()
+            .and_then(|c| c.try_get::<Option<String>, _>(k).ok().flatten())
+            .map(|v| esc(&v))
+            .unwrap_or_default()
+    };
+    let company_name = company
+        .as_ref()
+        .map(|c| esc(&c.get::<String, _>("name")))
+        .unwrap_or_else(|| "Company".into());
+    let logo_html = match state.files.get(&db_ctx.db_name, "company/logo").await {
+        Ok(Some(data)) => {
+            use base64::Engine;
+            let ct = if data.starts_with(&[0xFF, 0xD8, 0xFF]) { "image/jpeg" } else { "image/png" };
+            format!(
+                r#"<img src="data:{ct};base64,{}" alt="" style="max-height:64px;max-width:220px;margin-bottom:6px"/>"#,
+                base64::engine::general_purpose::STANDARD.encode(&data),
+            )
+        }
+        _ => String::new(),
+    };
+    let revision: i32 = head.try_get("revision").unwrap_or(1);
+    let rfq_state: String = head.get("state");
+    let display_number = {
+        let q = hval("rfq_number");
+        if revision > 1 { format!("{q} (Rev {revision})") } else { q }
+    };
+    let status_mark = match rfq_state.as_str() {
+        "superseded" => r#"<div class="watermark">SUPERSEDED</div>"#,
+        "cancelled" => r#"<div class="watermark">CANCELLED</div>"#,
+        _ => "",
+    };
+    let mut line_trs = String::new();
+    for (i, l) in lines.iter().enumerate() {
+        let qty: Decimal = l.get("quantity");
+        line_trs.push_str(&format!(
+            r#"<tr><td class="num">{n}</td><td class="mono-code">{code}</td><td>{desc}</td><td class="num">{qty}</td><td>{uom}</td><td></td><td></td></tr>"#,
+            n = i + 1,
+            code = esc(&l.get::<String, _>("code")),
+            desc = esc(&l.get::<String, _>("description")),
+            qty = qty.normalize(),
+            uom = l.try_get::<Option<String>, _>("uom_code").ok().flatten().map(|u| esc(&u).to_string()).unwrap_or_default(),
+        ));
+    }
+
+    let html = format!(
+        r##"<!DOCTYPE html><html><head><meta charset="utf-8"><title>{number} — REQUEST FOR QUOTATION</title>
+<style>{css}
+body {{ max-width: 21cm; margin: 1.2cm auto; position: relative; }}
+@page {{ size: A4; margin: 0; }}
+@media print {{
+  body {{ max-width: none; margin: 0; padding: 1.2cm 1.4cm; }}
+}}
+.head {{ display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 1.2em; }}
+.head h1 {{ font-size: 1.3em; letter-spacing: 0.06em; }}
+.seller p, .buyer p {{ margin: 1px 0; font-size: 0.85em; }}
+.seller .name {{ font-size: 1.1em; font-weight: 700; }}
+.meta td {{ padding: 1px 8px 1px 0; font-size: 0.85em; border: none; }}
+.num {{ text-align: right; font-variant-numeric: tabular-nums; }}
+.mono-code {{ font-family: monospace; }}
+.sig {{ margin-top: 3em; display: flex; gap: 3em; }}
+.sig div {{ flex: 1; border-top: 1px solid #333; padding-top: 0.4em; font-size: 0.8em; }}
+.footer {{ margin-top: 2em; font-size: 0.75em; color: #666; }}
+.watermark {{ position: absolute; top: 35%; left: 15%; font-size: 5em; color: rgba(200,0,0,0.12); transform: rotate(-25deg); pointer-events: none; }}
+.printbar {{ text-align: right; margin-bottom: 1em; }}
+.printbar button {{ padding: 0.4em 1.2em; cursor: pointer; }}
+@media print {{ .printbar {{ display: none; }} }}
+</style></head><body>
+{status_mark}
+<div class="printbar"><button onclick="window.print()">Print / Save as PDF</button></div>
+<div class="head">
+  <div class="seller">
+    {logo_html}
+    <p class="name">{company_name}</p>
+    <p>{addr1}</p><p>{addr2}</p><p>{postcode} {city}</p>
+    <p>{cphone} · {cemail}</p>
+  </div>
+  <div style="text-align:right">
+    <h1>REQUEST FOR QUOTATION</h1>
+    <table class="meta" style="margin-left:auto">
+      <tr><td>Number</td><td><b>{number}</b></td></tr>
+      <tr><td>Date</td><td>{date}</td></tr>
+      <tr><td>Respond By</td><td>{respond_by}</td></tr>
+      <tr><td>Goods Required By</td><td>{expected}</td></tr>
+    </table>
+  </div>
+</div>
+<div class="buyer" style="margin-bottom:1em">
+  <p style="font-size:0.75em;color:#666">TO (SUPPLIER)</p>
+  <p><b>{vendor}</b></p>
+  <p>{pstreet}</p><p>{pstreet2}</p><p>{pzip} {pcity}</p>
+  <p>{pphone} {pemail}</p>
+</div>
+<p style="font-size:0.85em">Please quote your best price, lead time and validity for the items below.</p>
+<table class="table table-sm" style="table-layout:fixed;width:100%">
+<colgroup><col style="width:2.5rem"/><col style="width:7rem"/><col/><col style="width:4.5rem"/><col style="width:4rem"/><col style="width:8rem"/><col style="width:8rem"/></colgroup>
+<thead><tr><th class="num">#</th><th>Code</th><th>Description</th><th class="num">Qty</th><th>UoM</th><th>Your Unit Price</th><th>Lead Time</th></tr></thead>
+<tbody>{line_trs}</tbody>
+</table>
+<div class="sig">
+  <div>Requested by<br><br>Name:<br>Date:</div>
+  <div>Quoted by (supplier)<br><br>Name, company stamp:<br>Date:</div>
+</div>
+<div class="footer">This is a request for quotation, not a purchase order — no commitment is implied. {note}</div>
+</body></html>"##,
+        css = vortex_plugin_sdk::framework::user_reports::REPORT_CSS,
+        status_mark = status_mark,
+        number = display_number,
+        logo_html = logo_html,
+        company_name = company_name,
+        addr1 = cval("company_address1"),
+        addr2 = cval("company_address2"),
+        postcode = cval("company_postcode"),
+        city = cval("company_city"),
+        cphone = cval("company_phone"),
+        cemail = cval("company_email"),
+        date = head
+            .try_get::<Option<vortex_plugin_sdk::chrono::NaiveDate>, _>("order_date")
+            .ok()
+            .flatten()
+            .map(|d| d.to_string())
+            .unwrap_or_default(),
+        respond_by = head
+            .try_get::<Option<vortex_plugin_sdk::chrono::NaiveDate>, _>("respond_by")
+            .ok()
+            .flatten()
+            .map(|d| d.to_string())
+            .unwrap_or_else(|| "—".into()),
+        expected = head
+            .try_get::<Option<vortex_plugin_sdk::chrono::NaiveDate>, _>("expected_date")
+            .ok()
+            .flatten()
+            .map(|d| d.to_string())
+            .unwrap_or_else(|| "—".into()),
+        vendor = hval("vendor_name"),
+        pstreet = hval("street"),
+        pstreet2 = hval("street2"),
+        pzip = hval("zip"),
+        pcity = hval("city"),
+        pphone = hval("vendor_phone"),
+        pemail = hval("vendor_email"),
+        line_trs = line_trs,
+        note = hval("note"),
+    );
+    Html(html).into_response()
+}
+
 async fn receive_form(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
@@ -921,7 +1458,7 @@ async fn receive_form(
     let Some(po) = po else {
         return (vortex_plugin_sdk::axum::http::StatusCode::NOT_FOUND, "Order not found").into_response();
     };
-    let number: String = po.get("number");
+    let number: String = po.try_get::<Option<String>, _>("number").ok().flatten().unwrap_or_default();
     let po_state: String = po.get("state");
     let dest_location_id: Option<Uuid> = po.try_get("dest_location_id").ok();
     if po_state != "confirmed" {
@@ -1016,7 +1553,7 @@ async fn process_receipt(
     let Some(po) = po else {
         return (vortex_plugin_sdk::axum::http::StatusCode::NOT_FOUND, "Order not found").into_response();
     };
-    let number: String = po.get("number");
+    let number: String = po.try_get::<Option<String>, _>("number").ok().flatten().unwrap_or_default();
     let po_state: String = po.get("state");
     let company_id: Option<Uuid> = po.try_get("company_id").ok();
     let Some(dest_location_id): Option<Uuid> = po.try_get("dest_location_id").ok() else {
@@ -1166,7 +1703,7 @@ async fn create_vendor_bill(
     let Some(po) = po else {
         return (vortex_plugin_sdk::axum::http::StatusCode::NOT_FOUND, "Order not found").into_response();
     };
-    let number: String = po.get("number");
+    let number: String = po.try_get::<Option<String>, _>("number").ok().flatten().unwrap_or_default();
     let po_state: String = po.get("state");
     if !matches!(po_state.as_str(), "confirmed" | "received") {
         return (vortex_plugin_sdk::axum::http::StatusCode::CONFLICT, "Only confirmed or received orders can be billed").into_response();
