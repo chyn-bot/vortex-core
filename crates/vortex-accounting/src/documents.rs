@@ -1190,3 +1190,113 @@ pub async fn cancel_document(
     .map_err(|e| VortexError::QueryExecution(e.to_string()))?;
     Ok(reversal_id)
 }
+
+/// Reset a posted document to draft — Malaysian practice: allowed as
+/// long as the e-invoice has NOT been submitted to LHDN. The document
+/// keeps its number; corrections are made in draft and it reposts
+/// under the same number. Once LHDN has it (submitted/valid/
+/// cancelled-with-LHDN), the books can only move forward — use the
+/// e-invoice cancellation + [`cancel_document`] then.
+pub async fn reset_to_draft(
+    db: &PgPool,
+    user_id: Uuid,
+    move_id: Uuid,
+) -> VortexResult<()> {
+    let head = vortex_plugin_sdk::sqlx::query(
+        "SELECT state, move_type, payment_state, move_date FROM acc_move WHERE id = $1",
+    )
+    .bind(move_id)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| VortexError::QueryExecution(e.to_string()))?
+    .ok_or_else(|| VortexError::ValidationFailed("document not found".into()))?;
+    let state: String = head.get("state");
+    let move_type: String = head.get("move_type");
+    let payment_state: String = head.get("payment_state");
+    let move_date: NaiveDate = head.get("move_date");
+    if state != "posted" {
+        return Err(VortexError::ValidationFailed("only posted documents can be reset".into()));
+    }
+    if !is_document(&move_type) {
+        return Err(VortexError::ValidationFailed(
+            "not a document — journal entries are corrected by reversal".into(),
+        ));
+    }
+    if payment_state == "reversed" {
+        return Err(VortexError::ValidationFailed("this document was cancelled by reversal".into()));
+    }
+    // Payments/contra/PDC allocated against it must be removed first.
+    let reconciles: i64 = vortex_plugin_sdk::sqlx::query_scalar(
+        "SELECT COUNT(*) FROM acc_partial_reconcile pr \
+         JOIN acc_move_line l ON l.id IN (pr.debit_line_id, pr.credit_line_id) \
+         WHERE l.move_id = $1",
+    )
+    .bind(move_id)
+    .fetch_one(db)
+    .await
+    .map_err(|e| VortexError::QueryExecution(e.to_string()))?;
+    if reconciles > 0 {
+        return Err(VortexError::ValidationFailed(
+            "payments are allocated against this document — remove them first".into(),
+        ));
+    }
+    // LHDN gate: past the point of submission the document is a tax
+    // artefact and cannot quietly change.
+    let einv: Option<String> = vortex_plugin_sdk::sqlx::query_scalar(
+        "SELECT status FROM acc_einvoice WHERE move_id = $1",
+    )
+    .bind(move_id)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| VortexError::QueryExecution(e.to_string()))?;
+    if matches!(einv.as_deref(), Some("submitted") | Some("valid") | Some("cancelled")) {
+        return Err(VortexError::ValidationFailed(
+            "this document has been submitted to LHDN — cancel the e-invoice there, then cancel by reversal"
+                .into(),
+        ));
+    }
+    // Period control: cannot reopen a locked or closed period.
+    let locks = vortex_plugin_sdk::sqlx::query(
+        "SELECT lock_date, tax_lock_date FROM acc_config ORDER BY company_id NULLS LAST LIMIT 1",
+    )
+    .fetch_optional(db)
+    .await
+    .map_err(|e| VortexError::QueryExecution(e.to_string()))?;
+    if let Some(l) = locks {
+        for col in ["lock_date", "tax_lock_date"] {
+            if let Some(lock) = l.get::<Option<NaiveDate>, _>(col) {
+                if move_date <= lock {
+                    return Err(VortexError::ValidationFailed(format!(
+                        "document date {move_date} falls in a locked period ({col} {lock})"
+                    )));
+                }
+            }
+        }
+    }
+    let closed_fy: Option<String> = vortex_plugin_sdk::sqlx::query_scalar(
+        "SELECT code FROM acc_fiscal_year \
+         WHERE state = 'closed' AND $1 BETWEEN date_from AND date_to LIMIT 1",
+    )
+    .bind(move_date)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| VortexError::QueryExecution(e.to_string()))?
+    .flatten();
+    if let Some(fy) = closed_fy {
+        return Err(VortexError::ValidationFailed(format!(
+            "fiscal year {fy} is closed"
+        )));
+    }
+
+    crate::service::unpost_move(db, move_id, user_id).await?;
+    // The e-invoice record (if any) goes back to a clean 'ready';
+    // reposting rebuilds the payload from the corrected data.
+    let _ = vortex_plugin_sdk::sqlx::query(
+        "UPDATE acc_einvoice SET status = 'ready', error_json = NULL, \
+                payload_sha256 = NULL, payload_file_key = NULL WHERE move_id = $1",
+    )
+    .bind(move_id)
+    .execute(db)
+    .await;
+    Ok(())
+}

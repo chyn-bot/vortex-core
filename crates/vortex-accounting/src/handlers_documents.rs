@@ -34,6 +34,7 @@ pub fn document_routes() -> Router<Arc<AppState>> {
         .route("/accounting/documents/{id}/print", get(print_document))
         .route("/accounting/documents/{id}/email", post(email_document))
         .route("/accounting/documents/{id}/cancel", post(cancel_document_action))
+        .route("/accounting/documents/{id}/reset-draft", post(reset_draft_action))
         .route("/accounting/payments", get(list_payments))
 }
 
@@ -176,6 +177,29 @@ async fn cancel_document_action(
             )
         }
         Err(e) => flash_redirect(&back, FlashKind::Error, &format!("Not cancelled — {e}")),
+    }
+}
+
+/// Reset a posted document to draft (pre-LHDN only) — corrections are
+/// made in draft and the document reposts under the SAME number.
+async fn reset_draft_action(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<Uuid>,
+) -> Response {
+    let back = format!("/accounting/documents/{id}");
+    match documents::reset_to_draft(&db, user.id, id).await {
+        Ok(()) => {
+            audit_move(&state, &db_ctx, &db, user.id, &user.username, id, "reset_to_draft").await;
+            flash_redirect(
+                &back,
+                FlashKind::Success,
+                "Back to draft — edit the lines and post again; the document keeps its number.",
+            )
+        }
+        Err(e) => flash_redirect(&back, FlashKind::Error, &format!("Not reset — {e}")),
     }
 }
 
@@ -1174,11 +1198,33 @@ async fn document_detail(
             residual = money(residual),
         ));
         if payment_state == "not_paid" {
-            actions.push_str(&format!(
-                r#"<form method="POST" action="/accounting/documents/{id}/cancel" class="inline"
+            // Pre-LHDN: Malaysian practice allows reset to draft and
+            // repost under the same number. Once LHDN has the
+            // document, the only path is e-invoice cancellation +
+            // reversal.
+            let lhdn_has_it: bool = vortex_plugin_sdk::sqlx::query_scalar(
+                "SELECT status IN ('submitted', 'valid', 'cancelled') \
+                 FROM acc_einvoice WHERE move_id = $1",
+            )
+            .bind(id)
+            .fetch_optional(&db)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(false);
+            if lhdn_has_it {
+                actions.push_str(&format!(
+                    r#"<form method="POST" action="/accounting/documents/{id}/cancel" class="inline"
 onsubmit="return confirm('Cancel this document? A reversal entry will be posted against it — the original stays on the ledger, marked reversed. This cannot be undone.')">
-<button class="btn btn-error btn-outline btn-sm">Cancel (Reverse)</button></form>"#
-            ));
+<button class="btn btn-error btn-outline btn-sm" title="This document is with LHDN — the books can only move forward">Cancel (Reverse)</button></form>"#
+                ));
+            } else {
+                actions.push_str(&format!(
+                    r#"<form method="POST" action="/accounting/documents/{id}/reset-draft" class="inline"
+onsubmit="return confirm('Reset to draft? You can edit and repost — the document keeps its number.')">
+<button class="btn btn-warning btn-outline btn-sm">Reset to Draft</button></form>"#
+                ));
+            }
         }
     }
 

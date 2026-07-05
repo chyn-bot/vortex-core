@@ -427,7 +427,7 @@ pub async fn post_move(
         .map_err(|e| VortexError::QueryExecution(e.to_string()))?;
 
     let Some(head) = vortex_plugin_sdk::sqlx::query(
-        "SELECT m.state, m.move_date, m.move_type, m.total_amount, m.company_id, \
+        "SELECT m.state, m.number, m.move_date, m.move_type, m.total_amount, m.company_id, \
                 j.journal_type \
          FROM acc_move m JOIN acc_journal j ON j.id = m.journal_id \
          WHERE m.id = $1 FOR UPDATE OF m",
@@ -493,8 +493,13 @@ pub async fn post_move(
         .collect();
     let total = validate_balanced(&amounts).map_err(VortexError::ValidationFailed)?;
 
-    // Mint the number last, after all validation, to keep gaps minimal.
-    let number = sequence::next(seq_pool, move_sequence_for(&journal_type)).await?;
+    // Mint the number last, after all validation, to keep gaps
+    // minimal. A repost after unpost keeps its original number —
+    // Malaysian practice, and no sequence gap.
+    let number = match head.get::<Option<String>, _>("number") {
+        Some(n) if !n.is_empty() => n,
+        _ => sequence::next(seq_pool, move_sequence_for(&journal_type)).await?,
+    };
 
     // Documents (invoices/bills) start life owing their full total.
     let stored_total: Decimal = head.get("total_amount");
@@ -536,6 +541,42 @@ pub async fn create_and_post(
     let move_id = create_move(db, user_id, new).await?;
     let number = post_move(db, seq_pool, move_id, user_id).await?;
     Ok((move_id, number))
+}
+
+/// Reset a posted entry to draft through the guarded unpost path —
+/// the transaction-local `vortex.unpost` setting is the only key that
+/// opens the immutability trigger, and it admits exactly the
+/// posted→draft transition. Callers own the business guards
+/// (reconciliations, LHDN state, lock dates) and the audit entry.
+/// The number is kept: reposting reuses it.
+pub async fn unpost_move(db: &PgPool, move_id: Uuid, user_id: Uuid) -> VortexResult<()> {
+    let mut tx = db
+        .begin()
+        .await
+        .map_err(|e| VortexError::QueryExecution(e.to_string()))?;
+    vortex_plugin_sdk::sqlx::query("SET LOCAL vortex.unpost = 'on'")
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| VortexError::QueryExecution(e.to_string()))?;
+    let updated = vortex_plugin_sdk::sqlx::query(
+        "UPDATE acc_move SET state = 'draft', posted_at = NULL, posted_by = NULL, \
+                payment_state = 'not_paid', amount_residual = 0, updated_by = $2 \
+         WHERE id = $1 AND state = 'posted'",
+    )
+    .bind(move_id)
+    .bind(user_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| VortexError::QueryExecution(e.to_string()))?;
+    if updated.rows_affected() != 1 {
+        return Err(VortexError::ValidationFailed(
+            "only posted entries can be reset to draft".into(),
+        ));
+    }
+    tx.commit()
+        .await
+        .map_err(|e| VortexError::QueryExecution(e.to_string()))?;
+    Ok(())
 }
 
 /// Reverse a posted entry: creates and posts a counter-entry (debits and
