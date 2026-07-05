@@ -86,9 +86,10 @@ pub async fn einvoice_widget(db: &vortex_plugin_sdk::sqlx::PgPool, move_id: Uuid
     let mut actions = String::new();
     match status.as_str() {
         "ready" | "exported" | "invalid" => {
+            let submit_label = if status == "invalid" { "Resubmit to LHDN" } else { "Submit to LHDN" };
             actions.push_str(&format!(
                 r#"<a href="/accounting/einvoice/{move_id}/export" class="btn btn-xs btn-outline">Export XML</a>
-                   <form method="post" action="/accounting/einvoice/{move_id}/submit" class="inline"><button class="btn btn-xs btn-primary">Submit to LHDN</button></form>"#,
+                   <form method="post" action="/accounting/einvoice/{move_id}/submit" class="inline"><button class="btn btn-xs btn-primary">{submit_label}</button></form>"#,
             ));
         }
         "valid" => {
@@ -168,10 +169,23 @@ async fn queue_page(
     for r in &rows {
         let mid: Uuid = r.get("move_id");
         let st: String = r.get("status");
+        // Triage actions right on the queue row (stopPropagation keeps
+        // the row's open-invoice click from firing too).
+        let action = match st.as_str() {
+            "ready" | "exported" => format!(
+                "<form method=\"post\" action=\"/accounting/einvoice/{mid}/submit\" onclick=\"event.stopPropagation()\">\
+                 <button class=\"btn btn-xs btn-primary\">Submit</button></form>"
+            ),
+            "invalid" => format!(
+                "<form method=\"post\" action=\"/accounting/einvoice/{mid}/submit\" onclick=\"event.stopPropagation()\">\
+                 <button class=\"btn btn-xs btn-warning\">Resubmit</button></form>"
+            ),
+            _ => String::new(),
+        };
         trs.push_str(&format!(
             "<tr class=\"hover cursor-pointer\" onclick=\"location='/accounting/documents/{mid}'\">\
              <td>{}</td><td>{}</td><td>{}</td><td class=\"text-right\">{}</td>\
-             <td><span class=\"badge badge-sm {}\">{}</span></td><td><code class=\"text-xs\">{}</code></td></tr>",
+             <td><span class=\"badge badge-sm {}\">{}</span></td><td><code class=\"text-xs\">{}</code></td><td>{}</td></tr>",
             esc(r.get::<Option<String>, _>("number").as_deref().unwrap_or("/")),
             esc(r.get::<Option<String>, _>("partner").as_deref().unwrap_or("—")),
             r.get::<Option<vortex_plugin_sdk::chrono::NaiveDate>, _>("invoice_date")
@@ -181,10 +195,11 @@ async fn queue_page(
             status_badge(&st),
             esc(&st),
             esc(r.get::<Option<String>, _>("lhdn_uuid").as_deref().unwrap_or("")),
+            action,
         ));
     }
     if trs.is_empty() {
-        trs = "<tr><td colspan=\"6\" class=\"text-center opacity-60 py-6\">No e-invoices yet — they appear when customer documents post.</td></tr>".into();
+        trs = "<tr><td colspan=\"7\" class=\"text-center opacity-60 py-6\">No e-invoices yet — they appear when customer documents post.</td></tr>".into();
     }
     let tabs: String = ["", "ready", "submitted", "valid", "invalid", "cancelled"]
         .iter()
@@ -204,7 +219,7 @@ async fn queue_page(
         <div class="tabs tabs-boxed mb-4 w-fit">{tabs}</div>
         <div class="card bg-base-100 shadow"><div class="card-body p-4 overflow-x-auto">
         <table class="table table-sm"><thead><tr><th>Number</th><th>Partner</th><th>Date</th>
-        <th class="text-right">Total</th><th>Status</th><th>LHDN UUID</th></tr></thead>
+        <th class="text-right">Total</th><th>Status</th><th>LHDN UUID</th><th></th></tr></thead>
         <tbody>{trs}</tbody></table></div></div>"##,
     );
     let sidebar = render_sidebar(&state, &user, &db_ctx);
