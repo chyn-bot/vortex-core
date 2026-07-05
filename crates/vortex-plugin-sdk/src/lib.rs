@@ -97,6 +97,9 @@ pub mod prelude {
     // ── Flash messages (one-shot toast across a redirect) ──
     pub use vortex_framework::{flash_redirect, FlashKind};
 
+    // ── QR codes ──
+    pub use vortex_framework::qr_svg;
+
     // ── Record panels (cross-plugin detail-page contributions) ──
     pub use vortex_framework::{
         handle_record_panel_saves, render_record_panels, PanelSaveCtx, RecordPanel,

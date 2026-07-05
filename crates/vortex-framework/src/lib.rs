@@ -47,6 +47,7 @@ pub mod mobile_auth;
 pub mod pdf;
 pub mod plugin;
 pub mod flash;
+pub mod qr;
 pub mod record_panel;
 pub mod registry;
 pub mod report_jobs;
@@ -89,6 +90,7 @@ pub use reports::{
     ReportRegistry,
 };
 pub use flash::{flash_redirect, FlashKind};
+pub use qr::qr_svg;
 pub use record_panel::{
     handle_record_panel_saves, render_record_panels, PanelSaveCtx, RecordPanel, RecordPanelDef,
     HOST_FORM_ID,

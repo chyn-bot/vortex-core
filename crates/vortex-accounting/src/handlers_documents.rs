@@ -40,7 +40,9 @@ pub fn document_routes() -> Router<Arc<AppState>> {
 /// "TAX INVOICE" title when SST-registered, seller TIN/SST/BRN block,
 /// per-rate SST summary, LHDN UUID + validation link once validated.
 async fn print_document(
+    State(app_state): State<Arc<AppState>>,
     Db(db): Db,
+    Extension(db_ctx): Extension<DatabaseContext>,
     Path(id): Path<Uuid>,
 ) -> Response {
     use vortex_plugin_sdk::rust_decimal::Decimal;
@@ -167,16 +169,34 @@ async fn print_document(
         .map(|e| {
             let status: String = e.get("status");
             if status == "valid" {
+                let link = e
+                    .get::<Option<String>, _>("validation_link")
+                    .unwrap_or_default();
+                // LHDN's visual-representation requirement: the QR
+                // encodes the validation link.
+                let qr = if link.is_empty() {
+                    String::new()
+                } else {
+                    vortex_plugin_sdk::framework::qr_svg(&link, 110)
+                        .map(|svg| format!("<div class=\"qr\">{svg}</div>"))
+                        .unwrap_or_default()
+                };
                 format!(
-                    "<div class=\"einv\">LHDN e-Invoice validated · UUID {} · <span class=\"mono\">{}</span></div>",
+                    "<div class=\"einv\">{qr}<div><b>LHDN e-Invoice validated</b><br/>UUID {}<br/>\
+                     <span class=\"mono\">{}</span><br/>Scan the QR to verify with LHDN MyInvois.</div></div>",
                     esc(e.get::<Option<String>, _>("lhdn_uuid").as_deref().unwrap_or("")),
-                    esc(e.get::<Option<String>, _>("validation_link").as_deref().unwrap_or("")),
+                    esc(&link),
                 )
             } else {
                 String::new()
             }
         })
         .unwrap_or_default();
+    // Company logo (uploaded in Accounting Settings, FileStore-backed).
+    let logo_html = match app_state.files.get(&db_ctx.db_name, "company/logo").await {
+        Ok(Some(_)) => r#"<img src="/accounting/company-logo" alt="" style="max-height:64px;max-width:220px;margin-bottom:6px"/>"#,
+        _ => "",
+    };
     let draft_mark = if state != "posted" {
         r#"<div class="watermark">DRAFT</div>"#
     } else {
@@ -196,7 +216,8 @@ body {{ max-width: 21cm; margin: 1.2cm auto; position: relative; }}
 .num {{ text-align: right; font-variant-numeric: tabular-nums; }}
 .mono {{ font-family: monospace; font-size: 0.75em; word-break: break-all; }}
 .totals td {{ font-weight: 600; }}
-.einv {{ margin-top: 1em; padding: 0.5em 0.8em; border: 1px solid #ccc; border-radius: 4px; font-size: 0.8em; }}
+.einv {{ margin-top: 1em; padding: 0.6em 0.8em; border: 1px solid #ccc; border-radius: 4px; font-size: 0.8em; display: flex; gap: 1em; align-items: center; }}
+.einv .qr svg {{ display: block; }}
 .footer {{ margin-top: 2em; font-size: 0.75em; color: #666; }}
 .watermark {{ position: absolute; top: 35%; left: 20%; font-size: 6em; color: rgba(200,0,0,0.12); transform: rotate(-25deg); pointer-events: none; }}
 .printbar {{ text-align: right; margin-bottom: 1em; }}
@@ -207,6 +228,7 @@ body {{ max-width: 21cm; margin: 1.2cm auto; position: relative; }}
 <div class="printbar"><button onclick="window.print()">Print / Save as PDF</button></div>
 <div class="head">
   <div class="seller">
+    {logo_html}
     <p class="name">{company_name}</p>
     <p>{addr1}</p><p>{addr2}</p><p>{postcode} {city}</p>
     <p>TIN: {ctin} · BRN: {cbrn}</p>

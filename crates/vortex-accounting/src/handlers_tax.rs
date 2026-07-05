@@ -31,6 +31,8 @@ pub fn tax_routes() -> Router<Arc<AppState>> {
         )
         .route("/accounting/partner-banks/{contact_id}/add", post(add_partner_bank))
         .route("/accounting/partner-banks/{bank_id}/delete", post(delete_partner_bank))
+        .route("/accounting/settings/logo", post(upload_logo))
+        .route("/accounting/company-logo", get(serve_logo))
         .route("/accounting/banks", get(banks_page))
         .route("/accounting/banks", post(bank_create))
         .route("/accounting/banks/{id}/toggle", post(bank_toggle))
@@ -512,8 +514,26 @@ async fn edit_settings(
     let form =
         render_form(&db, &settings_form(), FormMode::Edit, Some(&id.to_string()), &values, &[])
             .await;
+    // Logo upload card (multipart, outside the form engine).
+    let has_logo = matches!(state.files.get(&db_ctx.db_name, LOGO_KEY).await, Ok(Some(_)));
+    let preview = if has_logo {
+        r#"<img src="/accounting/company-logo" alt="Current logo" class="max-h-16 mb-2 rounded"/>"#
+    } else {
+        r#"<p class="text-sm opacity-60 mb-2">No logo yet.</p>"#
+    };
+    let logo_card = format!(
+        r#"<div class="card bg-base-100 shadow mt-4 max-w-2xl"><div class="card-body p-4">
+<h2 class="font-bold mb-1">Company Logo</h2>
+<p class="text-xs opacity-60 mb-2">Printed on invoices, credit notes and other documents. PNG or JPEG, up to 512 KB.</p>
+{preview}
+<form method="post" action="/accounting/settings/logo" enctype="multipart/form-data" data-no-guard class="flex gap-2 items-center">
+<input type="file" name="logo" accept="image/png,image/jpeg" required class="file-input file-input-bordered file-input-sm"/>
+<button class="btn btn-sm btn-primary">Upload</button>
+</form></div></div>"#,
+    );
     let sidebar = render_sidebar(&state, &user, &db_ctx);
-    Html(page_shell(&sidebar, "Accounting Settings", &form)).into_response()
+    Html(page_shell(&sidebar, "Accounting Settings", &format!("{form}{logo_card}")))
+        .into_response()
 }
 
 async fn save_settings(
@@ -1011,6 +1031,92 @@ async fn delete_partner_bank(
         }]}));
     let _ = state.audit.log(entry).await;
     Redirect::to(&format!("/contacts/{contact_id}")).into_response()
+}
+
+// ─── Company logo (FileStore-backed, printed on documents) ───────────────
+
+const LOGO_KEY: &str = "company/logo";
+const LOGO_MAX_BYTES: usize = 512 * 1024;
+
+/// PNG or JPEG by magic bytes; anything else is refused.
+fn logo_content_type(data: &[u8]) -> Option<&'static str> {
+    if data.starts_with(&[0x89, b'P', b'N', b'G']) {
+        Some("image/png")
+    } else if data.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("image/jpeg")
+    } else {
+        None
+    }
+}
+
+async fn upload_logo(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    mut multipart: vortex_plugin_sdk::axum::extract::Multipart,
+) -> Response {
+    let mut data: Option<Vec<u8>> = None;
+    while let Ok(Some(field)) = multipart.next_field().await {
+        if field.name() == Some("logo") {
+            if let Ok(bytes) = field.bytes().await {
+                data = Some(bytes.to_vec());
+            }
+        }
+    }
+    let Some(data) = data.filter(|d| !d.is_empty()) else {
+        return flash_redirect("/accounting/settings", FlashKind::Error, "No file received.");
+    };
+    if data.len() > LOGO_MAX_BYTES {
+        return flash_redirect(
+            "/accounting/settings",
+            FlashKind::Error,
+            "Logo too large — keep it under 512 KB.",
+        );
+    }
+    let Some(content_type) = logo_content_type(&data) else {
+        return flash_redirect(
+            "/accounting/settings",
+            FlashKind::Error,
+            "Unsupported format — upload a PNG or JPEG.",
+        );
+    };
+    if let Err(e) = state
+        .files
+        .put(&db_ctx.db_name, LOGO_KEY, &data, Some(content_type))
+        .await
+    {
+        error!("logo store failed: {e}");
+        return flash_redirect("/accounting/settings", FlashKind::Error, "Storing the logo failed.");
+    }
+    audit_setup(&state, &user, &db_ctx, "acc_company_logo", Uuid::nil()).await;
+    flash_redirect(
+        "/accounting/settings",
+        FlashKind::Success,
+        "Logo saved — it now prints on invoices and other documents.",
+    )
+}
+
+async fn serve_logo(
+    State(state): State<Arc<AppState>>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+) -> Response {
+    match state.files.get(&db_ctx.db_name, LOGO_KEY).await {
+        Ok(Some(data)) => {
+            let ct = logo_content_type(&data).unwrap_or("application/octet-stream");
+            (
+                [
+                    (vortex_plugin_sdk::axum::http::header::CONTENT_TYPE, ct),
+                    (
+                        vortex_plugin_sdk::axum::http::header::CACHE_CONTROL,
+                        "private, max-age=300",
+                    ),
+                ],
+                data,
+            )
+                .into_response()
+        }
+        _ => (StatusCode::NOT_FOUND, "No logo uploaded").into_response(),
+    }
 }
 
 // ─── Bank master ─────────────────────────────────────────────────────────
