@@ -211,6 +211,13 @@ async fn print_document(
         r##"<!DOCTYPE html><html><head><meta charset="utf-8"><title>{number} — {title}</title>
 <style>{css}
 body {{ max-width: 21cm; margin: 1.2cm auto; position: relative; }}
+/* Zero page margins: the browser prints its URL/date header-footer
+   into the margin band — with none, nothing is drawn. Content keeps
+   its whitespace via body padding instead. */
+@page {{ size: A4; margin: 0; }}
+@media print {{
+  body {{ max-width: none; margin: 0; padding: 1.2cm 1.4cm; }}
+}}
 .head {{ display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 1.2em; }}
 .head h1 {{ font-size: 1.5em; letter-spacing: 0.06em; }}
 .seller p, .buyer p {{ margin: 1px 0; font-size: 0.85em; }}
