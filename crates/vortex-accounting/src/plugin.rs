@@ -521,7 +521,27 @@ impl Plugin for AccountingPlugin {
                     tin = text_input("tin", "TIN", val("tin"), "C1234567890 / IG12345678901"),
                     id_value = text_input("id_value", "BRN / NRIC No.", val("id_value"), "201901012345"),
                     sst = text_input("sst_registration", "SST Registration", val("sst_registration"), ""),
-                    msic = text_input("msic_code", "MSIC Code", val("msic_code"), "62010"),
+                    msic = {
+                        // Searchable over the synced LHDN MSIC catalogue.
+                        let opts: String = crate::handlers_tax::msic_lookup(&db)
+                            .await
+                            .iter()
+                            .map(|(code, label)| {
+                                format!(
+                                    "<option value=\"{}\">{}</option>",
+                                    esc(code),
+                                    esc(label)
+                                )
+                            })
+                            .collect();
+                        format!(
+                            "<label class=\"form-control\"><span class=\"label-text text-xs mb-1\">MSIC Code</span>\
+                             <input name=\"msic_code\" value=\"{}\" placeholder=\"62010\" list=\"dl-panel-msic\" \
+                             form=\"record-form\" class=\"input input-bordered input-sm w-full\"/>\
+                             <datalist id=\"dl-panel-msic\">{opts}</datalist></label>",
+                            val("msic_code"),
+                        )
+                    },
                     email = text_input("einvoice_email", "e-Invoice Email", val("einvoice_email"), ""),
                     sel_brn = sel("BRN"),
                     sel_nric = sel("NRIC"),

@@ -42,6 +42,22 @@ pub fn tax_routes() -> Router<Arc<AppState>> {
         .route("/accounting/tax-profiles/{id}/validate-tin", post(validate_tin_action))
 }
 
+/// MSIC catalogue for the searchable pickers — synced from the LHDN
+/// SDK ("Sync LHDN codes" on the e-Invoice Queue). Empty until synced;
+/// the field still accepts typed codes.
+pub(crate) async fn msic_lookup(db: &vortex_plugin_sdk::sqlx::PgPool) -> Vec<(String, String)> {
+    vortex_plugin_sdk::sqlx::query(
+        "SELECT code, description FROM acc_lhdn_code \
+         WHERE code_type = 'msic' AND active ORDER BY code",
+    )
+    .fetch_all(db)
+    .await
+    .unwrap_or_default()
+    .iter()
+    .map(|r| (r.get::<String, _>("code"), r.get::<String, _>("description")))
+    .collect()
+}
+
 // ─── Forms (declared once — render + validate + save derive) ────────────
 
 fn tax_config_form() -> FormConfig {
@@ -75,7 +91,7 @@ fn fiscal_year_form() -> FormConfig {
         .field(FormField::date("date_to", "To").required())
 }
 
-fn settings_form() -> FormConfig {
+fn settings_form(msic: Vec<(String, String)>) -> FormConfig {
     FormConfig::new("Accounting Settings", "acc_config", "/accounting/settings")
         .section("Company Tax Identity (LHDN / MyInvois)")
         .field(FormField::text("company_tin", "TIN").placeholder("C1234567890"))
@@ -87,7 +103,8 @@ fn settings_form() -> FormConfig {
         ]))
         .field(FormField::text("company_id_value", "ID Value").placeholder("201901012345"))
         .field(FormField::text("company_sst_registration", "SST Registration No."))
-        .field(FormField::text("company_msic_code", "MSIC Code").placeholder("62010"))
+        .field(FormField::datalist("company_msic_code", "MSIC Code", msic.clone()).placeholder("62010")
+            .help("Type to search the LHDN MSIC catalogue"))
         .field(FormField::textarea("company_business_activity", "Business Activity"))
         .field(FormField::number("sst_period_months", "SST Taxable Period (months)")
             .default("2").help("2 = bi-monthly (standard)"))
@@ -144,7 +161,7 @@ fn settings_form() -> FormConfig {
             .help("Upper bounds for aged AR/AP report columns, JSON array of days"))
 }
 
-fn tax_profile_form() -> FormConfig {
+fn tax_profile_form(msic: Vec<(String, String)>) -> FormConfig {
     FormConfig::new("Partner Tax Profile", "acc_partner_tax_profile", "/accounting/tax-profiles")
         .section("LHDN Identity")
         .field(FormField::text("tin", "TIN").placeholder("C1234567890 / IG12345678901"))
@@ -156,7 +173,8 @@ fn tax_profile_form() -> FormConfig {
         ]))
         .field(FormField::text("id_value", "ID Value"))
         .field(FormField::text("sst_registration", "SST Registration No."))
-        .field(FormField::text("msic_code", "MSIC Code"))
+        .field(FormField::datalist("msic_code", "MSIC Code", msic).placeholder("62010")
+            .help("Type to search the LHDN MSIC catalogue"))
         .section("e-Invoice")
         .field(FormField::text("einvoice_email", "e-Invoice Email"))
         .field(FormField::checkbox("einvoice_optout", "Consolidated only (no individual e-invoice)"))
@@ -507,12 +525,12 @@ async fn edit_settings(
     let Some(id) = settings_row_id(&db).await else {
         return (StatusCode::NOT_FOUND, "No accounting configuration row").into_response();
     };
-    let values = match load_record(&db, &settings_form(), id).await {
+    let values = match load_record(&db, &settings_form(msic_lookup(&db).await), id).await {
         Ok(Some(v)) => v,
         _ => return (StatusCode::NOT_FOUND, "No accounting configuration row").into_response(),
     };
     let form =
-        render_form(&db, &settings_form(), FormMode::Edit, Some(&id.to_string()), &values, &[])
+        render_form(&db, &settings_form(msic_lookup(&db).await), FormMode::Edit, Some(&id.to_string()), &values, &[])
             .await;
     // Logo upload card (multipart, outside the form engine). The
     // preview URL carries a content hash so a fresh upload is never
@@ -547,14 +565,14 @@ async fn save_settings(
     Path(id): Path<Uuid>,
     Form(pairs): Form<Vec<(String, String)>>,
 ) -> Response {
-    match execute_form_save(&db, &settings_form(), &pairs, Some(id)).await {
+    match execute_form_save(&db, &settings_form(msic_lookup(&db).await), &pairs, Some(id)).await {
         Ok(SaveOutcome::Saved(_)) => {
             audit_setup(&state, &user, &db_ctx, "acc_config", id).await;
             Redirect::to("/accounting/settings").into_response()
         }
         Ok(SaveOutcome::Invalid { values, errors }) => {
             let form = render_form(
-                &db, &settings_form(), FormMode::Edit, Some(&id.to_string()), &values, &errors,
+                &db, &settings_form(msic_lookup(&db).await), FormMode::Edit, Some(&id.to_string()), &values, &errors,
             )
             .await;
             let sidebar = render_sidebar(&state, &user, &db_ctx);
@@ -657,12 +675,12 @@ async fn edit_tax_profile(
     let Some(partner) = partner else {
         return (StatusCode::NOT_FOUND, "Profile not found").into_response();
     };
-    let values = match load_record(&db, &tax_profile_form(), id).await {
+    let values = match load_record(&db, &tax_profile_form(msic_lookup(&db).await), id).await {
         Ok(Some(v)) => v,
         _ => return (StatusCode::NOT_FOUND, "Profile not found").into_response(),
     };
     let form =
-        render_form(&db, &tax_profile_form(), FormMode::Edit, Some(&id.to_string()), &values, &[])
+        render_form(&db, &tax_profile_form(msic_lookup(&db).await), FormMode::Edit, Some(&id.to_string()), &values, &[])
             .await;
     // Banner from a just-run LHDN TIN action (?tin_check=…).
     let esc = vortex_plugin_sdk::framework::html_escape;
@@ -773,7 +791,7 @@ async fn save_tax_profile(
     Path(id): Path<Uuid>,
     Form(pairs): Form<Vec<(String, String)>>,
 ) -> Response {
-    match execute_form_save(&db, &tax_profile_form(), &pairs, Some(id)).await {
+    match execute_form_save(&db, &tax_profile_form(msic_lookup(&db).await), &pairs, Some(id)).await {
         Ok(SaveOutcome::Saved(_)) => {
             audit_setup(&state, &user, &db_ctx, "acc_partner_tax_profile", id).await;
             // Land back on the customer, not on an accounting list —
@@ -793,7 +811,7 @@ async fn save_tax_profile(
         }
         Ok(SaveOutcome::Invalid { values, errors }) => {
             let form = render_form(
-                &db, &tax_profile_form(), FormMode::Edit, Some(&id.to_string()), &values, &errors,
+                &db, &tax_profile_form(msic_lookup(&db).await), FormMode::Edit, Some(&id.to_string()), &values, &errors,
             )
             .await;
             let sidebar = render_sidebar(&state, &user, &db_ctx);

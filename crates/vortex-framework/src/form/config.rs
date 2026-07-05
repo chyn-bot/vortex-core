@@ -22,6 +22,10 @@ pub enum FieldKind {
     /// JSON value in a single-line input; submitted text must parse as
     /// JSON, cast `::jsonb`.
     Json,
+    /// Text input with a native `<datalist>` — type-ahead search over
+    /// a large code catalogue (value, label). Free text is still
+    /// allowed; the authority (e.g. LHDN) validates downstream.
+    Datalist(Vec<(String, String)>),
     /// Reference to another record (`<select>` over the related
     /// table), cast `::uuid`. Options load at render time as
     /// `SELECT id, <display> FROM <table> WHERE active IS NOT FALSE`.
@@ -72,6 +76,10 @@ impl FormField {
     }
     pub fn json(name: &str, label: &str) -> Self {
         Self::new(name, label, FieldKind::Json)
+    }
+    /// Searchable code lookup over `(value, label)` pairs.
+    pub fn datalist(name: &str, label: &str, options: Vec<(String, String)>) -> Self {
+        Self::new(name, label, FieldKind::Datalist(options))
     }
     pub fn date(name: &str, label: &str) -> Self {
         Self::new(name, label, FieldKind::Date)

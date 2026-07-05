@@ -54,6 +54,19 @@ fn widget(field: &FormField, value: &str, m2o_options: &[(String, String)]) -> S
         FieldKind::Json => format!(
             r#"<input type="text" name="{name}" value="{val}" class="input input-bordered w-full font-mono"{placeholder}{required}{readonly}/>"#
         ),
+        FieldKind::Datalist(options) => {
+            let mut opts = String::new();
+            for (v, label) in options {
+                opts.push_str(&format!(
+                    r#"<option value="{}">{}</option>"#,
+                    html_escape(v),
+                    html_escape(label)
+                ));
+            }
+            format!(
+                r#"<input type="text" name="{name}" value="{val}" list="dl-{name}" class="input input-bordered w-full"{placeholder}{required}{readonly}/><datalist id="dl-{name}">{opts}</datalist>"#
+            )
+        }
         FieldKind::Date => format!(
             r#"<input type="date" name="{name}" value="{val}" class="input input-bordered w-full"{required}{readonly}/>"#
         ),
