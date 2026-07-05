@@ -492,16 +492,40 @@ pub async fn submit_via_api(
             .first()
             .map(|(_, e)| e.clone())
             .unwrap_or_else(|| json!({"error": "document not accepted"}));
+        let human = human_lhdn_error(&err);
+        let stored = json!({ "message": human, "raw": err });
         vortex_plugin_sdk::sqlx::query(
             "UPDATE acc_einvoice SET status = 'invalid', error_json = $2 WHERE id = $1",
         )
         .bind(einvoice_id)
-        .bind(&err)
+        .bind(&stored)
         .execute(db)
         .await
         .map_err(|e| e.to_string())?;
-        Err(format!("LHDN rejected at submission: {err}"))
+        Err(format!("LHDN rejected: {human}"))
     }
+}
+
+/// Flatten LHDN's nested validation error into the field messages a
+/// user can act on ("Enter valid e-mail address - SUPPLIER; …").
+fn human_lhdn_error(err: &Value) -> String {
+    let details: Vec<String> = err
+        .pointer("/error/details")
+        .and_then(|d| d.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|d| d.get("message").and_then(|m| m.as_str()))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    if !details.is_empty() {
+        return details.join(" · ");
+    }
+    err.pointer("/error/message")
+        .and_then(|m| m.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| err.to_string())
 }
 
 /// Poll job body: resolve the submission's final status.

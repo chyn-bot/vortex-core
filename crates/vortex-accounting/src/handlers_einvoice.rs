@@ -17,6 +17,7 @@ pub fn einvoice_routes() -> Router<Arc<AppState>> {
         .route("/accounting/einvoice", get(queue_page))
         .route("/accounting/einvoice/settings", get(edit_einvoice_settings))
         .route("/accounting/einvoice/settings/{id}", post(save_einvoice_settings))
+        .route("/accounting/einvoice/{move_id}/status", get(status_json))
         .route("/accounting/einvoice/{move_id}/export", get(export_action))
         .route("/accounting/einvoice/{move_id}/submit", post(submit_action))
         .route("/accounting/einvoice/{move_id}/cancel", post(cancel_action))
@@ -32,6 +33,35 @@ fn status_badge(status: &str) -> &'static str {
         "cancelled" => "badge-neutral",
         _ => "badge-ghost",
     }
+}
+
+/// Live status for the front-end poller: the invoice page watches a
+/// pending submission and updates itself instead of asking the user
+/// to refresh.
+async fn status_json(Db(db): Db, Path(move_id): Path<Uuid>) -> Response {
+    let row = vortex_plugin_sdk::sqlx::query(
+        "SELECT status, error_json FROM acc_einvoice WHERE move_id = $1",
+    )
+    .bind(move_id)
+    .fetch_optional(&db)
+    .await
+    .ok()
+    .flatten();
+    let (status, message) = match row {
+        Some(r) => {
+            let err: Option<vortex_plugin_sdk::serde_json::Value> =
+                r.try_get("error_json").ok().flatten();
+            (
+                r.get::<String, _>("status"),
+                err.and_then(|e| {
+                    e.get("message").and_then(|m| m.as_str()).map(str::to_string)
+                }),
+            )
+        }
+        None => ("none".to_string(), None),
+    };
+    vortex_plugin_sdk::axum::Json(json!({ "status": status, "message": message }))
+        .into_response()
 }
 
 /// Compact status widget for the document detail page.
@@ -71,21 +101,35 @@ pub async fn einvoice_widget(db: &vortex_plugin_sdk::sqlx::PgPool, move_id: Uuid
     let link_html = link
         .map(|l| format!(r#"<a href="{}" target="_blank" class="link link-primary text-xs">validation link</a>"#, esc(&l)))
         .unwrap_or_default();
-    let err_html = err
-        .map(|e| {
-            let msg = e
-                .get("message")
-                .and_then(|m| m.as_str())
-                .map(str::to_string)
-                .unwrap_or_else(|| e.to_string());
+    let err_msg: Option<String> = err.map(|e| {
+        e.get("message")
+            .and_then(|m| m.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| e.to_string())
+    });
+    let err_html = err_msg
+        .as_deref()
+        .map(|msg| {
             format!(
                 r#"<div class="text-error text-xs mt-1 max-w-xl" title="{t}">⚠ {t}</div>"#,
-                t = esc(&msg)
+                t = esc(msg)
             )
         })
         .unwrap_or_default();
+    // While a submission can still move (queued job / LHDN validating),
+    // the shared script polls the status endpoint and updates the page
+    // the moment the outcome lands — no manual refresh.
+    let poll_attr = if matches!(status.as_str(), "ready" | "exported" | "submitted" | "invalid") {
+        format!(
+            r#" data-vortex-poll="/accounting/einvoice/{move_id}/status" data-vortex-poll-state="{}" data-vortex-poll-msg="{}""#,
+            esc(&status),
+            esc(err_msg.as_deref().unwrap_or("")),
+        )
+    } else {
+        String::new()
+    };
     format!(
-        r#"<div class="card bg-base-100 shadow mb-4"><div class="card-body p-4">
+        r#"<div class="card bg-base-100 shadow mb-4"{poll_attr}><div class="card-body p-4">
         <div class="flex items-center gap-3 flex-wrap">
         <span class="font-semibold">e-Invoice</span>
         <span class="badge {badge}">{status}</span>
