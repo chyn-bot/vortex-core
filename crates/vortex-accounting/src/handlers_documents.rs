@@ -230,7 +230,8 @@ body {{ max-width: 21cm; margin: 1.2cm auto; position: relative; }}
   <p>{ptin_line}</p>
   <p>{pphone} {pemail}</p>
 </div></div>
-<table>
+<table class="table table-sm" style="table-layout:fixed;width:100%">
+<colgroup><col/><col style="width:4.5rem"/><col style="width:7rem"/><col style="width:4.5rem"/><col style="width:8rem"/><col style="width:8.5rem"/></colgroup>
 <thead><tr><th>Description</th><th class="num">Qty</th><th class="num">Unit Price</th><th>Class</th><th>Tax</th><th class="num">Amount (MYR)</th></tr></thead>
 <tbody>{line_trs}</tbody>
 <tfoot>
