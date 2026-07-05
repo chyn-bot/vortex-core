@@ -197,3 +197,161 @@ aside .menu a.active::before {
 .vortex-toast-error   { background: #dc2626; color: #fef2f2; }
 .vortex-toast-info    { background: #2563eb; color: #eff6ff; }
 @media print { .vortex-toast { display: none !important; } }
+
+/* 13 ▸ Mobile ergonomics. Pages are authored desktop-first with
+      fixed table layouts and 12-column form grids; below tablet
+      width those crush instead of adapting. Rules here make tables
+      scroll (never compress) and stack dense form grids. */
+@media (max-width: 767px) {
+  /* Tables keep their natural width and scroll inside their
+     .overflow-x-auto wrapper — fixed layouts otherwise squeeze
+     columns until headers overlap. */
+  .overflow-x-auto > table {
+    table-layout: auto !important;
+    min-width: max-content;
+  }
+  .overflow-x-auto > table colgroup {
+    display: none;
+  }
+
+  /* Dense form grids (add-line rows, header editors) stack: every
+     field gets the full row, so labels and inputs stay readable. */
+  form.grid[class*="grid-cols-"],
+  form .grid[class*="grid-cols-"] {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  form.grid[class*="grid-cols-"] > *,
+  form .grid[class*="grid-cols-"] > * {
+    grid-column: span 2 / span 2;
+  }
+
+  /* Read-only detail grids: 3+ columns fold to 2. */
+  .grid.grid-cols-3,
+  .grid.grid-cols-4,
+  .grid.grid-cols-6 {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  /* Inputs fill their grid cell instead of overflowing it. */
+  .form-control {
+    min-width: 0;
+  }
+  form .grid .input,
+  form .grid .select,
+  form .grid .textarea {
+    width: 100%;
+    min-width: 0;
+  }
+
+  /* Title + action-button rows wrap instead of shoving buttons
+     off-screen. */
+  main .flex.items-center.justify-between {
+    flex-wrap: wrap;
+    gap: 0.5rem;
+  }
+
+  /* Tables that were never wrapped in an .overflow-x-auto container
+     become self-scrolling instead of stretching the page. */
+  table.table:not(.overflow-x-auto table) {
+    display: block;
+    overflow-x: auto;
+  }
+
+  /* Tab strips scroll sideways rather than widening the page. */
+  .tabs {
+    max-width: 100%;
+    overflow-x: auto;
+    flex-wrap: nowrap;
+  }
+  .tabs.w-fit {
+    width: auto;
+  }
+}
+
+/* 14 ▸ Mobile action bar + slide-up sheet (built by vortex.js from a
+      page's .vortex-actions cluster; desktop never sees these). */
+@media (max-width: 767px) {
+  #vortex-action-bar {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 55;
+    display: flex;
+    gap: 0.5rem;
+    padding: 0.6rem 0.9rem calc(0.6rem + env(safe-area-inset-bottom));
+    background: var(--fallback-b1, oklch(var(--b1)/1));
+    border-top: 1px solid color-mix(in oklab, currentColor 12%, transparent);
+    box-shadow: 0 -4px 16px rgb(0 0 0 / 0.18);
+  }
+  #vortex-action-bar .btn {
+    flex: 1;
+  }
+  body.has-action-bar main {
+    padding-bottom: 5.5rem !important;
+  }
+
+  #vortex-action-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 56;
+    background: rgb(0 0 0 / 0.45);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.18s ease;
+  }
+  #vortex-action-backdrop.show {
+    opacity: 1;
+    pointer-events: auto;
+  }
+
+  #vortex-action-sheet {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 57;
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+    padding: 1rem 1rem calc(4.5rem + env(safe-area-inset-bottom));
+    background: var(--fallback-b1, oklch(var(--b1)/1));
+    border-radius: 1rem 1rem 0 0;
+    box-shadow: 0 -8px 30px rgb(0 0 0 / 0.35);
+    transform: translateY(105%);
+    transition: transform 0.2s ease;
+    max-height: 70vh;
+    overflow-y: auto;
+  }
+  #vortex-action-sheet.show {
+    transform: translateY(0);
+  }
+  /* Every control in the sheet reads as a full-width row; inline
+     payment-style forms stack their fields. */
+  #vortex-action-sheet .btn {
+    width: 100%;
+  }
+  #vortex-action-sheet form {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    margin: 0;
+  }
+  #vortex-action-sheet form .input,
+  #vortex-action-sheet form .select {
+    width: 100%;
+  }
+  /* Mobile-only field labels (server marks them .vortex-m-label). */
+  .vortex-m-label {
+    display: none;
+  }
+  #vortex-action-sheet .vortex-m-label {
+    display: block;
+    font-size: 0.7rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    opacity: 0.6;
+    margin-bottom: -0.25rem;
+  }
+}
