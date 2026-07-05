@@ -598,6 +598,58 @@ async fn doc_partner_options(
     out
 }
 
+/// Side-appropriate GL accounts for a line override: revenue accounts
+/// on customer documents; expense + asset accounts on vendor bills
+/// (capex and prepayments are billed too). `(id, "code name")` pairs.
+async fn line_account_choices(
+    db: &vortex_plugin_sdk::sqlx::PgPool,
+    customer_doc: bool,
+) -> Vec<(Uuid, String)> {
+    let types = if customer_doc {
+        "('income', 'income_other')"
+    } else {
+        "('expense', 'expense_direct_cost', 'expense_depreciation', \
+          'asset_fixed', 'asset_current', 'asset_non_current')"
+    };
+    vortex_plugin_sdk::sqlx::query(&format!(
+        "SELECT id, code, name FROM acc_account \
+         WHERE active AND account_type IN {types} ORDER BY code"
+    ))
+    .fetch_all(db)
+    .await
+    .unwrap_or_default()
+    .iter()
+    .map(|r| {
+        (
+            r.get::<Uuid, _>("id"),
+            format!("{} {}", r.get::<String, _>("code"), r.get::<String, _>("name")),
+        )
+    })
+    .collect()
+}
+
+/// Products from the inventory plugin, if installed — a SOFT link:
+/// the query failing (table absent) simply means no picker renders.
+async fn product_choices(
+    db: &vortex_plugin_sdk::sqlx::PgPool,
+) -> Vec<(Uuid, String, Decimal)> {
+    vortex_plugin_sdk::sqlx::query(
+        "SELECT id, code, name, cost FROM stock_product WHERE active ORDER BY code LIMIT 1000",
+    )
+    .fetch_all(db)
+    .await
+    .unwrap_or_default()
+    .iter()
+    .map(|r| {
+        (
+            r.get::<Uuid, _>("id"),
+            format!("{} · {}", r.get::<String, _>("code"), r.get::<String, _>("name")),
+            r.get::<Decimal, _>("cost"),
+        )
+    })
+    .collect()
+}
+
 async fn tax_options(db: &vortex_plugin_sdk::sqlx::PgPool, use_kind: &str) -> String {
     let esc = vortex_plugin_sdk::framework::html_escape;
     let rows = vortex_plugin_sdk::sqlx::query(
@@ -1072,14 +1124,22 @@ async fn document_detail(
     let customer_doc = use_kind == "sale";
     let line_rows = vortex_plugin_sdk::sqlx::query(
         "SELECT l.id, l.description, l.quantity, l.unit_price, l.classification_code, \
-                l.tax_id, t.name AS tax_name \
+                l.tax_id, l.account_id, t.name AS tax_name, \
+                COALESCE(a.code || ' ' || a.name, '') AS account_label \
          FROM acc_invoice_line l LEFT JOIN taxes t ON t.id = l.tax_id \
+         LEFT JOIN acc_account a ON a.id = l.account_id \
          WHERE l.move_id = $1 ORDER BY l.sequence",
     )
     .bind(id)
     .fetch_all(&db)
     .await
     .unwrap_or_default();
+    let account_choices = if is_draft {
+        line_account_choices(&db, customer_doc).await
+    } else {
+        Vec::new()
+    };
+    let default_account_label = if customer_doc { "Default income" } else { "Default expense" };
 
     // For DRAFT documents every line is editable in place — inputs
     // join a per-row <form> (rendered before the table; form="")
@@ -1108,6 +1168,8 @@ async fn document_detail(
         let unit_price: Decimal = row.get("unit_price");
         let tax_name: Option<String> = row.get("tax_name");
         let tax_id: Option<Uuid> = row.get("tax_id");
+        let account_id: Option<Uuid> = row.get("account_id");
+        let account_label: String = row.get("account_label");
         let classification: Option<String> = row.get("classification_code");
         if is_draft {
             let fid = format!("lf-{line_id}");
@@ -1120,6 +1182,14 @@ async fn document_detail(
                 tax_opts.push_str(&format!(
                     r#"<option value="{tid}"{sel}>{}</option>"#,
                     esc(tname)
+                ));
+            }
+            let mut acc_opts = format!(r#"<option value="">{default_account_label}</option>"#);
+            for (aid, alabel) in &account_choices {
+                let sel = if account_id == Some(*aid) { " selected" } else { "" };
+                acc_opts.push_str(&format!(
+                    r#"<option value="{aid}"{sel}>{}</option>"#,
+                    esc(alabel)
                 ));
             }
             let class_cell = if customer_doc {
@@ -1135,7 +1205,8 @@ async fn document_detail(
 <td><input name="description" value="{description}" form="{fid}" required class="input input-bordered input-xs w-full"/></td>
 <td><input name="quantity" type="number" step="0.0001" min="0.0001" value="{qty}" form="{fid}" class="input input-bordered input-xs w-full text-right"/></td>
 <td><input name="unit_price" type="number" step="0.01" value="{price}" form="{fid}" class="input input-bordered input-xs w-full text-right"/></td>
-<td><select name="tax_id" form="{fid}" class="select select-bordered select-xs w-full">{tax_opts}</select></td>{class_cell}
+<td><select name="tax_id" form="{fid}" class="select select-bordered select-xs w-full">{tax_opts}</select></td>
+<td><select name="account_id" form="{fid}" class="select select-bordered select-xs w-full" title="GL account this line posts to">{acc_opts}</select></td>{class_cell}
 <td class="text-right font-mono">{subtotal}</td>
 <td class="whitespace-nowrap"><button form="{fid}" class="btn btn-primary btn-xs">Update</button>
 <form method="POST" action="/accounting/documents/{id}/lines/{line_id}/delete" style="display:inline">
@@ -1156,12 +1227,18 @@ async fn document_detail(
             };
             lines_html.push_str(&format!(
                 r#"<tr><td>{description}</td><td class="text-right font-mono">{qty}</td>
-<td class="text-right font-mono">{price}</td><td>{tax}</td>{class_cell}
+<td class="text-right font-mono">{price}</td><td>{tax}</td>
+<td class="text-xs opacity-70">{account}</td>{class_cell}
 <td class="text-right font-mono">{subtotal}</td><td></td></tr>"#,
                 description = esc(&description),
                 qty = quantity.normalize(),
                 price = money(unit_price),
                 tax = esc(tax_name.as_deref().unwrap_or("")),
+                account = if account_label.is_empty() {
+                    default_account_label.to_string()
+                } else {
+                    esc(&account_label)
+                },
                 class_cell = class_cell,
                 subtotal = money((quantity * unit_price).round_dp(2)),
             ));
@@ -1222,6 +1299,39 @@ async fn document_detail(
         } else {
             String::new()
         };
+        // Product picker (inventory soft-link) + GL override.
+        let products = product_choices(&db).await;
+        let product_field = if products.is_empty() {
+            String::new()
+        } else {
+            let opts: String = products
+                .iter()
+                .map(|(pid, label, cost)| {
+                    format!(
+                        r#"<option value="{pid}" data-cost="{cost}">{}</option>"#,
+                        esc(label)
+                    )
+                })
+                .collect();
+            format!(
+                r#"<div class="form-control col-span-3">
+<label class="label py-0"><span class="label-text-alt">Product (optional — fills description/price)</span></label>
+<select name="product_id" class="select select-bordered select-sm w-full"><option value=""></option>{opts}</select>
+</div>"#
+            )
+        };
+        let acc_field = {
+            let mut opts = format!(r#"<option value="">{default_account_label}</option>"#);
+            for (aid, alabel) in &account_choices {
+                opts.push_str(&format!(r#"<option value="{aid}">{}</option>"#, esc(alabel)));
+            }
+            format!(
+                r#"<div class="form-control col-span-3">
+<label class="label py-0"><span class="label-text-alt">GL Account</span></label>
+<select name="account_id" class="select select-bordered select-sm w-full">{opts}</select>
+</div>"#
+            )
+        };
         let desc_span = if customer_doc { "col-span-4" } else { "col-span-5" };
         let btn_span = if customer_doc { "col-span-12 md:col-span-12" } else { "col-span-2" };
         format!(
@@ -1245,6 +1355,8 @@ async fn document_detail(
 <select name="tax_id" class="select select-bordered select-sm">{taxes}</select>
 </div>
 {class_field}
+{product_field}
+{acc_field}
 <div class="{btn_span}">
 <button class="btn btn-primary btn-sm w-full md:w-auto">Add</button>
 </div>
@@ -1396,11 +1508,11 @@ onsubmit="return confirm('Reset to draft? You can edit and repost — the docume
     // Fixed column grid: description flexes, everything else is a
     // stable width, so rows never jiggle as content changes.
     let colgroup = if customer_doc {
-        r#"<colgroup><col/><col style="width:6rem"/><col style="width:9rem"/><col style="width:12rem"/><col style="width:6rem"/><col style="width:9rem"/><col style="width:3.5rem"/></colgroup>"#
+        r#"<colgroup><col/><col style="width:5rem"/><col style="width:7rem"/><col style="width:9rem"/><col style="width:11rem"/><col style="width:5.5rem"/><col style="width:7.5rem"/><col style="width:6rem"/></colgroup>"#
     } else {
-        r#"<colgroup><col/><col style="width:6rem"/><col style="width:9rem"/><col style="width:12rem"/><col style="width:9rem"/><col style="width:3.5rem"/></colgroup>"#
+        r#"<colgroup><col/><col style="width:5rem"/><col style="width:7rem"/><col style="width:9rem"/><col style="width:11rem"/><col style="width:7.5rem"/><col style="width:6rem"/></colgroup>"#
     };
-    let foot_span = if customer_doc { 5 } else { 4 };
+    let foot_span = if customer_doc { 6 } else { 5 };
 
     // Header: editable on drafts (customer, dates, reference —
     // Malaysian correction flow needs the customer changeable until
@@ -1478,7 +1590,7 @@ onsubmit="return confirm('Reset to draft? You can edit and repost — the docume
 <h3 class="font-semibold mb-2">Lines</h3>
 <div class="overflow-x-auto"><table class="table table-sm table-fixed w-full">
 {colgroup}
-<thead><tr><th>Description</th><th class="text-right">Qty</th><th class="text-right">Unit Price</th><th>Tax</th>{class_header}<th class="text-right">Subtotal</th><th></th></tr></thead>
+<thead><tr><th>Description</th><th class="text-right">Qty</th><th class="text-right">Unit Price</th><th>Tax</th><th>GL Account</th>{class_header}<th class="text-right">Subtotal</th><th></th></tr></thead>
 <tbody>{lines}</tbody>
 <tfoot>
 <tr><td colspan="{foot_span}" class="text-right">Untaxed</td><td class="text-right font-mono">{untaxed}</td><td></td></tr>
@@ -1527,16 +1639,54 @@ async fn add_doc_line(
         HashMap<String, String>,
     >,
 ) -> Response {
-    let Some(description) = opt_str(&form, "description") else {
-        return redirect(&format!("/accounting/documents/{id}"));
+    // Product (optional): seeds description and price when not given.
+    let product_id = form
+        .get("product_id")
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse::<Uuid>().ok());
+    let product: Option<(String, Decimal)> = match product_id {
+        Some(pid) => vortex_plugin_sdk::sqlx::query(
+            "SELECT name, cost FROM stock_product WHERE id = $1",
+        )
+        .bind(pid)
+        .fetch_optional(&db)
+        .await
+        .ok()
+        .flatten()
+        .map(|r| (r.get("name"), r.get("cost"))),
+        None => None,
+    };
+    let description = match opt_str(&form, "description") {
+        Some(d) => d.to_string(),
+        None => match &product {
+            Some((name, _)) => name.clone(),
+            None => {
+                return flash_redirect(
+                    &format!("/accounting/documents/{id}"),
+                    FlashKind::Error,
+                    "Enter a description or pick a product.",
+                )
+            }
+        },
     };
     let quantity = {
         let q = dec_or_zero(&form, "quantity");
         if q <= Decimal::ZERO { Decimal::ONE } else { q }
     };
-    let unit_price = dec_or_zero(&form, "unit_price");
+    let unit_price = {
+        let p = dec_or_zero(&form, "unit_price");
+        if p.is_zero() {
+            product.as_ref().map(|(_, cost)| *cost).unwrap_or(p)
+        } else {
+            p
+        }
+    };
     let tax_id = form
         .get("tax_id")
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse::<Uuid>().ok());
+    let account_id = form
+        .get("account_id")
         .filter(|s| !s.is_empty())
         .and_then(|s| s.parse::<Uuid>().ok());
     let classification = form
@@ -1548,18 +1698,20 @@ async fn add_doc_line(
     let result = vortex_plugin_sdk::sqlx::query(
         "INSERT INTO acc_invoice_line \
             (move_id, sequence, description, quantity, unit_price, tax_id, \
-             classification_code, company_id) \
-         SELECT $1, COALESCE(MAX(l.sequence), 0) + 10, $2, $3, $4, $5, $6, $7 \
+             classification_code, account_id, product_id, company_id) \
+         SELECT $1, COALESCE(MAX(l.sequence), 0) + 10, $2, $3, $4, $5, $6, $7, $8, $9 \
          FROM acc_move m LEFT JOIN acc_invoice_line l ON l.move_id = m.id \
          WHERE m.id = $1 AND m.state = 'draft' \
          GROUP BY m.id",
     )
     .bind(id)
-    .bind(description)
+    .bind(&description)
     .bind(quantity)
     .bind(unit_price)
     .bind(tax_id)
     .bind(classification)
+    .bind(account_id)
+    .bind(product_id)
     .bind(company_id)
     .execute(&db)
     .await;
@@ -1570,7 +1722,7 @@ async fn add_doc_line(
                 vec![vortex_plugin_sdk::serde_json::json!({
                     "field": "Line",
                     "from": "",
-                    "to": format!("{} ({} × {})", form.get("description").map(String::as_str).unwrap_or(""), quantity.normalize(), unit_price),
+                    "to": format!("{description} ({} × {})", quantity.normalize(), unit_price),
                 })],
             )
             .await;
@@ -1733,8 +1885,10 @@ async fn line_snapshot(
 ) -> Option<Vec<(&'static str, String)>> {
     let r = vortex_plugin_sdk::sqlx::query(
         "SELECT l.description, l.quantity::text AS q, l.unit_price::text AS p, \
-                COALESCE(t.name, '') AS tax, COALESCE(l.classification_code, '') AS class \
-         FROM acc_invoice_line l LEFT JOIN taxes t ON t.id = l.tax_id WHERE l.id = $1",
+                COALESCE(t.name, '') AS tax, COALESCE(l.classification_code, '') AS class, \
+                COALESCE(a.code || ' ' || a.name, '') AS account \
+         FROM acc_invoice_line l LEFT JOIN taxes t ON t.id = l.tax_id \
+         LEFT JOIN acc_account a ON a.id = l.account_id WHERE l.id = $1",
     )
     .bind(line_id)
     .fetch_optional(db)
@@ -1746,6 +1900,7 @@ async fn line_snapshot(
         ("Line Qty", r.get::<String, _>("q")),
         ("Line Unit Price", r.get::<String, _>("p")),
         ("Line Tax", r.get::<String, _>("tax")),
+        ("Line GL Account", r.get::<String, _>("account")),
         ("Line Classification", r.get::<String, _>("class")),
     ])
 }
@@ -1783,9 +1938,13 @@ async fn update_doc_line(
         .get("classification_code")
         .map(|s| s.trim())
         .filter(|s| !s.is_empty());
+    let account_id = form
+        .get("account_id")
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse::<Uuid>().ok());
     let result = vortex_plugin_sdk::sqlx::query(
         "UPDATE acc_invoice_line l SET description = $3, quantity = $4, unit_price = $5, \
-                tax_id = $6, classification_code = $7 \
+                tax_id = $6, classification_code = $7, account_id = $8 \
          FROM acc_move m \
          WHERE l.id = $1 AND l.move_id = $2 AND m.id = l.move_id AND m.state = 'draft'",
     )
@@ -1796,6 +1955,7 @@ async fn update_doc_line(
     .bind(unit_price)
     .bind(tax_id)
     .bind(classification)
+    .bind(account_id)
     .execute(&db)
     .await;
     match result {

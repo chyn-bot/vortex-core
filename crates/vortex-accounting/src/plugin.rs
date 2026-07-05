@@ -36,6 +36,8 @@ const MIG_012_BANK_MASTER: &str =
 const MIG_013_CLASSIFICATION_CODES: &str =
     include_str!("../migrations/013_classification_codes/postgres.sql");
 const MIG_014_UNPOST: &str = include_str!("../migrations/014_unpost/postgres.sql");
+const MIG_015_LINE_PRODUCT: &str =
+    include_str!("../migrations/015_line_product/postgres.sql");
 
 pub struct AccountingPlugin;
 
@@ -412,6 +414,12 @@ impl Plugin for AccountingPlugin {
             PluginMigration {
                 name: "014_unpost",
                 up_sql: MIG_014_UNPOST,
+                down_sql: None,
+                requires_core_migration: Some("119_commerce_primitives"),
+            },
+            PluginMigration {
+                name: "015_line_product",
+                up_sql: MIG_015_LINE_PRODUCT,
                 down_sql: None,
                 requires_core_migration: Some("119_commerce_primitives"),
             },
