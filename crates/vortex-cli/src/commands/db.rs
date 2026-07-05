@@ -23,6 +23,7 @@ fn build_migration_registry() -> PluginRegistry {
     registry.register(Arc::new(vortex_accounting::AccountingPlugin::new()));
     registry.register(Arc::new(vortex_inventory::InventoryPlugin::new()));
     registry.register(Arc::new(vortex_purchase::PurchasePlugin::new()));
+    registry.register(Arc::new(vortex_sales::SalesPlugin::new()));
     registry.register(Arc::new(vortex_maintenance::MaintenancePlugin::new()));
     registry.register(Arc::new(vortex_sesb_eam::SesbEamPlugin::new()));
     #[cfg(feature = "cr")]

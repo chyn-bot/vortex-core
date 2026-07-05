@@ -4371,6 +4371,7 @@ dependencies = [
  "vortex-orm",
  "vortex-policy",
  "vortex-purchase",
+ "vortex-sales",
  "vortex-security",
  "vortex-server",
  "vortex-sesb-eam",
@@ -4537,6 +4538,17 @@ dependencies = [
 name = "vortex-purchase"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
+ "vortex-accounting",
+ "vortex-inventory",
+ "vortex-plugin-sdk",
+]
+
+[[package]]
+name = "vortex-sales"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
  "vortex-accounting",
  "vortex-inventory",
  "vortex-plugin-sdk",

@@ -60,6 +60,10 @@ pub struct InvoiceLine {
     pub tax_id: Option<Uuid>,
     /// Income (customer docs) / expense (vendor docs) account override.
     pub account_id: Option<Uuid>,
+    /// LHDN e-invoice classification code for this line.
+    pub classification_code: Option<String>,
+    /// Soft link to the inventory product the line came from.
+    pub product_id: Option<Uuid>,
 }
 
 impl InvoiceLine {
@@ -70,6 +74,8 @@ impl InvoiceLine {
             unit_price,
             tax_id: None,
             account_id: None,
+            classification_code: None,
+            product_id: None,
         }
     }
 
@@ -80,6 +86,16 @@ impl InvoiceLine {
 
     pub fn with_account(mut self, account_id: Uuid) -> Self {
         self.account_id = Some(account_id);
+        self
+    }
+
+    pub fn with_classification(mut self, code: impl Into<String>) -> Self {
+        self.classification_code = Some(code.into());
+        self
+    }
+
+    pub fn with_product(mut self, product_id: Uuid) -> Self {
+        self.product_id = Some(product_id);
         self
     }
 }
@@ -175,7 +191,9 @@ async fn load_tax(db: &PgPool, tax_id: Uuid) -> VortexResult<Option<Tax>> {
 }
 
 /// Per-line and total amounts for a document: `(untaxed, tax, total)`.
-async fn compute_document_totals(
+/// Public so order modules (sales/purchase) total their lines with the
+/// exact same tax math their invoices will post with.
+pub async fn compute_document_totals(
     db: &PgPool,
     lines: &[(Decimal, Decimal, Option<Uuid>)], // (quantity, unit_price, tax_id)
 ) -> VortexResult<(Decimal, Decimal, Decimal)> {
@@ -281,8 +299,9 @@ pub async fn create_invoice(
     for (i, line) in inv.lines.iter().enumerate() {
         vortex_plugin_sdk::sqlx::query(
             "INSERT INTO acc_invoice_line \
-                (move_id, sequence, description, quantity, unit_price, tax_id, account_id, company_id) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                (move_id, sequence, description, quantity, unit_price, tax_id, account_id, \
+                 classification_code, product_id, company_id) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
         )
         .bind(move_id)
         .bind(((i + 1) * 10) as i32)
@@ -291,6 +310,8 @@ pub async fn create_invoice(
         .bind(line.unit_price)
         .bind(line.tax_id)
         .bind(line.account_id)
+        .bind(line.classification_code.as_deref())
+        .bind(line.product_id)
         .bind(inv.company_id)
         .execute(&mut *tx)
         .await

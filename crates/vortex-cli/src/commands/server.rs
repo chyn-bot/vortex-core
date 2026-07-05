@@ -1836,6 +1836,10 @@ pub async fn run(host: String, port: u16, _workers: Option<usize>) -> Result<()>
     // Purchasing — registered AFTER inventory so its migrations (which FK
     // into stock_product / stock_location) apply once those tables exist.
     plugin_registry.register(Arc::new(vortex_purchase::PurchasePlugin::new()));
+    // Sales — the outbound mirror of purchasing: deliveries post stock
+    // moves OUT via vortex_inventory::post_move and the invoice bridge
+    // creates accounting customer invoices, so it registers after both.
+    plugin_registry.register(Arc::new(vortex_sales::SalesPlugin::new()));
     // Maintenance / CMMS — registered after inventory (its migrations FK
     // into stock_product / stock_location and it consumes parts via
     // vortex_inventory::post_move).

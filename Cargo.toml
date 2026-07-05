@@ -17,6 +17,7 @@ members = [
     "crates/vortex-accounting",
     "crates/vortex-inventory",
     "crates/vortex-purchase",
+    "crates/vortex-sales",
     "crates/vortex-maintenance",
     "crates/vortex-sesb-eam",
     "crates/vortex-plugin-sdk",
@@ -124,6 +125,7 @@ vortex-contacts = { path = "crates/vortex-contacts" }
 vortex-accounting = { path = "crates/vortex-accounting" }
 vortex-inventory = { path = "crates/vortex-inventory" }
 vortex-purchase = { path = "crates/vortex-purchase" }
+vortex-sales = { path = "crates/vortex-sales" }
 vortex-maintenance = { path = "crates/vortex-maintenance" }
 vortex-sesb-eam = { path = "crates/vortex-sesb-eam" }
 vortex-plugin-sdk = { path = "crates/vortex-plugin-sdk" }

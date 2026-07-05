@@ -1,0 +1,18 @@
+[package]
+name = "vortex-sales"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Sales plugin — customers → sales orders → deliveries out of inventory, bridged to accounting invoices"
+
+# Composes three primitives: deliveries call vortex_inventory::post_move
+# (goods out), the invoice bridge calls vortex_accounting::documents,
+# and lines default from the product master (descriptions, price, tax,
+# GL, LHDN classification). Nothing reinvented.
+
+[dependencies]
+vortex-plugin-sdk = { workspace = true }
+vortex-inventory = { workspace = true }
+vortex-accounting = { workspace = true }
+base64 = { workspace = true }

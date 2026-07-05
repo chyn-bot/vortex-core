@@ -33,6 +33,7 @@ vortex-accounting = { workspace = true }
 # Purchasing plugin — composes the inventory primitive (receipts post
 # stock moves). Always enabled.
 vortex-purchase = { workspace = true }
+vortex-sales = { workspace = true }
 # Maintenance / CMMS plugin — generic assets, work orders and plans;
 # composes inventory (part consumption) + scheduler. Always enabled.
 vortex-maintenance = { workspace = true }
