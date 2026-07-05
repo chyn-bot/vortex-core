@@ -15,6 +15,7 @@ pub fn currency_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/accounting/currency-rates", get(rates_page))
         .route("/accounting/currency-rates", post(add_rate))
+        .route("/accounting/currency-rates/sync-bnm", post(sync_bnm))
         .route("/accounting/revaluation", get(revaluation_page))
         .route("/accounting/revaluation", post(run_revaluation))
 }
@@ -76,6 +77,10 @@ async fn rates_page(
 <input name="rate_date" type="date" class="input input-bordered input-sm"/></label>
 <button class="btn btn-primary btn-sm">Add Rate</button>
 </form>
+<form method="post" action="/accounting/currency-rates/sync-bnm" class="mt-2">
+<button class="btn btn-sm btn-outline">Fetch BNM rates now</button>
+<span class="text-xs opacity-60 ml-2">Bank Negara Malaysia KL interbank middle rates — also synced automatically twice daily for active currencies.</span>
+</form>
 <p class="text-xs opacity-60 mt-2">Enter the commerce convention: currency units per 1 MYR
 (e.g. USD 0.2127 when 1 USD = RM 4.70). The MYR-per-unit column shows the accounting view.</p>
 </div></div>
@@ -130,6 +135,36 @@ async fn add_rate(
     }
     audit_fx(&state, &user, &db_ctx, "rate_added", json!({"code": code, "rate": rate.to_string(), "date": date})).await;
     Redirect::to("/accounting/currency-rates").into_response()
+}
+
+
+/// Manual BNM pull — same code path as the twice-daily scheduler.
+async fn sync_bnm(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+) -> Response {
+    match crate::bnm::sync_rates(&db).await {
+        Ok(n) if n > 0 => {
+            audit_fx(&state, &user, &db_ctx, "bnm_synced", json!({"currencies": n})).await;
+            flash_redirect(
+                "/accounting/currency-rates",
+                FlashKind::Success,
+                &format!("BNM rates fetched — {n} currencies updated."),
+            )
+        }
+        Ok(_) => flash_redirect(
+            "/accounting/currency-rates",
+            FlashKind::Info,
+            "BNM reached, but no active currencies matched — activate currencies (e.g. USD, SGD) to receive rates.",
+        ),
+        Err(e) => flash_redirect(
+            "/accounting/currency-rates",
+            FlashKind::Error,
+            &format!("BNM sync failed — {e}"),
+        ),
+    }
 }
 
 async fn revaluation_page(

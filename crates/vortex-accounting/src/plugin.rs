@@ -449,6 +449,15 @@ impl Plugin for AccountingPlugin {
             ),
             ScheduledAction::new(
                 ScheduledActionDef {
+                    code: "accounting.fx.bnm_rates",
+                    name: "Accounting: sync BNM exchange rates",
+                    schedule: Schedule::Every(Duration::from_secs(12 * 60 * 60)),
+                    enabled_by_default: true,
+                },
+                |state| async move { crate::bnm::run_bnm_sync(&state).await },
+            ),
+            ScheduledAction::new(
+                ScheduledActionDef {
                     code: "accounting.recurring.generate",
                     name: "Accounting: generate due recurring entries",
                     schedule: Schedule::Every(Duration::from_secs(24 * 60 * 60)),
