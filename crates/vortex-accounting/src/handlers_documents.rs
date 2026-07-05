@@ -651,8 +651,15 @@ async fn product_choices(
     } else {
         ("purchase_description", "purchase_tax_id", "expense_account_id")
     };
+    // AR prices from list_price (cost while unset); AP from cost.
+    let price_expr = if customer_doc {
+        "CASE WHEN list_price > 0 THEN list_price ELSE cost END"
+    } else {
+        "cost"
+    };
     vortex_plugin_sdk::sqlx::query(&format!(
-        "SELECT id, code, name, COALESCE(NULLIF({desc_col}, ''), name) AS side_desc, cost, \
+        "SELECT id, code, name, COALESCE(NULLIF({desc_col}, ''), name) AS side_desc, \
+                {price_expr} AS side_price, \
                 {tax_col} AS tax_id, {acc_col} AS account_id, classification_code \
          FROM stock_product WHERE active ORDER BY code LIMIT 1000"
     ))
@@ -664,7 +671,7 @@ async fn product_choices(
         id: r.get("id"),
         label: format!("{} · {}", r.get::<String, _>("code"), r.get::<String, _>("name")),
         description: r.get("side_desc"),
-        cost: r.get("cost"),
+        cost: r.get("side_price"),
         tax_id: r.try_get("tax_id").ok().flatten(),
         account_id: r.try_get("account_id").ok().flatten(),
         classification: r.try_get("classification_code").ok().flatten(),
@@ -1703,11 +1710,16 @@ async fn add_doc_line(
     } else {
         ("purchase_description", "purchase_tax_id", "expense_account_id")
     };
+    let side_price = if customer_side {
+        "CASE WHEN list_price > 0 THEN list_price ELSE cost END"
+    } else {
+        "cost"
+    };
     // (description, cost, default tax, default account, default class)
     let product: Option<(String, Decimal, Option<Uuid>, Option<Uuid>, Option<String>)> =
         match product_id {
             Some(pid) => vortex_plugin_sdk::sqlx::query(&format!(
-                "SELECT COALESCE(NULLIF({side_col}, ''), name) AS name, cost, \
+                "SELECT COALESCE(NULLIF({side_col}, ''), name) AS name, {side_price} AS cost, \
                         {side_tax} AS tax_id, {side_acc} AS account_id, classification_code \
                  FROM stock_product WHERE id = $1"
             ))

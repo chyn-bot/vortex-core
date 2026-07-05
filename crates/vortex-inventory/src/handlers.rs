@@ -703,6 +703,10 @@ async fn new_product_form(
 <input name="cost" type="number" step="0.0001" class="input input-bordered input-sm" value="0"/>
 </div>
 <div class="form-control mb-3">
+<label class="label"><span class="label-text">Sale Price</span></label>
+<input name="list_price" type="number" step="0.01" class="input input-bordered input-sm" value="0" placeholder="0 = use cost"/>
+</div>
+<div class="form-control mb-3">
 <label class="label"><span class="label-text">Reorder Min</span></label>
 <input name="reorder_min" type="number" step="0.0001" class="input input-bordered input-sm" value="0"/>
 </div>
@@ -776,8 +780,9 @@ async fn create_product(
          (id, code, name, barcode, description, category_id, product_type, uom_id, \
           tracking, cost, reorder_min, reorder_max, sales_description, \
           purchase_description, classification_code, income_account_id, \
-          expense_account_id, sales_tax_id, purchase_tax_id, company_id, created_by) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)",
+          expense_account_id, sales_tax_id, purchase_tax_id, list_price, \
+          company_id, created_by) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)",
     )
     .bind(product_id)
     .bind(&code)
@@ -798,6 +803,7 @@ async fn create_product(
     .bind(opt_uuid(&form, "expense_account_id"))
     .bind(opt_uuid(&form, "sales_tax_id"))
     .bind(opt_uuid(&form, "purchase_tax_id"))
+    .bind(dec(&form, "list_price"))
     .bind(company_id)
     .bind(user.id)
     .execute(&db)
@@ -850,7 +856,7 @@ async fn edit_product(
     let sidebar = render_sidebar(&state, &user, &db_ctx);
 
     let row = match vortex_plugin_sdk::sqlx::query(
-        "SELECT id, code, name, barcode, description, sales_description, purchase_description, classification_code, income_account_id, expense_account_id, sales_tax_id, purchase_tax_id, category_id, product_type, \
+        "SELECT id, code, name, barcode, description, sales_description, purchase_description, classification_code, income_account_id, expense_account_id, sales_tax_id, purchase_tax_id, list_price, category_id, product_type, \
          uom_id, tracking, cost, reorder_min, reorder_max, active \
          FROM stock_product WHERE id = $1",
     )
@@ -1037,6 +1043,10 @@ async fn edit_product(
 <input name="cost" type="number" step="0.0001" class="input input-bordered input-sm" value="{cost_val}"/>
 </div>
 <div class="form-control mb-3">
+<label class="label"><span class="label-text">Sale Price</span></label>
+<input name="list_price" type="number" step="0.01" class="input input-bordered input-sm" value="{list_price_val}" placeholder="0 = use cost"/>
+</div>
+<div class="form-control mb-3">
 <label class="label"><span class="label-text">Reorder Min</span></label>
 <input name="reorder_min" type="number" step="0.0001" class="input input-bordered input-sm" value="{rmin_val}"/>
 </div>
@@ -1083,6 +1093,7 @@ async fn edit_product(
         name_val = esc(&name),
         barcode_val = esc(barcode.as_deref().unwrap_or("")),
         desc_val = esc(description.as_deref().unwrap_or("")),
+        list_price_val = row.try_get::<vortex_plugin_sdk::rust_decimal::Decimal, _>("list_price").unwrap_or_default().round_dp(2),
         sales_desc_val = esc(row.try_get::<Option<String>, _>("sales_description").ok().flatten().as_deref().unwrap_or("")),
         purchase_desc_val = esc(row.try_get::<Option<String>, _>("purchase_description").ok().flatten().as_deref().unwrap_or("")),
         categories = categories,
@@ -1129,8 +1140,8 @@ async fn update_product(
          sales_description = $12, purchase_description = $13, \
          classification_code = $14, income_account_id = $15, \
          expense_account_id = $16, sales_tax_id = $17, purchase_tax_id = $18, \
-         updated_by = $19, updated_at = NOW() \
-         WHERE id = $20",
+         list_price = $19, updated_by = $20, updated_at = NOW() \
+         WHERE id = $21",
     )
     .bind(&name)
     .bind(form.get("barcode").filter(|s| !s.is_empty()))
@@ -1150,6 +1161,7 @@ async fn update_product(
     .bind(opt_uuid(&form, "expense_account_id"))
     .bind(opt_uuid(&form, "sales_tax_id"))
     .bind(opt_uuid(&form, "purchase_tax_id"))
+    .bind(dec(&form, "list_price"))
     .bind(user.id)
     .bind(id)
     .execute(&db)

@@ -16,6 +16,8 @@ const MIG_005_TRADE_DESC: &str =
     include_str!("../migrations/005_trade_descriptions/postgres.sql");
 const MIG_006_PRODUCT_DEFAULTS: &str =
     include_str!("../migrations/006_product_defaults/postgres.sql");
+const MIG_007_LIST_PRICE: &str =
+    include_str!("../migrations/007_list_price/postgres.sql");
 
 pub struct InventoryPlugin;
 
@@ -170,6 +172,12 @@ impl Plugin for InventoryPlugin {
             PluginMigration {
                 name: "006_product_defaults",
                 up_sql: MIG_006_PRODUCT_DEFAULTS,
+                down_sql: None,
+                requires_core_migration: Some("119_commerce_primitives"),
+            },
+            PluginMigration {
+                name: "007_list_price",
+                up_sql: MIG_007_LIST_PRICE,
                 down_sql: None,
                 requires_core_migration: Some("119_commerce_primitives"),
             },
