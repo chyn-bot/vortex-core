@@ -73,9 +73,14 @@ pub async fn einvoice_widget(db: &vortex_plugin_sdk::sqlx::PgPool, move_id: Uuid
         .unwrap_or_default();
     let err_html = err
         .map(|e| {
+            let msg = e
+                .get("message")
+                .and_then(|m| m.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| e.to_string());
             format!(
-                r#"<div class="text-error text-xs mt-1 max-w-xl truncate" title="{t}">{t}</div>"#,
-                t = esc(&e.to_string())
+                r#"<div class="text-error text-xs mt-1 max-w-xl" title="{t}">⚠ {t}</div>"#,
+                t = esc(&msg)
             )
         })
         .unwrap_or_default();

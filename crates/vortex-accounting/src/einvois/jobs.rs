@@ -81,7 +81,25 @@ async fn submit_job(ctx: JobContext) -> Result<(), String> {
         return Ok(());
     }
     let api = client_from(&settings)?;
-    flow::submit_via_api(&ctx.state, &db, &db_name, move_id, &api).await?;
+    if let Err(e) = flow::submit_via_api(&ctx.state, &db, &db_name, move_id, &api).await {
+        // Surface the rejection on the invoice — a failure only
+        // visible in the job queue reads as "nothing happened".
+        let _ = vortex_plugin_sdk::sqlx::query(
+            "UPDATE acc_einvoice SET error_json = $2 WHERE move_id = $1",
+        )
+        .bind(move_id)
+        .bind(json!({ "message": e, "at": vortex_plugin_sdk::chrono::Utc::now() }))
+        .execute(&db)
+        .await;
+        return Err(e);
+    }
+    // Submission accepted — clear any stale error from prior attempts.
+    let _ = vortex_plugin_sdk::sqlx::query(
+        "UPDATE acc_einvoice SET error_json = NULL WHERE move_id = $1",
+    )
+    .bind(move_id)
+    .execute(&db)
+    .await;
 
     // Schedule the first poll shortly after submission.
     vortex_plugin_sdk::framework::jobs::enqueue(
