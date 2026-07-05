@@ -288,6 +288,137 @@ pub(crate) async fn adjust_quant(
 // Products
 // ─────────────────────────────────────────────────────────────────────────
 
+
+/// "Document Defaults" card shared by the product forms — soft links
+/// into the accounting plugin's chart/catalogues (queries fail
+/// gracefully to empty pickers when accounting is absent) plus core
+/// taxes. `sel_*` = current values on the edit form.
+#[allow(clippy::too_many_arguments)]
+async fn doc_defaults_card(
+    db: &vortex_plugin_sdk::sqlx::PgPool,
+    sel_class: Option<&str>,
+    sel_income: Option<Uuid>,
+    sel_expense: Option<Uuid>,
+    sel_sales_tax: Option<Uuid>,
+    sel_purchase_tax: Option<Uuid>,
+) -> String {
+    let esc = vortex_plugin_sdk::framework::html_escape;
+    let account_opts = |rows: &[(Uuid, String)], sel: Option<Uuid>| {
+        let mut out = String::from("<option value=\"\">— company default —</option>");
+        for (id, label) in rows {
+            let s = if sel == Some(*id) { " selected" } else { "" };
+            out.push_str(&format!("<option value=\"{id}\"{s}>{}</option>", esc(label)));
+        }
+        out
+    };
+    let fetch_accounts = |types: &'static str| {
+        let db = db.clone();
+        async move {
+            vortex_plugin_sdk::sqlx::query(&format!(
+                "SELECT id, code, name FROM acc_account WHERE active AND account_type IN {types} ORDER BY code"
+            ))
+            .fetch_all(&db)
+            .await
+            .unwrap_or_default()
+            .iter()
+            .map(|r| {
+                (
+                    r.get::<Uuid, _>("id"),
+                    format!("{} {}", r.get::<String, _>("code"), r.get::<String, _>("name")),
+                )
+            })
+            .collect::<Vec<_>>()
+        }
+    };
+    let income = fetch_accounts("('income', 'income_other')").await;
+    let expense = fetch_accounts(
+        "('expense', 'expense_direct_cost', 'expense_depreciation', 'asset_fixed', 'asset_current', 'asset_non_current')",
+    )
+    .await;
+    let tax_opts = |use_kind: &str, sel: Option<Uuid>| {
+        let db = db.clone();
+        let use_kind = use_kind.to_string();
+        async move {
+            let rows = vortex_plugin_sdk::sqlx::query(
+                "SELECT id, name FROM taxes WHERE active AND type_tax_use IN ($1, 'none') ORDER BY name",
+            )
+            .bind(&use_kind)
+            .fetch_all(&db)
+            .await
+            .unwrap_or_default();
+            let mut out = String::from("<option value=\"\">— none —</option>");
+            for r in &rows {
+                let id: Uuid = r.get("id");
+                let s = if sel == Some(id) { " selected" } else { "" };
+                out.push_str(&format!(
+                    "<option value=\"{id}\"{s}>{}</option>",
+                    vortex_plugin_sdk::framework::html_escape(&r.get::<String, _>("name"))
+                ));
+            }
+            out
+        }
+    };
+    let sales_tax = tax_opts("sale", sel_sales_tax).await;
+    let purchase_tax = tax_opts("purchase", sel_purchase_tax).await;
+    // LHDN classification catalogue (accounting plugin) — datalist.
+    let class_opts: String = vortex_plugin_sdk::sqlx::query(
+        "SELECT code, description FROM acc_lhdn_code WHERE code_type = 'classification' AND active ORDER BY code",
+    )
+    .fetch_all(db)
+    .await
+    .unwrap_or_default()
+    .iter()
+    .map(|r| {
+        format!(
+            "<option value=\"{}\">{}</option>",
+            esc(&r.get::<String, _>("code")),
+            esc(&r.get::<String, _>("description")),
+        )
+    })
+    .collect();
+    let gl_block = if income.is_empty() && expense.is_empty() {
+        String::new()
+    } else {
+        format!(
+            r#"<div class="grid grid-cols-2 gap-3">
+<div class="form-control mb-3">
+<label class="label"><span class="label-text">Income GL Account (sales)</span></label>
+<select name="income_account_id" class="select select-bordered select-sm">{}</select>
+</div>
+<div class="form-control mb-3">
+<label class="label"><span class="label-text">Expense GL Account (purchases)</span></label>
+<select name="expense_account_id" class="select select-bordered select-sm">{}</select>
+</div>
+</div>"#,
+            account_opts(&income, sel_income),
+            account_opts(&expense, sel_expense),
+        )
+    };
+    format!(
+        r#"<div class="card bg-base-100 shadow"><div class="card-body">
+<h2 class="card-title text-lg mb-4">Document Defaults</h2>
+<p class="text-xs opacity-60 mb-2">Applied automatically when this product is picked on an invoice, bill or order line.</p>
+{gl_block}
+<div class="grid grid-cols-2 gap-3">
+<div class="form-control mb-3">
+<label class="label"><span class="label-text">Sales Tax</span></label>
+<select name="sales_tax_id" class="select select-bordered select-sm">{sales_tax}</select>
+</div>
+<div class="form-control mb-3">
+<label class="label"><span class="label-text">Purchase Tax</span></label>
+<select name="purchase_tax_id" class="select select-bordered select-sm">{purchase_tax}</select>
+</div>
+</div>
+<div class="form-control mb-3">
+<label class="label"><span class="label-text">LHDN e-Invoice Classification</span></label>
+<input name="classification_code" value="{class_val}" list="dl-prod-class" placeholder="e.g. 022" class="input input-bordered input-sm font-mono"/>
+<datalist id="dl-prod-class">{class_opts}</datalist>
+</div>
+</div></div>"#,
+        class_val = esc(sel_class.unwrap_or("")),
+    )
+}
+
 async fn list_products(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
@@ -526,6 +657,7 @@ async fn new_product_form(
     let sidebar = render_sidebar(&state, &user, &db_ctx);
     let categories = category_options(&db, None).await;
     let uoms = uom_options(&db, None).await;
+    let doc_defaults = doc_defaults_card(&db, None, None, None, None, None).await;
 
     let content = format!(
         r#"<div class="max-w-2xl">
@@ -597,11 +729,12 @@ async fn new_product_form(
 <textarea name="purchase_description" class="textarea textarea-bordered" rows="2" placeholder="Line text on POs and vendor bills — empty uses the product name"></textarea>
 </div>
 </div>
-<div class="flex gap-2">
+</div></div>
+{doc_defaults}
+<div class="flex gap-2 mt-4">
 <button type="submit" class="btn btn-primary btn-sm">Create</button>
 <a href="/inventory" class="btn btn-ghost btn-sm">Cancel</a>
 </div>
-</div></div>
 </form>
 </div>"#,
         categories = categories,
@@ -642,8 +775,9 @@ async fn create_product(
         "INSERT INTO stock_product \
          (id, code, name, barcode, description, category_id, product_type, uom_id, \
           tracking, cost, reorder_min, reorder_max, sales_description, \
-          purchase_description, company_id, created_by) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)",
+          purchase_description, classification_code, income_account_id, \
+          expense_account_id, sales_tax_id, purchase_tax_id, company_id, created_by) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)",
     )
     .bind(product_id)
     .bind(&code)
@@ -659,6 +793,11 @@ async fn create_product(
     .bind(dec(&form, "reorder_max"))
     .bind(form.get("sales_description").filter(|s| !s.is_empty()))
     .bind(form.get("purchase_description").filter(|s| !s.is_empty()))
+    .bind(form.get("classification_code").map(|s| s.trim()).filter(|s| !s.is_empty()))
+    .bind(opt_uuid(&form, "income_account_id"))
+    .bind(opt_uuid(&form, "expense_account_id"))
+    .bind(opt_uuid(&form, "sales_tax_id"))
+    .bind(opt_uuid(&form, "purchase_tax_id"))
     .bind(company_id)
     .bind(user.id)
     .execute(&db)
@@ -711,7 +850,7 @@ async fn edit_product(
     let sidebar = render_sidebar(&state, &user, &db_ctx);
 
     let row = match vortex_plugin_sdk::sqlx::query(
-        "SELECT id, code, name, barcode, description, sales_description, purchase_description, category_id, product_type, \
+        "SELECT id, code, name, barcode, description, sales_description, purchase_description, classification_code, income_account_id, expense_account_id, sales_tax_id, purchase_tax_id, category_id, product_type, \
          uom_id, tracking, cost, reorder_min, reorder_max, active \
          FROM stock_product WHERE id = $1",
     )
@@ -732,6 +871,15 @@ async fn edit_product(
     let barcode: Option<String> = row.try_get("barcode").ok();
     let description: Option<String> = row.try_get("description").ok();
     let category_id: Option<Uuid> = row.try_get("category_id").ok();
+    let doc_defaults = doc_defaults_card(
+        &db,
+        row.try_get::<Option<String>, _>("classification_code").ok().flatten().as_deref(),
+        row.try_get::<Option<Uuid>, _>("income_account_id").ok().flatten(),
+        row.try_get::<Option<Uuid>, _>("expense_account_id").ok().flatten(),
+        row.try_get::<Option<Uuid>, _>("sales_tax_id").ok().flatten(),
+        row.try_get::<Option<Uuid>, _>("purchase_tax_id").ok().flatten(),
+    )
+    .await;
     let product_type: String = row.get("product_type");
     let uom_id: Option<Uuid> = row.try_get("uom_id").ok();
     let tracking: String = row.get("tracking");
@@ -923,6 +1071,7 @@ async fn edit_product(
 </div>
 </div>
 
+<div class="mt-6">{doc_defaults}</div>
 <div class="mt-6 flex gap-2">
 <button type="submit" class="btn btn-primary btn-sm">Save</button>
 <a href="/inventory" class="btn btn-ghost btn-sm">Cancel</a>
@@ -978,8 +1127,10 @@ async fn update_product(
          product_type = $5, uom_id = $6, tracking = $7, \
          cost = $8, reorder_min = $9, reorder_max = $10, active = $11, \
          sales_description = $12, purchase_description = $13, \
-         updated_by = $14, updated_at = NOW() \
-         WHERE id = $15",
+         classification_code = $14, income_account_id = $15, \
+         expense_account_id = $16, sales_tax_id = $17, purchase_tax_id = $18, \
+         updated_by = $19, updated_at = NOW() \
+         WHERE id = $20",
     )
     .bind(&name)
     .bind(form.get("barcode").filter(|s| !s.is_empty()))
@@ -994,6 +1145,11 @@ async fn update_product(
     .bind(form.contains_key("active"))
     .bind(form.get("sales_description").filter(|s| !s.is_empty()))
     .bind(form.get("purchase_description").filter(|s| !s.is_empty()))
+    .bind(form.get("classification_code").map(|s| s.trim()).filter(|s| !s.is_empty()))
+    .bind(opt_uuid(&form, "income_account_id"))
+    .bind(opt_uuid(&form, "expense_account_id"))
+    .bind(opt_uuid(&form, "sales_tax_id"))
+    .bind(opt_uuid(&form, "purchase_tax_id"))
     .bind(user.id)
     .bind(id)
     .execute(&db)

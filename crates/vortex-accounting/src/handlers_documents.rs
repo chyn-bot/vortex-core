@@ -630,29 +630,44 @@ async fn line_account_choices(
 
 /// Products from the inventory plugin, if installed — a SOFT link:
 /// the query failing (table absent) simply means no picker renders.
-/// `(id, "code · name", side_description, cost)` — the description is
-/// the sales or purchase text depending on the document side, falling
-/// back to the product name.
+/// A product option for the line picker, carrying every default the
+/// side needs: description text, cost, tax, GL account, classification.
+struct ProductChoice {
+    id: Uuid,
+    label: String,
+    description: String,
+    cost: Decimal,
+    tax_id: Option<Uuid>,
+    account_id: Option<Uuid>,
+    classification: Option<String>,
+}
+
 async fn product_choices(
     db: &vortex_plugin_sdk::sqlx::PgPool,
     customer_doc: bool,
-) -> Vec<(Uuid, String, String, Decimal)> {
-    let side_col = if customer_doc { "sales_description" } else { "purchase_description" };
+) -> Vec<ProductChoice> {
+    let (desc_col, tax_col, acc_col) = if customer_doc {
+        ("sales_description", "sales_tax_id", "income_account_id")
+    } else {
+        ("purchase_description", "purchase_tax_id", "expense_account_id")
+    };
     vortex_plugin_sdk::sqlx::query(&format!(
-        "SELECT id, code, name, COALESCE(NULLIF({side_col}, ''), name) AS side_desc, cost \
+        "SELECT id, code, name, COALESCE(NULLIF({desc_col}, ''), name) AS side_desc, cost, \
+                {tax_col} AS tax_id, {acc_col} AS account_id, classification_code \
          FROM stock_product WHERE active ORDER BY code LIMIT 1000"
     ))
     .fetch_all(db)
     .await
     .unwrap_or_default()
     .iter()
-    .map(|r| {
-        (
-            r.get::<Uuid, _>("id"),
-            format!("{} · {}", r.get::<String, _>("code"), r.get::<String, _>("name")),
-            r.get::<String, _>("side_desc"),
-            r.get::<Decimal, _>("cost"),
-        )
+    .map(|r| ProductChoice {
+        id: r.get("id"),
+        label: format!("{} · {}", r.get::<String, _>("code"), r.get::<String, _>("name")),
+        description: r.get("side_desc"),
+        cost: r.get("cost"),
+        tax_id: r.try_get("tax_id").ok().flatten(),
+        account_id: r.try_get("account_id").ok().flatten(),
+        classification: r.try_get("classification_code").ok().flatten(),
     })
     .collect()
 }
@@ -1313,18 +1328,27 @@ async fn document_detail(
         } else {
             let opts: String = products
                 .iter()
-                .map(|(pid, label, side_desc, cost)| {
+                .map(|pc| {
                     // data-fill drives the client-side autofill; the
                     // server seeds the same values when JS is off.
-                    let fill = vortex_plugin_sdk::serde_json::json!({
-                        "description": side_desc,
-                        "unit_price": cost.round_dp(2).to_string(),
-                    })
-                    .to_string();
+                    let mut fill = vortex_plugin_sdk::serde_json::json!({
+                        "description": pc.description,
+                        "unit_price": pc.cost.round_dp(2).to_string(),
+                    });
+                    if let Some(t) = pc.tax_id {
+                        fill["tax_id"] = vortex_plugin_sdk::serde_json::json!(t.to_string());
+                    }
+                    if let Some(a) = pc.account_id {
+                        fill["account_id"] = vortex_plugin_sdk::serde_json::json!(a.to_string());
+                    }
+                    if let Some(c) = &pc.classification {
+                        fill["classification_code"] = vortex_plugin_sdk::serde_json::json!(c);
+                    }
                     format!(
-                        r#"<option value="{pid}" data-fill="{}">{}</option>"#,
-                        esc(&fill),
-                        esc(label)
+                        r#"<option value="{}" data-fill="{}">{}</option>"#,
+                        pc.id,
+                        esc(&fill.to_string()),
+                        esc(&pc.label)
                     )
                 })
                 .collect();
@@ -1674,24 +1698,39 @@ async fn add_doc_line(
     .ok()
     .flatten()
     .unwrap_or(true);
-    let side_col = if customer_side { "sales_description" } else { "purchase_description" };
-    let product: Option<(String, Decimal)> = match product_id {
-        Some(pid) => vortex_plugin_sdk::sqlx::query(&format!(
-            "SELECT COALESCE(NULLIF({side_col}, ''), name) AS name, cost \
-             FROM stock_product WHERE id = $1"
-        ))
-        .bind(pid)
-        .fetch_optional(&db)
-        .await
-        .ok()
-        .flatten()
-        .map(|r| (r.get("name"), r.get("cost"))),
-        None => None,
+    let (side_col, side_tax, side_acc) = if customer_side {
+        ("sales_description", "sales_tax_id", "income_account_id")
+    } else {
+        ("purchase_description", "purchase_tax_id", "expense_account_id")
     };
+    // (description, cost, default tax, default account, default class)
+    let product: Option<(String, Decimal, Option<Uuid>, Option<Uuid>, Option<String>)> =
+        match product_id {
+            Some(pid) => vortex_plugin_sdk::sqlx::query(&format!(
+                "SELECT COALESCE(NULLIF({side_col}, ''), name) AS name, cost, \
+                        {side_tax} AS tax_id, {side_acc} AS account_id, classification_code \
+                 FROM stock_product WHERE id = $1"
+            ))
+            .bind(pid)
+            .fetch_optional(&db)
+            .await
+            .ok()
+            .flatten()
+            .map(|r| {
+                (
+                    r.get("name"),
+                    r.get("cost"),
+                    r.try_get("tax_id").ok().flatten(),
+                    r.try_get("account_id").ok().flatten(),
+                    r.try_get("classification_code").ok().flatten(),
+                )
+            }),
+            None => None,
+        };
     let description = match opt_str(&form, "description") {
         Some(d) => d.to_string(),
         None => match &product {
-            Some((name, _)) => name.clone(),
+            Some((name, ..)) => name.clone(),
             None => {
                 return flash_redirect(
                     &format!("/accounting/documents/{id}"),
@@ -1708,7 +1747,7 @@ async fn add_doc_line(
     let unit_price = {
         let p = dec_or_zero(&form, "unit_price");
         if p.is_zero() {
-            product.as_ref().map(|(_, cost)| *cost).unwrap_or(p)
+            product.as_ref().map(|(_, cost, ..)| *cost).unwrap_or(p)
         } else {
             p
         }
@@ -1716,15 +1755,18 @@ async fn add_doc_line(
     let tax_id = form
         .get("tax_id")
         .filter(|s| !s.is_empty())
-        .and_then(|s| s.parse::<Uuid>().ok());
+        .and_then(|s| s.parse::<Uuid>().ok())
+        .or_else(|| product.as_ref().and_then(|(_, _, t, _, _)| *t));
     let account_id = form
         .get("account_id")
         .filter(|s| !s.is_empty())
-        .and_then(|s| s.parse::<Uuid>().ok());
-    let classification = form
+        .and_then(|s| s.parse::<Uuid>().ok())
+        .or_else(|| product.as_ref().and_then(|(_, _, _, a, _)| *a));
+    let classification: Option<String> = form
         .get("classification_code")
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty());
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| product.as_ref().and_then(|(_, _, _, _, c)| c.clone()));
     let company_id = default_company(&db).await;
 
     let result = vortex_plugin_sdk::sqlx::query(
