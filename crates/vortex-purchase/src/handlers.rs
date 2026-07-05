@@ -1181,7 +1181,7 @@ async fn create_vendor_bill(
         .unwrap_or_else(|_| vortex_plugin_sdk::chrono::Utc::now().date_naive());
 
     let line_rows = vortex_plugin_sdk::sqlx::query(
-        "SELECT COALESCE(NULLIF(l.description, ''), p.name) AS name, \
+        "SELECT COALESCE(NULLIF(l.description, ''), NULLIF(p.purchase_description, ''), p.name) AS name, \
                 l.quantity, l.unit_price, l.tax_percent \
          FROM purchase_order_line l JOIN stock_product p ON p.id = l.product_id \
          WHERE l.order_id = $1 ORDER BY l.sequence",

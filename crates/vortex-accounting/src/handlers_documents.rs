@@ -630,12 +630,18 @@ async fn line_account_choices(
 
 /// Products from the inventory plugin, if installed — a SOFT link:
 /// the query failing (table absent) simply means no picker renders.
+/// `(id, "code · name", side_description, cost)` — the description is
+/// the sales or purchase text depending on the document side, falling
+/// back to the product name.
 async fn product_choices(
     db: &vortex_plugin_sdk::sqlx::PgPool,
-) -> Vec<(Uuid, String, Decimal)> {
-    vortex_plugin_sdk::sqlx::query(
-        "SELECT id, code, name, cost FROM stock_product WHERE active ORDER BY code LIMIT 1000",
-    )
+    customer_doc: bool,
+) -> Vec<(Uuid, String, String, Decimal)> {
+    let side_col = if customer_doc { "sales_description" } else { "purchase_description" };
+    vortex_plugin_sdk::sqlx::query(&format!(
+        "SELECT id, code, name, COALESCE(NULLIF({side_col}, ''), name) AS side_desc, cost \
+         FROM stock_product WHERE active ORDER BY code LIMIT 1000"
+    ))
     .fetch_all(db)
     .await
     .unwrap_or_default()
@@ -644,6 +650,7 @@ async fn product_choices(
         (
             r.get::<Uuid, _>("id"),
             format!("{} · {}", r.get::<String, _>("code"), r.get::<String, _>("name")),
+            r.get::<String, _>("side_desc"),
             r.get::<Decimal, _>("cost"),
         )
     })
@@ -1300,18 +1307,17 @@ async fn document_detail(
             String::new()
         };
         // Product picker (inventory soft-link) + GL override.
-        let products = product_choices(&db).await;
+        let products = product_choices(&db, customer_doc).await;
         let product_field = if products.is_empty() {
             String::new()
         } else {
             let opts: String = products
                 .iter()
-                .map(|(pid, label, cost)| {
+                .map(|(pid, label, side_desc, cost)| {
                     // data-fill drives the client-side autofill; the
                     // server seeds the same values when JS is off.
-                    let name_only = label.split(" · ").nth(1).unwrap_or(label);
                     let fill = vortex_plugin_sdk::serde_json::json!({
-                        "description": name_only,
+                        "description": side_desc,
                         "unit_price": cost.round_dp(2).to_string(),
                     })
                     .to_string();
@@ -1659,10 +1665,21 @@ async fn add_doc_line(
         .get("product_id")
         .filter(|s| !s.is_empty())
         .and_then(|s| s.parse::<Uuid>().ok());
+    let customer_side: bool = vortex_plugin_sdk::sqlx::query_scalar(
+        "SELECT move_type LIKE 'customer%' FROM acc_move WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&db)
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or(true);
+    let side_col = if customer_side { "sales_description" } else { "purchase_description" };
     let product: Option<(String, Decimal)> = match product_id {
-        Some(pid) => vortex_plugin_sdk::sqlx::query(
-            "SELECT name, cost FROM stock_product WHERE id = $1",
-        )
+        Some(pid) => vortex_plugin_sdk::sqlx::query(&format!(
+            "SELECT COALESCE(NULLIF({side_col}, ''), name) AS name, cost \
+             FROM stock_product WHERE id = $1"
+        ))
         .bind(pid)
         .fetch_optional(&db)
         .await

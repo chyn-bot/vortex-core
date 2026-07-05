@@ -587,6 +587,16 @@ async fn new_product_form(
 <label class="label"><span class="label-text">Description</span></label>
 <textarea name="description" class="textarea textarea-bordered" rows="2"></textarea>
 </div>
+<div class="grid grid-cols-2 gap-3">
+<div class="form-control mb-3">
+<label class="label"><span class="label-text">Sales Description</span></label>
+<textarea name="sales_description" class="textarea textarea-bordered" rows="2" placeholder="Line text on customer invoices — empty uses the product name"></textarea>
+</div>
+<div class="form-control mb-3">
+<label class="label"><span class="label-text">Purchase Description</span></label>
+<textarea name="purchase_description" class="textarea textarea-bordered" rows="2" placeholder="Line text on POs and vendor bills — empty uses the product name"></textarea>
+</div>
+</div>
 <div class="flex gap-2">
 <button type="submit" class="btn btn-primary btn-sm">Create</button>
 <a href="/inventory" class="btn btn-ghost btn-sm">Cancel</a>
@@ -631,8 +641,9 @@ async fn create_product(
     if let Err(e) = vortex_plugin_sdk::sqlx::query(
         "INSERT INTO stock_product \
          (id, code, name, barcode, description, category_id, product_type, uom_id, \
-          tracking, cost, reorder_min, reorder_max, company_id, created_by) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",
+          tracking, cost, reorder_min, reorder_max, sales_description, \
+          purchase_description, company_id, created_by) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)",
     )
     .bind(product_id)
     .bind(&code)
@@ -646,6 +657,8 @@ async fn create_product(
     .bind(dec(&form, "cost"))
     .bind(dec(&form, "reorder_min"))
     .bind(dec(&form, "reorder_max"))
+    .bind(form.get("sales_description").filter(|s| !s.is_empty()))
+    .bind(form.get("purchase_description").filter(|s| !s.is_empty()))
     .bind(company_id)
     .bind(user.id)
     .execute(&db)
@@ -698,7 +711,7 @@ async fn edit_product(
     let sidebar = render_sidebar(&state, &user, &db_ctx);
 
     let row = match vortex_plugin_sdk::sqlx::query(
-        "SELECT id, code, name, barcode, description, category_id, product_type, \
+        "SELECT id, code, name, barcode, description, sales_description, purchase_description, category_id, product_type, \
          uom_id, tracking, cost, reorder_min, reorder_max, active \
          FROM stock_product WHERE id = $1",
     )
@@ -888,6 +901,16 @@ async fn edit_product(
 <label class="label"><span class="label-text">Description</span></label>
 <textarea name="description" class="textarea textarea-bordered" rows="2">{desc_val}</textarea>
 </div>
+<div class="grid grid-cols-2 gap-3">
+<div class="form-control mb-3">
+<label class="label"><span class="label-text">Sales Description</span></label>
+<textarea name="sales_description" class="textarea textarea-bordered" rows="2" placeholder="Line text on customer invoices — empty uses the product name">{sales_desc_val}</textarea>
+</div>
+<div class="form-control mb-3">
+<label class="label"><span class="label-text">Purchase Description</span></label>
+<textarea name="purchase_description" class="textarea textarea-bordered" rows="2" placeholder="Line text on POs and vendor bills — empty uses the product name">{purchase_desc_val}</textarea>
+</div>
+</div>
 </div></div>
 
 <div class="card bg-base-100 shadow"><div class="card-body">
@@ -911,6 +934,8 @@ async fn edit_product(
         name_val = esc(&name),
         barcode_val = esc(barcode.as_deref().unwrap_or("")),
         desc_val = esc(description.as_deref().unwrap_or("")),
+        sales_desc_val = esc(row.try_get::<Option<String>, _>("sales_description").ok().flatten().as_deref().unwrap_or("")),
+        purchase_desc_val = esc(row.try_get::<Option<String>, _>("purchase_description").ok().flatten().as_deref().unwrap_or("")),
         categories = categories,
         uoms = uoms,
         cost_val = cost,
@@ -952,8 +977,9 @@ async fn update_product(
          name = $1, barcode = $2, description = $3, category_id = $4, \
          product_type = $5, uom_id = $6, tracking = $7, \
          cost = $8, reorder_min = $9, reorder_max = $10, active = $11, \
-         updated_by = $12, updated_at = NOW() \
-         WHERE id = $13",
+         sales_description = $12, purchase_description = $13, \
+         updated_by = $14, updated_at = NOW() \
+         WHERE id = $15",
     )
     .bind(&name)
     .bind(form.get("barcode").filter(|s| !s.is_empty()))
@@ -966,6 +992,8 @@ async fn update_product(
     .bind(dec(&form, "reorder_min"))
     .bind(dec(&form, "reorder_max"))
     .bind(form.contains_key("active"))
+    .bind(form.get("sales_description").filter(|s| !s.is_empty()))
+    .bind(form.get("purchase_description").filter(|s| !s.is_empty()))
     .bind(user.id)
     .bind(id)
     .execute(&db)
