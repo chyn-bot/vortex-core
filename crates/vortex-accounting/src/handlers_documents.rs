@@ -135,14 +135,31 @@ async fn document_list(
         "/accounting/documents/new?kind=vendor_bill"
     };
 
-    let config = ListConfig::new(title, "acc_move")
-        .custom_from("acc_move m JOIN contacts p ON p.id = m.partner_id")
-        .custom_select(
+    // Customer side also shows the LHDN e-invoice status inline —
+    // every invoice's compliance state is visible on the register
+    // itself (the e-Invoice Queue page is only the operational
+    // monitor for the same data).
+    let (from, select) = if customer_side {
+        (
+            "acc_move m JOIN contacts p ON p.id = m.partner_id \
+             LEFT JOIN acc_einvoice e ON e.move_id = m.id",
+            "m.id, COALESCE(m.number, '/') AS number, p.name AS partner_name, \
+             m.invoice_date::text AS invoice_date, m.due_date::text AS due_date, \
+             m.total_amount::text AS total_amount, m.amount_residual::text AS amount_residual, \
+             m.state, m.payment_state, COALESCE(e.status, '') AS lhdn",
+        )
+    } else {
+        (
+            "acc_move m JOIN contacts p ON p.id = m.partner_id",
             "m.id, COALESCE(m.number, '/') AS number, p.name AS partner_name, \
              m.invoice_date::text AS invoice_date, m.due_date::text AS due_date, \
              m.total_amount::text AS total_amount, m.amount_residual::text AS amount_residual, \
              m.state, m.payment_state",
         )
+    };
+    let mut config = ListConfig::new(title, "acc_move")
+        .custom_from(from)
+        .custom_select(select)
         .base_filter(type_filter)
         .column(ListColumn::new("number", "Number").sortable().code().sql_expr("m.number"))
         .column(ListColumn::new("partner_name", "Partner").sortable().searchable().sql_expr("p.name"))
@@ -183,6 +200,28 @@ async fn document_list(
         )
         .default_sort("invoice_date")
         .group_by_options(&[("partner_name", "Partner"), ("payment_state", "Payment")]);
+    if customer_side {
+        config = config.column(
+            ListColumn::new("lhdn", "LHDN")
+                .filterable(&[
+                    ("ready", "Ready"),
+                    ("exported", "Exported"),
+                    ("submitted", "Submitted"),
+                    ("valid", "Valid"),
+                    ("invalid", "Invalid"),
+                    ("cancelled", "Cancelled"),
+                ])
+                .badge(&[
+                    ("ready", "Ready", "badge-ghost"),
+                    ("exported", "Exported", "badge-info"),
+                    ("submitted", "Submitted", "badge-info"),
+                    ("valid", "Valid", "badge-success"),
+                    ("invalid", "Invalid", "badge-error"),
+                    ("cancelled", "Cancelled", "badge-warning"),
+                ])
+                .sql_expr("COALESCE(e.status, '')"),
+        );
+    }
 
     let params = ListParams::from_query(&query);
     let result = match execute_list(&db, &config, &params).await {

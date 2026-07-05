@@ -146,8 +146,9 @@ async fn queue_page(
         })
         .collect();
     let content = format!(
-        r##"<div class="flex justify-between items-center mb-4">
-        <h1 class="text-2xl font-bold">e-Invoices</h1>
+        r##"<div class="flex justify-between items-start mb-4 gap-4">
+        <div><h1 class="text-2xl font-bold">e-Invoice Queue (LHDN)</h1>
+        <p class="text-sm opacity-60 mt-1 max-w-2xl">Submission monitor for MyInvois — every customer invoice lands here when posted. Submit or cancel from the invoice itself; this page is for watching statuses and retrying failures.</p></div>
         <div class="flex gap-2">
         <form method="post" action="/accounting/einvoice/sync-codes" class="inline"><button class="btn btn-sm btn-ghost">Sync LHDN codes</button></form>
         <a href="/accounting/einvoice/settings" class="btn btn-sm btn-outline">Settings</a></div></div>
@@ -158,7 +159,7 @@ async fn queue_page(
         <tbody>{trs}</tbody></table></div></div>"##,
     );
     let sidebar = render_sidebar(&state, &user, &db_ctx);
-    Html(page_shell(&sidebar, "e-Invoices", &content)).into_response()
+    Html(page_shell(&sidebar, "e-Invoice Queue", &content)).into_response()
 }
 
 fn settings_form() -> FormConfig {

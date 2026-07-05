@@ -120,7 +120,7 @@ impl Plugin for AccountingPlugin {
             .under("accounting.ar"),
             MenuEntry::new(
                 "accounting.ar.einvoice",
-                "e-Invoices (MyInvois)",
+                "e-Invoice Queue (LHDN)",
                 "/accounting/einvoice",
                 MenuGroup::Operations,
             )
