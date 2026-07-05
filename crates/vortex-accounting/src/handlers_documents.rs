@@ -33,6 +33,7 @@ pub fn document_routes() -> Router<Arc<AppState>> {
         .route("/accounting/documents/{id}/pay", post(pay_document))
         .route("/accounting/documents/{id}/print", get(print_document))
         .route("/accounting/documents/{id}/email", post(email_document))
+        .route("/accounting/documents/{id}/cancel", post(cancel_document_action))
         .route("/accounting/payments", get(list_payments))
 }
 
@@ -148,6 +149,34 @@ async fn print_document(
         };
     }
     Html(rendered.html).into_response()
+}
+
+/// Cancel a posted document — posts a full reversal and marks the
+/// document reversed. The ledger keeps both entries (posted moves are
+/// immutable by design); this is the audit-honest "cancel".
+async fn cancel_document_action(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<Uuid>,
+) -> Response {
+    let back = format!("/accounting/documents/{id}");
+    let today = vortex_plugin_sdk::chrono::Utc::now().date_naive();
+    match documents::cancel_document(&db, &state.pool, user.id, id, today).await {
+        Ok(reversal) => {
+            audit_move(&state, &db_ctx, &db, user.id, &user.username, id, "cancelled_via_reversal")
+                .await;
+            flash_redirect(
+                &back,
+                FlashKind::Success,
+                &format!(
+                    "Cancelled — a reversal entry was posted and reconciled against this document. (Reversal: {reversal})"
+                ),
+            )
+        }
+        Err(e) => flash_redirect(&back, FlashKind::Error, &format!("Not cancelled — {e}")),
+    }
 }
 
 /// A rendered print page plus the bits reuse needs (PDF filename,
@@ -1144,6 +1173,13 @@ async fn document_detail(
 </form>"#,
             residual = money(residual),
         ));
+        if payment_state == "not_paid" {
+            actions.push_str(&format!(
+                r#"<form method="POST" action="/accounting/documents/{id}/cancel" class="inline"
+onsubmit="return confirm('Cancel this document? A reversal entry will be posted against it — the original stays on the ledger, marked reversed. This cannot be undone.')">
+<button class="btn btn-error btn-outline btn-sm">Cancel (Reverse)</button></form>"#
+            ));
+        }
     }
 
     // Related payments (via reconciliation)

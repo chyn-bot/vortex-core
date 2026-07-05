@@ -1071,3 +1071,122 @@ pub async fn register_payment(
 
     Ok(payment_id)
 }
+
+/// Cancel a posted document the ledger-honest way: post a full
+/// reversal, reconcile it against the original so nothing stays open,
+/// and mark the document `reversed`. The original entry remains on the
+/// ledger untouched (posted entries are immutable by design — this IS
+/// the cancellation, with a complete audit trail).
+///
+/// Guards: only posted documents with no payments allocated; documents
+/// already submitted to / validated by LHDN must be cancelled with
+/// LHDN first (the e-invoice actions), then reversed here.
+pub async fn cancel_document(
+    db: &PgPool,
+    seq_pool: &ConnectionPool,
+    user_id: Uuid,
+    move_id: Uuid,
+    date: NaiveDate,
+) -> VortexResult<Uuid> {
+    let head = vortex_plugin_sdk::sqlx::query(
+        "SELECT state, move_type, payment_state, total_amount FROM acc_move WHERE id = $1",
+    )
+    .bind(move_id)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| VortexError::QueryExecution(e.to_string()))?
+    .ok_or_else(|| VortexError::ValidationFailed("document not found".into()))?;
+    let state: String = head.get("state");
+    let move_type: String = head.get("move_type");
+    let payment_state: String = head.get("payment_state");
+    if state != "posted" {
+        return Err(VortexError::ValidationFailed(
+            "only posted documents can be cancelled — drafts can simply be deleted".into(),
+        ));
+    }
+    if !is_document(&move_type) {
+        return Err(VortexError::ValidationFailed(
+            "not a document — reverse plain entries from the journal entry page".into(),
+        ));
+    }
+    if payment_state == "reversed" {
+        return Err(VortexError::ValidationFailed("already cancelled".into()));
+    }
+    if payment_state != "not_paid" {
+        return Err(VortexError::ValidationFailed(
+            "payments are allocated against this document — remove/refund them first, or issue a credit note instead"
+                .into(),
+        ));
+    }
+    // LHDN state gate: a submitted/validated e-invoice must be
+    // cancelled with LHDN (72h window) before the books reverse it.
+    let einv_status: Option<String> = vortex_plugin_sdk::sqlx::query_scalar(
+        "SELECT status FROM acc_einvoice WHERE move_id = $1",
+    )
+    .bind(move_id)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| VortexError::QueryExecution(e.to_string()))?;
+    match einv_status.as_deref() {
+        Some("submitted") | Some("valid") => {
+            return Err(VortexError::ValidationFailed(
+                "this invoice is with LHDN — cancel the e-invoice first (within 72 hours), then cancel here"
+                    .into(),
+            ));
+        }
+        Some(_) => {
+            // ready / exported / invalid: withdraw it locally.
+            let _ = vortex_plugin_sdk::sqlx::query(
+                "UPDATE acc_einvoice SET status = 'cancelled' WHERE move_id = $1",
+            )
+            .bind(move_id)
+            .execute(db)
+            .await;
+        }
+        None => {}
+    }
+
+    // The original's open counterpart line, then the reversal.
+    let (orig_line, open, orig_is_debit) = open_counterpart_line(db, move_id)
+        .await?
+        .ok_or_else(|| VortexError::ValidationFailed("no counterpart line on document".into()))?;
+    let reversal_id = crate::service::reverse_move(db, seq_pool, move_id, date, user_id).await?;
+    // Reconcile original ↔ reversal so neither shows as open AR/AP.
+    let rev_line: Uuid = vortex_plugin_sdk::sqlx::query_scalar(
+        "SELECT r.id FROM acc_move_line r \
+         JOIN acc_move_line o ON o.id = $2 AND o.account_id = r.account_id \
+         WHERE r.move_id = $1 LIMIT 1",
+    )
+    .bind(reversal_id)
+    .bind(orig_line)
+    .fetch_one(db)
+    .await
+    .map_err(|e| VortexError::QueryExecution(e.to_string()))?;
+    let (debit_line, credit_line) = if orig_is_debit {
+        (orig_line, rev_line)
+    } else {
+        (rev_line, orig_line)
+    };
+    vortex_plugin_sdk::sqlx::query(
+        "INSERT INTO acc_partial_reconcile (debit_line_id, credit_line_id, amount, created_by) \
+         VALUES ($1, $2, $3, $4)",
+    )
+    .bind(debit_line)
+    .bind(credit_line)
+    .bind(open)
+    .bind(user_id)
+    .execute(db)
+    .await
+    .map_err(|e| VortexError::QueryExecution(e.to_string()))?;
+    // Terminal state: reversed, nothing outstanding.
+    vortex_plugin_sdk::sqlx::query(
+        "UPDATE acc_move SET payment_state = 'reversed', amount_residual = 0, \
+                amount_residual_currency = CASE WHEN currency_rate IS NULL THEN NULL ELSE 0 END \
+         WHERE id = $1",
+    )
+    .bind(move_id)
+    .execute(db)
+    .await
+    .map_err(|e| VortexError::QueryExecution(e.to_string()))?;
+    Ok(reversal_id)
+}
