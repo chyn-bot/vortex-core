@@ -317,12 +317,18 @@ pub(crate) async fn render_print_html(
         })
         .unwrap_or_default();
     // Company logo (uploaded in Accounting Settings, FileStore-backed).
-    // Content-hashed URL: a new upload always shows immediately.
+    // Embedded as a data URI: the page is fully self-contained, so the
+    // headless PDF renderer (no session, no origin) and browser print
+    // both show it — and caching can never hide a new upload.
     let logo_html = match app_state.files.get(db_name, "company/logo").await {
-        Ok(Some(data)) => format!(
-            r#"<img src="/accounting/company-logo?v={}" alt="" style="max-height:64px;max-width:220px;margin-bottom:6px"/>"#,
-            &crate::einvois::sha256_hex(&data)[..12],
-        ),
+        Ok(Some(data)) => {
+            use base64::Engine;
+            let ct = if data.starts_with(&[0xFF, 0xD8, 0xFF]) { "image/jpeg" } else { "image/png" };
+            format!(
+                r#"<img src="data:{ct};base64,{}" alt="" style="max-height:64px;max-width:220px;margin-bottom:6px"/>"#,
+                base64::engine::general_purpose::STANDARD.encode(&data),
+            )
+        }
         _ => String::new(),
     };
     let draft_mark = if state != "posted" {
