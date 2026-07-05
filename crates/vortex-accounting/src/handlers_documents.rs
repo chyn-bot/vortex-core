@@ -29,6 +29,10 @@ pub fn document_routes() -> Router<Arc<AppState>> {
             "/accounting/documents/{id}/lines/{line_id}/delete",
             post(delete_doc_line),
         )
+        .route(
+            "/accounting/documents/{id}/lines/{line_id}/update",
+            post(update_doc_line),
+        )
         .route("/accounting/documents/{id}/post", post(post_document))
         .route("/accounting/documents/{id}/pay", post(pay_document))
         .route("/accounting/documents/{id}/print", get(print_document))
@@ -1056,7 +1060,7 @@ async fn document_detail(
     let customer_doc = use_kind == "sale";
     let line_rows = vortex_plugin_sdk::sqlx::query(
         "SELECT l.id, l.description, l.quantity, l.unit_price, l.classification_code, \
-                t.name AS tax_name \
+                l.tax_id, t.name AS tax_name \
          FROM acc_invoice_line l LEFT JOIN taxes t ON t.id = l.tax_id \
          WHERE l.move_id = $1 ORDER BY l.sequence",
     )
@@ -1065,42 +1069,115 @@ async fn document_detail(
     .await
     .unwrap_or_default();
 
+    // For DRAFT documents every line is editable in place — inputs
+    // join a per-row <form> (rendered before the table; form="")
+    // posting to the line-update endpoint. Posted documents render
+    // read-only text.
+    let taxes_for_rows: Vec<(Uuid, String)> = if is_draft {
+        vortex_plugin_sdk::sqlx::query(
+            "SELECT id, name FROM taxes WHERE active AND type_tax_use IN ($1, 'none') ORDER BY name",
+        )
+        .bind(use_kind)
+        .fetch_all(&db)
+        .await
+        .unwrap_or_default()
+        .iter()
+        .map(|r| (r.get("id"), r.get("name")))
+        .collect()
+    } else {
+        Vec::new()
+    };
     let mut lines_html = String::new();
+    let mut line_forms = String::new();
     for row in &line_rows {
         let line_id: Uuid = row.get("id");
         let description: String = row.get("description");
         let quantity: Decimal = row.get("quantity");
         let unit_price: Decimal = row.get("unit_price");
         let tax_name: Option<String> = row.get("tax_name");
-        let class_cell = if customer_doc {
-            format!(
-                "<td><span class=\"badge badge-ghost badge-sm\" title=\"LHDN classification\">{}</span></td>",
-                esc(row.get::<Option<String>, _>("classification_code").as_deref().unwrap_or("022")),
-            )
+        let tax_id: Option<Uuid> = row.get("tax_id");
+        let classification: Option<String> = row.get("classification_code");
+        if is_draft {
+            let fid = format!("lf-{line_id}");
+            line_forms.push_str(&format!(
+                r#"<form id="{fid}" method="POST" action="/accounting/documents/{id}/lines/{line_id}/update"></form>"#
+            ));
+            let mut tax_opts = String::from(r#"<option value="">— no tax —</option>"#);
+            for (tid, tname) in &taxes_for_rows {
+                let sel = if tax_id == Some(*tid) { " selected" } else { "" };
+                tax_opts.push_str(&format!(
+                    r#"<option value="{tid}"{sel}>{}</option>"#,
+                    esc(tname)
+                ));
+            }
+            let class_cell = if customer_doc {
+                format!(
+                    r#"<td><input name="classification_code" value="{}" list="dl-line-class" form="{fid}" class="input input-bordered input-xs w-full font-mono"/></td>"#,
+                    esc(classification.as_deref().unwrap_or("022")),
+                )
+            } else {
+                String::new()
+            };
+            lines_html.push_str(&format!(
+                r#"<tr>
+<td><input name="description" value="{description}" form="{fid}" required class="input input-bordered input-xs w-full"/></td>
+<td><input name="quantity" type="number" step="0.0001" min="0.0001" value="{qty}" form="{fid}" class="input input-bordered input-xs w-full text-right"/></td>
+<td><input name="unit_price" type="number" step="0.01" value="{price}" form="{fid}" class="input input-bordered input-xs w-full text-right"/></td>
+<td><select name="tax_id" form="{fid}" class="select select-bordered select-xs w-full">{tax_opts}</select></td>{class_cell}
+<td class="text-right font-mono">{subtotal}</td>
+<td class="whitespace-nowrap"><button form="{fid}" class="btn btn-primary btn-xs">Update</button>
+<form method="POST" action="/accounting/documents/{id}/lines/{line_id}/delete" style="display:inline">
+<button class="btn btn-ghost btn-xs text-error" onclick="return confirm('Remove this line?')">✕</button></form></td></tr>"#,
+                description = esc(&description),
+                qty = quantity.normalize(),
+                price = unit_price.round_dp(2),
+                subtotal = money((quantity * unit_price).round_dp(2)),
+            ));
         } else {
-            String::new()
-        };
-        let delete_btn = if is_draft {
-            format!(
-                r#"<form method="POST" action="/accounting/documents/{id}/lines/{line_id}/delete" style="display:inline">
-<button class="btn btn-ghost btn-xs text-error" onclick="return confirm('Remove this line?')">✕</button></form>"#
-            )
-        } else {
-            String::new()
-        };
-        lines_html.push_str(&format!(
-            r#"<tr><td>{description}</td><td class="text-right font-mono">{qty}</td>
+            let class_cell = if customer_doc {
+                format!(
+                    "<td><span class=\"badge badge-ghost badge-sm\" title=\"LHDN classification\">{}</span></td>",
+                    esc(classification.as_deref().unwrap_or("022")),
+                )
+            } else {
+                String::new()
+            };
+            lines_html.push_str(&format!(
+                r#"<tr><td>{description}</td><td class="text-right font-mono">{qty}</td>
 <td class="text-right font-mono">{price}</td><td>{tax}</td>{class_cell}
-<td class="text-right font-mono">{subtotal}</td><td>{delete_btn}</td></tr>"#,
-            description = esc(&description),
-            qty = quantity.normalize(),
-            price = money(unit_price),
-            tax = esc(tax_name.as_deref().unwrap_or("")),
-            class_cell = class_cell,
-            subtotal = money((quantity * unit_price).round_dp(2)),
-            delete_btn = delete_btn,
-        ));
+<td class="text-right font-mono">{subtotal}</td><td></td></tr>"#,
+                description = esc(&description),
+                qty = quantity.normalize(),
+                price = money(unit_price),
+                tax = esc(tax_name.as_deref().unwrap_or("")),
+                class_cell = class_cell,
+                subtotal = money((quantity * unit_price).round_dp(2)),
+            ));
+        }
     }
+    // Shared datalist for per-row classification inputs.
+    if is_draft && customer_doc {
+        let opts: String = vortex_plugin_sdk::sqlx::query(
+            "SELECT code, description FROM acc_lhdn_code \
+             WHERE code_type = 'classification' AND active ORDER BY code",
+        )
+        .fetch_all(&db)
+        .await
+        .unwrap_or_default()
+        .iter()
+        .map(|r| {
+            format!(
+                "<option value=\"{}\">{}</option>",
+                esc(&r.get::<String, _>("code")),
+                esc(&r.get::<String, _>("description")),
+            )
+        })
+        .collect();
+        line_forms.push_str(&format!(r#"<datalist id="dl-line-class">{opts}</datalist>"#));
+    }
+    // (line_forms is emitted after the table — <form> elements are not
+    // valid inside <tbody>; the form="" attribute association works
+    // regardless of placement.)
 
     let add_line_form = if is_draft {
         let taxes = tax_options(&db, use_kind).await;
@@ -1165,6 +1242,8 @@ async fn document_detail(
     } else {
         String::new()
     };
+    // Per-row edit forms + shared datalist live outside the table.
+    let add_line_form = format!("{line_forms}{add_line_form}");
 
     // Actions
     let mut actions = String::new();
@@ -1445,6 +1524,73 @@ async fn delete_doc_line(
     }
     let _ = documents::refresh_document_totals(&db, id).await;
     redirect(&format!("/accounting/documents/{id}"))
+}
+
+/// Edit a line in place (draft documents only — the state guard is in
+/// the SQL, same as delete).
+async fn update_doc_line(
+    State(_state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(_user): Extension<AuthUser>,
+    Path((id, line_id)): Path<(Uuid, Uuid)>,
+    vortex_plugin_sdk::axum::extract::Form(form): vortex_plugin_sdk::axum::extract::Form<
+        HashMap<String, String>,
+    >,
+) -> Response {
+    let Some(description) = opt_str(&form, "description") else {
+        return flash_redirect(
+            &format!("/accounting/documents/{id}"),
+            FlashKind::Error,
+            "Description cannot be empty.",
+        );
+    };
+    let quantity = {
+        let q = dec_or_zero(&form, "quantity");
+        if q <= Decimal::ZERO { Decimal::ONE } else { q }
+    };
+    let unit_price = dec_or_zero(&form, "unit_price");
+    let tax_id = form
+        .get("tax_id")
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse::<Uuid>().ok());
+    let classification = form
+        .get("classification_code")
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty());
+    let result = vortex_plugin_sdk::sqlx::query(
+        "UPDATE acc_invoice_line l SET description = $3, quantity = $4, unit_price = $5, \
+                tax_id = $6, classification_code = $7 \
+         FROM acc_move m \
+         WHERE l.id = $1 AND l.move_id = $2 AND m.id = l.move_id AND m.state = 'draft'",
+    )
+    .bind(line_id)
+    .bind(id)
+    .bind(description)
+    .bind(quantity)
+    .bind(unit_price)
+    .bind(tax_id)
+    .bind(classification)
+    .execute(&db)
+    .await;
+    match result {
+        Ok(r) if r.rows_affected() == 1 => {
+            let _ = documents::refresh_document_totals(&db, id).await;
+            redirect(&format!("/accounting/documents/{id}"))
+        }
+        Ok(_) => flash_redirect(
+            &format!("/accounting/documents/{id}"),
+            FlashKind::Error,
+            "Line not updated — only draft documents can be edited.",
+        ),
+        Err(e) => {
+            error!(error = %e, "document line update failed");
+            flash_redirect(
+                &format!("/accounting/documents/{id}"),
+                FlashKind::Error,
+                "Line update failed.",
+            )
+        }
+    }
 }
 
 async fn post_document(
