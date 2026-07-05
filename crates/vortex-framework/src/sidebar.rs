@@ -140,7 +140,7 @@ pub fn build_sidebar(
         }
     }
 
-    format!(r##"<aside id="sidebar" class="w-64 bg-base-100 shadow-lg min-h-screen flex flex-col fixed lg:static top-0 left-0 z-40 h-full -translate-x-full lg:translate-x-0 transition-transform duration-200">
+    format!(r##"<aside id="sidebar" class="w-64 bg-base-100 shadow-lg flex flex-col fixed top-0 left-0 z-40 h-full -translate-x-full transition-transform duration-200 lg:translate-x-0 lg:sticky lg:top-0 lg:h-screen lg:self-start overflow-y-auto">
 <div class="p-4 border-b border-base-300"><a href="/home" class="text-xl font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a></div>
 <nav class="flex-1 p-4 overflow-y-auto"><ul class="menu menu-sm gap-1">{}</ul></nav>
 <div class="p-4 border-t border-base-300"><div class="flex items-center gap-3">

@@ -152,6 +152,9 @@ pub async fn render_form(
                 html_escape(title)
             ));
         }
+        // Fields lay out on a responsive two-column grid; long inputs
+        // (textareas) span the full row.
+        body.push_str(r#"<div class="grid grid-cols-1 md:grid-cols-2 gap-x-8">"#);
         for field in &section.fields {
             let value = values
                 .get(&field.name)
@@ -177,8 +180,14 @@ pub async fn render_form(
                 format!(r#"<span class="label-text-alt opacity-60">{}</span>"#, html_escape(h))
             });
             let star = if field.required { " *" } else { "" };
+            let span = if matches!(field.kind, FieldKind::TextArea) {
+                " md:col-span-2"
+            } else {
+                ""
+            };
             body.push_str(&format!(
-                r#"<label class="form-control mb-3"><div class="label"><span class="label-text">{label}{star}</span>{help}</div>{widget}<div class="label">{error}</div></label>"#,
+                r#"<label class="form-control mb-3{span}"><div class="label"><span class="label-text">{label}{star}</span>{help}</div>{widget}<div class="label">{error}</div></label>"#,
+                span = span,
                 label = html_escape(&field.label),
                 star = star,
                 help = help.unwrap_or_default(),
@@ -186,10 +195,11 @@ pub async fn render_form(
                 error = error.unwrap_or_default(),
             ));
         }
+        body.push_str("</div>");
     }
 
     format!(
-        r##"<div class="max-w-2xl"><h1 class="text-2xl font-bold mb-6">{heading}</h1>{top_errors}
+        r##"<div class="max-w-5xl"><h1 class="text-2xl font-bold mb-6">{heading}</h1>{top_errors}
 <form method="post" action="{action}" class="card bg-base-100 shadow"><div class="card-body">
 {body}
 <div class="card-actions justify-end mt-2">
