@@ -252,6 +252,13 @@ impl Plugin for AccountingPlugin {
             )
             .under("accounting.config"),
             MenuEntry::new(
+                "accounting.config.lhdn_codes",
+                "LHDN Catalogues",
+                "/accounting/lhdn-codes",
+                MenuGroup::Operations,
+            )
+            .under("accounting.config"),
+            MenuEntry::new(
                 "accounting.config.banks",
                 "Banks",
                 "/accounting/banks",

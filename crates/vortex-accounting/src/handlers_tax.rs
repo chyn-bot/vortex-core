@@ -33,6 +33,7 @@ pub fn tax_routes() -> Router<Arc<AppState>> {
         .route("/accounting/partner-banks/{bank_id}/delete", post(delete_partner_bank))
         .route("/accounting/settings/logo", post(upload_logo))
         .route("/accounting/company-logo", get(serve_logo))
+        .route("/accounting/lhdn-codes", get(lhdn_codes_page))
         .route("/accounting/banks", get(banks_page))
         .route("/accounting/banks", post(bank_create))
         .route("/accounting/banks/{id}/toggle", post(bank_toggle))
@@ -1140,6 +1141,100 @@ async fn serve_logo(
         }
         _ => (StatusCode::NOT_FOUND, "No logo uploaded").into_response(),
     }
+}
+
+// ─── LHDN catalogues viewer ──────────────────────────────────────────────
+
+/// Browse the reference catalogues synced from the LHDN SDK / API —
+/// what came in, how many, and when.
+async fn lhdn_codes_page(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let esc = vortex_plugin_sdk::framework::html_escape;
+    let selected = q.get("type").cloned().unwrap_or_else(|| "msic".into());
+    let search = q.get("q").map(String::as_str).unwrap_or("").trim().to_string();
+
+    // Tabs: every catalogue present, with counts + freshness.
+    let types = vortex_plugin_sdk::sqlx::query(
+        "SELECT code_type, COUNT(*) AS n, MAX(updated_at) AS synced \
+         FROM acc_lhdn_code GROUP BY code_type ORDER BY code_type",
+    )
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default();
+    let mut tabs = String::new();
+    let mut synced_line = String::new();
+    for t in &types {
+        let ct: String = t.get("code_type");
+        let n: i64 = t.get("n");
+        let active = if ct == selected { "tab-active" } else { "" };
+        tabs.push_str(&format!(
+            r#"<a class="tab {active}" href="/accounting/lhdn-codes?type={ct}">{ct} <span class="badge badge-sm badge-ghost ml-1">{n}</span></a>"#,
+        ));
+        if ct == selected {
+            if let Ok(Some(ts)) =
+                t.try_get::<Option<vortex_plugin_sdk::chrono::DateTime<vortex_plugin_sdk::chrono::Utc>>, _>("synced")
+            {
+                synced_line = format!(
+                    "<span class=\"text-xs opacity-60\">last synced {}</span>",
+                    ts.format("%Y-%m-%d %H:%M UTC"),
+                );
+            }
+        }
+    }
+
+    let rows = vortex_plugin_sdk::sqlx::query(
+        "SELECT code, description, active FROM acc_lhdn_code \
+         WHERE code_type = $1 AND ($2 = '' OR code ILIKE '%' || $2 || '%' \
+               OR description ILIKE '%' || $2 || '%') \
+         ORDER BY code LIMIT 300",
+    )
+    .bind(&selected)
+    .bind(&search)
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default();
+    let shown = rows.len();
+    let mut trs = String::new();
+    for r in &rows {
+        trs.push_str(&format!(
+            "<tr><td class=\"font-mono\">{}</td><td>{}</td><td>{}</td></tr>",
+            esc(&r.get::<String, _>("code")),
+            esc(&r.get::<String, _>("description")),
+            if r.get::<bool, _>("active") { "✓" } else { "—" },
+        ));
+    }
+    if trs.is_empty() {
+        trs = "<tr><td colspan=\"3\" class=\"text-center opacity-60 py-6\">Nothing here — run Sync LHDN codes, or clear the search.</td></tr>".into();
+    }
+    let content = format!(
+        r##"<div class="flex justify-between items-start mb-4 gap-4">
+<div><h1 class="text-2xl font-bold">LHDN Catalogues</h1>
+<p class="text-sm opacity-60 mt-1 max-w-2xl">Reference data imported from the LHDN MyInvois SDK — MSIC, classifications, UoM, tax types, states, countries. These feed the pickers on invoices and tax profiles.</p></div>
+<form method="post" action="/accounting/einvoice/sync-codes"><button class="btn btn-sm btn-outline">Sync LHDN codes</button></form>
+</div>
+<div class="tabs tabs-boxed mb-3 w-fit flex-wrap">{tabs}</div>
+<div class="card bg-base-100 shadow"><div class="card-body p-4">
+<form method="get" class="flex gap-2 items-center mb-3">
+<input type="hidden" name="type" value="{selected}"/>
+<input name="q" value="{search}" placeholder="Search code or description…" class="input input-bordered input-sm w-72"/>
+<button class="btn btn-sm">Search</button>
+<span class="text-xs opacity-60">{shown} shown (max 300)</span> {synced_line}
+</form>
+<div class="overflow-x-auto"><table class="table table-sm table-fixed w-full">
+<colgroup><col style="width:9rem"/><col/><col style="width:5rem"/></colgroup>
+<thead><tr><th>Code</th><th>Description</th><th>Active</th></tr></thead>
+<tbody>{trs}</tbody></table></div>
+</div></div>"##,
+        selected = esc(&selected),
+        search = esc(&search),
+    );
+    let sidebar = render_sidebar(&state, &user, &db_ctx);
+    Html(page_shell(&sidebar, "LHDN Catalogues", &content)).into_response()
 }
 
 // ─── Bank master ─────────────────────────────────────────────────────────
