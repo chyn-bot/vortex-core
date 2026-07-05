@@ -37,8 +37,8 @@ fn portal_shell(title: &str, body: &str) -> String {
         r#"<!DOCTYPE html><html data-theme="dark"><head><meta charset="utf-8"><title>{title} · Field</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css" rel="stylesheet"/>
-<script src="/static/vortex.js" defer></script>
+<link href="/static/vortex.css?v=2" rel="stylesheet"/>
+<script src="/static/vortex.js?v=2" defer></script>
 <script src="/static/vendor/tailwind.js"></script></head>
 <body class="min-h-screen bg-base-200">
 <div class="navbar bg-base-100 shadow sticky top-0 z-30">
