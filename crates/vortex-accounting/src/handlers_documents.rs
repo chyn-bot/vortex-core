@@ -33,6 +33,7 @@ pub fn document_routes() -> Router<Arc<AppState>> {
             "/accounting/documents/{id}/lines/{line_id}/update",
             post(update_doc_line),
         )
+        .route("/accounting/documents/{id}/header", post(update_doc_header))
         .route("/accounting/documents/{id}/post", post(post_document))
         .route("/accounting/documents/{id}/pay", post(pay_document))
         .route("/accounting/documents/{id}/print", get(print_document))
@@ -1022,7 +1023,7 @@ async fn document_detail(
         "SELECT m.number, m.move_type, m.state, m.payment_state, \
                 m.invoice_date::text AS invoice_date, m.due_date::text AS due_date, \
                 m.untaxed_amount, m.tax_amount, m.total_amount, m.amount_residual, \
-                m.origin_ref, p.name AS partner_name \
+                m.origin_ref, m.ref, m.partner_id, p.name AS partner_name \
          FROM acc_move m JOIN contacts p ON p.id = m.partner_id \
          WHERE m.id = $1 AND m.move_type <> 'entry'",
     )
@@ -1389,6 +1390,66 @@ onsubmit="return confirm('Reset to draft? You can edit and repost — the docume
         r#"<colgroup><col/><col style="width:6rem"/><col style="width:9rem"/><col style="width:12rem"/><col style="width:9rem"/><col style="width:3.5rem"/></colgroup>"#
     };
     let foot_span = if customer_doc { 5 } else { 4 };
+
+    // Header: editable on drafts (customer, dates, reference —
+    // Malaysian correction flow needs the customer changeable until
+    // the document is posted/submitted), read-only once posted.
+    let header_block = if is_draft {
+        let partner_id: Uuid = head.get("partner_id");
+        let side_filter = if customer_doc {
+            "('customer', 'both')"
+        } else {
+            "('supplier', 'both')"
+        };
+        let partners = vortex_plugin_sdk::sqlx::query(&format!(
+            "SELECT id, name FROM contacts WHERE active AND contact_type IN {side_filter} \
+             ORDER BY name LIMIT 1000"
+        ))
+        .fetch_all(&db)
+        .await
+        .unwrap_or_default();
+        let mut popts = String::new();
+        for p in &partners {
+            let pid: Uuid = p.get("id");
+            let sel = if pid == partner_id { " selected" } else { "" };
+            popts.push_str(&format!(
+                r#"<option value="{pid}"{sel}>{}</option>"#,
+                esc(&p.get::<String, _>("name"))
+            ));
+        }
+        let ref_val: Option<String> = head.try_get("ref").ok().flatten();
+        format!(
+            r#"<form method="POST" action="/accounting/documents/{id}/header" class="grid grid-cols-2 md:grid-cols-5 gap-3 items-end">
+<label class="form-control"><span class="label-text text-xs mb-1">{partner_label}</span>
+<select name="partner_id" class="select select-bordered select-sm w-full">{popts}</select></label>
+<label class="form-control"><span class="label-text text-xs mb-1">Date</span>
+<input name="invoice_date" type="date" value="{inv_date}" class="input input-bordered input-sm w-full"/></label>
+<label class="form-control"><span class="label-text text-xs mb-1">Due</span>
+<input name="due_date" type="date" value="{due}" class="input input-bordered input-sm w-full"/></label>
+<label class="form-control"><span class="label-text text-xs mb-1">Reference</span>
+<input name="ref" value="{ref_val}" placeholder="PO number, contract…" class="input input-bordered input-sm w-full"/></label>
+<button class="btn btn-sm btn-outline">Save Header</button>
+</form>"#,
+            partner_label = if customer_doc { "Customer" } else { "Vendor" },
+            inv_date = esc(invoice_date.as_deref().unwrap_or("")),
+            due = esc(due_date.as_deref().unwrap_or("")),
+            ref_val = esc(ref_val.as_deref().unwrap_or("")),
+        )
+    } else {
+        format!(
+            r#"<div class="grid grid-cols-4 gap-4 text-sm">
+<div><span class="opacity-60">Partner</span><br/>{}</div>
+<div><span class="opacity-60">Date</span><br/>{}</div>
+<div><span class="opacity-60">Due</span><br/>{}</div>
+<div><span class="opacity-60">Open Amount</span><br/><span class="font-mono">{}</span></div>
+</div>"#,
+            esc(&partner_name),
+            esc(invoice_date.as_deref().unwrap_or("—")),
+            esc(due_date.as_deref().unwrap_or("—")),
+            money(residual),
+        )
+    };
+
     let content = format!(
         r#"<div class="w-full">
 <a href="{family_url}" class="btn btn-ghost btn-sm mb-4">← Back to {family_title}</a>
@@ -1397,12 +1458,7 @@ onsubmit="return confirm('Reset to draft? You can edit and repost — the docume
 <div>{actions}</div>
 </div>
 <div class="card bg-base-100 shadow"><div class="card-body py-4">
-<div class="grid grid-cols-4 gap-4 text-sm">
-<div><span class="opacity-60">Partner</span><br/>{partner}</div>
-<div><span class="opacity-60">Date</span><br/>{invoice_date}</div>
-<div><span class="opacity-60">Due</span><br/>{due_date}</div>
-<div><span class="opacity-60">Open Amount</span><br/><span class="font-mono">{residual}</span></div>
-</div>
+{header_block}
 {origin_block}
 {gl_link}
 </div></div>
@@ -1431,10 +1487,7 @@ onsubmit="return confirm('Reset to draft? You can edit and repost — the docume
         state_badge = state_badge,
         payment_badge = payment_badge,
         actions = actions,
-        partner = esc(&partner_name),
-        invoice_date = esc(invoice_date.as_deref().unwrap_or("—")),
-        due_date = esc(due_date.as_deref().unwrap_or("—")),
-        residual = money(residual),
+        header_block = header_block,
         origin_block = origin_block,
         gl_link = gl_link,
         lines = lines_html,
@@ -1524,6 +1577,58 @@ async fn delete_doc_line(
     }
     let _ = documents::refresh_document_totals(&db, id).await;
     redirect(&format!("/accounting/documents/{id}"))
+}
+
+/// Edit the document header (draft only): partner, dates, reference.
+async fn update_doc_header(
+    State(_state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(_user): Extension<AuthUser>,
+    Path(id): Path<Uuid>,
+    vortex_plugin_sdk::axum::extract::Form(form): vortex_plugin_sdk::axum::extract::Form<
+        HashMap<String, String>,
+    >,
+) -> Response {
+    let back = format!("/accounting/documents/{id}");
+    let Some(partner_id) = form
+        .get("partner_id")
+        .and_then(|s| s.parse::<Uuid>().ok())
+    else {
+        return flash_redirect(&back, FlashKind::Error, "Pick a partner.");
+    };
+    let invoice_date: Option<vortex_plugin_sdk::chrono::NaiveDate> =
+        form.get("invoice_date").and_then(|s| s.parse().ok());
+    let due_date: Option<vortex_plugin_sdk::chrono::NaiveDate> =
+        form.get("due_date").and_then(|s| s.parse().ok());
+    let ref_val = form.get("ref").map(|s| s.trim()).filter(|s| !s.is_empty());
+    let result = vortex_plugin_sdk::sqlx::query(
+        "UPDATE acc_move SET partner_id = $2, \
+                invoice_date = COALESCE($3, invoice_date), \
+                move_date = COALESCE($3, move_date), \
+                due_date = $4, ref = $5 \
+         WHERE id = $1 AND state = 'draft'",
+    )
+    .bind(id)
+    .bind(partner_id)
+    .bind(invoice_date)
+    .bind(due_date)
+    .bind(ref_val)
+    .execute(&db)
+    .await;
+    match result {
+        Ok(r) if r.rows_affected() == 1 => {
+            flash_redirect(&back, FlashKind::Success, "Header updated.")
+        }
+        Ok(_) => flash_redirect(
+            &back,
+            FlashKind::Error,
+            "Not updated — only draft documents can be edited.",
+        ),
+        Err(e) => {
+            error!(error = %e, "document header update failed");
+            flash_redirect(&back, FlashKind::Error, "Header update failed.")
+        }
+    }
 }
 
 /// Edit a line in place (draft documents only — the state guard is in
