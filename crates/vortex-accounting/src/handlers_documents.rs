@@ -1307,16 +1307,25 @@ async fn document_detail(
             let opts: String = products
                 .iter()
                 .map(|(pid, label, cost)| {
+                    // data-fill drives the client-side autofill; the
+                    // server seeds the same values when JS is off.
+                    let name_only = label.split(" · ").nth(1).unwrap_or(label);
+                    let fill = vortex_plugin_sdk::serde_json::json!({
+                        "description": name_only,
+                        "unit_price": cost.round_dp(2).to_string(),
+                    })
+                    .to_string();
                     format!(
-                        r#"<option value="{pid}" data-cost="{cost}">{}</option>"#,
+                        r#"<option value="{pid}" data-fill="{}">{}</option>"#,
+                        esc(&fill),
                         esc(label)
                     )
                 })
                 .collect();
             format!(
                 r#"<div class="form-control col-span-3">
-<label class="label py-0"><span class="label-text-alt">Product (optional — fills description/price)</span></label>
-<select name="product_id" class="select select-bordered select-sm w-full"><option value=""></option>{opts}</select>
+<label class="label py-0"><span class="label-text-alt">Product</span></label>
+<select name="product_id" data-vortex-autofill class="select select-bordered select-sm w-full"><option value="">— none —</option>{opts}</select>
 </div>"#
             )
         };
@@ -1332,15 +1341,22 @@ async fn document_detail(
 </div>"#
             )
         };
-        let desc_span = if customer_doc { "col-span-4" } else { "col-span-5" };
+        let desc_span = if products.is_empty() {
+            if customer_doc { "col-span-4" } else { "col-span-5" }
+        } else if customer_doc {
+            "col-span-3"
+        } else {
+            "col-span-4"
+        };
         let btn_span = if customer_doc { "col-span-12 md:col-span-12" } else { "col-span-2" };
         format!(
             r#"<div class="card bg-base-100 shadow mt-4"><div class="card-body py-4">
 <h3 class="font-semibold mb-2">Add Line</h3>
 <form method="POST" action="/accounting/documents/{id}/lines" class="grid grid-cols-12 gap-2 items-end">
+{product_field}
 <div class="form-control {desc_span}">
 <label class="label py-0"><span class="label-text-alt">Description *</span></label>
-<input name="description" class="input input-bordered input-sm" required/>
+<input name="description" class="input input-bordered input-sm"/>
 </div>
 <div class="form-control col-span-1">
 <label class="label py-0"><span class="label-text-alt">Qty</span></label>
@@ -1355,7 +1371,6 @@ async fn document_detail(
 <select name="tax_id" class="select select-bordered select-sm">{taxes}</select>
 </div>
 {class_field}
-{product_field}
 {acc_field}
 <div class="{btn_span}">
 <button class="btn btn-primary btn-sm w-full md:w-auto">Add</button>
