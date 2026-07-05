@@ -13,8 +13,8 @@ use vortex_plugin_sdk::uuid::Uuid;
 
 use crate::documents::{self, NewPayment, PaymentDirection};
 use crate::handlers::{
-    audit_move, date_or_today, dec_or_zero, default_company, money, opt_str, page_shell,
-    redirect, render_sidebar,
+    audit_move, audit_move_changes, date_or_today, dec_or_zero, default_company, money, opt_str,
+    page_shell, redirect, render_sidebar,
 };
 
 pub fn document_routes() -> Router<Arc<AppState>> {
@@ -171,8 +171,13 @@ async fn cancel_document_action(
     let today = vortex_plugin_sdk::chrono::Utc::now().date_naive();
     match documents::cancel_document(&db, &state.pool, user.id, id, today).await {
         Ok(reversal) => {
-            audit_move(&state, &db_ctx, &db, user.id, &user.username, id, "cancelled_via_reversal")
-                .await;
+            audit_move_changes(
+                &state, &db_ctx, &db, user.id, &user.username, id, "cancelled_via_reversal",
+                vec![vortex_plugin_sdk::serde_json::json!({
+                    "field": "Status", "from": "posted", "to": "reversed (cancelled)"
+                })],
+            )
+            .await;
             flash_redirect(
                 &back,
                 FlashKind::Success,
@@ -197,7 +202,13 @@ async fn reset_draft_action(
     let back = format!("/accounting/documents/{id}");
     match documents::reset_to_draft(&db, user.id, id).await {
         Ok(()) => {
-            audit_move(&state, &db_ctx, &db, user.id, &user.username, id, "reset_to_draft").await;
+            audit_move_changes(
+                &state, &db_ctx, &db, user.id, &user.username, id, "reset_to_draft",
+                vec![vortex_plugin_sdk::serde_json::json!({
+                    "field": "Status", "from": "posted", "to": "draft"
+                })],
+            )
+            .await;
             flash_redirect(
                 &back,
                 FlashKind::Success,
@@ -1507,9 +1518,10 @@ onsubmit="return confirm('Reset to draft? You can edit and repost — the docume
 // ─────────────────────────────────────────────────────────────────────────
 
 async fn add_doc_line(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     Db(db): Db,
-    Extension(_user): Extension<AuthUser>,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
     Path(id): Path<Uuid>,
     vortex_plugin_sdk::axum::extract::Form(form): vortex_plugin_sdk::axum::extract::Form<
         HashMap<String, String>,
@@ -1551,19 +1563,34 @@ async fn add_doc_line(
     .bind(company_id)
     .execute(&db)
     .await;
-    if let Err(e) = result {
-        error!(error = %e, "document line insert failed");
+    match result {
+        Ok(r) if r.rows_affected() == 1 => {
+            audit_move_changes(
+                &state, &db_ctx, &db, user.id, &user.username, id, "line_added",
+                vec![vortex_plugin_sdk::serde_json::json!({
+                    "field": "Line",
+                    "from": "",
+                    "to": format!("{} ({} × {})", form.get("description").map(String::as_str).unwrap_or(""), quantity.normalize(), unit_price),
+                })],
+            )
+            .await;
+        }
+        Ok(_) => {}
+        Err(e) => error!(error = %e, "document line insert failed"),
     }
     let _ = documents::refresh_document_totals(&db, id).await;
     redirect(&format!("/accounting/documents/{id}"))
 }
 
 async fn delete_doc_line(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     Db(db): Db,
-    Extension(_user): Extension<AuthUser>,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
     Path((id, line_id)): Path<(Uuid, Uuid)>,
 ) -> Response {
+    // Capture what is being removed before it goes.
+    let gone = line_snapshot(&db, line_id).await;
     let result = vortex_plugin_sdk::sqlx::query(
         "DELETE FROM acc_invoice_line l USING acc_move m \
          WHERE l.id = $1 AND l.move_id = $2 AND m.id = l.move_id AND m.state = 'draft'",
@@ -1572,18 +1599,75 @@ async fn delete_doc_line(
     .bind(id)
     .execute(&db)
     .await;
-    if let Err(e) = result {
-        error!(error = %e, "document line delete failed");
+    match result {
+        Ok(r) if r.rows_affected() == 1 => {
+            if let Some(snap) = gone {
+                let desc = snap
+                    .iter()
+                    .find(|(l, _)| *l == "Line Description")
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_default();
+                audit_move_changes(
+                    &state, &db_ctx, &db, user.id, &user.username, id, "line_removed",
+                    vec![vortex_plugin_sdk::serde_json::json!({
+                        "field": "Line",
+                        "from": desc,
+                        "to": "",
+                    })],
+                )
+                .await;
+            }
+        }
+        Ok(_) => {}
+        Err(e) => error!(error = %e, "document line delete failed"),
     }
     let _ = documents::refresh_document_totals(&db, id).await;
     redirect(&format!("/accounting/documents/{id}"))
 }
 
+/// Snapshot of the auditable header fields, as display strings.
+async fn header_snapshot(
+    db: &vortex_plugin_sdk::sqlx::PgPool,
+    id: Uuid,
+) -> Option<Vec<(&'static str, String)>> {
+    let r = vortex_plugin_sdk::sqlx::query(
+        "SELECT p.name AS partner, m.invoice_date::text AS d, m.due_date::text AS due, \
+                COALESCE(m.ref, '') AS ref \
+         FROM acc_move m JOIN contacts p ON p.id = m.partner_id WHERE m.id = $1",
+    )
+    .bind(id)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()?;
+    Some(vec![
+        ("Partner", r.get::<String, _>("partner")),
+        ("Date", r.get::<Option<String>, _>("d").unwrap_or_default()),
+        ("Due", r.get::<Option<String>, _>("due").unwrap_or_default()),
+        ("Reference", r.get::<String, _>("ref")),
+    ])
+}
+
+fn diff_snapshots(
+    before: &[(&'static str, String)],
+    after: &[(&'static str, String)],
+) -> Vec<vortex_plugin_sdk::serde_json::Value> {
+    before
+        .iter()
+        .zip(after.iter())
+        .filter(|((_, b), (_, a))| b != a)
+        .map(|((label, b), (_, a))| {
+            vortex_plugin_sdk::serde_json::json!({ "field": label, "from": b, "to": a })
+        })
+        .collect()
+}
+
 /// Edit the document header (draft only): partner, dates, reference.
 async fn update_doc_header(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     Db(db): Db,
-    Extension(_user): Extension<AuthUser>,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
     Path(id): Path<Uuid>,
     vortex_plugin_sdk::axum::extract::Form(form): vortex_plugin_sdk::axum::extract::Form<
         HashMap<String, String>,
@@ -1601,6 +1685,7 @@ async fn update_doc_header(
     let due_date: Option<vortex_plugin_sdk::chrono::NaiveDate> =
         form.get("due_date").and_then(|s| s.parse().ok());
     let ref_val = form.get("ref").map(|s| s.trim()).filter(|s| !s.is_empty());
+    let before = header_snapshot(&db, id).await;
     let result = vortex_plugin_sdk::sqlx::query(
         "UPDATE acc_move SET partner_id = $2, \
                 invoice_date = COALESCE($3, invoice_date), \
@@ -1617,6 +1702,16 @@ async fn update_doc_header(
     .await;
     match result {
         Ok(r) if r.rows_affected() == 1 => {
+            if let (Some(b), Some(a)) = (before, header_snapshot(&db, id).await) {
+                let changes = diff_snapshots(&b, &a);
+                if !changes.is_empty() {
+                    audit_move_changes(
+                        &state, &db_ctx, &db, user.id, &user.username, id,
+                        "header_updated", changes,
+                    )
+                    .await;
+                }
+            }
             flash_redirect(&back, FlashKind::Success, "Header updated.")
         }
         Ok(_) => flash_redirect(
@@ -1631,17 +1726,43 @@ async fn update_doc_header(
     }
 }
 
+/// Auditable display snapshot of one line.
+async fn line_snapshot(
+    db: &vortex_plugin_sdk::sqlx::PgPool,
+    line_id: Uuid,
+) -> Option<Vec<(&'static str, String)>> {
+    let r = vortex_plugin_sdk::sqlx::query(
+        "SELECT l.description, l.quantity::text AS q, l.unit_price::text AS p, \
+                COALESCE(t.name, '') AS tax, COALESCE(l.classification_code, '') AS class \
+         FROM acc_invoice_line l LEFT JOIN taxes t ON t.id = l.tax_id WHERE l.id = $1",
+    )
+    .bind(line_id)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()?;
+    Some(vec![
+        ("Line Description", r.get::<String, _>("description")),
+        ("Line Qty", r.get::<String, _>("q")),
+        ("Line Unit Price", r.get::<String, _>("p")),
+        ("Line Tax", r.get::<String, _>("tax")),
+        ("Line Classification", r.get::<String, _>("class")),
+    ])
+}
+
 /// Edit a line in place (draft documents only — the state guard is in
 /// the SQL, same as delete).
 async fn update_doc_line(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     Db(db): Db,
-    Extension(_user): Extension<AuthUser>,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
     Path((id, line_id)): Path<(Uuid, Uuid)>,
     vortex_plugin_sdk::axum::extract::Form(form): vortex_plugin_sdk::axum::extract::Form<
         HashMap<String, String>,
     >,
 ) -> Response {
+    let before = line_snapshot(&db, line_id).await;
     let Some(description) = opt_str(&form, "description") else {
         return flash_redirect(
             &format!("/accounting/documents/{id}"),
@@ -1680,6 +1801,16 @@ async fn update_doc_line(
     match result {
         Ok(r) if r.rows_affected() == 1 => {
             let _ = documents::refresh_document_totals(&db, id).await;
+            if let (Some(b), Some(a)) = (before, line_snapshot(&db, line_id).await) {
+                let changes = diff_snapshots(&b, &a);
+                if !changes.is_empty() {
+                    audit_move_changes(
+                        &state, &db_ctx, &db, user.id, &user.username, id,
+                        "line_updated", changes,
+                    )
+                    .await;
+                }
+            }
             redirect(&format!("/accounting/documents/{id}"))
         }
         Ok(_) => flash_redirect(
@@ -1707,7 +1838,13 @@ async fn post_document(
 ) -> Response {
     match documents::post_invoice(&db, &state.pool, id, user.id).await {
         Ok(number) => {
-            audit_move(&state, &db_ctx, &db, user.id, &user.username, id, "posted").await;
+            audit_move_changes(
+                &state, &db_ctx, &db, user.id, &user.username, id, "posted",
+                vec![vortex_plugin_sdk::serde_json::json!({
+                    "field": "Status", "from": "draft", "to": "posted"
+                })],
+            )
+            .await;
             vortex_plugin_sdk::tracing::info!(number = %number, "document posted");
             // e-Invoice hook: create the LHDN row (auto-submits in API
             // mode). Best-effort — a mis-set profile must not block

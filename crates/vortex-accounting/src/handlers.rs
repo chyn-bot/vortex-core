@@ -259,6 +259,39 @@ pub(crate) async fn audit_move(
     let _ = state.audit.log(entry).await;
 }
 
+/// Like [`audit_move`], but with a field-level diff the history panel
+/// renders as from→to rows. Every document mutation goes through this.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn audit_move_changes(
+    state: &AppState,
+    db_ctx: &DatabaseContext,
+    db: &vortex_plugin_sdk::sqlx::PgPool,
+    user_id: Uuid,
+    username: &str,
+    id: Uuid,
+    action: &str,
+    changes: Vec<vortex_plugin_sdk::serde_json::Value>,
+) {
+    let number: Option<String> =
+        vortex_plugin_sdk::sqlx::query_scalar("SELECT number FROM acc_move WHERE id = $1")
+            .bind(id)
+            .fetch_optional(db)
+            .await
+            .ok()
+            .flatten();
+    let entry = vortex_plugin_sdk::security::AuditEntry::new(
+        vortex_plugin_sdk::security::AuditAction::RecordUpdated,
+        vortex_plugin_sdk::security::AuditSeverity::Info,
+    )
+    .with_user(vortex_plugin_sdk::common::UserId(user_id))
+    .with_username(username)
+    .with_database(&db_ctx.db_name)
+    .with_resource("acc_move", id.to_string())
+    .with_resource_name(number.as_deref().unwrap_or("draft"))
+    .with_details(json!({ "action": action, "changes": changes }));
+    let _ = state.audit.log(entry).await;
+}
+
 pub(crate) fn redirect(to: &str) -> Response {
     vortex_plugin_sdk::axum::response::Redirect::to(to).into_response()
 }
