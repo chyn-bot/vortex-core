@@ -32,7 +32,63 @@ pub fn document_routes() -> Router<Arc<AppState>> {
         .route("/accounting/documents/{id}/post", post(post_document))
         .route("/accounting/documents/{id}/pay", post(pay_document))
         .route("/accounting/documents/{id}/print", get(print_document))
+        .route("/accounting/documents/{id}/email", post(email_document))
         .route("/accounting/payments", get(list_payments))
+}
+
+/// Queue "email the PDF to the partner" — validated up front so the
+/// user hears about missing prerequisites immediately, then delivered
+/// by the durable job (SMTP retries survive restarts).
+async fn email_document(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<Uuid>,
+) -> Response {
+    let back = format!("/accounting/documents/{id}");
+    if !vortex_plugin_sdk::framework::pdf::available() {
+        return flash_redirect(
+            &back,
+            FlashKind::Error,
+            "Not sent — the PDF engine is not enabled on this server (deploy with the pdf feature + Chromium).",
+        );
+    }
+    let rendered = match render_print_html(&state, &db, &db_ctx.db_name, id).await {
+        Ok(Some(r)) => r,
+        _ => return flash_redirect(&back, FlashKind::Error, "Document not found."),
+    };
+    let Some(to) = rendered.partner_email.clone() else {
+        return flash_redirect(
+            &back,
+            FlashKind::Error,
+            "Not sent — the customer has no email address. Add one on the contact.",
+        );
+    };
+    match vortex_plugin_sdk::framework::jobs::enqueue(
+        &state.db,
+        vortex_plugin_sdk::prelude::NewJob::new(
+            crate::doc_email::KIND_EMAIL,
+            vortex_plugin_sdk::serde_json::json!({ "move_id": id.to_string() }),
+        )
+        .for_db(&db_ctx.db_name)
+        .trace("acc_move", &id.to_string()),
+    )
+    .await
+    {
+        Ok(_) => {
+            audit_move(&state, &db_ctx, &db, user.id, &user.username, id, "email_enqueued").await;
+            flash_redirect(
+                &back,
+                FlashKind::Success,
+                &format!("Queued — {} will be emailed to {to} with the PDF attached.", rendered.number),
+            )
+        }
+        Err(e) => {
+            error!("email enqueue failed: {e}");
+            flash_redirect(&back, FlashKind::Error, "Not sent — could not queue the email job.")
+        }
+    }
 }
 
 /// Print view — a standalone, letterhead-style page (no sidebar) for
@@ -44,7 +100,74 @@ async fn print_document(
     Db(db): Db,
     Extension(db_ctx): Extension<DatabaseContext>,
     Path(id): Path<Uuid>,
+    Query(q): Query<HashMap<String, String>>,
 ) -> Response {
+    let rendered = match render_print_html(&app_state, &db, &db_ctx.db_name, id).await {
+        Ok(Some(r)) => r,
+        Ok(None) => return (StatusCode::NOT_FOUND, "Document not found").into_response(),
+        Err(e) => {
+            error!("print render failed: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Print failed").into_response();
+        }
+    };
+    if q.get("format").map(String::as_str) == Some("pdf") {
+        if !vortex_plugin_sdk::framework::pdf::available() {
+            return flash_redirect(
+                &format!("/accounting/documents/{id}"),
+                FlashKind::Error,
+                "PDF engine not enabled on this server — use Print and the browser's Save as PDF, or deploy the pdf feature with a Chromium binary.",
+            );
+        }
+        let opts = vortex_plugin_sdk::framework::pdf::PdfOptions::default();
+        return match vortex_plugin_sdk::framework::pdf::html_to_pdf(&rendered.html, &opts).await {
+            Ok(bytes) => {
+                let fname = format!("{}.pdf", rendered.number.replace('/', "-"));
+                (
+                    [
+                        (
+                            vortex_plugin_sdk::axum::http::header::CONTENT_TYPE,
+                            "application/pdf".to_string(),
+                        ),
+                        (
+                            vortex_plugin_sdk::axum::http::header::CONTENT_DISPOSITION,
+                            format!("attachment; filename=\"{fname}\""),
+                        ),
+                    ],
+                    bytes,
+                )
+                    .into_response()
+            }
+            Err(e) => {
+                error!("pdf render failed: {e}");
+                flash_redirect(
+                    &format!("/accounting/documents/{id}"),
+                    FlashKind::Error,
+                    "PDF rendering failed — check the server's Chromium (VORTEX_CHROMIUM).",
+                )
+            }
+        };
+    }
+    Html(rendered.html).into_response()
+}
+
+/// A rendered print page plus the bits reuse needs (PDF filename,
+/// email recipient/subject).
+pub(crate) struct RenderedPrint {
+    pub html: String,
+    pub number: String,
+    pub partner_email: Option<String>,
+    pub partner_name: String,
+    pub total: String,
+}
+
+/// Build the print HTML for any document. Shared by the print/PDF
+/// route and the email-invoice job.
+pub(crate) async fn render_print_html(
+    app_state: &AppState,
+    db: &vortex_plugin_sdk::sqlx::PgPool,
+    db_name: &str,
+    id: Uuid,
+) -> Result<Option<RenderedPrint>, String> {
     use vortex_plugin_sdk::rust_decimal::Decimal;
     let esc = vortex_plugin_sdk::framework::html_escape;
     let Some(head) = vortex_plugin_sdk::sqlx::query(
@@ -53,18 +176,19 @@ async fn print_document(
                 m.payment_state, m.narration, \
                 p.name AS partner_name, p.street, p.street2, p.city, p.zip, \
                 p.email AS partner_email, p.phone AS partner_phone, \
-                tp.tin AS partner_tin, tp.sst_registration AS partner_sst \
+                tp.tin AS partner_tin, tp.sst_registration AS partner_sst, \
+                tp.einvoice_email AS partner_einvoice_email \
          FROM acc_move m \
          JOIN contacts p ON p.id = m.partner_id \
          LEFT JOIN acc_partner_tax_profile tp ON tp.contact_id = p.id \
          WHERE m.id = $1",
     )
     .bind(id)
-    .fetch_optional(&db)
+    .fetch_optional(db)
     .await
-    .ok()
-    .flatten() else {
-        return (StatusCode::NOT_FOUND, "Document not found").into_response();
+    .map_err(|e| e.to_string())?
+    else {
+        return Ok(None);
     };
     let company = vortex_plugin_sdk::sqlx::query(
         "SELECT COALESCE(co.name, 'Company') AS name, c.company_tin, c.company_id_value, \
@@ -73,7 +197,7 @@ async fn print_document(
          FROM acc_config c LEFT JOIN companies co ON co.id = c.company_id \
          ORDER BY c.company_id NULLS LAST LIMIT 1",
     )
-    .fetch_optional(&db)
+    .fetch_optional(db)
     .await
     .ok()
     .flatten();
@@ -84,7 +208,7 @@ async fn print_document(
          WHERE l.move_id = $1 ORDER BY l.sequence",
     )
     .bind(id)
-    .fetch_all(&db)
+    .fetch_all(db)
     .await
     .unwrap_or_default();
     // Per-rate SST summary off the posted GL tax lines.
@@ -94,14 +218,14 @@ async fn print_document(
          WHERE l.move_id = $1 GROUP BY t.name ORDER BY t.name",
     )
     .bind(id)
-    .fetch_all(&db)
+    .fetch_all(db)
     .await
     .unwrap_or_default();
     let einv = vortex_plugin_sdk::sqlx::query(
         "SELECT status, lhdn_uuid, validation_link FROM acc_einvoice WHERE move_id = $1",
     )
     .bind(id)
-    .fetch_optional(&db)
+    .fetch_optional(db)
     .await
     .ok()
     .flatten();
@@ -194,7 +318,7 @@ async fn print_document(
         .unwrap_or_default();
     // Company logo (uploaded in Accounting Settings, FileStore-backed).
     // Content-hashed URL: a new upload always shows immediately.
-    let logo_html = match app_state.files.get(&db_ctx.db_name, "company/logo").await {
+    let logo_html = match app_state.files.get(db_name, "company/logo").await {
         Ok(Some(data)) => format!(
             r#"<img src="/accounting/company-logo?v={}" alt="" style="max-height:64px;max-width:220px;margin-bottom:6px"/>"#,
             &crate::einvois::sha256_hex(&data)[..12],
@@ -327,7 +451,29 @@ body {{ max-width: 21cm; margin: 1.2cm auto; position: relative; }}
         draft_mark = draft_mark,
         narration = hval("narration"),
     );
-    Html(html).into_response()
+    // e-invoice email wins over the general contact email.
+    let partner_email = head
+        .try_get::<Option<String>, _>("partner_einvoice_email")
+        .ok()
+        .flatten()
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            head.try_get::<Option<String>, _>("partner_email")
+                .ok()
+                .flatten()
+                .filter(|s| !s.is_empty())
+        });
+    Ok(Some(RenderedPrint {
+        html,
+        number: head
+            .try_get::<Option<String>, _>("number")
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "draft".into()),
+        partner_email,
+        partner_name: head.get("partner_name"),
+        total: money(head.get("total_amount")),
+    }))
 }
 
 fn doc_family(move_type: &str) -> (&'static str, &'static str, &'static str) {
@@ -966,6 +1112,16 @@ async fn document_detail(
     actions.push_str(&format!(
         r#"<a href="/accounting/documents/{id}/print" target="_blank" class="btn btn-outline btn-sm">Print</a> "#
     ));
+    if vortex_plugin_sdk::framework::pdf::available() {
+        actions.push_str(&format!(
+            r#"<a href="/accounting/documents/{id}/print?format=pdf" class="btn btn-outline btn-sm">Download PDF</a> "#
+        ));
+        if !is_draft {
+            actions.push_str(&format!(
+                r#"<form method="POST" action="/accounting/documents/{id}/email" style="display:inline"><button class="btn btn-outline btn-sm" title="Emails the PDF to the partner via the job queue">Email PDF</button></form> "#
+            ));
+        }
+    }
     if is_draft {
         actions.push_str(&format!(
             r#"<form method="POST" action="/accounting/documents/{id}/post" style="display:inline">

@@ -441,9 +441,11 @@ impl Plugin for AccountingPlugin {
         crate::reports::report_defs()
     }
 
-    /// Durable jobs: MyInvois submit/poll + LHDN code-table sync.
+    /// Durable jobs: MyInvois submit/poll + LHDN code-table sync +
+    /// email-document-with-PDF.
     fn register_jobs(&self, registry: &mut vortex_plugin_sdk::framework::jobs::JobRegistry) {
         crate::einvois::jobs::register(registry);
+        crate::doc_email::register(registry);
     }
 
     /// Contribute the Malaysian tax identity (TIN, BRN/NRIC, SST) to

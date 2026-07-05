@@ -83,6 +83,14 @@ pub struct MailServer {
     pub is_default: bool,
 }
 
+/// A file attached to an outgoing email.
+#[derive(Debug, Clone)]
+pub struct MailAttachment {
+    pub filename: String,
+    pub content_type: String,
+    pub data: Vec<u8>,
+}
+
 /// One email to send.
 #[derive(Debug, Clone)]
 pub struct EmailMessage {
@@ -90,14 +98,34 @@ pub struct EmailMessage {
     pub subject: String,
     pub text: String,
     pub html: Option<String>,
+    pub attachments: Vec<MailAttachment>,
 }
 
 impl EmailMessage {
     pub fn text(to: impl Into<String>, subject: impl Into<String>, text: impl Into<String>) -> Self {
-        Self { to: to.into(), subject: subject.into(), text: text.into(), html: None }
+        Self {
+            to: to.into(),
+            subject: subject.into(),
+            text: text.into(),
+            html: None,
+            attachments: Vec::new(),
+        }
     }
     pub fn with_html(mut self, html: impl Into<String>) -> Self {
         self.html = Some(html.into());
+        self
+    }
+    pub fn with_attachment(
+        mut self,
+        filename: impl Into<String>,
+        content_type: impl Into<String>,
+        data: Vec<u8>,
+    ) -> Self {
+        self.attachments.push(MailAttachment {
+            filename: filename.into(),
+            content_type: content_type.into(),
+            data,
+        });
         self
     }
 }
@@ -207,13 +235,35 @@ async fn deliver(server: &MailServer, msg: &EmailMessage) -> Result<(), MailErro
         .map_err(|_| MailError::Address(msg.to.clone()))?;
 
     let builder = Message::builder().from(from).to(to).subject(&msg.subject);
-    let email = match &msg.html {
-        Some(html) => builder
-            .multipart(MultiPart::alternative_plain_html(msg.text.clone(), html.clone()))
-            .map_err(|e| MailError::Build(e.to_string()))?,
-        None => builder
-            .body(msg.text.clone())
-            .map_err(|e| MailError::Build(e.to_string()))?,
+    let email = if msg.attachments.is_empty() {
+        match &msg.html {
+            Some(html) => builder
+                .multipart(MultiPart::alternative_plain_html(msg.text.clone(), html.clone()))
+                .map_err(|e| MailError::Build(e.to_string()))?,
+            None => builder
+                .body(msg.text.clone())
+                .map_err(|e| MailError::Build(e.to_string()))?,
+        }
+    } else {
+        // mixed( alternative(text, html?), attachment* )
+        let body_part = match &msg.html {
+            Some(html) => MultiPart::alternative_plain_html(msg.text.clone(), html.clone()),
+            None => MultiPart::alternative()
+                .singlepart(lettre::message::SinglePart::plain(msg.text.clone())),
+        };
+        let mut mixed = MultiPart::mixed().multipart(body_part);
+        for a in &msg.attachments {
+            let ct = a
+                .content_type
+                .parse::<lettre::message::header::ContentType>()
+                .map_err(|_| MailError::Build(format!("bad content type {}", a.content_type)))?;
+            mixed = mixed.singlepart(
+                lettre::message::Attachment::new(a.filename.clone()).body(a.data.clone(), ct),
+            );
+        }
+        builder
+            .multipart(mixed)
+            .map_err(|e| MailError::Build(e.to_string()))?
     };
 
     let mut tb = match server.security {

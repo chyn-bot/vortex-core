@@ -28,6 +28,7 @@ pub mod assets;
 pub mod banking;
 pub mod closing;
 pub mod currency;
+pub mod doc_email;
 pub mod documents;
 pub mod einvois;
 pub mod handlers;

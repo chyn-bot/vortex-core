@@ -67,7 +67,7 @@ pub use approval::{ApprovalRequest, ApprovalStep, DecisionOutcome, NewRequest};
 pub use audit_trail::render_audit_trail;
 pub use auth::{AuthUser, Db};
 pub use jobs::{enqueue, JobContext, JobRegistry, JobWorker, NewJob};
-pub use mail::{EmailMessage, MailError, MailSecurity, MailServer};
+pub use mail::{EmailMessage, MailAttachment, MailError, MailSecurity, MailServer};
 pub use status::{Stage, StageAction, StageActions, StageColor, StatusBar};
 pub use tracking::{FieldKind, NewValueSource, Snapshot, TrackedField, Tracker};
 pub use i18n::{
