@@ -31,7 +31,269 @@ pub fn document_routes() -> Router<Arc<AppState>> {
         )
         .route("/accounting/documents/{id}/post", post(post_document))
         .route("/accounting/documents/{id}/pay", post(pay_document))
+        .route("/accounting/documents/{id}/print", get(print_document))
         .route("/accounting/payments", get(list_payments))
+}
+
+/// Print view — a standalone, letterhead-style page (no sidebar) for
+/// the browser's print dialog / save-as-PDF. Malaysian conventions:
+/// "TAX INVOICE" title when SST-registered, seller TIN/SST/BRN block,
+/// per-rate SST summary, LHDN UUID + validation link once validated.
+async fn print_document(
+    Db(db): Db,
+    Path(id): Path<Uuid>,
+) -> Response {
+    use vortex_plugin_sdk::rust_decimal::Decimal;
+    let esc = vortex_plugin_sdk::framework::html_escape;
+    let Some(head) = vortex_plugin_sdk::sqlx::query(
+        "SELECT m.number, m.move_type, m.state, m.invoice_date, m.due_date, m.ref, \
+                m.untaxed_amount, m.tax_amount, m.total_amount, m.amount_residual, \
+                m.payment_state, m.narration, \
+                p.name AS partner_name, p.street, p.street2, p.city, p.zip, \
+                p.email AS partner_email, p.phone AS partner_phone, \
+                tp.tin AS partner_tin, tp.sst_registration AS partner_sst \
+         FROM acc_move m \
+         JOIN contacts p ON p.id = m.partner_id \
+         LEFT JOIN acc_partner_tax_profile tp ON tp.contact_id = p.id \
+         WHERE m.id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&db)
+    .await
+    .ok()
+    .flatten() else {
+        return (StatusCode::NOT_FOUND, "Document not found").into_response();
+    };
+    let company = vortex_plugin_sdk::sqlx::query(
+        "SELECT COALESCE(co.name, 'Company') AS name, c.company_tin, c.company_id_value, \
+                c.company_sst_registration, c.company_address1, c.company_address2, \
+                c.company_city, c.company_postcode, c.company_phone, c.company_email \
+         FROM acc_config c LEFT JOIN companies co ON co.id = c.company_id \
+         ORDER BY c.company_id NULLS LAST LIMIT 1",
+    )
+    .fetch_optional(&db)
+    .await
+    .ok()
+    .flatten();
+    let lines = vortex_plugin_sdk::sqlx::query(
+        "SELECT l.description, l.quantity, l.unit_price, l.classification_code, \
+                t.name AS tax_name, t.amount AS tax_rate \
+         FROM acc_invoice_line l LEFT JOIN taxes t ON t.id = l.tax_id \
+         WHERE l.move_id = $1 ORDER BY l.sequence",
+    )
+    .bind(id)
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default();
+    // Per-rate SST summary off the posted GL tax lines.
+    let tax_rows = vortex_plugin_sdk::sqlx::query(
+        "SELECT t.name, SUM(l.credit - l.debit) AS tax, SUM(COALESCE(l.tax_base_amount,0)) AS base \
+         FROM acc_move_line l JOIN taxes t ON t.id = l.tax_id \
+         WHERE l.move_id = $1 GROUP BY t.name ORDER BY t.name",
+    )
+    .bind(id)
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default();
+    let einv = vortex_plugin_sdk::sqlx::query(
+        "SELECT status, lhdn_uuid, validation_link FROM acc_einvoice WHERE move_id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&db)
+    .await
+    .ok()
+    .flatten();
+
+    let move_type: String = head.get("move_type");
+    let state: String = head.get("state");
+    let sst_registered = company
+        .as_ref()
+        .and_then(|c| c.get::<Option<String>, _>("company_sst_registration"))
+        .filter(|s| !s.is_empty())
+        .is_some();
+    let title = match move_type.as_str() {
+        "customer_invoice" if sst_registered => "TAX INVOICE",
+        "customer_invoice" => "INVOICE",
+        "customer_credit_note" => "CREDIT NOTE",
+        "vendor_bill" => "VENDOR BILL",
+        "vendor_credit_note" => "DEBIT NOTE",
+        _ => "DOCUMENT",
+    };
+    let cval = |k: &str| -> String {
+        company
+            .as_ref()
+            .and_then(|c| c.try_get::<Option<String>, _>(k).ok().flatten())
+            .map(|v| esc(&v))
+            .unwrap_or_default()
+    };
+    let company_name = company
+        .as_ref()
+        .map(|c| esc(&c.get::<String, _>("name")))
+        .unwrap_or_else(|| "Company".into());
+    let hval = |k: &str| -> String {
+        head.try_get::<Option<String>, _>(k)
+            .ok()
+            .flatten()
+            .map(|v| esc(&v))
+            .unwrap_or_default()
+    };
+
+    let mut line_trs = String::new();
+    for l in &lines {
+        let qty: Decimal = l.get("quantity");
+        let price: Decimal = l.get("unit_price");
+        let rate: Option<Decimal> = l.try_get::<Option<Decimal>, _>("tax_rate").ok().flatten();
+        line_trs.push_str(&format!(
+            "<tr><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td>\
+             <td>{}</td><td>{}</td><td class=\"num\">{}</td></tr>",
+            esc(&l.get::<String, _>("description")),
+            qty.normalize(),
+            money(price),
+            esc(l.get::<Option<String>, _>("classification_code").as_deref().unwrap_or("")),
+            rate.map(|r| format!("{}%", r.normalize())).unwrap_or_default(),
+            money((qty * price).round_dp(2)),
+        ));
+    }
+    let mut tax_trs = String::new();
+    for t in &tax_rows {
+        tax_trs.push_str(&format!(
+            "<tr><td colspan=\"5\" class=\"num\">{} (on {})</td><td class=\"num\">{}</td></tr>",
+            esc(&t.get::<String, _>("name")),
+            money(t.get("base")),
+            money(t.get("tax")),
+        ));
+    }
+    let einv_block = einv
+        .map(|e| {
+            let status: String = e.get("status");
+            if status == "valid" {
+                format!(
+                    "<div class=\"einv\">LHDN e-Invoice validated · UUID {} · <span class=\"mono\">{}</span></div>",
+                    esc(e.get::<Option<String>, _>("lhdn_uuid").as_deref().unwrap_or("")),
+                    esc(e.get::<Option<String>, _>("validation_link").as_deref().unwrap_or("")),
+                )
+            } else {
+                String::new()
+            }
+        })
+        .unwrap_or_default();
+    let draft_mark = if state != "posted" {
+        r#"<div class="watermark">DRAFT</div>"#
+    } else {
+        ""
+    };
+
+    let html = format!(
+        r##"<!DOCTYPE html><html><head><meta charset="utf-8"><title>{number} — {title}</title>
+<style>{css}
+body {{ max-width: 21cm; margin: 1.2cm auto; position: relative; }}
+.head {{ display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 1.2em; }}
+.head h1 {{ font-size: 1.5em; letter-spacing: 0.06em; }}
+.seller p, .buyer p {{ margin: 1px 0; font-size: 0.85em; }}
+.seller .name {{ font-size: 1.1em; font-weight: 700; }}
+.meta td {{ padding: 1px 8px 1px 0; font-size: 0.85em; border: none; }}
+.parties {{ display: flex; justify-content: space-between; gap: 2em; margin-bottom: 1em; }}
+.num {{ text-align: right; font-variant-numeric: tabular-nums; }}
+.mono {{ font-family: monospace; font-size: 0.75em; word-break: break-all; }}
+.totals td {{ font-weight: 600; }}
+.einv {{ margin-top: 1em; padding: 0.5em 0.8em; border: 1px solid #ccc; border-radius: 4px; font-size: 0.8em; }}
+.footer {{ margin-top: 2em; font-size: 0.75em; color: #666; }}
+.watermark {{ position: absolute; top: 35%; left: 20%; font-size: 6em; color: rgba(200,0,0,0.12); transform: rotate(-25deg); pointer-events: none; }}
+.printbar {{ text-align: right; margin-bottom: 1em; }}
+.printbar button {{ padding: 0.4em 1.2em; cursor: pointer; }}
+@media print {{ .printbar {{ display: none; }} }}
+</style></head><body>
+{draft_mark}
+<div class="printbar"><button onclick="window.print()">Print / Save as PDF</button></div>
+<div class="head">
+  <div class="seller">
+    <p class="name">{company_name}</p>
+    <p>{addr1}</p><p>{addr2}</p><p>{postcode} {city}</p>
+    <p>TIN: {ctin} · BRN: {cbrn}</p>
+    <p>{sst_line}</p>
+    <p>{cphone} · {cemail}</p>
+  </div>
+  <div style="text-align:right">
+    <h1>{title}</h1>
+    <table class="meta" style="margin-left:auto">
+      <tr><td>Number</td><td><b>{number}</b></td></tr>
+      <tr><td>Date</td><td>{date}</td></tr>
+      <tr><td>Due</td><td>{due}</td></tr>
+      <tr><td>Reference</td><td>{reference}</td></tr>
+    </table>
+  </div>
+</div>
+<div class="parties"><div class="buyer">
+  <p style="font-size:0.75em;color:#666">BILL TO</p>
+  <p><b>{partner}</b></p>
+  <p>{pstreet}</p><p>{pstreet2}</p><p>{pzip} {pcity}</p>
+  <p>{ptin_line}</p>
+  <p>{pphone} {pemail}</p>
+</div></div>
+<table>
+<thead><tr><th>Description</th><th class="num">Qty</th><th class="num">Unit Price</th><th>Class</th><th>Tax</th><th class="num">Amount (MYR)</th></tr></thead>
+<tbody>{line_trs}</tbody>
+<tfoot>
+<tr><td colspan="5" class="num">Subtotal</td><td class="num">{untaxed}</td></tr>
+{tax_trs}
+<tr class="totals"><td colspan="5" class="num">TOTAL</td><td class="num">{total}</td></tr>
+<tr><td colspan="5" class="num">Balance due</td><td class="num">{residual}</td></tr>
+</tfoot>
+</table>
+{einv_block}
+<div class="footer">This is a computer-generated document. {narration}</div>
+</body></html>"##,
+        css = vortex_plugin_sdk::framework::user_reports::REPORT_CSS,
+        number = hval("number"),
+        title = title,
+        company_name = company_name,
+        addr1 = cval("company_address1"),
+        addr2 = cval("company_address2"),
+        postcode = cval("company_postcode"),
+        city = cval("company_city"),
+        ctin = cval("company_tin"),
+        cbrn = cval("company_id_value"),
+        sst_line = if sst_registered {
+            format!("SST Reg. No: {}", cval("company_sst_registration"))
+        } else {
+            String::new()
+        },
+        cphone = cval("company_phone"),
+        cemail = cval("company_email"),
+        date = head
+            .try_get::<Option<vortex_plugin_sdk::chrono::NaiveDate>, _>("invoice_date")
+            .ok()
+            .flatten()
+            .map(|d| d.to_string())
+            .unwrap_or_default(),
+        due = head
+            .try_get::<Option<vortex_plugin_sdk::chrono::NaiveDate>, _>("due_date")
+            .ok()
+            .flatten()
+            .map(|d| d.to_string())
+            .unwrap_or_default(),
+        reference = hval("ref"),
+        partner = hval("partner_name"),
+        pstreet = hval("street"),
+        pstreet2 = hval("street2"),
+        pzip = hval("zip"),
+        pcity = hval("city"),
+        ptin_line = {
+            let tin = hval("partner_tin");
+            if tin.is_empty() { String::new() } else { format!("TIN: {tin}") }
+        },
+        pphone = hval("partner_phone"),
+        pemail = hval("partner_email"),
+        line_trs = line_trs,
+        tax_trs = tax_trs,
+        untaxed = money(head.get("untaxed_amount")),
+        total = money(head.get("total_amount")),
+        residual = money(head.get("amount_residual")),
+        einv_block = einv_block,
+        draft_mark = draft_mark,
+        narration = hval("narration"),
+    );
+    Html(html).into_response()
 }
 
 fn doc_family(move_type: &str) -> (&'static str, &'static str, &'static str) {
@@ -667,6 +929,9 @@ async fn document_detail(
 
     // Actions
     let mut actions = String::new();
+    actions.push_str(&format!(
+        r#"<a href="/accounting/documents/{id}/print" target="_blank" class="btn btn-outline btn-sm">Print</a> "#
+    ));
     if is_draft {
         actions.push_str(&format!(
             r#"<form method="POST" action="/accounting/documents/{id}/post" style="display:inline">
