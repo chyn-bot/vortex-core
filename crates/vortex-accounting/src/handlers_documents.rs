@@ -193,9 +193,13 @@ async fn print_document(
         })
         .unwrap_or_default();
     // Company logo (uploaded in Accounting Settings, FileStore-backed).
+    // Content-hashed URL: a new upload always shows immediately.
     let logo_html = match app_state.files.get(&db_ctx.db_name, "company/logo").await {
-        Ok(Some(_)) => r#"<img src="/accounting/company-logo" alt="" style="max-height:64px;max-width:220px;margin-bottom:6px"/>"#,
-        _ => "",
+        Ok(Some(data)) => format!(
+            r#"<img src="/accounting/company-logo?v={}" alt="" style="max-height:64px;max-width:220px;margin-bottom:6px"/>"#,
+            &crate::einvois::sha256_hex(&data)[..12],
+        ),
+        _ => String::new(),
     };
     let draft_mark = if state != "posted" {
         r#"<div class="watermark">DRAFT</div>"#

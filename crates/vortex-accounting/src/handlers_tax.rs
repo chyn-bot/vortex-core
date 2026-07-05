@@ -514,12 +514,15 @@ async fn edit_settings(
     let form =
         render_form(&db, &settings_form(), FormMode::Edit, Some(&id.to_string()), &values, &[])
             .await;
-    // Logo upload card (multipart, outside the form engine).
-    let has_logo = matches!(state.files.get(&db_ctx.db_name, LOGO_KEY).await, Ok(Some(_)));
-    let preview = if has_logo {
-        r#"<img src="/accounting/company-logo" alt="Current logo" class="max-h-16 mb-2 rounded"/>"#
-    } else {
-        r#"<p class="text-sm opacity-60 mb-2">No logo yet.</p>"#
+    // Logo upload card (multipart, outside the form engine). The
+    // preview URL carries a content hash so a fresh upload is never
+    // hidden behind the browser cache.
+    let preview = match state.files.get(&db_ctx.db_name, LOGO_KEY).await {
+        Ok(Some(data)) => format!(
+            r#"<img src="/accounting/company-logo?v={}" alt="Current logo" class="max-h-16 mb-2 rounded"/>"#,
+            &crate::einvois::sha256_hex(&data)[..12],
+        ),
+        _ => r#"<p class="text-sm opacity-60 mb-2">No logo yet.</p>"#.to_string(),
     };
     let logo_card = format!(
         r#"<div class="card bg-base-100 shadow mt-4 max-w-2xl"><div class="card-body p-4">
@@ -1106,9 +1109,11 @@ async fn serve_logo(
             (
                 [
                     (vortex_plugin_sdk::axum::http::header::CONTENT_TYPE, ct),
+                    // The URL is content-hashed (?v=sha), so long
+                    // caching is safe — a new logo gets a new URL.
                     (
                         vortex_plugin_sdk::axum::http::header::CACHE_CONTROL,
-                        "private, max-age=300",
+                        "private, max-age=86400",
                     ),
                 ],
                 data,
