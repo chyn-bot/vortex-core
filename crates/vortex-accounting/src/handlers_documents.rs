@@ -571,33 +571,6 @@ fn doc_type_label(t: &str) -> &'static str {
     DOC_TYPES.iter().find(|(k, _)| *k == t).map(|(_, l)| *l).unwrap_or("Document")
 }
 
-async fn doc_partner_options(
-    db: &vortex_plugin_sdk::sqlx::PgPool,
-    kind: &str,
-    selected: Option<Uuid>,
-) -> String {
-    let esc = vortex_plugin_sdk::framework::html_escape;
-    let sql = if kind == "customer" {
-        "SELECT id, name FROM contacts WHERE active AND contact_type IN ('customer','both') ORDER BY name"
-    } else {
-        "SELECT id, name FROM contacts WHERE active AND contact_type IN ('supplier','both') ORDER BY name"
-    };
-    let rows = vortex_plugin_sdk::sqlx::query(sql).fetch_all(db).await.unwrap_or_default();
-    let mut out = String::new();
-    for row in rows {
-        let id: Uuid = row.get("id");
-        let name: String = row.get("name");
-        let sel = if Some(id) == selected { " selected" } else { "" };
-        out.push_str(&format!(
-            r#"<option value="{id}"{sel}>{name}</option>"#,
-            id = id,
-            sel = sel,
-            name = esc(&name)
-        ));
-    }
-    out
-}
-
 /// Side-appropriate GL accounts for a line override: revenue accounts
 /// on customer documents; expense + asset accounts on vendor bills
 /// (capex and prepayments are billed too). `(id, "code name")` pairs.
@@ -918,7 +891,25 @@ async fn new_document_form(
     let sidebar = render_sidebar(&state, &user, &db_ctx);
     let kind = query.get("kind").map(String::as_str).unwrap_or("customer_invoice");
     let (family_title, family_url, partner_kind) = doc_family(kind);
-    let partners = doc_partner_options(&db, partner_kind, None).await;
+    // Partner is a typeahead over contacts (thousands of rows), scoped to the
+    // right side of the ledger. The descriptor is signed server-side, so this
+    // filter can't be tampered with by the browser.
+    let partner_filter = if partner_kind == "customer" {
+        "contact_type IN ('customer','both')"
+    } else {
+        "contact_type IN ('supplier','both')"
+    };
+    let partner_src =
+        vortex_plugin_sdk::framework::form::LookupSource::with_filter("contacts", "name", partner_filter);
+    let partner_widget = vortex_plugin_sdk::framework::form::typeahead_widget(
+        "partner_id",
+        &partner_src.encode(),
+        "",
+        "",
+        true,
+        false,
+        Some("Search partner…"),
+    );
 
     let type_options: String = DOC_TYPES
         .iter()
@@ -960,7 +951,7 @@ async fn new_document_form(
 </div>
 <div class="form-control mb-3">
 <label class="label"><span class="label-text">Partner *</span></label>
-<select name="partner_id" class="select select-bordered select-sm" required>{partners}</select>
+{partner_widget}
 </div>
 <div class="grid grid-cols-2 gap-3">
 <div class="form-control mb-3">
@@ -985,7 +976,7 @@ async fn new_document_form(
         family_title = family_title,
         label = doc_type_label(kind),
         type_options = type_options,
-        partners = partners,
+        partner_widget = partner_widget,
         currency_options = currency_options,
     );
     Html(page_shell(&sidebar, "New Document", &content)).into_response()

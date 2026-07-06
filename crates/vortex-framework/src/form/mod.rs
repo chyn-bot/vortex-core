@@ -36,10 +36,12 @@
 //!   default from the registry; the builder stays the override.
 
 mod config;
+mod lookup;
 mod render;
 mod save;
 
 pub use config::{FieldKind, FormConfig, FormField, FormSection};
+pub use lookup::{typeahead_widget, LookupSource};
 pub use render::{render_form, FormMode};
 pub use save::{execute_form_save, load_record, FieldError, FormValues, SaveOutcome};
 
