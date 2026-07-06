@@ -27,6 +27,7 @@ pub fn contacts_routes() -> Router<Arc<AppState>> {
         .route("/contacts/{id}", post(update_contact))
         .route("/contacts/{id}/archive", post(archive_contact))
         .route("/contacts/{id}/unarchive", post(unarchive_contact))
+        .route("/contacts/{id}/duplicate", post(duplicate_contact))
         .route("/contacts/{id}/status/{state}", post(change_contact_status))
 }
 
@@ -39,8 +40,8 @@ fn page_shell(sidebar: &str, title: &str, content: &str) -> String {
 <title>{title} - Vortex</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=7" rel="stylesheet"/>
-<script src="/static/vortex.js?v=7" defer></script>
+<link href="/static/vortex.css?v=12" rel="stylesheet"/>
+<script src="/static/vortex.js?v=12" defer></script>
 <script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
@@ -680,7 +681,10 @@ async fn edit_contact(
 <a href="/contacts" class="btn btn-ghost btn-sm mb-2">← Back to Contacts</a>
 <h1 class="text-2xl font-bold">{name} <span class="text-base-content/40 font-mono text-sm">{code}</span></h1>
 </div>
+<div class="flex items-center gap-2">
+{duplicate_button}
 {archive_button}
+</div>
 </div>
 
 {status_bar}
@@ -859,6 +863,7 @@ async function loadStates(countryId) {{
         status_bar = status_bar,
         approval_panel = approval_panel,
         form_disabled = form_disabled,
+        duplicate_button = duplicate_button(&format!("/contacts/{id}/duplicate")),
         archive_button = archive_button,
     );
 
@@ -1170,4 +1175,80 @@ async fn unarchive_contact(
 
     info!(id = %id, "contact un-archived");
     vortex_plugin_sdk::axum::response::Redirect::to(&format!("/contacts/{id}")).into_response()
+}
+
+/// POST /contacts/:id/duplicate — copy the contact into a fresh, active
+/// draft: new sequence code, name marked "(copy)", lifecycle reset.
+async fn duplicate_contact(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<Uuid>,
+) -> Response {
+    // Draw a fresh contact code — `code` is unique per company, so the
+    // copy can never reuse the source's number.
+    let code = match vortex_plugin_sdk::orm::sequence::next(&state.pool, &CONTACT_SEQ).await {
+        Ok(c) => c,
+        Err(e) => {
+            error!(error = %e, "duplicate sequence draw failed");
+            return (
+                vortex_plugin_sdk::axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to generate contact code",
+            ).into_response();
+        }
+    };
+
+    // Lifecycle columns fall back to their DB defaults: the duplicate
+    // comes out active (even when the source is archived) and back at the
+    // initial `record_state`. `updated_by` is a stale editor stamp — the
+    // copy hasn't been edited yet. `created_by` is stamped by execute().
+    // Tags (`contact_tag_rel`) are copied separately below — the rel table
+    // has a composite PK and no `id` column, so `ChildCopy` doesn't apply.
+    // Cross-plugin record-panel data (e.g. accounting's tax identity)
+    // belongs to its owning plugin and is deliberately NOT copied.
+    let spec = DuplicateSpec::new("contacts")
+        .set("code", json!(code))
+        .copy_suffix("name")
+        .skip("record_state")
+        .skip("active")
+        .skip("updated_by");
+    let new_id = match spec.execute(&db, id, Some(user.id)).await {
+        Ok(new_id) => new_id,
+        Err(e) => {
+            error!(error = %e, "contact duplicate failed");
+            return (
+                vortex_plugin_sdk::axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "Duplicate failed",
+            ).into_response();
+        }
+    };
+
+    // Carry the source's tags over to the copy (best-effort: a tag
+    // failure must not orphan the already-created contact).
+    if let Err(e) = vortex_plugin_sdk::sqlx::query(
+        "INSERT INTO contact_tag_rel (contact_id, tag_id) \
+         SELECT $1, tag_id FROM contact_tag_rel WHERE contact_id = $2",
+    )
+    .bind(new_id)
+    .bind(id)
+    .execute(&db)
+    .await
+    {
+        error!(error = %e, "copying contact tags failed");
+    }
+
+    let audit_entry = vortex_plugin_sdk::security::AuditEntry::new(
+        vortex_plugin_sdk::security::AuditAction::RecordCreated,
+        vortex_plugin_sdk::security::AuditSeverity::Info,
+    )
+    .with_user(vortex_plugin_sdk::common::UserId(user.id))
+    .with_username(&user.username)
+    .with_database(&db_ctx.db_name)
+    .with_resource("contact", new_id.to_string())
+    .with_details(json!({ "duplicated_from": id, "code": code }));
+    let _ = state.audit.log(audit_entry).await;
+
+    info!(id = %new_id, source = %id, code = %code, "contact duplicated");
+    vortex_plugin_sdk::axum::response::Redirect::to(&format!("/contacts/{new_id}")).into_response()
 }

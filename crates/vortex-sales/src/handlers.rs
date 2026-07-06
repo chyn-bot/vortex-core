@@ -39,6 +39,7 @@ pub fn sales_routes() -> Router<Arc<AppState>> {
         .route("/sales/orders/{id}/confirm", post(confirm_order))
         .route("/sales/orders/{id}/send", post(mark_sent))
         .route("/sales/orders/{id}/revise", post(revise_quote))
+        .route("/sales/orders/{id}/duplicate", post(duplicate_order))
         .route("/sales/orders/{id}/lost", post(mark_lost))
         .route("/sales/orders/{id}/print-quote", get(print_quote))
         .route("/sales/orders/{id}/cancel", post(cancel_order))
@@ -61,8 +62,8 @@ fn page_shell(sidebar: &str, title: &str, content: &str) -> String {
 <title>{title} - Vortex</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=7" rel="stylesheet"/>
-<script src="/static/vortex.js?v=7" defer></script>
+<link href="/static/vortex.css?v=12" rel="stylesheet"/>
+<script src="/static/vortex.js?v=12" defer></script>
 <script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
@@ -877,6 +878,12 @@ async fn edit_order(
             ));
         }
     }
+    // Duplicate is available from every state: unlike Revise (next
+    // revision of THIS family), it starts a brand-new quotation family.
+    actions.push_str(&format!(
+        r#"<span class="inline ml-2">{}</span>"#,
+        duplicate_button(&format!("/sales/orders/{id}/duplicate"))
+    ));
 
     // ── Fulfilment documents (DO / service confirmations) ──
     let deliveries = vortex_plugin_sdk::sqlx::query(
@@ -1467,6 +1474,67 @@ async fn revise_quote(
 
     audit_so(&state, &db_ctx, &db, user.id, &user.username, new_id, "revised").await;
     info!(quote = %quote_number, revision = next_rev, "quotation revised");
+    vortex_plugin_sdk::axum::response::Redirect::to(&format!("/sales/orders/{new_id}")).into_response()
+}
+
+/// POST /sales/orders/{id}/duplicate — Odoo-style Duplicate, distinct from
+/// Revise: works from ANY state and starts a brand-new document family
+/// (fresh QT number, revision 1, its own root_quote_id). Lifecycle state,
+/// SO number, fulfilment/invoice links and counters all reset; stored
+/// totals are recomputed from the cloned lines.
+async fn duplicate_order(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<Uuid>,
+) -> Response {
+    let quote_number = match vortex_plugin_sdk::orm::sequence::next(&state.pool, &QT_SEQ).await {
+        Ok(n) => n,
+        Err(e) => {
+            error!(error = %e, "duplicate QT sequence draw failed");
+            return (vortex_plugin_sdk::axum::http::StatusCode::INTERNAL_SERVER_ERROR, "Duplicate failed").into_response();
+        }
+    };
+    let today = vortex_plugin_sdk::chrono::Utc::now().date_naive();
+    let validity = today + vortex_plugin_sdk::chrono::Duration::days(30);
+
+    let new_id = Uuid::now_v7();
+    let spec = DuplicateSpec::new("sales_order")
+        .with_id(new_id)
+        // Fresh identity: new quotation family rooted at itself.
+        .set("quote_number", json!(quote_number))
+        .set("revision", json!(1))
+        .set("root_quote_id", json!(new_id))
+        // Back to the initial 'quotation' state via the DB default.
+        .skip("state")
+        // SO number is only minted at confirmation; lost verdicts,
+        // review stamps and the invoice bridge belong to the source.
+        .skip("number")
+        .skip("lost_reason")
+        .skip("updated_by")
+        .skip("customer_invoice_move_id")
+        // Stored totals restart at 0 and are recomputed below.
+        .skip("untaxed_amount")
+        .skip("tax_amount")
+        .skip("total_amount")
+        // Commercial dates restart from today.
+        .set("order_date", json!(today.to_string()))
+        .set("validity_date", json!(validity.to_string()))
+        .child(
+            ChildCopy::new("sales_order_line", "order_id")
+                // Fulfilment counters restart at zero, like revise_quote.
+                .set("qty_delivered", json!(0))
+                .set("qty_invoiced", json!(0)),
+        );
+    if let Err(e) = spec.execute(&db, id, Some(user.id)).await {
+        error!(error = %e, "sales order duplicate failed");
+        return (vortex_plugin_sdk::axum::http::StatusCode::INTERNAL_SERVER_ERROR, "Duplicate failed").into_response();
+    }
+    recompute_totals(&db, new_id).await;
+
+    audit_so(&state, &db_ctx, &db, user.id, &user.username, new_id, "duplicated").await;
+    info!(quote = %quote_number, source = %id, "sales order duplicated");
     vortex_plugin_sdk::axum::response::Redirect::to(&format!("/sales/orders/{new_id}")).into_response()
 }
 

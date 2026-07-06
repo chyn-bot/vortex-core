@@ -100,6 +100,9 @@ pub mod prelude {
     // ── QR codes ──
     pub use vortex_framework::qr_svg;
 
+    // ── Record duplication (the platform-wide "Duplicate" button) ──
+    pub use vortex_framework::{duplicate_button, ChildCopy, DuplicateSpec};
+
     // ── Record panels (cross-plugin detail-page contributions) ──
     pub use vortex_framework::{
         handle_record_panel_saves, render_record_panels, PanelSaveCtx, RecordPanel,

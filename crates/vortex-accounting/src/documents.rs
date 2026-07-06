@@ -1093,6 +1093,611 @@ pub async fn register_payment(
     Ok(payment_id)
 }
 
+/// One line of a settlement: how much of `doc_id`'s open balance to apply.
+#[derive(Debug, Clone, Copy)]
+pub struct Allocation {
+    pub doc_id: Uuid,
+    pub amount: Decimal,
+}
+
+/// Settle a partner's open items together: pay some invoices/bills (in full
+/// or part), knock outstanding credit notes off against them, and — when the
+/// invoices exceed the credit notes — post one bank/cash payment for the net
+/// cash. Everything reconciles in a single pass, which is what lets one call
+/// cover: full/partial payment of one document, one payment across several,
+/// partial allocation across several, and payment-plus-credit-note.
+///
+/// `inbound` = receiving from a customer (settles customer invoices, offset by
+/// customer credit notes / cash); `!inbound` = paying a vendor. Each
+/// [`Allocation::amount`] is a positive company-currency figure applied to that
+/// document's open balance — the caller owns the split. Credit notes are just
+/// documents whose reconcilable line sits on the *opposite* GL side, so they go
+/// in the same list and are classified here by that side.
+///
+/// Returns the payment move id when net cash was paid, or `None` for a pure
+/// credit-note knock-off. Company-currency (MYR) documents only; FX documents
+/// are rejected here (settle those one-by-one through [`register_payment`]).
+#[allow(clippy::too_many_arguments)]
+pub async fn settle_documents(
+    db: &PgPool,
+    seq_pool: &ConnectionPool,
+    user_id: Uuid,
+    partner_id: Uuid,
+    inbound: bool,
+    journal_code: &str,
+    payment_date: NaiveDate,
+    memo: Option<&str>,
+    company_id: Option<Uuid>,
+    allocations: &[Allocation],
+) -> VortexResult<Option<Uuid>> {
+    struct Leg {
+        doc_id: Uuid,
+        line_id: Uuid,
+        is_debit: bool,
+        amount: Decimal,
+    }
+    // Resolve each requested document to its open reconcilable line, clamp the
+    // amount to what's actually open, and reject FX documents.
+    let mut legs: Vec<Leg> = Vec::new();
+    for a in allocations {
+        if a.amount <= Decimal::ZERO {
+            continue;
+        }
+        let fx: Option<Decimal> = vortex_plugin_sdk::sqlx::query_scalar(
+            "SELECT currency_rate FROM acc_move WHERE id = $1",
+        )
+        .bind(a.doc_id)
+        .fetch_one(db)
+        .await
+        .map_err(|e| VortexError::QueryExecution(e.to_string()))?;
+        if fx.is_some() {
+            return Err(VortexError::ValidationFailed(
+                "multi-currency documents can't be allocated here yet — settle them one at a time"
+                    .to_string(),
+            ));
+        }
+        let Some((line_id, open, is_debit)) = open_counterpart_line(db, a.doc_id).await? else {
+            continue;
+        };
+        if open <= Decimal::ZERO {
+            continue;
+        }
+        legs.push(Leg { doc_id: a.doc_id, line_id, is_debit, amount: a.amount.min(open) });
+    }
+    if legs.is_empty() {
+        return Err(VortexError::ValidationFailed(
+            "nothing to settle — allocate an amount to at least one document".to_string(),
+        ));
+    }
+
+    // Targets = invoices/bills (the side we're clearing); offsets = credit
+    // notes (the opposite side). Inbound targets are debit-side (receivable
+    // debit), outbound targets are credit-side (payable credit).
+    let sum_target: Decimal =
+        legs.iter().filter(|l| l.is_debit == inbound).map(|l| l.amount).sum();
+    let sum_offset: Decimal =
+        legs.iter().filter(|l| l.is_debit != inbound).map(|l| l.amount).sum();
+    if sum_target <= Decimal::ZERO {
+        return Err(VortexError::ValidationFailed(
+            "select at least one invoice or bill to settle".to_string(),
+        ));
+    }
+    let net_cash = (sum_target - sum_offset).round_dp(2);
+    if net_cash < Decimal::ZERO {
+        return Err(VortexError::ValidationFailed(
+            "credit notes exceed the selected invoices — reduce the credit-note amount".to_string(),
+        ));
+    }
+
+    // Two pools of reconcilable lines. Every document leg lands in a pool by
+    // its own GL side; the net-cash payment (if any) balances the two, so the
+    // pools sum equal and greedy matching consumes them exactly.
+    let mut debits: Vec<(Uuid, Decimal)> = Vec::new();
+    let mut credits: Vec<(Uuid, Decimal)> = Vec::new();
+    for l in &legs {
+        if l.is_debit {
+            debits.push((l.line_id, l.amount));
+        } else {
+            credits.push((l.line_id, l.amount));
+        }
+    }
+
+    // Post the net cash payment via the full payment engine (no built-in
+    // allocation), then drop its counterpart line into the matching pool.
+    let payment_id = if net_cash > Decimal::ZERO {
+        let pid = register_payment(
+            db,
+            seq_pool,
+            user_id,
+            &NewPayment {
+                partner_id,
+                direction: if inbound {
+                    PaymentDirection::Inbound
+                } else {
+                    PaymentDirection::Outbound
+                },
+                journal_code,
+                currency_code: None,
+                amount: net_cash,
+                payment_date,
+                memo,
+                company_id,
+                allocate_to: Vec::new(),
+            },
+        )
+        .await?;
+        let Some((pline, _open, pis_debit)) = open_counterpart_line(db, pid).await? else {
+            return Err(VortexError::ValidationFailed(
+                "payment posted without a reconcilable line".to_string(),
+            ));
+        };
+        if pis_debit {
+            debits.push((pline, net_cash));
+        } else {
+            credits.push((pline, net_cash));
+        }
+        Some(pid)
+    } else {
+        None
+    };
+
+    // Greedy line-to-line matching: both pools total the same, so this drains
+    // them fully. Each match is one acc_partial_reconcile row (debit ↔ credit).
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < debits.len() && j < credits.len() {
+        let matched = debits[i].1.min(credits[j].1);
+        if matched > Decimal::ZERO {
+            vortex_plugin_sdk::sqlx::query(
+                "INSERT INTO acc_partial_reconcile \
+                    (debit_line_id, credit_line_id, amount, company_id, created_by) \
+                 VALUES ($1, $2, $3, $4, $5)",
+            )
+            .bind(debits[i].0)
+            .bind(credits[j].0)
+            .bind(matched)
+            .bind(company_id)
+            .bind(user_id)
+            .execute(db)
+            .await
+            .map_err(|e| VortexError::QueryExecution(e.to_string()))?;
+            debits[i].1 -= matched;
+            credits[j].1 -= matched;
+        }
+        if debits[i].1 <= Decimal::ZERO {
+            i += 1;
+        }
+        if credits[j].1 <= Decimal::ZERO {
+            j += 1;
+        }
+    }
+
+    // Recompute residual / payment_state on every touched document + payment.
+    for l in &legs {
+        refresh_payment_state(db, l.doc_id).await?;
+    }
+    if let Some(pid) = payment_id {
+        refresh_payment_state(db, pid).await?;
+    }
+    Ok(payment_id)
+}
+
+/// Amount-driven settlement: take a cash `amount_received` and a set of `picked`
+/// documents, then knock the invoices/bills off **oldest-first** — the flow
+/// that scales when a partner has a long list of open invoices. The user picks
+/// *which* to clear and how much cash arrived; the split is computed here.
+///
+/// Behaviour:
+/// - Picked invoices/bills are the targets, ordered by date (FIFO).
+/// - Picked credit notes / unapplied advances add to the pool that clears them.
+/// - The pool = `amount_received` (posted as one payment) + selected credits;
+///   it fills the oldest targets first. Leftover **cash** stays on the payment
+///   as an advance; targets the pool can't reach stay open (partial/not paid).
+///
+/// `picked` may be given in any order — targets are sorted here, so the caller
+/// can pass an unordered form set. Returns the payment id (or `None` when only
+/// credits were applied with no cash). Company-currency (MYR) only.
+#[allow(clippy::too_many_arguments)]
+pub async fn apply_payment(
+    db: &PgPool,
+    seq_pool: &ConnectionPool,
+    user_id: Uuid,
+    partner_id: Uuid,
+    inbound: bool,
+    journal_code: &str,
+    payment_date: NaiveDate,
+    memo: Option<&str>,
+    company_id: Option<Uuid>,
+    amount_received: Decimal,
+    picked: &[Uuid],
+) -> VortexResult<Option<Uuid>> {
+    struct Item {
+        doc_id: Uuid,
+        line_id: Uuid,
+        open: Decimal,
+        is_debit: bool,
+        date: NaiveDate,
+    }
+    let mut targets: Vec<Item> = Vec::new();
+    let mut offsets: Vec<Item> = Vec::new();
+    for id in picked {
+        let head = vortex_plugin_sdk::sqlx::query(
+            "SELECT currency_rate, move_date FROM acc_move WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(db)
+        .await
+        .map_err(|e| VortexError::QueryExecution(e.to_string()))?;
+        let Some(head) = head else { continue };
+        let fx: Option<Decimal> = head.get("currency_rate");
+        if fx.is_some() {
+            return Err(VortexError::ValidationFailed(
+                "multi-currency documents can't be settled here yet — do them one at a time"
+                    .to_string(),
+            ));
+        }
+        let date: NaiveDate = head.get("move_date");
+        let Some((line_id, open, is_debit)) = open_counterpart_line(db, *id).await? else {
+            continue;
+        };
+        if open <= Decimal::ZERO {
+            continue;
+        }
+        let item = Item { doc_id: *id, line_id, open, is_debit, date };
+        // A target is on the same GL side as its invoice/bill; a credit
+        // (note or advance) is on the opposite side.
+        if is_debit == inbound {
+            targets.push(item);
+        } else {
+            offsets.push(item);
+        }
+    }
+    if amount_received <= Decimal::ZERO && offsets.is_empty() {
+        return Err(VortexError::ValidationFailed(
+            "enter an amount received, or select a credit / advance to apply".to_string(),
+        ));
+    }
+    // FIFO: oldest targets clear first.
+    targets.sort_by(|a, b| a.date.cmp(&b.date).then(a.doc_id.cmp(&b.doc_id)));
+    offsets.sort_by(|a, b| a.date.cmp(&b.date).then(a.doc_id.cmp(&b.doc_id)));
+
+    // Post the cash as one payment (unallocated for now).
+    let payment_id = if amount_received > Decimal::ZERO {
+        Some(
+            register_payment(
+                db,
+                seq_pool,
+                user_id,
+                &NewPayment {
+                    partner_id,
+                    direction: if inbound {
+                        PaymentDirection::Inbound
+                    } else {
+                        PaymentDirection::Outbound
+                    },
+                    journal_code,
+                    currency_code: None,
+                    amount: amount_received,
+                    payment_date,
+                    memo,
+                    company_id,
+                    allocate_to: Vec::new(),
+                },
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+
+    // Pools by GL side. Targets keep their FIFO order; credits come before the
+    // payment so cash (last) absorbs any overpayment as an advance.
+    let mut debits: Vec<(Uuid, Decimal)> = Vec::new();
+    let mut credits: Vec<(Uuid, Decimal)> = Vec::new();
+    let mut place = |line: Uuid, open: Decimal, is_debit: bool| {
+        if is_debit {
+            debits.push((line, open));
+        } else {
+            credits.push((line, open));
+        }
+    };
+    for t in &targets {
+        place(t.line_id, t.open, t.is_debit);
+    }
+    for o in &offsets {
+        place(o.line_id, o.open, o.is_debit);
+    }
+    if let Some(pid) = payment_id {
+        let Some((pline, popen, pis_debit)) = open_counterpart_line(db, pid).await? else {
+            return Err(VortexError::ValidationFailed(
+                "payment posted without a reconcilable line".to_string(),
+            ));
+        };
+        place(pline, popen, pis_debit);
+    }
+
+    // Greedy line-to-line matching. Pools may differ in total: leftovers stay
+    // open (unpaid targets, or an advance on the payment).
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < debits.len() && j < credits.len() {
+        let matched = debits[i].1.min(credits[j].1);
+        if matched > Decimal::ZERO {
+            vortex_plugin_sdk::sqlx::query(
+                "INSERT INTO acc_partial_reconcile \
+                    (debit_line_id, credit_line_id, amount, company_id, created_by) \
+                 VALUES ($1, $2, $3, $4, $5)",
+            )
+            .bind(debits[i].0)
+            .bind(credits[j].0)
+            .bind(matched)
+            .bind(company_id)
+            .bind(user_id)
+            .execute(db)
+            .await
+            .map_err(|e| VortexError::QueryExecution(e.to_string()))?;
+            debits[i].1 -= matched;
+            credits[j].1 -= matched;
+        }
+        if debits[i].1 <= Decimal::ZERO {
+            i += 1;
+        }
+        if credits[j].1 <= Decimal::ZERO {
+            j += 1;
+        }
+    }
+
+    for t in &targets {
+        refresh_payment_state(db, t.doc_id).await?;
+    }
+    for o in &offsets {
+        refresh_payment_state(db, o.doc_id).await?;
+    }
+    if let Some(pid) = payment_id {
+        refresh_payment_state(db, pid).await?;
+    }
+    Ok(payment_id)
+}
+
+/// An optional settlement difference posted to `account_id`, so the selected
+/// targets can be cleared in full even when the cash + credits fall short: an
+/// early-payment / settlement discount, a bank charge the remitter deducted,
+/// or a small write-off. Company-currency (MYR). For an inbound (customer)
+/// receipt the difference debits `account_id` (a discount/expense) and credits
+/// the receivable; for an outbound (vendor) payment it debits the payable and
+/// credits `account_id` (a discount income).
+#[derive(Debug, Clone, Copy)]
+pub struct WriteOff {
+    pub account_id: Uuid,
+    pub amount: Decimal,
+}
+
+/// General company-currency (MYR) settlement — the one the Register Payment
+/// page posts to. It combines every lever the earlier services had, plus the
+/// two that were missing:
+///
+/// - **Directed amounts** — each [`Allocation::amount`] is exactly how much of
+///   that document to knock off; the caller owns the split (restores manual /
+///   partial allocation across several invoices, in any order, not just FIFO).
+/// - **Explicit cash** — `amount_received` is the money that arrived; any excess
+///   over what the targets need stays on the payment as an advance credit.
+/// - **Credits** — allocations whose reconcilable line is on the opposite GL
+///   side (credit notes, unapplied advances) fund the targets like cash does.
+/// - **Write-off** — an optional difference to a discount / charge account so a
+///   short-paid invoice can still be marked fully paid.
+///
+/// Everything reconciles in one greedy pass over two line pools. The cash
+/// payment is placed last, so leftover funds land on it (advance) rather than
+/// on a credit note. Returns the payment id, or `None` when only credits /
+/// write-off cleared the targets with no cash. FX documents are rejected here
+/// (route those through [`register_payment`] with their currency).
+#[allow(clippy::too_many_arguments)]
+pub async fn post_settlement(
+    db: &PgPool,
+    seq_pool: &ConnectionPool,
+    user_id: Uuid,
+    partner_id: Uuid,
+    inbound: bool,
+    journal_code: &str,
+    payment_date: NaiveDate,
+    memo: Option<&str>,
+    company_id: Option<Uuid>,
+    amount_received: Decimal,
+    allocations: &[Allocation],
+    write_off: Option<WriteOff>,
+) -> VortexResult<Option<Uuid>> {
+    struct Leg {
+        doc_id: Uuid,
+        line_id: Uuid,
+        is_debit: bool,
+        amount: Decimal,
+    }
+    // Resolve each allocation to its open reconcilable line, clamp to what's
+    // open, and reject FX documents (this path is company-currency).
+    let mut legs: Vec<Leg> = Vec::new();
+    for a in allocations {
+        if a.amount <= Decimal::ZERO {
+            continue;
+        }
+        let fx: Option<Decimal> = vortex_plugin_sdk::sqlx::query_scalar(
+            "SELECT currency_rate FROM acc_move WHERE id = $1",
+        )
+        .bind(a.doc_id)
+        .fetch_one(db)
+        .await
+        .map_err(|e| VortexError::QueryExecution(e.to_string()))?;
+        if fx.is_some() {
+            return Err(VortexError::ValidationFailed(
+                "multi-currency documents can't be settled here — pick that currency to pay them"
+                    .to_string(),
+            ));
+        }
+        let Some((line_id, open, is_debit)) = open_counterpart_line(db, a.doc_id).await? else {
+            continue;
+        };
+        if open <= Decimal::ZERO {
+            continue;
+        }
+        legs.push(Leg { doc_id: a.doc_id, line_id, is_debit, amount: a.amount.min(open) });
+    }
+
+    let has_writeoff = write_off.map(|w| w.amount > Decimal::ZERO).unwrap_or(false);
+    if legs.is_empty() && amount_received <= Decimal::ZERO {
+        return Err(VortexError::ValidationFailed(
+            "enter an amount received, or allocate at least one document".to_string(),
+        ));
+    }
+
+    // Counterpart (AR/AP) account for the cash payment and the write-off.
+    let counterpart_role = if inbound { "receivable" } else { "payable" };
+    let counterpart =
+        service::partner_account(db, company_id, Some(partner_id), counterpart_role)
+            .await?
+            .ok_or_else(|| {
+                VortexError::ValidationFailed(format!("no {counterpart_role} account configured"))
+            })?;
+
+    // Two pools of reconcilable lines. Targets go on their own GL side; the
+    // funding sources (credits, write-off counterpart, cash payment) go on the
+    // opposite side and drain them by greedy match.
+    let mut debits: Vec<(Uuid, Decimal)> = Vec::new();
+    let mut credits: Vec<(Uuid, Decimal)> = Vec::new();
+    let mut place = |line: Uuid, amount: Decimal, is_debit: bool| {
+        if is_debit {
+            debits.push((line, amount));
+        } else {
+            credits.push((line, amount));
+        }
+    };
+    // Targets first, then offset credits — so the write-off and the cash
+    // (added after) are consumed last and any excess cash becomes an advance.
+    for l in legs.iter().filter(|l| l.is_debit == inbound) {
+        place(l.line_id, l.amount, l.is_debit);
+    }
+    for l in legs.iter().filter(|l| l.is_debit != inbound) {
+        place(l.line_id, l.amount, l.is_debit);
+    }
+
+    // Write-off: post the difference entry and drop its counterpart line into
+    // the pool on the side that clears targets.
+    if let Some(w) = write_off {
+        if w.amount > Decimal::ZERO {
+            let name = Some("Payment difference");
+            let lines = if inbound {
+                vec![
+                    service::MoveLine::debit(w.account_id, w.amount, name),
+                    service::MoveLine::credit(counterpart, w.amount, name).with_partner(partner_id),
+                ]
+            } else {
+                vec![
+                    service::MoveLine::debit(counterpart, w.amount, name).with_partner(partner_id),
+                    service::MoveLine::credit(w.account_id, w.amount, name),
+                ]
+            };
+            let (wid, _) = service::create_and_post(
+                db,
+                seq_pool,
+                user_id,
+                &service::NewMove {
+                    journal_code: "GEN",
+                    move_date: payment_date,
+                    move_type: "entry",
+                    ref_: Some("Payment difference"),
+                    narration: None,
+                    partner_id: Some(partner_id),
+                    origin_ref: None,
+                    company_id,
+                    lines,
+                },
+            )
+            .await?;
+            let Some((wline, wopen, wis_debit)) = open_counterpart_line(db, wid).await? else {
+                return Err(VortexError::ValidationFailed(
+                    "write-off posted without a reconcilable line".to_string(),
+                ));
+            };
+            place(wline, wopen, wis_debit);
+        }
+    }
+
+    // Cash payment last, so overpayment stays on it as an advance.
+    let payment_id = if amount_received > Decimal::ZERO {
+        let pid = register_payment(
+            db,
+            seq_pool,
+            user_id,
+            &NewPayment {
+                partner_id,
+                direction: if inbound {
+                    PaymentDirection::Inbound
+                } else {
+                    PaymentDirection::Outbound
+                },
+                journal_code,
+                currency_code: None,
+                amount: amount_received,
+                payment_date,
+                memo,
+                company_id,
+                allocate_to: Vec::new(),
+            },
+        )
+        .await?;
+        let Some((pline, popen, pis_debit)) = open_counterpart_line(db, pid).await? else {
+            return Err(VortexError::ValidationFailed(
+                "payment posted without a reconcilable line".to_string(),
+            ));
+        };
+        place(pline, popen, pis_debit);
+        Some(pid)
+    } else {
+        None
+    };
+
+    // A write-off with no targets and no cash would post a difference into
+    // nowhere — guard it (already covered above unless only write-off given).
+    if legs.is_empty() && payment_id.is_none() && has_writeoff {
+        return Err(VortexError::ValidationFailed(
+            "a write-off needs at least one document to apply against".to_string(),
+        ));
+    }
+
+    // Greedy line-to-line matching across the two pools.
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < debits.len() && j < credits.len() {
+        let matched = debits[i].1.min(credits[j].1);
+        if matched > Decimal::ZERO {
+            vortex_plugin_sdk::sqlx::query(
+                "INSERT INTO acc_partial_reconcile \
+                    (debit_line_id, credit_line_id, amount, company_id, created_by) \
+                 VALUES ($1, $2, $3, $4, $5)",
+            )
+            .bind(debits[i].0)
+            .bind(credits[j].0)
+            .bind(matched)
+            .bind(company_id)
+            .bind(user_id)
+            .execute(db)
+            .await
+            .map_err(|e| VortexError::QueryExecution(e.to_string()))?;
+            debits[i].1 -= matched;
+            credits[j].1 -= matched;
+        }
+        if debits[i].1 <= Decimal::ZERO {
+            i += 1;
+        }
+        if credits[j].1 <= Decimal::ZERO {
+            j += 1;
+        }
+    }
+
+    for l in &legs {
+        refresh_payment_state(db, l.doc_id).await?;
+    }
+    if let Some(pid) = payment_id {
+        refresh_payment_state(db, pid).await?;
+    }
+    Ok(payment_id)
+}
+
 /// Cancel a posted document the ledger-honest way: post a full
 /// reversal, reconcile it against the original so nothing stays open,
 /// and mark the document `reversed`. The original entry remains on the
@@ -1320,4 +1925,130 @@ pub async fn reset_to_draft(
     .execute(db)
     .await;
     Ok(())
+}
+
+/// Reset a posted **payment** to draft, unallocating it from every document it
+/// settled. Where [`reset_to_draft`] refuses while anything is reconciled, this
+/// is the payment desk's "undo": it removes the payment's reconciliations so
+/// the invoices/bills reopen, then unposts the payment through the guarded
+/// [`crate::service::unpost_move`] path (the number is kept, so a corrected
+/// repost reuses it). Returns how many documents were reopened.
+///
+/// Guards mirror `reset_to_draft`: posted only, `payment` move type, and the
+/// period must be open (no lock date / closed fiscal year). Foreign-currency
+/// payments post realised FX entries when they settle, which a plain
+/// unallocation would strand — those must be cancelled by reversal instead.
+pub async fn reset_payment_to_draft(
+    db: &PgPool,
+    user_id: Uuid,
+    move_id: Uuid,
+) -> VortexResult<usize> {
+    let head = vortex_plugin_sdk::sqlx::query(
+        "SELECT state, move_type, move_date, currency_rate FROM acc_move WHERE id = $1",
+    )
+    .bind(move_id)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| VortexError::QueryExecution(e.to_string()))?
+    .ok_or_else(|| VortexError::ValidationFailed("payment not found".into()))?;
+    let state: String = head.get("state");
+    let move_type: String = head.get("move_type");
+    let move_date: NaiveDate = head.get("move_date");
+    let fx: Option<Decimal> = head.get("currency_rate");
+    if state != "posted" {
+        return Err(VortexError::ValidationFailed(
+            "only posted payments can be reset to draft".into(),
+        ));
+    }
+    if move_type != "payment" {
+        return Err(VortexError::ValidationFailed(
+            "this isn't a payment — reset documents from the document page, or reverse a journal entry"
+                .into(),
+        ));
+    }
+    if fx.is_some() {
+        return Err(VortexError::ValidationFailed(
+            "foreign-currency payment: it posted a realised FX entry on settlement — cancel it by reversal instead"
+                .into(),
+        ));
+    }
+    // Period control: can't reopen a locked or closed period.
+    let locks = vortex_plugin_sdk::sqlx::query(
+        "SELECT lock_date, tax_lock_date FROM acc_config ORDER BY company_id NULLS LAST LIMIT 1",
+    )
+    .fetch_optional(db)
+    .await
+    .map_err(|e| VortexError::QueryExecution(e.to_string()))?;
+    if let Some(l) = locks {
+        for col in ["lock_date", "tax_lock_date"] {
+            if let Some(lock) = l.get::<Option<NaiveDate>, _>(col) {
+                if move_date <= lock {
+                    return Err(VortexError::ValidationFailed(format!(
+                        "payment date {move_date} falls in a locked period ({col} {lock})"
+                    )));
+                }
+            }
+        }
+    }
+    let closed_fy: Option<String> = vortex_plugin_sdk::sqlx::query_scalar(
+        "SELECT code FROM acc_fiscal_year \
+         WHERE state = 'closed' AND $1 BETWEEN date_from AND date_to LIMIT 1",
+    )
+    .bind(move_date)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| VortexError::QueryExecution(e.to_string()))?
+    .flatten();
+    if let Some(fy) = closed_fy {
+        return Err(VortexError::ValidationFailed(format!("fiscal year {fy} is closed")));
+    }
+
+    // Documents this payment settled — the *other* side of each reconcile.
+    // Captured before we delete, so we know which ones to reopen.
+    let affected: Vec<Uuid> = vortex_plugin_sdk::sqlx::query_scalar(
+        "SELECT DISTINCT ol.move_id \
+         FROM acc_partial_reconcile pr \
+         JOIN acc_move_line pl ON pl.id IN (pr.debit_line_id, pr.credit_line_id) AND pl.move_id = $1 \
+         JOIN acc_move_line ol ON ol.id IN (pr.debit_line_id, pr.credit_line_id) AND ol.move_id <> $1",
+    )
+    .bind(move_id)
+    .fetch_all(db)
+    .await
+    .map_err(|e| VortexError::QueryExecution(e.to_string()))?;
+
+    // Remove the payment's reconciliations (the unallocation).
+    vortex_plugin_sdk::sqlx::query(
+        "DELETE FROM acc_partial_reconcile \
+         WHERE debit_line_id IN (SELECT id FROM acc_move_line WHERE move_id = $1) \
+            OR credit_line_id IN (SELECT id FROM acc_move_line WHERE move_id = $1)",
+    )
+    .bind(move_id)
+    .execute(db)
+    .await
+    .map_err(|e| VortexError::QueryExecution(e.to_string()))?;
+
+    // Clear the fully-reconciled flag on the payment's lines and on each
+    // reopened document's reconcilable line; refresh_payment_state re-sets it
+    // where another payment still fully covers a document.
+    vortex_plugin_sdk::sqlx::query("UPDATE acc_move_line SET reconciled = FALSE WHERE move_id = $1")
+        .bind(move_id)
+        .execute(db)
+        .await
+        .map_err(|e| VortexError::QueryExecution(e.to_string()))?;
+    for doc_id in &affected {
+        vortex_plugin_sdk::sqlx::query(
+            "UPDATE acc_move_line l SET reconciled = FALSE \
+             FROM acc_account a \
+             WHERE l.move_id = $1 AND a.id = l.account_id AND a.reconcile",
+        )
+        .bind(doc_id)
+        .execute(db)
+        .await
+        .map_err(|e| VortexError::QueryExecution(e.to_string()))?;
+        refresh_payment_state(db, *doc_id).await?;
+    }
+
+    // Unpost the payment (guarded posted→draft; number kept for a clean repost).
+    crate::service::unpost_move(db, move_id, user_id).await?;
+    Ok(affected.len())
 }

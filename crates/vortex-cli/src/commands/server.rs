@@ -1222,6 +1222,42 @@ async fn api_create_record(
     }
 }
 
+/// `POST /api/v1/{model}/{id}/duplicate` — copy a record into a fresh row.
+/// Identity columns are regenerated and `created_by` becomes the calling
+/// user; everything else is copied verbatim (unique columns may reject the
+/// copy — the DB constraint decides).
+async fn api_duplicate_record(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(tok): Extension<vortex_framework::api::ResolvedToken>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path((model, id)): Path<(String, uuid::Uuid)>,
+) -> Response {
+    if let Some(resp) = require_write(&tok) {
+        return resp;
+    }
+    match vortex_framework::api::duplicate_record(&db, &model, id, Some(user.id)).await {
+        Ok(new_id) => {
+            api_audit(
+                &state, &db_ctx.db_name, &user,
+                AuditAction::RecordCreated, AuditSeverity::Info, &model, Some(&new_id.to_string()),
+                serde_json::json!({"via": "api", "duplicated_from": id}),
+            ).await;
+            let rec = vortex_framework::api::get_record(&db, &model, new_id).await.ok().flatten();
+            vortex_framework::webhooks::emit(
+                &state.db, &db, &db_ctx.db_name, "record.created",
+                serde_json::json!({"model": model, "id": new_id, "record": rec, "duplicated_from": id}),
+            ).await;
+            (StatusCode::CREATED, Json(serde_json::json!({"id": new_id, "record": rec}))).into_response()
+        }
+        Err(e) if e == "source record not found" => {
+            api_error(StatusCode::NOT_FOUND, "not_found", "No such record.")
+        }
+        Err(e) => api_error(StatusCode::BAD_REQUEST, "duplicate_failed", &e),
+    }
+}
+
 /// `PATCH /api/v1/{model}/{id}` — partial update from a JSON body.
 async fn api_update_record(
     State(state): State<Arc<AppState>>,
@@ -1332,8 +1368,8 @@ fn module_not_installed_page(module_name: &str) -> String {
     format!(r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style><title>Module Not Installed</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=7" rel="stylesheet"/>
-<script src="/static/vortex.js?v=7" defer></script>
+<link href="/static/vortex.css?v=12" rel="stylesheet"/>
+<script src="/static/vortex.js?v=12" defer></script>
 <script src="/static/vendor/tailwind.js"></script></head>
 <body class="min-h-screen bg-base-200 flex items-center justify-center">
 <div class="card bg-base-100 shadow-xl max-w-md w-full">
@@ -2357,6 +2393,7 @@ fn build_router(state: Arc<AppState>) -> Router {
             "/api/v1/{model}/{id}",
             get(api_get_record).patch(api_update_record).delete(api_delete_record),
         )
+        .route("/api/v1/{model}/{id}/duplicate", post(api_duplicate_record))
         .route_layer(middleware::from_fn_with_state(state.clone(), api_auth_middleware));
 
     // Public routes - no authentication required
@@ -2964,8 +3001,8 @@ async fn home_page(
         r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style><title>Home - Remicle</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=7" rel="stylesheet"/>
-<script src="/static/vortex.js?v=7" defer></script>
+<link href="/static/vortex.css?v=12" rel="stylesheet"/>
+<script src="/static/vortex.js?v=12" defer></script>
 <script src="/static/vendor/tailwind.js"></script>
 <script src="/static/vendor/htmx.min.js"></script>
 </head>
@@ -3702,8 +3739,8 @@ async fn announcements_list(
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style><title>Announcements - Remicle</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=7" rel="stylesheet"/>
-<script src="/static/vortex.js?v=7" defer></script>
+<link href="/static/vortex.css?v=12" rel="stylesheet"/>
+<script src="/static/vortex.js?v=12" defer></script>
 <script src="/static/vendor/tailwind.js"></script></head>
 <body class="min-h-screen bg-base-200">
 <div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a><button onclick="(function(){{var h=document.documentElement,c=h.getAttribute('data-theme')==='dark'?'corporate':'dark';h.setAttribute('data-theme',c);localStorage.setItem('theme',c);document.querySelectorAll('.theme-icon-sun,.theme-icon-moon').forEach(function(e){{e.classList.toggle('hidden')}})}})();" class="btn btn-ghost btn-sm btn-square ml-auto"><svg class="theme-icon-sun w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5" stroke-width="2"/><path stroke-linecap="round" stroke-width="2" d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg><svg class="theme-icon-moon w-5 h-5 hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg></button></div>
@@ -3738,8 +3775,8 @@ async fn announcement_new(
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style><title>New Announcement - Remicle</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=7" rel="stylesheet"/>
-<script src="/static/vortex.js?v=7" defer></script>
+<link href="/static/vortex.css?v=12" rel="stylesheet"/>
+<script src="/static/vortex.js?v=12" defer></script>
 <script src="/static/vendor/tailwind.js"></script></head>
 <body class="min-h-screen bg-base-200">
 <div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a><button onclick="(function(){{var h=document.documentElement,c=h.getAttribute('data-theme')==='dark'?'corporate':'dark';h.setAttribute('data-theme',c);localStorage.setItem('theme',c);document.querySelectorAll('.theme-icon-sun,.theme-icon-moon').forEach(function(e){{e.classList.toggle('hidden')}})}})();" class="btn btn-ghost btn-sm btn-square ml-auto"><svg class="theme-icon-sun w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5" stroke-width="2"/><path stroke-linecap="round" stroke-width="2" d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg><svg class="theme-icon-moon w-5 h-5 hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg></button></div>
@@ -3853,8 +3890,8 @@ async fn announcement_edit(
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style><title>Edit Announcement - Remicle</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=7" rel="stylesheet"/>
-<script src="/static/vortex.js?v=7" defer></script>
+<link href="/static/vortex.css?v=12" rel="stylesheet"/>
+<script src="/static/vortex.js?v=12" defer></script>
 <script src="/static/vendor/tailwind.js"></script></head>
 <body class="min-h-screen bg-base-200">
 <div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a><button onclick="(function(){{var h=document.documentElement,c=h.getAttribute('data-theme')==='dark'?'corporate':'dark';h.setAttribute('data-theme',c);localStorage.setItem('theme',c);document.querySelectorAll('.theme-icon-sun,.theme-icon-moon').forEach(function(e){{e.classList.toggle('hidden')}})}})();" class="btn btn-ghost btn-sm btn-square ml-auto"><svg class="theme-icon-sun w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5" stroke-width="2"/><path stroke-linecap="round" stroke-width="2" d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg><svg class="theme-icon-moon w-5 h-5 hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg></button></div>
@@ -4923,8 +4960,8 @@ async fn access_control_page(
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Access Control - Remicle</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=7" rel="stylesheet"/>
-<script src="/static/vortex.js?v=7" defer></script>
+<link href="/static/vortex.css?v=12" rel="stylesheet"/>
+<script src="/static/vortex.js?v=12" defer></script>
     <script src="/static/vendor/tailwind.js"></script>
     <script src="/static/vendor/htmx.min.js"></script>
     <script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style>
@@ -5413,8 +5450,8 @@ async fn modules_list_with_filter(
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Apps & Modules - Remicle</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet" type="text/css" />
-<link href="/static/vortex.css?v=7" rel="stylesheet"/>
-<script src="/static/vortex.js?v=7" defer></script>
+<link href="/static/vortex.css?v=12" rel="stylesheet"/>
+<script src="/static/vortex.js?v=12" defer></script>
     <script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
@@ -5759,8 +5796,8 @@ async fn modules_detail(
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>{name} - Apps & Modules</title>
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet" type="text/css"/>
-<link href="/static/vortex.css?v=7" rel="stylesheet"/>
-<script src="/static/vortex.js?v=7" defer></script>
+<link href="/static/vortex.css?v=12" rel="stylesheet"/>
+<script src="/static/vortex.js?v=12" defer></script>
 <script src="/static/vendor/tailwind.js"></script></head>
 <body class="min-h-screen bg-base-200"><main class="max-w-4xl mx-auto p-4 lg:p-8">
 <a href="/modules" class="btn btn-ghost btn-sm mb-4 gap-2">← Back to Apps &amp; Modules</a>
@@ -6724,8 +6761,8 @@ async fn generic_list_view(
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style><title>{}</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=7" rel="stylesheet"/>
-<script src="/static/vortex.js?v=7" defer></script>
+<link href="/static/vortex.css?v=12" rel="stylesheet"/>
+<script src="/static/vortex.js?v=12" defer></script>
 <script src="/static/vendor/tailwind.js"></script>
 <style>
 body {{ background: oklch(var(--b2)); color: oklch(var(--bc)); }}
@@ -7017,8 +7054,8 @@ async fn generic_kanban_view(
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style><title>{} - Kanban</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=7" rel="stylesheet"/>
-<script src="/static/vortex.js?v=7" defer></script>
+<link href="/static/vortex.css?v=12" rel="stylesheet"/>
+<script src="/static/vortex.js?v=12" defer></script>
 <script src="/static/vendor/tailwind.js"></script>
 <style>
 body {{ background: oklch(var(--b2)); color: oklch(var(--bc)); }}
@@ -7164,8 +7201,8 @@ async fn generic_graph_view(
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style><title>{} - Graph</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=7" rel="stylesheet"/>
-<script src="/static/vortex.js?v=7" defer></script>
+<link href="/static/vortex.css?v=12" rel="stylesheet"/>
+<script src="/static/vortex.js?v=12" defer></script>
 <script src="/static/vendor/tailwind.js"></script>
 <script src="/static/vendor/chart.umd.js"></script>
 <style>
@@ -7436,8 +7473,8 @@ async fn generic_calendar_view(
     <script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style>
     <title>{} - Calendar</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=7" rel="stylesheet"/>
-<script src="/static/vortex.js?v=7" defer></script>
+<link href="/static/vortex.css?v=12" rel="stylesheet"/>
+<script src="/static/vortex.js?v=12" defer></script>
     <script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
@@ -7968,8 +8005,8 @@ async fn generic_pivot_view(
     <title>{} - Pivot</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=7" rel="stylesheet"/>
-<script src="/static/vortex.js?v=7" defer></script>
+<link href="/static/vortex.css?v=12" rel="stylesheet"/>
+<script src="/static/vortex.js?v=12" defer></script>
     <script src="/static/vendor/tailwind.js"></script>
     <style>
         body {{ background: oklch(var(--b2)); color: oklch(var(--bc)); }}
@@ -8552,8 +8589,8 @@ async fn contacts_list(
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style><title>Contacts - Remicle</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=7" rel="stylesheet"/>
-<script src="/static/vortex.js?v=7" defer></script>
+<link href="/static/vortex.css?v=12" rel="stylesheet"/>
+<script src="/static/vortex.js?v=12" defer></script>
 <script src="/static/vendor/tailwind.js"></script></head>
 <body class="min-h-screen bg-base-200">
 <div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a><button onclick="(function(){{var h=document.documentElement,c=h.getAttribute('data-theme')==='dark'?'corporate':'dark';h.setAttribute('data-theme',c);localStorage.setItem('theme',c);document.querySelectorAll('.theme-icon-sun,.theme-icon-moon').forEach(function(e){{e.classList.toggle('hidden')}})}})();" class="btn btn-ghost btn-sm btn-square ml-auto"><svg class="theme-icon-sun w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5" stroke-width="2"/><path stroke-linecap="round" stroke-width="2" d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg><svg class="theme-icon-moon w-5 h-5 hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg></button></div>
@@ -8587,8 +8624,8 @@ async fn contacts_new(State(state): State<Arc<AppState>>, Db(db): Db, Extension(
     }
 
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style><title>New Contact</title><meta name="viewport" content="width=device-width, initial-scale=1.0"><link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=7" rel="stylesheet"/>
-<script src="/static/vortex.js?v=7" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=12" rel="stylesheet"/>
+<script src="/static/vortex.js?v=12" defer></script><script src="/static/vendor/tailwind.js"></script>
 <style>
 .country-dropdown {{ position: relative; }}
 .country-dropdown .dropdown-content {{ max-height: 300px; overflow-y: auto; width: 100%; }}
@@ -8891,8 +8928,8 @@ async fn contacts_edit(
     };
 
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style><title>Edit Contact</title><meta name="viewport" content="width=device-width, initial-scale=1.0"><link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=7" rel="stylesheet"/>
-<script src="/static/vortex.js?v=7" defer></script><script src="/static/vendor/tailwind.js"></script><script src="/static/vendor/htmx.min.js"></script>
+<link href="/static/vortex.css?v=12" rel="stylesheet"/>
+<script src="/static/vortex.js?v=12" defer></script><script src="/static/vendor/tailwind.js"></script><script src="/static/vendor/htmx.min.js"></script>
 <style>
 .country-dropdown {{ position: relative; }}
 .country-dropdown .dropdown-content {{ max-height: 300px; overflow-y: auto; width: 100%; }}
@@ -10207,8 +10244,8 @@ async fn notifications_page(
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Notifications - Remicle</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=7" rel="stylesheet"/>
-<script src="/static/vortex.js?v=7" defer></script>
+<link href="/static/vortex.css?v=12" rel="stylesheet"/>
+<script src="/static/vortex.js?v=12" defer></script>
     <script src="/static/vendor/tailwind.js"></script>
     <style>
         body {{ background: oklch(var(--b2)); color: oklch(var(--bc)); }}
@@ -10325,8 +10362,8 @@ async fn settings_index(
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Settings - Remicle</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=7" rel="stylesheet"/>
-<script src="/static/vortex.js?v=7" defer></script>
+<link href="/static/vortex.css?v=12" rel="stylesheet"/>
+<script src="/static/vortex.js?v=12" defer></script>
     <script src="/static/vendor/tailwind.js"></script>
     <style>
         body {{ background: oklch(var(--b2)); color: oklch(var(--bc)); }}
@@ -10885,8 +10922,8 @@ async fn audit_log_page(
         r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style><title>Audit Log - Remicle</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=7" rel="stylesheet"/>
-<script src="/static/vortex.js?v=7" defer></script>
+<link href="/static/vortex.css?v=12" rel="stylesheet"/>
+<script src="/static/vortex.js?v=12" defer></script>
 <script src="/static/vendor/tailwind.js"></script></head>
 <body class="min-h-screen bg-base-200">
 <div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a></div>
@@ -10951,8 +10988,8 @@ async fn activity_types_list(
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Activity Types - Settings</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=7" rel="stylesheet"/>
-<script src="/static/vortex.js?v=7" defer></script>
+<link href="/static/vortex.css?v=12" rel="stylesheet"/>
+<script src="/static/vortex.js?v=12" defer></script>
     <script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
@@ -11114,8 +11151,8 @@ async fn activity_type_edit(
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{} - Activity Type</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=7" rel="stylesheet"/>
-<script src="/static/vortex.js?v=7" defer></script>
+<link href="/static/vortex.css?v=12" rel="stylesheet"/>
+<script src="/static/vortex.js?v=12" defer></script>
     <script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
@@ -11248,8 +11285,8 @@ fn settings_write_error(back: &str, msg: &str) -> Response {
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Error</title>
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=7" rel="stylesheet"/>
-<script src="/static/vortex.js?v=7" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=12" rel="stylesheet"/>
+<script src="/static/vortex.js?v=12" defer></script><script src="/static/vendor/tailwind.js"></script>
 </head><body class="min-h-screen bg-base-200"><div class="container mx-auto p-6 max-w-xl">
 <div class="alert alert-error mb-4"><span>{}</span></div>
 <a href="{}" class="btn btn-ghost btn-sm">← Back</a>
@@ -11267,8 +11304,8 @@ fn settings_write_ok(back: &str, msg: &str) -> Response {
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Done</title>
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=7" rel="stylesheet"/>
-<script src="/static/vortex.js?v=7" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=12" rel="stylesheet"/>
+<script src="/static/vortex.js?v=12" defer></script><script src="/static/vendor/tailwind.js"></script>
 </head><body class="min-h-screen bg-base-200"><div class="container mx-auto p-6 max-w-xl">
 <div class="alert alert-success mb-4"><span>{}</span></div>
 <a href="{}" class="btn btn-ghost btn-sm">← Back</a>
@@ -11338,8 +11375,8 @@ async fn countries_list(
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Countries - Settings</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=7" rel="stylesheet"/>
-<script src="/static/vortex.js?v=7" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=12" rel="stylesheet"/>
+<script src="/static/vortex.js?v=12" defer></script><script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg">
@@ -11492,8 +11529,8 @@ async fn country_edit(
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{name} - Country</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=7" rel="stylesheet"/>
-<script src="/static/vortex.js?v=7" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=12" rel="stylesheet"/>
+<script src="/static/vortex.js?v=12" defer></script><script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg">
@@ -11671,8 +11708,8 @@ async fn states_list(
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>States - Settings</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=7" rel="stylesheet"/>
-<script src="/static/vortex.js?v=7" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=12" rel="stylesheet"/>
+<script src="/static/vortex.js?v=12" defer></script><script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg">
@@ -11818,8 +11855,8 @@ async fn state_edit(
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{name} - State</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=7" rel="stylesheet"/>
-<script src="/static/vortex.js?v=7" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=12" rel="stylesheet"/>
+<script src="/static/vortex.js?v=12" defer></script><script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg">
@@ -12017,8 +12054,8 @@ async fn stages_list(
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Stages - Settings</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=7" rel="stylesheet"/>
-<script src="/static/vortex.js?v=7" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=12" rel="stylesheet"/>
+<script src="/static/vortex.js?v=12" defer></script><script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg">
@@ -12177,8 +12214,8 @@ async fn stage_edit(
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{label} - Stage</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=7" rel="stylesheet"/>
-<script src="/static/vortex.js?v=7" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=12" rel="stylesheet"/>
+<script src="/static/vortex.js?v=12" defer></script><script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg">
@@ -12429,8 +12466,8 @@ async fn stage_buttons_list(
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Stage Buttons - Settings</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=7" rel="stylesheet"/>
-<script src="/static/vortex.js?v=7" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=12" rel="stylesheet"/>
+<script src="/static/vortex.js?v=12" defer></script><script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg">
@@ -12598,8 +12635,8 @@ async fn stage_button_edit(
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{label} - Stage Button</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=7" rel="stylesheet"/>
-<script src="/static/vortex.js?v=7" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=12" rel="stylesheet"/>
+<script src="/static/vortex.js?v=12" defer></script><script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg">
@@ -12850,8 +12887,8 @@ async fn approval_rules_list(Db(db): Db, Extension(user): Extension<AuthUser>) -
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Approval Rules - Settings</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=7" rel="stylesheet"/>
-<script src="/static/vortex.js?v=7" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=12" rel="stylesheet"/>
+<script src="/static/vortex.js?v=12" defer></script><script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg">
@@ -13053,8 +13090,8 @@ async fn approvals_inbox(
         r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><title>Approvals - Remicle</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=7" rel="stylesheet"/>
-<script src="/static/vortex.js?v=7" defer></script>
+<link href="/static/vortex.css?v=12" rel="stylesheet"/>
+<script src="/static/vortex.js?v=12" defer></script>
 <script src="/static/vendor/tailwind.js"></script></head>
 <body class="min-h-screen bg-base-200">
 <div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a></div>
@@ -13233,8 +13270,8 @@ async fn email_servers_list(Db(db): Db, Extension(user): Extension<AuthUser>) ->
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Email / SMTP - Settings</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=7" rel="stylesheet"/>
-<script src="/static/vortex.js?v=7" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=12" rel="stylesheet"/>
+<script src="/static/vortex.js?v=12" defer></script><script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg">
@@ -13439,8 +13476,8 @@ async fn email_server_edit(
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{name} - Mail Server</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=7" rel="stylesheet"/>
-<script src="/static/vortex.js?v=7" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=12" rel="stylesheet"/>
+<script src="/static/vortex.js?v=12" defer></script><script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg">
@@ -13705,8 +13742,8 @@ async fn jobs_list(
 <script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Jobs - Settings</title>
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=7" rel="stylesheet"/>
-<script src="/static/vortex.js?v=7" defer></script><script src="/static/vendor/tailwind.js"></script></head>
+<link href="/static/vortex.css?v=12" rel="stylesheet"/>
+<script src="/static/vortex.js?v=12" defer></script><script src="/static/vendor/tailwind.js"></script></head>
 <body class="min-h-screen bg-base-200">
 <div class="navbar bg-base-100 shadow-lg"><div class="flex-1"><a href="/" class="btn btn-ghost text-xl">remicle</a></div><div class="flex-none"><span class="text-sm">@{user}</span></div></div>
 <div class="container mx-auto p-6 max-w-5xl">
@@ -13751,8 +13788,8 @@ fn api_tokens_page_shell(user: &AuthUser, inner: &str) -> Html<String> {
 <script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>API Tokens - Settings</title>
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=7" rel="stylesheet"/>
-<script src="/static/vortex.js?v=7" defer></script><script src="/static/vendor/tailwind.js"></script></head>
+<link href="/static/vortex.css?v=12" rel="stylesheet"/>
+<script src="/static/vortex.js?v=12" defer></script><script src="/static/vendor/tailwind.js"></script></head>
 <body class="min-h-screen bg-base-200">
 <div class="navbar bg-base-100 shadow-lg"><div class="flex-1"><a href="/" class="btn btn-ghost text-xl">remicle</a></div><div class="flex-none"><span class="text-sm">@{user}</span></div></div>
 <div class="container mx-auto p-6 max-w-5xl">{inner}</div></body></html>"##,
@@ -13931,8 +13968,8 @@ fn webhooks_page_shell(user: &AuthUser, title: &str, inner: &str) -> Html<String
 <script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>{title} - Settings</title>
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=7" rel="stylesheet"/>
-<script src="/static/vortex.js?v=7" defer></script><script src="/static/vendor/tailwind.js"></script></head>
+<link href="/static/vortex.css?v=12" rel="stylesheet"/>
+<script src="/static/vortex.js?v=12" defer></script><script src="/static/vendor/tailwind.js"></script></head>
 <body class="min-h-screen bg-base-200">
 <div class="navbar bg-base-100 shadow-lg"><div class="flex-1"><a href="/" class="btn btn-ghost text-xl">remicle</a></div><div class="flex-none"><span class="text-sm">@{user}</span></div></div>
 <div class="container mx-auto p-6 max-w-4xl">{inner}</div></body></html>"##,
@@ -14214,8 +14251,8 @@ async fn sequences_list(
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Sequences - Settings</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=7" rel="stylesheet"/>
-<script src="/static/vortex.js?v=7" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=12" rel="stylesheet"/>
+<script src="/static/vortex.js?v=12" defer></script><script src="/static/vendor/tailwind.js"></script>
     <script src="/static/vendor/htmx.min.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
@@ -14419,8 +14456,8 @@ async fn sequence_edit(
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{} - Sequence</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=7" rel="stylesheet"/>
-<script src="/static/vortex.js?v=7" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=12" rel="stylesheet"/>
+<script src="/static/vortex.js?v=12" defer></script><script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg">
@@ -14611,8 +14648,8 @@ async fn cron_list(
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Scheduled Jobs - Settings</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=7" rel="stylesheet"/>
-<script src="/static/vortex.js?v=7" defer></script>
+<link href="/static/vortex.css?v=12" rel="stylesheet"/>
+<script src="/static/vortex.js?v=12" defer></script>
     <script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
@@ -14833,8 +14870,8 @@ async fn cron_edit(
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{} - Scheduled Job</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=7" rel="stylesheet"/>
-<script src="/static/vortex.js?v=7" defer></script>
+<link href="/static/vortex.css?v=12" rel="stylesheet"/>
+<script src="/static/vortex.js?v=12" defer></script>
     <script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
@@ -15409,8 +15446,8 @@ async fn reports_list(Db(db): Db, Extension(user): Extension<AuthUser>) -> Respo
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Reports - Settings</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=7" rel="stylesheet"/>
-<script src="/static/vortex.js?v=7" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=12" rel="stylesheet"/>
+<script src="/static/vortex.js?v=12" defer></script><script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg"><div class="flex-1"><a href="/" class="btn btn-ghost text-xl">remicle</a></div><div class="flex-none"><span class="text-sm">@{user}</span></div></div>
@@ -15603,8 +15640,8 @@ async fn report_edit(Db(db): Db, Extension(user): Extension<AuthUser>, Path(id):
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{name} - Report</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=7" rel="stylesheet"/>
-<script src="/static/vortex.js?v=7" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=12" rel="stylesheet"/>
+<script src="/static/vortex.js?v=12" defer></script><script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg"><div class="flex-1"><a href="/" class="btn btn-ghost text-xl">remicle</a></div><div class="flex-none"><span class="text-sm">@{user}</span></div></div>
@@ -15816,8 +15853,8 @@ async fn reports_hub(
     let html = format!(
         r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><title>Reports - Remicle</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0"><link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=7" rel="stylesheet"/>
-<script src="/static/vortex.js?v=7" defer></script><script src="/static/vendor/tailwind.js"></script></head>
+<link href="/static/vortex.css?v=12" rel="stylesheet"/>
+<script src="/static/vortex.js?v=12" defer></script><script src="/static/vendor/tailwind.js"></script></head>
 <body class="min-h-screen bg-base-200"><div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a></div>
 <div id="sidebar-overlay" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
 <div class="flex">{sidebar}<main class="flex-1 p-4 lg:p-6 min-w-0">{content}</main></div></body></html>"#,
@@ -16018,8 +16055,8 @@ async fn report_runs_page(
     let html = format!(
         r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><title>Generated Reports - Remicle</title>{refresh}
 <meta name="viewport" content="width=device-width, initial-scale=1.0"><link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=7" rel="stylesheet"/>
-<script src="/static/vortex.js?v=7" defer></script><script src="/static/vendor/tailwind.js"></script></head>
+<link href="/static/vortex.css?v=12" rel="stylesheet"/>
+<script src="/static/vortex.js?v=12" defer></script><script src="/static/vendor/tailwind.js"></script></head>
 <body class="min-h-screen bg-base-200"><div class="flex">{sidebar}<main class="flex-1 p-4 lg:p-6 min-w-0">{content}</main></div></body></html>"#,
         refresh = refresh, sidebar = sidebar, content = content,
     );
@@ -16394,8 +16431,8 @@ async fn render_dynamic_form(
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{}</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=7" rel="stylesheet"/>
-<script src="/static/vortex.js?v=7" defer></script>
+<link href="/static/vortex.css?v=12" rel="stylesheet"/>
+<script src="/static/vortex.js?v=12" defer></script>
     <script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">

@@ -130,6 +130,13 @@ impl Plugin for AccountingPlugin {
                 MenuGroup::Operations,
             )
             .under("accounting.ar"),
+            MenuEntry::new(
+                "accounting.ar.statement",
+                "Statement of Account",
+                "/accounting/statement",
+                MenuGroup::Operations,
+            )
+            .under("accounting.ar"),
             // ── Payables (AP) ───────────────────────────────────
             MenuEntry::new(
                 "accounting.ap",
@@ -821,6 +828,59 @@ impl Plugin for AccountingPlugin {
 <button form="record-form" formmethod="post" formaction="/accounting/partner-banks/{contact_id}/add" class="btn btn-sm btn-outline" title="Also saves the accounting fields above">Add Bank Account</button>
 </div>
 <p class="text-xs opacity-50 mt-1">SWIFT fills in from the bank master — manage the list under Accounting Setup ▸ Banks.</p>"#,
+                ))
+            },
+        ),
+        RecordPanel::new(
+            RecordPanelDef {
+                model: "contacts",
+                title: "Statement of Account",
+                priority: 70,
+            },
+            |_state, db, contact_id| async move {
+                // Net posted AR/AP balance for this partner (debit − credit):
+                // positive = a customer owes us, negative = we owe a vendor.
+                let bal: vortex_plugin_sdk::rust_decimal::Decimal =
+                    vortex_plugin_sdk::sqlx::query_scalar(
+                        "SELECT COALESCE(SUM(l.debit - l.credit), 0) FROM acc_move_line l \
+                         JOIN acc_move m ON m.id = l.move_id AND m.state = 'posted' \
+                         JOIN acc_account a ON a.id = l.account_id \
+                         WHERE l.partner_id = $1 \
+                           AND a.account_type IN ('asset_receivable', 'liability_payable')",
+                    )
+                    .bind(contact_id)
+                    .fetch_one(&db)
+                    .await
+                    .unwrap_or_default();
+                let zero = vortex_plugin_sdk::rust_decimal::Decimal::ZERO;
+                let hint = if bal > zero {
+                    "owed to you (receivable)"
+                } else if bal < zero {
+                    "you owe (payable)"
+                } else {
+                    "nothing outstanding"
+                };
+                Ok(format!(
+                    r#"<div class="flex items-center justify-between flex-wrap gap-3">
+<div><div class="text-2xl font-bold font-mono">{bal:.2}</div><div class="text-xs opacity-60">Outstanding balance — {hint}</div></div>
+<div class="flex gap-2">
+<a href="/reports/accounting.statement_of_account?partner={cid}" target="_blank" class="btn btn-sm btn-primary">View statement</a>
+{pdf}
+<a href="/reports/accounting.statement_of_account?partner={cid}&amp;format=csv" class="btn btn-sm btn-outline">CSV</a>
+<a href="/accounting/statement?partner={cid}" class="btn btn-sm btn-ghost">Date range…</a>
+</div>
+</div>"#,
+                    bal = bal,
+                    hint = hint,
+                    cid = contact_id,
+                    pdf = if vortex_plugin_sdk::framework::pdf::available() {
+                        format!(
+                            r#"<a href="/accounting/statement/pdf?partner={cid}" class="btn btn-sm btn-outline">PDF</a>"#,
+                            cid = contact_id,
+                        )
+                    } else {
+                        String::new()
+                    },
                 ))
             },
         )]

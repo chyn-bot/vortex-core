@@ -993,14 +993,135 @@ fn aged(code: &'static str, title: &'static str, receivable: bool) -> ReportDef 
     )
 }
 
-/// Statement of Account — every posted AR/AP ledger line for one
-/// partner with a running balance. Params: `partner` (contact UUID,
-/// required), `from`, `to`.
+/// Company logo as a self-contained `<img>` data URI — the same FileStore
+/// key (`company/logo`) and embedding that invoices print, so a logo uploaded
+/// in Accounting Settings shows on statements too. Empty if none is set. Uses
+/// the database the report is reading from, so it matches the right tenant.
+async fn company_logo_html(state: &AppState) -> String {
+    let db_name = state
+        .db
+        .connect_options()
+        .get_database()
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| state.default_db.clone());
+    match state.files.get(&db_name, "company/logo").await {
+        Ok(Some(data)) => {
+            use base64::Engine;
+            let ct = if data.starts_with(&[0xFF, 0xD8, 0xFF]) { "image/jpeg" } else { "image/png" };
+            format!(
+                r#"<img class="lh-logo" src="data:{ct};base64,{}" alt="" style="max-height:64px;max-width:240px;margin-bottom:6px"/>"#,
+                base64::engine::general_purpose::STANDARD.encode(&data),
+            )
+        }
+        _ => String::new(),
+    }
+}
+
+/// Company letterhead (name + address + contact + registration) for printable
+/// documents, pulled from `companies` + `acc_config`. Returns an HTML fragment
+/// (empty if there's no config row); the logo is prepended by the caller.
+async fn company_letterhead(db: &vortex_plugin_sdk::sqlx::PgPool) -> String {
+    let Some(r) = vortex_plugin_sdk::sqlx::query(
+        "SELECT COALESCE((SELECT name FROM companies WHERE id = cfg.company_id), \
+                         (SELECT name FROM companies ORDER BY created_at LIMIT 1), '') AS name, \
+                COALESCE(cfg.company_address1,'') AS a1, COALESCE(cfg.company_address2,'') AS a2, \
+                COALESCE(cfg.company_city,'') AS city, COALESCE(cfg.company_postcode,'') AS post, \
+                COALESCE(cfg.company_country_code,'') AS country, \
+                COALESCE(cfg.company_phone,'') AS phone, COALESCE(cfg.company_email,'') AS email, \
+                COALESCE(cfg.company_tin,'') AS tin, COALESCE(cfg.company_sst_registration,'') AS sst, \
+                COALESCE(cfg.company_id_value,'') AS regno \
+         FROM acc_config cfg ORDER BY cfg.company_id NULLS LAST LIMIT 1",
+    )
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten() else {
+        return String::new();
+    };
+    let name: String = r.get("name");
+    let a1: String = r.get("a1");
+    let a2: String = r.get("a2");
+    let city: String = r.get("city");
+    let post: String = r.get("post");
+    let country: String = r.get("country");
+    let phone: String = r.get("phone");
+    let email: String = r.get("email");
+    let tin: String = r.get("tin");
+    let sst: String = r.get("sst");
+    let regno: String = r.get("regno");
+
+    let mut addr: Vec<String> = Vec::new();
+    if !a1.is_empty() {
+        addr.push(esc(&a1));
+    }
+    if !a2.is_empty() {
+        addr.push(esc(&a2));
+    }
+    let city_line = format!("{post} {city}").trim().to_string();
+    let city_line = if country.is_empty() {
+        city_line
+    } else if city_line.is_empty() {
+        country.clone()
+    } else {
+        format!("{city_line}, {country}")
+    };
+    if !city_line.is_empty() {
+        addr.push(esc(&city_line));
+    }
+    let mut contact: Vec<String> = Vec::new();
+    if !phone.is_empty() {
+        contact.push(format!("Tel: {}", esc(&phone)));
+    }
+    if !email.is_empty() {
+        contact.push(esc(&email));
+    }
+    let mut reg: Vec<String> = Vec::new();
+    if !regno.is_empty() {
+        reg.push(format!("Reg No: {}", esc(&regno)));
+    }
+    if !tin.is_empty() {
+        reg.push(format!("TIN: {}", esc(&tin)));
+    }
+    if !sst.is_empty() {
+        reg.push(format!("SST: {}", esc(&sst)));
+    }
+
+    let mut html = format!("<div class=\"lh-name\">{}</div>", esc(&name));
+    if !addr.is_empty() {
+        html.push_str(&format!("<div class=\"lh-addr\">{}</div>", addr.join("<br>")));
+    }
+    if !contact.is_empty() {
+        html.push_str(&format!("<div class=\"lh-contact\">{}</div>", contact.join(" · ")));
+    }
+    if !reg.is_empty() {
+        html.push_str(&format!("<div class=\"lh-reg\">{}</div>", reg.join(" · ")));
+    }
+    html
+}
+
+/// Extra print styles for the statement letterhead + aging block.
+const STATEMENT_STYLE: &str = "<style>\
+.letterhead{display:flex;justify-content:space-between;align-items:flex-start;gap:2em;\
+border-bottom:2px solid #333;padding-bottom:12px;margin-bottom:10px}\
+.lh-name{font-size:20px;font-weight:bold}\
+.lh-addr,.lh-contact,.lh-reg{color:#444;font-size:12px;margin-top:3px;line-height:1.4}\
+.lh-doc{text-align:right;white-space:nowrap}\
+.lh-title{font-size:18px;font-weight:bold;letter-spacing:1px}\
+.lh-sub{color:#666;font-size:12px;margin-top:3px}\
+.stmt-to{margin:6px 0 16px}.muted{color:#888;font-size:12px}\
+.agh{margin-top:26px;margin-bottom:6px;font-size:14px}\
+table.aging{width:auto;min-width:60%}\
+</style>";
+
+/// Statement of Account — company letterhead, every posted AR/AP ledger line
+/// for one partner with a running balance, and an ageing summary of overdue
+/// invoices. Params: `partner` (contact UUID, required), `from`, `to` (the
+/// `to` date is also the ageing as-of date).
 fn statement_of_account() -> ReportDef {
     ReportDef::new(
         "accounting.statement_of_account",
         "Statement of Account",
-        "Per-partner AR/AP ledger with running balance — send to customers for collections",
+        "Per-partner AR/AP ledger with running balance + ageing — send to customers for collections",
         vec![ReportFormat::Html, ReportFormat::Csv],
         |state, params| async move {
             let partner: vortex_plugin_sdk::uuid::Uuid = params
@@ -1009,7 +1130,7 @@ fn statement_of_account() -> ReportDef {
                 .parse()
                 .map_err(|_| {
                     VortexError::ValidationFailed(
-                        "pass ?partner=<contact uuid> — see /accounting/tax-profiles for IDs".into(),
+                        "pass ?partner=<contact uuid> — open the customer and use the Statement of Account card".into(),
                     )
                 })?;
             let (date_sql, date_label) = date_clause(&params);
@@ -1036,6 +1157,56 @@ fn statement_of_account() -> ReportDef {
                 .fetch_all(&state.db)
                 .await
                 .map_err(|e| VortexError::QueryExecution(e.to_string()))?;
+
+            // Ageing of the partner's open invoices/bills, as of the `to` date
+            // (or today), in the configured buckets.
+            let as_of: Option<vortex_plugin_sdk::chrono::NaiveDate> =
+                params.get("to").and_then(|s| s.parse().ok());
+            let as_of_sql = match as_of {
+                Some(d) => format!("DATE '{d}'"),
+                None => "CURRENT_DATE".to_string(),
+            };
+            let buckets = aging_buckets(&state).await;
+            let mut cases = String::new();
+            let mut lo = 1i64;
+            for (i, hi) in buckets.iter().enumerate() {
+                cases.push_str(&format!(
+                    "SUM(CASE WHEN {as_of_sql} - m.due_date BETWEEN {lo} AND {hi} \
+                     THEN m.amount_residual ELSE 0 END) AS b{i}, "
+                ));
+                lo = hi + 1;
+            }
+            let last = buckets.len();
+            let over = buckets.last().copied().unwrap_or(0);
+            let age_sql = format!(
+                "SELECT SUM(CASE WHEN m.due_date IS NULL OR m.due_date >= {as_of_sql} \
+                        THEN m.amount_residual ELSE 0 END) AS bcurrent, {cases} \
+                    SUM(CASE WHEN {as_of_sql} - m.due_date > {over} \
+                        THEN m.amount_residual ELSE 0 END) AS b{last}, \
+                    COALESCE(SUM(m.amount_residual), 0) AS btotal \
+                 FROM acc_move m \
+                 WHERE m.partner_id = $1 AND m.state = 'posted' \
+                   AND m.move_type IN ('customer_invoice', 'vendor_bill') \
+                   AND m.payment_state IN ('not_paid', 'partial') AND m.amount_residual > 0"
+            );
+            let age_row = vortex_plugin_sdk::sqlx::query(&age_sql)
+                .bind(partner)
+                .fetch_optional(&state.db)
+                .await
+                .map_err(|e| VortexError::QueryExecution(e.to_string()))?;
+            let mut age_labels: Vec<String> = vec!["Current".into()];
+            age_labels.extend(bucket_labels(&buckets));
+            let mut age_cols: Vec<String> = vec!["bcurrent".into()];
+            age_cols.extend((0..=last).map(|i| format!("b{i}")));
+            let age_vals: Vec<Decimal> = age_cols
+                .iter()
+                .map(|c| {
+                    age_row.as_ref().map(|r| r.get::<Decimal, _>(c.as_str())).unwrap_or(Decimal::ZERO)
+                })
+                .collect();
+            let age_total: Decimal =
+                age_row.as_ref().map(|r| r.get::<Decimal, _>("btotal")).unwrap_or(Decimal::ZERO);
+
             let mut balance = Decimal::ZERO;
             match params.format {
                 ReportFormat::Csv => {
@@ -1055,6 +1226,16 @@ fn statement_of_account() -> ReportDef {
                             money(balance),
                         ));
                     }
+                    // Ageing summary appended as its own block.
+                    csv.push_str("\nageing");
+                    for l in &age_labels {
+                        csv.push_str(&format!(",{}", csv_escape(l)));
+                    }
+                    csv.push_str(",Total\namount");
+                    for v in &age_vals {
+                        csv.push_str(&format!(",{}", money(*v)));
+                    }
+                    csv.push_str(&format!(",{}\n", money(age_total)));
                     Ok(ReportOutput::csv("statement-of-account.csv", csv.into_bytes()))
                 }
                 _ => {
@@ -1085,14 +1266,53 @@ fn statement_of_account() -> ReportDef {
                          <td class=\"num\">{}</td></tr></table>",
                         money(balance),
                     ));
-                    Ok(ReportOutput::html(
-                        "statement-of-account.html",
-                        html_page(
-                            &format!("Statement of Account — {partner_name}"),
-                            &date_label,
-                            &table,
-                        ),
-                    ))
+
+                    // Ageing table.
+                    let mut aging = String::from("<table class=\"aging\"><tr>");
+                    for l in &age_labels {
+                        aging.push_str(&format!("<th class=\"num\">{}</th>", esc(l)));
+                    }
+                    aging.push_str("<th class=\"num\">Total</th></tr><tr>");
+                    for v in &age_vals {
+                        aging.push_str(&format!("<td class=\"num\">{}</td>", money(*v)));
+                    }
+                    aging.push_str(&format!(
+                        "<td class=\"num\">{}</td></tr></table>",
+                        money(age_total)
+                    ));
+
+                    let logo = company_logo_html(&state).await;
+                    let letterhead = company_letterhead(&state.db).await;
+                    let as_of_display = as_of
+                        .unwrap_or_else(|| vortex_plugin_sdk::chrono::Utc::now().date_naive())
+                        .to_string();
+                    let period = if date_label == "all dates" {
+                        String::new()
+                    } else {
+                        format!("<br><span class=\"muted\">Period: {}</span>", esc(&date_label))
+                    };
+                    let page = format!(
+                        "<!DOCTYPE html><html><head><title>Statement of Account — {pn}</title>\
+                         {style}{sstyle}</head><body>\
+                         <div class=\"letterhead\"><div class=\"lh-co\">{logo}{lh}</div>\
+                         <div class=\"lh-doc\"><div class=\"lh-title\">STATEMENT OF ACCOUNT</div>\
+                         <div class=\"lh-sub\">As of {asof}</div></div></div>\
+                         <div class=\"stmt-to\"><span class=\"muted\">Statement for</span><br>\
+                         <strong>{pn}</strong>{period}</div>\
+                         {ledger}\
+                         <h3 class=\"agh\">Ageing of overdue invoices</h3>{aging}\
+                         </body></html>",
+                        pn = esc(&partner_name),
+                        style = REPORT_STYLE,
+                        sstyle = STATEMENT_STYLE,
+                        logo = logo,
+                        lh = letterhead,
+                        asof = esc(&as_of_display),
+                        period = period,
+                        ledger = table,
+                        aging = aging,
+                    );
+                    Ok(ReportOutput::html("statement-of-account.html", page))
                 }
             }
         },

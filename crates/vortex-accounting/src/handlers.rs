@@ -25,6 +25,7 @@ pub fn accounting_routes() -> Router<Arc<AppState>> {
         .route("/accounting/moves/{id}/lines/{line_id}/delete", post(delete_line))
         .route("/accounting/moves/{id}/post", post(post_move))
         .route("/accounting/moves/{id}/reverse", post(reverse_move))
+        .route("/accounting/moves/{id}/reset-draft", post(reset_payment_draft))
         .route("/accounting/moves/{id}/cancel", post(cancel_move))
         .route("/accounting/accounts", get(list_accounts))
         .route("/accounting/accounts/new", get(new_account_form))
@@ -47,8 +48,8 @@ pub(crate) fn page_shell(sidebar: &str, title: &str, content: &str) -> String {
 <title>{title} - Vortex</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=7" rel="stylesheet"/>
-<script src="/static/vortex.js?v=7" defer></script>
+<link href="/static/vortex.css?v=12" rel="stylesheet"/>
+<script src="/static/vortex.js?v=12" defer></script>
 <script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
@@ -292,6 +293,37 @@ pub(crate) async fn audit_move_changes(
     let _ = state.audit.log(entry).await;
 }
 
+/// Audit a document created by copying another (the Duplicate action):
+/// a RecordCreated entry on the NEW move, carrying `duplicated_from`.
+pub(crate) async fn audit_move_duplicated(
+    state: &AppState,
+    db_ctx: &DatabaseContext,
+    db: &vortex_plugin_sdk::sqlx::PgPool,
+    user_id: Uuid,
+    username: &str,
+    new_id: Uuid,
+    source_id: Uuid,
+) {
+    let number: Option<String> =
+        vortex_plugin_sdk::sqlx::query_scalar("SELECT number FROM acc_move WHERE id = $1")
+            .bind(new_id)
+            .fetch_optional(db)
+            .await
+            .ok()
+            .flatten();
+    let entry = vortex_plugin_sdk::security::AuditEntry::new(
+        vortex_plugin_sdk::security::AuditAction::RecordCreated,
+        vortex_plugin_sdk::security::AuditSeverity::Info,
+    )
+    .with_user(vortex_plugin_sdk::common::UserId(user_id))
+    .with_username(username)
+    .with_database(&db_ctx.db_name)
+    .with_resource("acc_move", new_id.to_string())
+    .with_resource_name(number.as_deref().unwrap_or("draft"))
+    .with_details(json!({ "action": "duplicated", "duplicated_from": source_id }));
+    let _ = state.audit.log(entry).await;
+}
+
 pub(crate) fn redirect(to: &str) -> Response {
     vortex_plugin_sdk::axum::response::Redirect::to(to).into_response()
 }
@@ -512,6 +544,7 @@ async fn move_detail(
     let ref_: Option<String> = head.get("ref");
     let narration: Option<String> = head.get("narration");
     let move_state: String = head.get("state");
+    let move_type: String = head.get("move_type");
     let journal_code: String = head.get("journal_code");
     let journal_name: String = head.get("journal_name");
     let partner_name: Option<String> = head.get("partner_name");
@@ -640,6 +673,15 @@ async fn move_detail(
 <button class="btn btn-ghost btn-sm" onclick="return confirm('Cancel this draft entry?')">Cancel</button></form>"#
         ));
     } else if move_state == "posted" && payment_state != "reversed" {
+        // Payments can be reset to draft — this unallocates them from every
+        // document they settled (invoices reopen). Journal entries and
+        // documents are corrected by reversal instead.
+        if move_type == "payment" {
+            actions.push_str(&format!(
+                r#"<form method="POST" action="/accounting/moves/{id}/reset-draft" style="display:inline" class="mr-2">
+<button class="btn btn-warning btn-outline btn-sm" onclick="return confirm('Reset this payment to draft? Every invoice it paid will be un-allocated and reopened.')">Reset to Draft</button></form>"#
+            ));
+        }
         actions.push_str(&format!(
             r#"<form method="POST" action="/accounting/moves/{id}/reverse" style="display:inline">
 <button class="btn btn-warning btn-sm" onclick="return confirm('Post a reversal of this entry?')">Reverse</button></form>"#
@@ -901,6 +943,31 @@ async fn reverse_move(
             )),
         )
             .into_response(),
+    }
+}
+
+/// Reset a posted payment to draft, unallocating it from every document it
+/// settled (the invoices/bills reopen). Payment-desk "undo" — see
+/// [`crate::documents::reset_payment_to_draft`].
+async fn reset_payment_draft(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<Uuid>,
+) -> Response {
+    let back = format!("/accounting/moves/{id}");
+    match crate::documents::reset_payment_to_draft(&db, user.id, id).await {
+        Ok(reopened) => {
+            audit_move(&state, &db_ctx, &db, user.id, &user.username, id, "reset_to_draft").await;
+            let msg = match reopened {
+                0 => "Payment reset to draft.".to_string(),
+                1 => "Payment reset to draft — 1 document reopened.".to_string(),
+                n => format!("Payment reset to draft — {n} documents reopened."),
+            };
+            flash_redirect(&back, FlashKind::Success, &msg)
+        }
+        Err(e) => flash_redirect(&back, FlashKind::Error, &format!("Could not reset: {e}")),
     }
 }
 

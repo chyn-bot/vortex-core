@@ -9,6 +9,7 @@ use vortex_plugin_sdk::axum::extract::Form;
 use vortex_plugin_sdk::axum::http::StatusCode;
 use vortex_plugin_sdk::axum::response::Redirect;
 use vortex_plugin_sdk::prelude::*;
+use vortex_plugin_sdk::serde_json::json;
 use vortex_plugin_sdk::sqlx::{PgPool, Row};
 use vortex_plugin_sdk::tracing::error;
 use vortex_plugin_sdk::uuid::Uuid;
@@ -45,6 +46,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/sesb-eam/inspections/{id}", get(edit_inspection))
         .route("/sesb-eam/inspections/{id}", post(update_inspection))
         .route("/sesb-eam/inspections/{id}/action/{action}", post(inspection_action))
+        .route("/sesb-eam/inspections/{id}/duplicate", post(duplicate_inspection))
         // Condition monitoring
         .route("/sesb-eam/condition-monitoring", get(list_cm))
         .route("/sesb-eam/condition-monitoring/new", get(new_cm))
@@ -396,7 +398,8 @@ async fn edit_inspection(
     };
     let header = format!(r#"<a href="/sesb-eam/inspections" class="btn btn-ghost btn-sm mb-3">← Back to Inspections</a>
 <h1 class="text-2xl font-bold mb-3">Inspection <span class="font-mono text-sm opacity-50">{num}</span> {badge}</h1>"#, num = esc(number.as_deref().unwrap_or("")), badge = badge(&istate, INSP_STATE_BADGES));
-    let actions_bar = if actions.is_empty() { String::new() } else { format!(r#"<div class="flex gap-2 mb-4">{}</div>"#, actions) };
+    let dup = duplicate_button(&format!("/sesb-eam/inspections/{id}/duplicate"));
+    let actions_bar = format!(r#"<div class="flex gap-2 mb-4">{}{}</div>"#, actions, dup);
     let content = format!("<div class=\"max-w-4xl\">{}{}{}</div>", header, actions_bar, wide_form_page(&format!("/sesb-eam/inspections/{id}"), "", &body));
     Html(page_shell(&sidebar, "Inspection", &content)).into_response()
 }
@@ -434,6 +437,51 @@ async fn inspection_action(
         _ => return (StatusCode::BAD_REQUEST, "Unknown action").into_response(),
     }
     Redirect::to(&format!("/sesb-eam/inspections/{id}")).into_response()
+}
+
+/// POST /sesb-eam/inspections/{id}/duplicate — copy an inspection into a
+/// fresh draft dated today: new INS number, all recorded results/checks and
+/// the approval cleared. The inspector is kept deliberately — a routine
+/// inspection is re-run by the same inspector on the same equipment.
+async fn duplicate_inspection(
+    State(state): State<Arc<AppState>>, Db(db): Db,
+    Extension(user): Extension<AuthUser>, Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<Uuid>,
+) -> Response {
+    let number = match vortex_plugin_sdk::orm::sequence::next(&state.pool, &INS_SEQ).await {
+        Ok(n) => n,
+        Err(_) => return bad("Failed to generate number"),
+    };
+    let today = vortex_plugin_sdk::chrono::Utc::now().date_naive();
+    let spec = DuplicateSpec::new("eam_inspection")
+        .set("name", json!(number))
+        .set("inspection_date", json!(today.to_string()))
+        // lifecycle → DB default: state 'draft'
+        .skip("state")
+        // recorded results / measurements
+        .skip("overall_condition").skip("condition_score")
+        .skip("visual_check").skip("cleanliness_check").skip("corrosion_check")
+        .skip("oil_leak_check").skip("connection_check").skip("labeling_check")
+        .skip("temperature_c").skip("humidity_percent").skip("noise_level_db")
+        .skip("findings").skip("defects_found").skip("recommendations")
+        .skip("immediate_action_required")
+        // sign-off + source work-order link stay with the source
+        .skip("approved_by").skip("approved_date").skip("maintenance_id");
+    match spec.execute(&db, id, Some(user.id)).await {
+        Ok(new_id) => {
+            let entry = vortex_plugin_sdk::security::AuditEntry::new(
+                vortex_plugin_sdk::security::AuditAction::RecordCreated, vortex_plugin_sdk::security::AuditSeverity::Info,
+            ).with_user(vortex_plugin_sdk::common::UserId(user.id)).with_username(&user.username)
+             .with_database(&db_ctx.db_name).with_resource("eam_inspection", new_id.to_string()).with_resource_name(&number)
+             .with_details(json!({"duplicated_from": id, "number": number}));
+            let _ = state.audit.log(entry).await;
+            Redirect::to(&format!("/sesb-eam/inspections/{new_id}")).into_response()
+        }
+        Err(e) => {
+            error!(error=%e, "inspection duplicate");
+            (StatusCode::INTERNAL_SERVER_ERROR, "Duplicate failed").into_response()
+        }
+    }
 }
 
 // ═════════════════════════════════════════════════════════════════════════

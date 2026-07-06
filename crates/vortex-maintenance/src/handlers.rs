@@ -29,6 +29,7 @@ pub fn maintenance_routes() -> Router<Arc<AppState>> {
         .route("/maintenance/work-orders/{id}", post(update_work_order))
         .route("/maintenance/work-orders/{id}/parts", post(add_part))
         .route("/maintenance/work-orders/{id}/parts/{part_id}/delete", post(delete_part))
+        .route("/maintenance/work-orders/{id}/duplicate", post(duplicate_work_order))
         .route("/maintenance/work-orders/{id}/start", post(start_work_order))
         .route("/maintenance/work-orders/{id}/complete", post(complete_work_order))
         .route("/maintenance/work-orders/{id}/cancel", post(cancel_work_order))
@@ -51,6 +52,7 @@ pub fn maintenance_routes() -> Router<Arc<AppState>> {
         .route("/maintenance/plans/create", post(create_plan))
         .route("/maintenance/plans/{id}", get(edit_plan))
         .route("/maintenance/plans/{id}", post(update_plan))
+        .route("/maintenance/plans/{id}/duplicate", post(duplicate_plan))
         .route("/maintenance/plans/generate", post(generate_now))
 }
 
@@ -65,8 +67,8 @@ fn page_shell(sidebar: &str, title: &str, content: &str) -> String {
 <title>{title} - Vortex</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=7" rel="stylesheet"/>
-<script src="/static/vortex.js?v=7" defer></script>
+<link href="/static/vortex.css?v=12" rel="stylesheet"/>
+<script src="/static/vortex.js?v=12" defer></script>
 <script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
@@ -965,6 +967,14 @@ async fn edit_work_order(
         }
         _ => {}
     }
+    // Duplicate is available in every state — re-raising a done/cancelled
+    // work order as a fresh draft is its main use case.
+    let dup = duplicate_button(&format!("/maintenance/work-orders/{id}/duplicate"));
+    if actions.is_empty() {
+        actions.push_str(&dup);
+    } else {
+        actions.push_str(&format!(r#"<span class="inline-block ml-2">{dup}</span>"#));
+    }
 
     let content = format!(
         r#"<div class="flex items-center justify-between mb-4">
@@ -1015,6 +1025,54 @@ async fn update_work_order(
     .bind(id)
     .execute(&db).await;
     vortex_plugin_sdk::axum::response::Redirect::to(&format!("/maintenance/work-orders/{id}")).into_response()
+}
+
+/// POST /maintenance/work-orders/{id}/duplicate — copy a work order (with
+/// its planned parts) into a fresh draft: new number from the WO sequence,
+/// state back to draft, all execution history (schedule, start/completion,
+/// resolution, downtime) reset. Copied parts come out un-consumed with no
+/// stock-move reference — completing the duplicate posts its own moves;
+/// the source's moves are never referenced or replayed.
+async fn duplicate_work_order(
+    State(state): State<Arc<AppState>>, Db(db): Db,
+    Extension(user): Extension<AuthUser>, Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<Uuid>,
+) -> Response {
+    let number = match vortex_plugin_sdk::orm::sequence::next(&state.pool, &WO_SEQ).await {
+        Ok(n) => n,
+        Err(e) => { error!(error=%e, "duplicate WO seq failed"); return (vortex_plugin_sdk::axum::http::StatusCode::INTERNAL_SERVER_ERROR, "Failed to generate number").into_response(); }
+    };
+    let spec = DuplicateSpec::new("maint_work_order")
+        .set("number", json!(number))       // fresh unique document number
+        .skip("state")                      // DB default 'draft'
+        .skip("scheduled_date")             // NULL — the copy is scheduled anew
+        .skip("started_at")                 // execution history stays on the source
+        .skip("completed_at")
+        .skip("resolution")
+        .skip("downtime_hours")             // DB default 0
+        .skip("plan_id")                    // a manual copy was not plan-generated
+        .skip("updated_by")
+        .child(
+            ChildCopy::new("maint_work_order_part", "work_order_id")
+                .set("consumed", json!(false)) // copy is un-consumed…
+                .skip("move_id"),              // …and references no stock move
+        );
+    match spec.execute(&db, id, Some(user.id)).await {
+        Ok(new_id) => {
+            let entry = vortex_plugin_sdk::security::AuditEntry::new(
+                vortex_plugin_sdk::security::AuditAction::RecordCreated, vortex_plugin_sdk::security::AuditSeverity::Info,
+            ).with_user(vortex_plugin_sdk::common::UserId(user.id)).with_username(&user.username)
+             .with_database(&db_ctx.db_name).with_resource("maint_work_order", new_id.to_string()).with_resource_name(&number)
+             .with_details(json!({"duplicated_from": id, "number": number}));
+            let _ = state.audit.log(entry).await;
+            info!(number=%number, "work order duplicated");
+            vortex_plugin_sdk::axum::response::Redirect::to(&format!("/maintenance/work-orders/{new_id}")).into_response()
+        }
+        Err(e) => {
+            error!(error=%e, "WO duplicate failed");
+            (vortex_plugin_sdk::axum::http::StatusCode::INTERNAL_SERVER_ERROR, "Duplicate failed").into_response()
+        }
+    }
 }
 
 /// True iff the work order is in one of `wants`.
@@ -1390,13 +1448,16 @@ async fn edit_plan(
     let content = format!(
         r#"<div class="max-w-3xl">
 <a href="/maintenance/plans" class="btn btn-ghost btn-sm mb-4">← Back to Plans</a>
-<h1 class="text-2xl font-bold mb-6">Edit Plan</h1>
+<div class="flex items-center justify-between mb-6">
+<h1 class="text-2xl font-bold">Edit Plan</h1>
+<div>{dup}</div></div>
 <form method="POST" action="/maintenance/plans/{id}">
 <div class="card bg-base-100 shadow"><div class="card-body">{fields}
 <div class="flex gap-2 mt-4"><button class="btn btn-primary btn-sm">Save</button>
 <a href="/maintenance/plans" class="btn btn-ghost btn-sm">Cancel</a></div>
 </div></div></form></div>"#,
         id = id, fields = fields,
+        dup = duplicate_button(&format!("/maintenance/plans/{id}/duplicate")),
     );
     Html(page_shell(&sidebar, &format!("Plan {}", name), &content)).into_response()
 }
@@ -1429,6 +1490,37 @@ async fn update_plan(
     .bind(id)
     .execute(&db).await;
     vortex_plugin_sdk::axum::response::Redirect::to(&format!("/maintenance/plans/{id}")).into_response()
+}
+
+/// POST /maintenance/plans/{id}/duplicate — copy a preventive plan. The
+/// copy is created *paused*: an active duplicate on the same cadence would
+/// silently double-generate work orders, so the user reviews (asset,
+/// next date) and activates it deliberately.
+async fn duplicate_plan(
+    State(state): State<Arc<AppState>>, Db(db): Db,
+    Extension(user): Extension<AuthUser>, Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<Uuid>,
+) -> Response {
+    let spec = DuplicateSpec::new("maint_plan")
+        .copy_suffix("name")                 // "Monthly service" -> "Monthly service (copy)"
+        .set("state", json!("paused"))       // no double WO generation until activated
+        .skip("updated_by");
+    match spec.execute(&db, id, Some(user.id)).await {
+        Ok(new_id) => {
+            let entry = vortex_plugin_sdk::security::AuditEntry::new(
+                vortex_plugin_sdk::security::AuditAction::RecordCreated, vortex_plugin_sdk::security::AuditSeverity::Info,
+            ).with_user(vortex_plugin_sdk::common::UserId(user.id)).with_username(&user.username)
+             .with_database(&db_ctx.db_name).with_resource("maint_plan", new_id.to_string())
+             .with_details(json!({"duplicated_from": id}));
+            let _ = state.audit.log(entry).await;
+            info!(plan=%new_id, "maintenance plan duplicated");
+            vortex_plugin_sdk::axum::response::Redirect::to(&format!("/maintenance/plans/{new_id}")).into_response()
+        }
+        Err(e) => {
+            error!(error=%e, "plan duplicate failed");
+            (vortex_plugin_sdk::axum::http::StatusCode::INTERNAL_SERVER_ERROR, "Duplicate failed").into_response()
+        }
+    }
 }
 
 async fn generate_now(

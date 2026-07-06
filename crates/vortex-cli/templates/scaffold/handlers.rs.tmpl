@@ -29,6 +29,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/__KEBAB__/{id}", get(item_page))
         .route("/__KEBAB__/{id}", post(update_item))
         .route("/__KEBAB__/{id}/edit", get(edit_item_form))
+        .route("/__KEBAB__/{id}/duplicate", post(duplicate_item))
         .route("/__KEBAB__/{id}/status/{state}", post(change_status))
 }
 
@@ -274,7 +275,7 @@ async fn item_page(
     <div><h1 class="text-2xl font-bold">{name}</h1>
     <p class="opacity-60"><code>{code}</code></p></div>
     <div class="flex items-center gap-3">{bar}
-    <a href="/__KEBAB__/{id}/edit" class="btn btn-sm btn-outline">Edit</a></div>
+    <a href="/__KEBAB__/{id}/edit" class="btn btn-sm btn-outline">Edit</a>{duplicate}</div>
   </div>
   <p class="mt-4">{description}</p>
 </div></div>
@@ -285,11 +286,44 @@ async fn item_page(
         name = esc(&name),
         code = esc(code.as_deref().unwrap_or("—")),
         bar = bar,
+        duplicate = duplicate_button(&format!("/__KEBAB__/{id}/duplicate")),
         description = esc(description.as_deref().unwrap_or("")),
         id = id,
     );
     let sidebar = sidebar_for(&state, &user, &db_ctx);
     Html(page_shell(&sidebar, &name, &content)).into_response()
+}
+
+/// POST /__KEBAB__/{id}/duplicate — copy the record into a fresh draft:
+/// new sequence code, state back to the DB default, name marked "(copy)".
+async fn duplicate_item(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<Uuid>,
+) -> Response {
+    let code = match vortex_plugin_sdk::orm::sequence::next(&db_ctx.pool, &ITEM_SEQ).await {
+        Ok(code) => code,
+        Err(e) => {
+            error!("duplicate sequence draw failed: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Duplicate failed").into_response();
+        }
+    };
+    let spec = DuplicateSpec::new("__SNAKE___item")
+        .set("code", json!(code))
+        .skip("record_state")
+        .copy_suffix("name");
+    match spec.execute(&db, id, Some(user.id)).await {
+        Ok(new_id) => {
+            audit_item(&state, &user, &db_ctx, new_id, AuditAction::RecordCreated, json!({"duplicated_from": id, "code": code})).await;
+            Redirect::to(&format!("/__KEBAB__/{new_id}")).into_response()
+        }
+        Err(e) => {
+            error!("duplicate failed: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "Duplicate failed").into_response()
+        }
+    }
 }
 
 /// POST /__KEBAB__/{id}/status/{state} — audited stage transition.

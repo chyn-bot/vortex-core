@@ -31,6 +31,7 @@ pub fn inventory_routes() -> Router<Arc<AppState>> {
         .route("/inventory/products/{id}", get(edit_product))
         .route("/inventory/products/{id}", post(update_product))
         .route("/inventory/products/{id}/delete", post(delete_product))
+        .route("/inventory/products/{id}/duplicate", post(duplicate_product))
         // Product categories (configuration)
         .route("/inventory/categories", get(list_categories))
         .route("/inventory/categories/new", get(new_category_form))
@@ -76,8 +77,8 @@ fn page_shell(sidebar: &str, title: &str, content: &str) -> String {
 <title>{title} - Vortex</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=7" rel="stylesheet"/>
-<script src="/static/vortex.js?v=7" defer></script>
+<link href="/static/vortex.css?v=12" rel="stylesheet"/>
+<script src="/static/vortex.js?v=12" defer></script>
 <script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
@@ -980,9 +981,12 @@ async fn edit_product(
 <a href="/inventory" class="btn btn-ghost btn-sm mb-2">← Back to Products</a>
 <h1 class="text-2xl font-bold">{name} <span class="text-base-content/40 font-mono text-sm">{code}</span></h1>
 </div>
+<div class="flex items-center gap-2">
+{dup_btn}
 <form method="POST" action="/inventory/products/{id}/delete" onsubmit="return confirm('Archive this product?')">
 <button class="btn btn-error btn-sm btn-outline">Archive</button>
 </form>
+</div>
 </div>
 
 <form method="POST" action="/inventory/products/{id}">
@@ -1090,6 +1094,7 @@ async fn edit_product(
         id = id,
         name = esc(&name),
         code = esc(&code),
+        dup_btn = duplicate_button(&format!("/inventory/products/{id}/duplicate")),
         name_val = esc(&name),
         barcode_val = esc(barcode.as_deref().unwrap_or("")),
         desc_val = esc(description.as_deref().unwrap_or("")),
@@ -1214,6 +1219,59 @@ async fn delete_product(
 
     info!(id = %id, "product archived");
     vortex_plugin_sdk::axum::response::Redirect::to("/inventory").into_response()
+}
+
+/// POST /inventory/products/{id}/duplicate — copy a product into a fresh,
+/// editable record. Master data only: the copy gets a freshly drawn PRD
+/// code (the (company_id, code) unique key forbids reuse) and a blank
+/// barcode (a barcode identifies one physical product). Stock moves,
+/// quants, lots, and adjustments are ledger entries and are deliberately
+/// never copied — the duplicate starts with zero on-hand.
+async fn duplicate_product(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<Uuid>,
+) -> Response {
+    // Same sequence source as create_product, so codes never collide.
+    let code = match vortex_plugin_sdk::orm::sequence::next(&state.pool, &PRODUCT_SEQ).await {
+        Ok(c) => c,
+        Err(e) => {
+            error!(error = %e, "product duplicate sequence draw failed");
+            return (vortex_plugin_sdk::axum::http::StatusCode::INTERNAL_SERVER_ERROR, "Duplicate failed").into_response();
+        }
+    };
+
+    let spec = DuplicateSpec::new("stock_product")
+        .set("code", json!(code)) // fresh sequence — UNIQUE (company_id, code)
+        .skip("barcode") // NULL — a barcode belongs to exactly one product
+        .skip("updated_by") // NULL — the copy has never been edited
+        .copy_suffix("name"); // "Widget" -> "Widget (copy)"
+
+    match spec.execute(&db, id, Some(user.id)).await {
+        Ok(new_id) => {
+            let audit_entry = vortex_plugin_sdk::security::AuditEntry::new(
+                vortex_plugin_sdk::security::AuditAction::RecordCreated,
+                vortex_plugin_sdk::security::AuditSeverity::Info,
+            )
+            .with_user(vortex_plugin_sdk::common::UserId(user.id))
+            .with_username(&user.username)
+            .with_database(&db_ctx.db_name)
+            .with_resource("stock_product", new_id.to_string())
+            .with_details(json!({ "duplicated_from": id, "code": code }));
+            if let Err(e) = state.audit.log(audit_entry).await {
+                error!(error = %e, "audit log for product duplicate failed");
+            }
+
+            info!(id = %new_id, code = %code, "product duplicated");
+            vortex_plugin_sdk::axum::response::Redirect::to(&format!("/inventory/products/{new_id}")).into_response()
+        }
+        Err(e) => {
+            error!(error = %e, "product duplicate failed");
+            (vortex_plugin_sdk::axum::http::StatusCode::INTERNAL_SERVER_ERROR, "Duplicate failed").into_response()
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────
