@@ -1,0 +1,5 @@
+# Migration metadata for 138_automation_rules
+module = "core"
+description = "No-code automation rules: automation_rule table (trigger + condition + set_field action)"
+reversible = true
+dependencies = ["122_model_registry"]
