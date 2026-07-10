@@ -1,0 +1,5 @@
+# Migration metadata for 140_dashboards
+module = "core"
+description = "Saveable dashboards: dashboard + dashboard_widget (registry-driven KPI / bar widgets)"
+reversible = true
+dependencies = ["122_model_registry"]
