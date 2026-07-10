@@ -1,0 +1,5 @@
+# Migration metadata for 139_computed_fields
+module = "core"
+description = "Computed / related virtual fields: is_computed + compute_kind + compute_expr on ir_model_field"
+reversible = true
+dependencies = ["137_custom_fields"]
