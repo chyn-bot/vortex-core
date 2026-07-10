@@ -1,26 +1,9 @@
--- Register sales_order in the platform metadata registry so the
--- generic list/pivot/API layer can discover it. Idempotent.
-
-INSERT INTO ir_model (name, display_name, table_name, module)
-VALUES ('sales_order', 'Sales Orders', 'sales_order', 'sales')
-ON CONFLICT (name) DO UPDATE
-    SET display_name = EXCLUDED.display_name,
-        table_name   = EXCLUDED.table_name,
-        module       = EXCLUDED.module,
-        is_active    = true;
-
-WITH m AS (SELECT id FROM ir_model WHERE name = 'sales_order')
-INSERT INTO ir_model_field
-    (model_id, name, display_name, field_type, related_model, selection_options, sequence)
-VALUES
-    ((SELECT id FROM m), 'number',       'Number',     'string',    NULL,       NULL,                                                   10),
-    ((SELECT id FROM m), 'customer_id',  'Customer',   'many2one',  'contacts', NULL,                                                   20),
-    ((SELECT id FROM m), 'order_date',   'Order Date', 'date',      NULL,       NULL,                                                   30),
-    ((SELECT id FROM m), 'state',        'Status',     'selection', NULL,       '["draft","confirmed","delivered","cancelled"]'::jsonb, 40),
-    ((SELECT id FROM m), 'total_amount', 'Total',      'monetary',  NULL,       NULL,                                                   50)
-ON CONFLICT (model_id, name) DO UPDATE
-    SET display_name      = EXCLUDED.display_name,
-        field_type        = EXCLUDED.field_type,
-        related_model     = EXCLUDED.related_model,
-        selection_options = EXCLUDED.selection_options,
-        sequence          = EXCLUDED.sequence;
+-- SUPERSEDED — the sales registry metadata is now derived from the plugin's
+-- `#[derive(Model)]` structs (`Plugin::models()`) and synced into
+-- ir_model / ir_model_field by `vortex_orm::registry_sync` on every
+-- provisioning path (db migrate / create, module install, apps-list refresh).
+--
+-- This migration is retained as a tombstone so its recorded key stays stable
+-- for databases that already applied it. It intentionally does nothing.
+-- Previous hand-seeded INSERTs lived here (sales_order).
+SELECT 1;
