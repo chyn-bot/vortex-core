@@ -24,6 +24,8 @@
 //! the registration line.
 
 pub mod handlers;
+pub mod model;
 pub mod plugin;
 
+pub use model::Contact;
 pub use plugin::ContactsPlugin;

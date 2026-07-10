@@ -33,8 +33,10 @@
 //! - **i18n** — menu + field labels in English + Malay
 
 pub mod handlers;
+pub mod model;
 pub mod plugin;
 pub mod service;
 
+pub use model::{StockLocation, StockLot, StockMove, StockProduct};
 pub use plugin::InventoryPlugin;
 pub use service::{move_sequence, post_move};

@@ -67,8 +67,8 @@ fn page_shell(sidebar: &str, title: &str, content: &str) -> String {
 <title>{title} - Vortex</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=12" rel="stylesheet"/>
-<script src="/static/vortex.js?v=12" defer></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script>
 <script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
@@ -340,7 +340,9 @@ async fn edit_category(
     let parent_id: Option<Uuid> = row.try_get("parent_id").ok();
     let active: bool = row.try_get("active").unwrap_or(true);
     let parents = category_options(&db, parent_id).await;
+    let activity_panel = vortex_plugin_sdk::framework::render_chatter_panel("maint_category", id);
     let body = category_form_body(&format!("/maintenance/asset-categories/{id}"), &format!("Edit {}", name), &esc(&name), &parents, active, false);
+    let body = format!(r#"{body}<div class="mt-6">{activity_panel}</div>"#);
     Html(page_shell(&sidebar, "Edit Category", &body)).into_response()
 }
 
@@ -605,6 +607,8 @@ async fn edit_asset(
     }
 
     let history = vortex_plugin_sdk::framework::render_audit_trail(&db, "maint_asset", id).await;
+    // Activity stream: schedule/assign/complete tasks, messages, attachments.
+    let activity_panel = vortex_plugin_sdk::framework::render_chatter_panel("maint_asset", id);
     let active_checked = if active { "checked" } else { "" };
 
     let content = format!(
@@ -634,11 +638,13 @@ async fn edit_asset(
 <table class="table table-sm"><thead><tr><th>Number</th><th>Type</th><th>Scheduled</th><th>Status</th></tr></thead>
 <tbody>{wo_html}</tbody></table>
 </div></div>
+{activity_panel}
 {history}
 </div>
 </div>"#,
         id = id, name = esc(&name), code = esc(&code), name_val = esc(&name),
         fields = fields, active_checked = active_checked, wo_html = wo_html, history = history,
+        activity_panel = activity_panel,
     );
     Html(page_shell(&sidebar, &format!("Asset {}", name), &content)).into_response()
 }
@@ -976,6 +982,7 @@ async fn edit_work_order(
         actions.push_str(&format!(r#"<span class="inline-block ml-2">{dup}</span>"#));
     }
 
+    let activity_panel = vortex_plugin_sdk::framework::render_chatter_panel("maint_work_order", id);
     let content = format!(
         r#"<div class="flex items-center justify-between mb-4">
 <div><a href="/maintenance" class="btn btn-ghost btn-sm mb-2">← Back to Work Orders</a>
@@ -994,7 +1001,8 @@ async fn edit_work_order(
 <thead><tr><th>Code</th><th>Product</th><th class="text-right">Qty</th><th>Lot/Serial</th><th class="text-right">Unit Cost</th><th>Status</th><th></th></tr></thead>
 <tbody>{parts}</tbody></table></div>
 {add_part}
-</div></div>"#,
+</div></div>
+<div class="mt-6">{activity_panel}</div>"#,
         number = esc(&number), badge = wo_state_badge(&wstate), actions = actions,
         header = header, parts = parts_html, add_part = add_part,
     );
@@ -1445,6 +1453,7 @@ async fn edit_plan(
     // Inject the existing name into the (placeholder-only) name input.
     let fields = fields.replacen(r#"<input name="name" class="input input-bordered input-sm" value=""#, &format!(r#"<input name="name" class="input input-bordered input-sm" value="{}"#, esc(&name)), 1);
 
+    let activity_panel = vortex_plugin_sdk::framework::render_chatter_panel("maint_plan", id);
     let content = format!(
         r#"<div class="max-w-3xl">
 <a href="/maintenance/plans" class="btn btn-ghost btn-sm mb-4">← Back to Plans</a>
@@ -1455,7 +1464,8 @@ async fn edit_plan(
 <div class="card bg-base-100 shadow"><div class="card-body">{fields}
 <div class="flex gap-2 mt-4"><button class="btn btn-primary btn-sm">Save</button>
 <a href="/maintenance/plans" class="btn btn-ghost btn-sm">Cancel</a></div>
-</div></div></form></div>"#,
+</div></div></form>
+<div class="mt-6">{activity_panel}</div></div>"#,
         id = id, fields = fields,
         dup = duplicate_button(&format!("/maintenance/plans/{id}/duplicate")),
     );

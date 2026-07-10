@@ -199,13 +199,14 @@ async fn edit_defect(
     let body = defect_body(&db, &v, None, false).await;
     let actions = defect_actions(&dstate, id, repair_mid);
     let history = vortex_plugin_sdk::framework::render_audit_trail(&db, "eam_defect", id).await;
+    let activity_panel = vortex_plugin_sdk::framework::render_chatter_panel("eam_defect", id);
     let header = format!(
         r#"<div class="flex items-center justify-between mb-3"><div>
 <a href="/sesb-eam/defects" class="btn btn-ghost btn-sm mb-2">← Back to Defects</a>
 <h1 class="text-2xl font-bold">{title} <span class="font-mono text-sm opacity-50">{num}</span> {badge}</h1></div></div>"#,
         title = esc(&title), num = esc(number.as_deref().unwrap_or("")), badge = badge(&dstate, DEFECT_STATE_BADGES));
-    let content = format!("<div class=\"max-w-3xl\">{}{}{}<div class=\"mt-6\">{}</div></div>",
-        header, actions, wide_form_page(&format!("/sesb-eam/defects/{id}"), "", &body), history);
+    let content = format!("<div class=\"max-w-3xl\">{}{}{}<div class=\"mt-6\">{}</div><div class=\"mt-6\">{}</div></div>",
+        header, actions, wide_form_page(&format!("/sesb-eam/defects/{id}"), "", &body), activity_panel, history);
     Html(page_shell(&sidebar, &format!("Defect {}", title), &content)).into_response()
 }
 
@@ -400,7 +401,8 @@ async fn edit_inspection(
 <h1 class="text-2xl font-bold mb-3">Inspection <span class="font-mono text-sm opacity-50">{num}</span> {badge}</h1>"#, num = esc(number.as_deref().unwrap_or("")), badge = badge(&istate, INSP_STATE_BADGES));
     let dup = duplicate_button(&format!("/sesb-eam/inspections/{id}/duplicate"));
     let actions_bar = format!(r#"<div class="flex gap-2 mb-4">{}{}</div>"#, actions, dup);
-    let content = format!("<div class=\"max-w-4xl\">{}{}{}</div>", header, actions_bar, wide_form_page(&format!("/sesb-eam/inspections/{id}"), "", &body));
+    let activity_panel = vortex_plugin_sdk::framework::render_chatter_panel("eam_inspection", id);
+    let content = format!("<div class=\"max-w-4xl\">{}{}{}<div class=\"mt-6\">{activity_panel}</div></div>", header, actions_bar, wide_form_page(&format!("/sesb-eam/inspections/{id}"), "", &body));
     Html(page_shell(&sidebar, "Inspection", &content)).into_response()
 }
 
@@ -618,7 +620,8 @@ async fn edit_cm(
     let body = cm_body(&db, &v, None, false).await;
     let header = format!(r#"<a href="/sesb-eam/condition-monitoring" class="btn btn-ghost btn-sm mb-3">← Back</a>
 <h1 class="text-2xl font-bold mb-3">CM Test <span class="font-mono text-sm opacity-50">{}</span></h1>"#, esc(number.as_deref().unwrap_or("")));
-    let content = format!("<div class=\"max-w-4xl\">{}{}{}</div>", header, diag, wide_form_page(&format!("/sesb-eam/condition-monitoring/{id}"), "", &body));
+    let activity_panel = vortex_plugin_sdk::framework::render_chatter_panel("eam_cm", id);
+    let content = format!("<div class=\"max-w-4xl\">{}{}{}<div class=\"mt-6\">{activity_panel}</div></div>", header, diag, wide_form_page(&format!("/sesb-eam/condition-monitoring/{id}"), "", &body));
     Html(page_shell(&sidebar, "CM Test", &content)).into_response()
 }
 
@@ -738,7 +741,9 @@ async fn edit_patrol(
     let number: Option<String> = row.try_get("name").ok();
     let body = patrol_body(&db, &v, false).await;
     let header = form_header("/sesb-eam/patrols", "Back to Patrols", &format!("Patrol {}", number.as_deref().unwrap_or("")));
-    Html(page_shell(&sidebar, "Patrol", &wide_form_page(&format!("/sesb-eam/patrols/{id}"), &header, &body))).into_response()
+    let activity_panel = vortex_plugin_sdk::framework::render_chatter_panel("eam_patrol", id);
+    let content = format!("{}<div class=\"max-w-4xl mt-6\">{activity_panel}</div>", wide_form_page(&format!("/sesb-eam/patrols/{id}"), &header, &body));
+    Html(page_shell(&sidebar, "Patrol", &content)).into_response()
 }
 
 async fn update_patrol(
@@ -860,7 +865,9 @@ async fn edit_outage(
     let number: Option<String> = row.try_get("name").ok();
     let body = outage_body(&db, &v, false).await;
     let header = form_header("/sesb-eam/outages", "Back to Outages", &format!("Outage {}", number.as_deref().unwrap_or("")));
-    Html(page_shell(&sidebar, "Outage", &wide_form_page(&format!("/sesb-eam/outages/{id}"), &header, &body))).into_response()
+    let activity_panel = vortex_plugin_sdk::framework::render_chatter_panel("eam_outage", id);
+    let content = format!("{}<div class=\"max-w-4xl mt-6\">{activity_panel}</div>", wide_form_page(&format!("/sesb-eam/outages/{id}"), &header, &body));
+    Html(page_shell(&sidebar, "Outage", &content)).into_response()
 }
 
 async fn update_outage(
@@ -960,7 +967,9 @@ async fn edit_veg(
     }
     let body = veg_body(&db, &v, false).await;
     let header = form_header("/sesb-eam/vegetation", "Back to Vegetation", "Edit Vegetation Section");
-    Html(page_shell(&sidebar, "Vegetation Section", &wide_form_page(&format!("/sesb-eam/vegetation/{id}"), &header, &body))).into_response()
+    let activity_panel = vortex_plugin_sdk::framework::render_chatter_panel("eam_veg", id);
+    let content = format!("{}<div class=\"max-w-4xl mt-6\">{activity_panel}</div>", wide_form_page(&format!("/sesb-eam/vegetation/{id}"), &header, &body));
+    Html(page_shell(&sidebar, "Vegetation Section", &content)).into_response()
 }
 
 async fn update_veg(
@@ -1055,7 +1064,9 @@ async fn edit_tsr(
     let active: bool = row.try_get("active").unwrap_or(true);
     let header = form_header("/sesb-eam/troubleshooting", "Back to Rules", &format!("Edit {}", name));
     let body = tsr_body(&name, &priority, cat.as_deref().unwrap_or(""), keywords.as_deref().unwrap_or(""), &guidance, active, false);
-    Html(page_shell(&sidebar, "Edit Rule", &form_page(&format!("/sesb-eam/troubleshooting/{id}"), &header, &body))).into_response()
+    let activity_panel = vortex_plugin_sdk::framework::render_chatter_panel("eam_tsr", id);
+    let content = format!("{}<div class=\"mt-6\">{activity_panel}</div>", form_page(&format!("/sesb-eam/troubleshooting/{id}"), &header, &body));
+    Html(page_shell(&sidebar, "Edit Rule", &content)).into_response()
 }
 
 async fn update_tsr(

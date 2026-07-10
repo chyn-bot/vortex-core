@@ -21,6 +21,9 @@
 //! everything else is borrowed.
 
 pub mod handlers;
+pub mod model;
 pub mod plugin;
+pub mod richtext;
 
 pub use plugin::SalesPlugin;
+pub use model::SalesOrder;

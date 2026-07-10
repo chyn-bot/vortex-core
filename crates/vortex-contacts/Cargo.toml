@@ -14,3 +14,11 @@ description = "Contacts plugin — the first vertical built entirely against vor
 
 [dependencies]
 vortex-plugin-sdk = { workspace = true }
+# Direct deps required by `#[derive(Model)]`: the macro emits absolute
+# `vortex_orm::` / `vortex_common::` paths (standard for derive macros, like
+# depending on `serde` to use `#[derive(Serialize)]`). The `Model` derive
+# itself is re-exported through `vortex_orm::prelude`.
+vortex-orm = { workspace = true }
+vortex-common = { workspace = true }
+uuid = { workspace = true }
+serde = { workspace = true }

@@ -194,7 +194,8 @@ async fn edit_plan(
     let body = plan_body(&db, &v, None, false, freq_locked).await;
     let header = format!(r#"<a href="/sesb-eam/plans" class="btn btn-ghost btn-sm mb-3">← Back to Plans</a>
 <h1 class="text-2xl font-bold mb-3">Plan <span class="font-mono text-sm opacity-50">{}</span></h1>"#, esc(number.as_deref().unwrap_or("")));
-    let content = format!("<div class=\"max-w-4xl\">{}{}{}{}</div>", header, stats, actions, wide_form_page(&format!("/sesb-eam/plans/{id}"), "", &body));
+    let activity_panel = vortex_plugin_sdk::framework::render_chatter_panel("eam_plan", id);
+    let content = format!("<div class=\"max-w-4xl\">{}{}{}{}<div class=\"mt-6\">{activity_panel}</div></div>", header, stats, actions, wide_form_page(&format!("/sesb-eam/plans/{id}"), "", &body));
     Html(page_shell(&sidebar, "Maintenance Plan", &content)).into_response()
 }
 

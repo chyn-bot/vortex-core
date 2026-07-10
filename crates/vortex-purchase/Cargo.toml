@@ -13,6 +13,11 @@ description = "Purchasing plugin — vendors → purchase orders → receipts, p
 
 [dependencies]
 vortex-plugin-sdk = { workspace = true }
+# Direct deps required by `#[derive(Model)]` (macro emits absolute vortex_orm:: / vortex_common:: paths).
+vortex-orm = { workspace = true }
+vortex-common = { workspace = true }
+uuid = { workspace = true }
+serde = { workspace = true }
 vortex-inventory = { workspace = true }
 vortex-accounting = { workspace = true }
 base64 = { workspace = true }

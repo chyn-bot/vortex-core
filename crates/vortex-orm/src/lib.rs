@@ -38,6 +38,7 @@ pub mod model_impl;
 pub mod pool_manager;
 pub mod query;
 pub mod registry;
+pub mod registry_sync;
 pub mod schema;
 pub mod sequence;
 
@@ -53,6 +54,13 @@ pub mod prelude {
     pub use crate::pool_manager::{DatabasePoolManager, PoolManagerConfig};
     pub use crate::query::{Query, QueryBuilder, Filter, OrderBy, SecureQueryBuilder, SecureQuery};
     pub use crate::registry::ModelRegistry;
+    pub use crate::registry_sync::sync_model_registry;
+    // The `#[derive(Model)]` procedural macro. Lives in `vortex-macros`; the
+    // derive macro and the `Model` trait share a name but occupy different
+    // namespaces, so both re-exports coexist. Without this, `#[derive(Model)]`
+    // is not in scope for plugin authors using the prelude — which is why the
+    // derive layer was previously unused.
+    pub use vortex_macros::Model;
     pub use crate::sequence::{SequenceScope, SequenceSpec};
     pub use crate::commerce::{
         Currency, CurrencyRate, Tax, TaxAmountType, TaxComputation, TaxTypeUse,

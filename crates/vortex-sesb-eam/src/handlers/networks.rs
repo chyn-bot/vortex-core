@@ -231,11 +231,13 @@ async fn edit_tline(
     if twr_html.is_empty() { twr_html.push_str(r#"<tr><td colspan="3" class="text-base-content/50">No towers</td></tr>"#); }
 
     let header = form_header("/sesb-eam/transmission-lines", "Back to Transmission Lines", &format!("{} · {}", f.name, code));
+    let activity_panel = vortex_plugin_sdk::framework::render_chatter_panel("eam_tline", id);
     let content = format!(
         r#"{form}<div class="max-w-4xl mt-6"><div class="card bg-base-100 shadow"><div class="card-body">
 <div class="flex items-center justify-between mb-2"><h2 class="card-title text-lg">Towers</h2>
 <a href="/sesb-eam/towers/new?line={id}" class="btn btn-primary btn-sm">New Tower</a></div>
-<table class="table table-sm"><thead><tr><th>Code</th><th>No</th><th>Type</th></tr></thead><tbody>{twr}</tbody></table></div></div></div>"#,
+<table class="table table-sm"><thead><tr><th>Code</th><th>No</th><th>Type</th></tr></thead><tbody>{twr}</tbody></table></div></div></div>
+<div class="max-w-4xl mt-6">{activity_panel}</div>"#,
         form = wide_form_page(&format!("/sesb-eam/transmission-lines/{id}"), &header, &body), id = id, twr = twr_html);
     Html(page_shell(&sidebar, &format!("Line {}", f.name), &content)).into_response()
 }
@@ -481,7 +483,9 @@ async fn edit_tower(
     let back = v.get("transmission_line_id").map(|l| format!("/sesb-eam/transmission-lines/{l}")).unwrap_or_else(|| "/sesb-eam/transmission-lines".into());
     let header = form_header(&back, "Back to Line", &format!("{} · {}", name, code.unwrap_or_default()));
     let _ = user;
-    Html(page_shell(&sidebar, &format!("Tower {}", name), &wide_form_page(&format!("/sesb-eam/towers/{id}"), &header, &body))).into_response()
+    let activity_panel = vortex_plugin_sdk::framework::render_chatter_panel("eam_tower", id);
+    let content = format!("{}<div class=\"max-w-4xl mt-6\">{activity_panel}</div>", wide_form_page(&format!("/sesb-eam/towers/{id}"), &header, &body));
+    Html(page_shell(&sidebar, &format!("Tower {}", name), &content)).into_response()
 }
 
 async fn update_tower(
@@ -694,11 +698,13 @@ async fn edit_dline(
     if seg_html.is_empty() { seg_html.push_str(r#"<tr><td colspan="2" class="text-base-content/50">No cable segments</td></tr>"#); }
 
     let header = form_header("/sesb-eam/distribution-lines", "Back to Distribution Lines", &format!("{} · {}", name, code.unwrap_or_default()));
+    let activity_panel = vortex_plugin_sdk::framework::render_chatter_panel("eam_dline", id);
     let content = format!(
         r#"{form}<div class="max-w-4xl mt-6"><div class="card bg-base-100 shadow"><div class="card-body">
 <div class="flex items-center justify-between mb-2"><h2 class="card-title text-lg">Cable Segments</h2>
 <a href="/sesb-eam/cable-segments/new?line={id}" class="btn btn-primary btn-sm">New Segment</a></div>
-<table class="table table-sm"><thead><tr><th>Code</th><th>Name</th></tr></thead><tbody>{seg}</tbody></table></div></div></div>"#,
+<table class="table table-sm"><thead><tr><th>Code</th><th>Name</th></tr></thead><tbody>{seg}</tbody></table></div></div></div>
+<div class="max-w-4xl mt-6">{activity_panel}</div>"#,
         form = wide_form_page(&format!("/sesb-eam/distribution-lines/{id}"), &header, &body), id = id, seg = seg_html);
     Html(page_shell(&sidebar, &format!("Distribution Line {}", name), &content)).into_response()
 }
@@ -827,7 +833,9 @@ async fn edit_ugc(
     let name = v.get("name").cloned().unwrap_or_default();
     let body = ugc_body(&db, &v, false).await;
     let header = form_header("/sesb-eam/ugc-lines", "Back to UGC Lines", &format!("{} · {}", name, code.unwrap_or_default()));
-    Html(page_shell(&sidebar, &format!("UGC Line {}", name), &wide_form_page(&format!("/sesb-eam/ugc-lines/{id}"), &header, &body))).into_response()
+    let activity_panel = vortex_plugin_sdk::framework::render_chatter_panel("eam_ugc", id);
+    let content = format!("{}<div class=\"max-w-4xl mt-6\">{activity_panel}</div>", wide_form_page(&format!("/sesb-eam/ugc-lines/{id}"), &header, &body));
+    Html(page_shell(&sidebar, &format!("UGC Line {}", name), &content)).into_response()
 }
 
 async fn update_ugc(
@@ -965,11 +973,13 @@ async fn edit_cseg(
 
     let back = dline.map(|l| format!("/sesb-eam/distribution-lines/{l}")).unwrap_or_else(|| "/sesb-eam/distribution-lines".into());
     let header = form_header(&back, "Back to Line", &format!("Cable Segment {}", name));
+    let activity_panel = vortex_plugin_sdk::framework::render_chatter_panel("eam_cseg", id);
     let content = format!(
         r#"{form}<div class="max-w-4xl mt-6"><div class="card bg-base-100 shadow"><div class="card-body">
 <h2 class="card-title text-lg mb-2">IR / PI Tests</h2>
 <table class="table table-sm"><thead><tr><th>Date</th><th>Type</th><th>PI</th><th>DAR</th><th>Result</th></tr></thead><tbody>{tests}</tbody></table>
-{test_form}</div></div></div>"#,
+{test_form}</div></div></div>
+<div class="max-w-4xl mt-6">{activity_panel}</div>"#,
         form = wide_form_page(&format!("/sesb-eam/cable-segments/{id}"), &header, &body), tests = test_rows, test_form = test_form);
     Html(page_shell(&sidebar, &format!("Cable Segment {}", name), &content)).into_response()
 }

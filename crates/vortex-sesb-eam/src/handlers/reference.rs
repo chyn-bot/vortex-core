@@ -131,7 +131,9 @@ async fn edit_voltage(
     let active: bool = row.try_get("active").unwrap_or(true);
     let header = form_header("/sesb-eam/voltage-levels", "Back to Voltage Levels", &format!("Edit {}", name));
     let body = voltage_body(&code, &name, kv.as_deref().unwrap_or(""), &vtype, desc.as_deref().unwrap_or(""), active, false);
-    Html(page_shell(&sidebar, "Edit Voltage Level", &form_page(&format!("/sesb-eam/voltage-levels/{id}"), &header, &body))).into_response()
+    let activity_panel = vortex_plugin_sdk::framework::render_chatter_panel("eam_voltage", id);
+    let content = format!("{}<div class=\"mt-6\">{activity_panel}</div>", form_page(&format!("/sesb-eam/voltage-levels/{id}"), &header, &body));
+    Html(page_shell(&sidebar, "Edit Voltage Level", &content)).into_response()
 }
 
 async fn update_voltage(
@@ -244,7 +246,9 @@ async fn edit_mfr(
     let countries = country_options(&db, country_id).await;
     let header = form_header("/sesb-eam/manufacturers", "Back to Manufacturers", &format!("Edit {}", name));
     let body = mfr_body(&code, &name, &countries, website.as_deref().unwrap_or(""), phone.as_deref().unwrap_or(""), email.as_deref().unwrap_or(""), notes.as_deref().unwrap_or(""), active, false);
-    Html(page_shell(&sidebar, "Edit Manufacturer", &form_page(&format!("/sesb-eam/manufacturers/{id}"), &header, &body))).into_response()
+    let activity_panel = vortex_plugin_sdk::framework::render_chatter_panel("eam_mfr", id);
+    let content = format!("{}<div class=\"mt-6\">{activity_panel}</div>", form_page(&format!("/sesb-eam/manufacturers/{id}"), &header, &body));
+    Html(page_shell(&sidebar, "Edit Manufacturer", &content)).into_response()
 }
 
 async fn update_mfr(
@@ -388,7 +392,9 @@ async fn edit_class(
     let body = class_body(&code, &name, &seq.to_string(), &ctype, cgroup.as_deref().unwrap_or(""), &parents,
         tier.as_deref().unwrap_or(""), &t1.map(|v| v.to_string()).unwrap_or_default(), &t2.map(|v| v.to_string()).unwrap_or_default(),
         dur.as_deref().unwrap_or(""), scope.as_deref().unwrap_or(""), desc.as_deref().unwrap_or(""), active, false);
-    Html(page_shell(&sidebar, "Edit Asset Class", &form_page(&format!("/sesb-eam/asset-classes/{id}"), &header, &body))).into_response()
+    let activity_panel = vortex_plugin_sdk::framework::render_chatter_panel("eam_class", id);
+    let content = format!("{}<div class=\"mt-6\">{activity_panel}</div>", form_page(&format!("/sesb-eam/asset-classes/{id}"), &header, &body));
+    Html(page_shell(&sidebar, "Edit Asset Class", &content)).into_response()
 }
 
 async fn update_class(
@@ -514,7 +520,9 @@ async fn edit_type(
     let active: bool = row.try_get("active").unwrap_or(true);
     let header = form_header("/sesb-eam/asset-types", "Back to Asset Types", &format!("Edit {}", acronym));
     let body = type_body(&acronym, &name, &category, &level.map(|v| v.to_string()).unwrap_or_default(), &schema, desc.as_deref().unwrap_or(""), active, false);
-    Html(page_shell(&sidebar, "Edit Asset Type", &form_page(&format!("/sesb-eam/asset-types/{id}"), &header, &body))).into_response()
+    let activity_panel = vortex_plugin_sdk::framework::render_chatter_panel("eam_type", id);
+    let content = format!("{}<div class=\"mt-6\">{activity_panel}</div>", form_page(&format!("/sesb-eam/asset-types/{id}"), &header, &body));
+    Html(page_shell(&sidebar, "Edit Asset Type", &content)).into_response()
 }
 
 async fn update_type(

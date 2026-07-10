@@ -19,6 +19,8 @@
 //! everything else is borrowed from core and the inventory primitive.
 
 pub mod handlers;
+pub mod model;
 pub mod plugin;
 
 pub use plugin::PurchasePlugin;
+pub use model::PurchaseOrder;

@@ -43,6 +43,20 @@ impl Plugin for InventoryPlugin {
         "Inventory"
     }
 
+    /// Inventory models projected into the metadata registry from their
+    /// `#[derive(Model)]` structs — the single source of truth that supersedes
+    /// the hand-seeded rows in migrations `002_inventory_registry` and
+    /// `004_lot_registry`.
+    fn models(&self) -> Vec<&'static vortex_orm::model::ModelMeta> {
+        use vortex_orm::model::Model;
+        vec![
+            crate::model::StockProduct::meta(),
+            crate::model::StockLocation::meta(),
+            crate::model::StockMove::meta(),
+            crate::model::StockLot::meta(),
+        ]
+    }
+
     fn version(&self) -> &'static str {
         "0.1.0"
     }
@@ -130,6 +144,15 @@ impl Plugin for InventoryPlugin {
             )
             .with_icon("map-pin")
             .with_priority(92)
+            .under("inventory.config"),
+            MenuEntry::new(
+                "inventory.uoms",
+                "Units of Measure",
+                "/inventory/uoms",
+                MenuGroup::Operations,
+            )
+            .with_icon("ruler")
+            .with_priority(93)
             .under("inventory.config"),
         ]
     }

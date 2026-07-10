@@ -30,6 +30,17 @@ impl Plugin for MaintenancePlugin {
         "maintenance"
     }
 
+    /// Maintenance models projected into the metadata registry from their
+    /// `#[derive(Model)]` structs — supersedes migration `002_maintenance_registry`.
+    fn models(&self) -> Vec<&'static vortex_orm::model::ModelMeta> {
+        use vortex_orm::model::Model;
+        vec![
+            crate::model::MaintAsset::meta(),
+            crate::model::MaintWorkOrder::meta(),
+            crate::model::MaintPlan::meta(),
+        ]
+    }
+
     fn display_name(&self) -> &'static str {
         "Maintenance"
     }

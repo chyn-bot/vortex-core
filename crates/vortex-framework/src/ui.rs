@@ -200,8 +200,8 @@ pub fn forbidden_page(action: &str) -> String {
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Access Denied - Vortex</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-    <link href="/static/vortex.css?v=12" rel="stylesheet">
-    <script src="/static/vortex.js?v=12" defer></script>
+    <link href="/static/vortex.css?v=18" rel="stylesheet">
+    <script src="/static/vortex.js?v=18" defer></script>
     <script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200 flex items-center justify-center">
@@ -216,7 +216,7 @@ pub fn forbidden_page(action: &str) -> String {
                 This action requires Administrator or System Administrator privileges.
             </p>
             <div class="card-actions justify-center mt-6">
-                <a href="/dashboard" class="btn btn-primary">Return to Dashboard</a>
+                <a href="/home" class="btn btn-primary">Return to Home</a>
             </div>
         </div>
     </div>

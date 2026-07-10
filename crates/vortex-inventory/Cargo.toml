@@ -14,3 +14,10 @@ description = "Inventory / Stock plugin — a generic, reusable stock primitive 
 
 [dependencies]
 vortex-plugin-sdk = { workspace = true }
+# Direct deps required by `#[derive(Model)]` (the macro emits absolute
+# `vortex_orm::` / `vortex_common::` paths; the derive itself is re-exported
+# through `vortex_orm::prelude`).
+vortex-orm = { workspace = true }
+vortex-common = { workspace = true }
+uuid = { workspace = true }
+serde = { workspace = true }

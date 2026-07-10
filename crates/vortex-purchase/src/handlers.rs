@@ -52,8 +52,8 @@ fn page_shell(sidebar: &str, title: &str, content: &str) -> String {
 <title>{title} - Vortex</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=12" rel="stylesheet"/>
-<script src="/static/vortex.js?v=12" defer></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script>
 <script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
@@ -823,6 +823,9 @@ async fn edit_order(
         String::new()
     };
 
+    // Activity stream: schedule/assign/complete tasks, messages, attachments.
+    let activity_panel = vortex_plugin_sdk::framework::render_chatter_panel("purchase_order", id);
+
     let content = format!(
         r#"<div class="flex items-center justify-between mb-4">
 <div>
@@ -855,7 +858,8 @@ async fn edit_order(
 </div>
 </div></div>
 
-{revisions_card}"#,
+{revisions_card}
+<div class="mt-6">{activity_panel}</div>"#,
         back_url = if is_rfq_stage { "/purchase/rfqs" } else { "/purchase" },
         back_label = if is_rfq_stage { "RFQs" } else { "Purchase Orders" },
         number = esc(&identity),

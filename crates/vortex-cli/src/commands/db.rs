@@ -31,6 +31,29 @@ fn build_migration_registry() -> PluginRegistry {
     registry
 }
 
+/// Project every compiled-in plugin's `#[derive(Model)]` metadata into a
+/// database's `ir_model` / `ir_model_field` registry, making the derive the
+/// single source of truth for the generic views and REST API. Idempotent; run
+/// after the migration phase so the registry tables exist. Non-fatal on error
+/// (a legacy DB may predate migration 122) — returns the number of models
+/// synced.
+async fn sync_model_registries(pool: &PgPool, registry: &PluginRegistry) -> usize {
+    let metas: Vec<&'static vortex_orm::model::ModelMeta> = registry
+        .plugins_iter()
+        .flat_map(|p| p.models())
+        .collect();
+    if metas.is_empty() {
+        return 0;
+    }
+    match vortex_orm::registry_sync::sync_model_registry(pool, &metas).await {
+        Ok(n) => n,
+        Err(e) => {
+            println!("  Warning: model registry sync failed: {}", e);
+            0
+        }
+    }
+}
+
 /// Composite identifier stored in `vortex_migrations.name` for
 /// plugin migrations. Core migrations keep their raw directory name
 /// (e.g. `116_workflow_engine`) for backwards compatibility; plugin
@@ -166,6 +189,11 @@ pub async fn run(command: DbCommands) -> Result<()> {
                                     println!("  Apps list synced: {} new, {} refreshed", ins, upd);
                                 }
                             }
+                            // Project plugin `#[derive(Model)]` metadata into ir_model.
+                            let synced = sync_model_registries(&pool, &registry).await;
+                            if synced > 0 {
+                                println!("  Model registry synced: {} model(s)", synced);
+                            }
                         }
                         Err(e) => {
                             println!("  Warning: Could not connect to '{}': {}", db_name, e);
@@ -286,6 +314,12 @@ pub async fn run(command: DbCommands) -> Result<()> {
                     }
                     Ok(_) => {}
                     Err(e) => println!("Warning: apps list sync failed: {}", e),
+                }
+                // Project plugin `#[derive(Model)]` metadata into ir_model /
+                // ir_model_field so the generic views + REST API see it.
+                let synced = sync_model_registries(&pool, &registry).await;
+                if synced > 0 {
+                    println!("Model registry synced: {} model(s)", synced);
                 }
             }
 
@@ -848,6 +882,18 @@ pub async fn install_plugin_schema(pool: &PgPool, technical_name: &str) -> Resul
         }
     }
 
+    // Project this plugin's `#[derive(Model)]` metadata into the registry so
+    // installing a module also wires its generic views + REST API.
+    let metas = plugin.models();
+    if !metas.is_empty() {
+        if let Err(e) = vortex_orm::registry_sync::sync_model_registry(pool, &metas).await {
+            println!(
+                "  Warning: model registry sync for '{}' failed: {}",
+                technical_name, e
+            );
+        }
+    }
+
     Ok((applied, skipped))
 }
 
@@ -913,5 +959,8 @@ async fn run_all_migrations(pool: &PgPool) -> Result<()> {
     // Apply plugin-declared migrations after the core filesystem
     // ones. Same pattern as the single-DB path above.
     let _ = run_plugin_migrations(pool).await?;
+
+    // Project plugin model metadata into ir_model / ir_model_field.
+    let _ = sync_model_registries(pool, &build_migration_registry()).await;
     Ok(())
 }

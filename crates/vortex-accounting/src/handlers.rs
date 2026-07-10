@@ -48,8 +48,8 @@ pub(crate) fn page_shell(sidebar: &str, title: &str, content: &str) -> String {
 <title>{title} - Vortex</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=12" rel="stylesheet"/>
-<script src="/static/vortex.js?v=12" defer></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script>
 <script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
@@ -746,6 +746,8 @@ async fn move_detail(
         .unwrap_or_default();
 
     let history_panel = vortex_plugin_sdk::framework::render_audit_trail(&db, "acc_move", id).await;
+    // Activity stream: schedule/assign/complete tasks, messages, attachments.
+    let activity_panel = vortex_plugin_sdk::framework::render_chatter_panel("acc_move", id);
 
     let content = format!(
         r#"<div class="max-w-5xl">
@@ -771,6 +773,7 @@ async fn move_detail(
 </table></div>
 </div></div>
 {add_line_form}
+<div class="mt-6">{activity_panel}</div>
 <div class="mt-6">{history}</div>
 </div>"#,
         number = esc(&number),
@@ -787,6 +790,7 @@ async fn move_detail(
         credit_total = money(credit_total),
         add_line_form = add_line_form,
         history = history_panel,
+        activity_panel = activity_panel,
     );
 
     Html(page_shell(&sidebar, &format!("Entry {number}"), &content)).into_response()
@@ -1181,11 +1185,14 @@ async fn edit_account(
     let reconcile: bool = row.get("reconcile");
     let active: bool = row.get("active");
 
+    let activity_panel = vortex_plugin_sdk::framework::render_chatter_panel("acc_account", id);
+
     let content = format!(
         r#"<div class="max-w-xl">
 <a href="/accounting/accounts" class="btn btn-ghost btn-sm mb-4">← Back to Chart of Accounts</a>
 <h1 class="text-2xl font-bold mb-6">{code} — {name} <span class="badge badge-ghost">{type_label}</span></h1>
 {form}
+<div class="mt-6">{activity_panel}</div>
 </div>"#,
         code = vortex_plugin_sdk::framework::html_escape(&code),
         name = vortex_plugin_sdk::framework::html_escape(&name),
@@ -1314,6 +1321,8 @@ async fn edit_journal(
     let note: Option<String> = row.get("note");
     let accounts = account_options(&db, default_account_id).await;
 
+    let activity_panel = vortex_plugin_sdk::framework::render_chatter_panel("acc_journal", id);
+
     let content = format!(
         r#"<div class="max-w-xl">
 <a href="/accounting/journals" class="btn btn-ghost btn-sm mb-4">← Back to Journals</a>
@@ -1335,6 +1344,7 @@ async fn edit_journal(
 <button type="submit" class="btn btn-primary btn-sm">Save</button>
 </div></div>
 </form>
+<div class="mt-6">{activity_panel}</div>
 </div>"#,
         id = id,
         code = esc(&code),

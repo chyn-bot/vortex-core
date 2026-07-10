@@ -144,8 +144,8 @@ fn page_shell(title: &str, sidebar: &str) -> (String, &'static str) {
         r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><title>{}</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=12" rel="stylesheet"/>
-<script src="/static/vortex.js?v=12" defer></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script>
 <script src="/static/vendor/tailwind.js"></script></head>
 <body class="min-h-screen bg-base-200">
 <div class="flex">{}<main class="flex-1 p-4 lg:p-6 min-w-0">"#,
@@ -565,6 +565,9 @@ async fn cr_detail(
 
     let requester_display = requester_name.as_deref().unwrap_or(&requester_username);
 
+    // Activity stream: schedule/assign/complete tasks, messages, attachments.
+    let activity_panel = vortex_framework::render_chatter_panel("change_request", id);
+
     let mut action_buttons = String::new();
     if !legal_transitions.is_empty() {
         action_buttons.push_str(r#"<div class="flex flex-wrap gap-2">"#);
@@ -667,8 +670,10 @@ async fn cr_detail(
 {history_html}
 <p class="text-xs text-base-content/60 mt-3">Each transition is hash-chained in the WORM audit ledger. Use <code>vortex audit verify</code> to verify integrity.</p>
 </div></div>
+<div class="mt-6">{activity_panel}</div>
 "#,
         number = html_escape(&number),
+        activity_panel = activity_panel,
         title = html_escape(&title),
         state_badge = state_badge(&current_state),
         crit_badge = criticality_badge(&criticality),

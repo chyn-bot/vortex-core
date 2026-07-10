@@ -217,6 +217,16 @@ pub async fn render_form(
         body.push_str("</div>");
     }
 
+    // Per-tenant custom fields for this model render as an extra section inside
+    // the same form, so they submit and persist with the record. Empty string
+    // when the model has none. (Model identity = the form's table name, which
+    // is the registry key since Initiative #1.)
+    body.push_str(&crate::custom_fields::render_for_form(db, &config.table, record_id).await);
+
+    // Computed / related virtual fields render read-only below the custom
+    // fields, evaluated live in Edit mode. Empty string when the model has none.
+    body.push_str(&crate::computed_fields::render_for_form(db, &config.table, record_id).await);
+
     format!(
         r##"<div class="max-w-5xl"><h1 class="text-2xl font-bold mb-6">{heading}</h1>{top_errors}
 <form method="post" action="{action}" class="card bg-base-100 shadow"><div class="card-body">

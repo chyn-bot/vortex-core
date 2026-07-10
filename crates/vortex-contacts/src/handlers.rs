@@ -40,8 +40,8 @@ fn page_shell(sidebar: &str, title: &str, content: &str) -> String {
 <title>{title} - Vortex</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=12" rel="stylesheet"/>
-<script src="/static/vortex.js?v=12" defer></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script>
 <script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
@@ -620,6 +620,11 @@ async fn edit_contact(
     // Per-record audit trail (reusable core widget over the WORM ledger).
     let history_panel = vortex_plugin_sdk::framework::render_audit_trail(&db, "contact", id).await;
 
+    // On-record activity stream: schedule tasks, assign to a colleague for
+    // review, mark complete — plus messages and attachments. Core primitive,
+    // same slot on every module's record page.
+    let activity_panel = vortex_plugin_sdk::framework::render_chatter_panel("contacts", id);
+
     // Status section: display-only progress bar + role-gated transition
     // buttons, plus a lock banner when the current stage is locked.
     let status_change_base = format!("/contacts/{}/status", id);
@@ -835,8 +840,11 @@ async function loadStates(countryId) {{
 </fieldset>
 </form>
 
+{activity_panel}
+
 {history_panel}"#,
         id = id,
+        activity_panel = activity_panel,
         name = esc(&name),
         code = esc(code.as_deref().unwrap_or("")),
         name_val = esc(&name),

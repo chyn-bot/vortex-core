@@ -33,6 +33,14 @@ struct ModelArgs {
     /// Enable audit fields
     #[darling(default)]
     audited: Option<bool>,
+
+    /// Display name for the metadata registry (`ir_model.display_name`).
+    #[darling(default)]
+    label: Option<String>,
+
+    /// Registry name (`ir_model.name`). Defaults to the table name.
+    #[darling(default)]
+    name: Option<String>,
 }
 
 /// Attributes for model fields
@@ -93,6 +101,19 @@ struct FieldArgs {
     /// Skip in audit log
     #[darling(default)]
     no_audit: bool,
+
+    /// Display label for the UI / metadata registry.
+    #[darling(default)]
+    label: Option<String>,
+
+    /// UI/semantic type override for the metadata registry
+    /// (e.g. "monetary", "string", "text", "number").
+    #[darling(default)]
+    ui_type: Option<String>,
+
+    /// Selection options (comma-separated) → a `selection` registry field.
+    #[darling(default)]
+    selection: Option<String>,
 }
 
 /// Derive macro for Vortex models
@@ -141,6 +162,15 @@ pub fn derive_model(input: TokenStream) -> TokenStream {
     let soft_delete = args.soft_delete.unwrap_or(true);
     let audited = args.audited.unwrap_or(true);
 
+    let model_label_expr = match &args.label {
+        Some(l) => quote! { meta.label = Some(#l.to_string()); },
+        None => quote! {},
+    };
+    let registry_name_expr = match &args.name {
+        Some(n) => quote! { meta.registry_name = Some(#n.to_string()); },
+        None => quote! {},
+    };
+
     let fields = match &args.data {
         darling::ast::Data::Struct(fields) => fields,
         _ => panic!("Model can only be derived for structs"),
@@ -149,7 +179,7 @@ pub fn derive_model(input: TokenStream) -> TokenStream {
     // Generate field definitions
     let field_defs: Vec<_> = fields.fields.iter().map(|f| {
         let field_name = f.ident.as_ref().expect("Named fields required");
-        let field_name_str = field_name.to_string();
+        let field_name_str = ident_to_name(field_name);
         let column_name = f.column.clone().unwrap_or_else(|| field_name_str.clone());
         let ty = &f.ty;
 
@@ -172,6 +202,42 @@ pub fn derive_model(input: TokenStream) -> TokenStream {
             quote! { vec![#(#deps.to_string()),*] }
         }).unwrap_or_else(|| quote! { vec![] });
 
+        // A `references = "model"` attribute overrides the storage type with a
+        // foreign-key Reference, which the registry projects as a `many2one`.
+        let reference_expr = if let Some(model) = &f.references {
+            let on_delete = match f.on_delete.as_deref() {
+                Some("cascade") => quote! { vortex_orm::field::OnDelete::Cascade },
+                Some("set_null") | Some("setnull") => quote! { vortex_orm::field::OnDelete::SetNull },
+                Some("set_default") => quote! { vortex_orm::field::OnDelete::SetDefault },
+                Some("no_action") => quote! { vortex_orm::field::OnDelete::NoAction },
+                _ => quote! { vortex_orm::field::OnDelete::Restrict },
+            };
+            quote! {
+                field.field_type = vortex_orm::field::FieldType::Reference {
+                    model: #model.to_string(),
+                    on_delete: #on_delete,
+                };
+            }
+        } else {
+            quote! {}
+        };
+
+        let label_expr = match &f.label {
+            Some(l) => quote! { field.label = Some(#l.to_string()); },
+            None => quote! {},
+        };
+        let ui_type_expr = match &f.ui_type {
+            Some(u) => quote! { field.ui_type = Some(#u.to_string()); },
+            None => quote! {},
+        };
+        let selection_expr = match &f.selection {
+            Some(s) => {
+                let opts: Vec<_> = s.split(',').map(|x| x.trim().to_string()).collect();
+                quote! { field.selection = vec![#(#opts.to_string()),*]; }
+            }
+            None => quote! {},
+        };
+
         quote! {
             {
                 let mut field = vortex_orm::field::FieldDef::new(#field_name_str, #field_type);
@@ -188,6 +254,10 @@ pub fn derive_model(input: TokenStream) -> TokenStream {
                     field.field_type = vortex_orm::field::FieldType::Computed;
                     field.depends_on = #depends_on;
                 }
+                #reference_expr
+                #label_expr
+                #ui_type_expr
+                #selection_expr
                 field
             }
         }
@@ -216,7 +286,7 @@ pub fn derive_model(input: TokenStream) -> TokenStream {
     // Generate to_values implementation
     let to_values_fields: Vec<_> = fields.fields.iter().map(|f| {
         let field_name = f.ident.as_ref().unwrap();
-        let field_name_str = field_name.to_string();
+        let field_name_str = ident_to_name(field_name);
         quote! {
             values.insert(#field_name_str.to_string(), vortex_orm::field::Field::to_field_value(&self.#field_name));
         }
@@ -225,7 +295,7 @@ pub fn derive_model(input: TokenStream) -> TokenStream {
     // Generate from_values implementation
     let from_values_fields: Vec<_> = fields.fields.iter().map(|f| {
         let field_name = f.ident.as_ref().unwrap();
-        let field_name_str = field_name.to_string();
+        let field_name_str = ident_to_name(field_name);
         let ty = &f.ty;
         quote! {
             #field_name: {
@@ -248,6 +318,8 @@ pub fn derive_model(input: TokenStream) -> TokenStream {
                     meta.multi_tenant = #multi_tenant;
                     meta.soft_delete = #soft_delete;
                     meta.audited = #audited;
+                    #model_label_expr
+                    #registry_name_expr
 
                     #(meta.add_field(#field_defs);)*
 
@@ -278,6 +350,14 @@ pub fn derive_model(input: TokenStream) -> TokenStream {
     };
 
     TokenStream::from(expanded)
+}
+
+/// Field/column name for an identifier, stripping the `r#` prefix of raw
+/// identifiers so a column that collides with a Rust keyword (e.g. `ref`) can
+/// be modelled as `r#ref` yet still register and map to the column `ref`.
+fn ident_to_name(ident: &Ident) -> String {
+    let s = ident.to_string();
+    s.strip_prefix("r#").map(str::to_string).unwrap_or(s)
 }
 
 /// Convert CamelCase to snake_case

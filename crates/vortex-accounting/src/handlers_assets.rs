@@ -615,6 +615,7 @@ async fn asset_detail(
         ),
         _ => String::new(),
     };
+    let activity_panel = vortex_plugin_sdk::framework::render_chatter_panel("acc_asset", id);
     let content = format!(
         r##"<div class="mb-2"><a href="/accounting/assets" class="link link-hover text-sm">← Fixed Assets</a></div>
 <div class="flex justify-between items-center mb-4">
@@ -623,7 +624,8 @@ async fn asset_detail(
 <p class="text-sm opacity-70 mb-3">Cost {} · salvage {} · {} months from {}</p>
 <table class="table table-sm"><thead><tr><th>#</th><th>Date</th><th class="text-right">Amount</th>
 <th class="text-right">Cumulative</th><th>State</th><th>Entry</th></tr></thead>
-<tbody>{trs}</tbody></table></div></div>"##,
+<tbody>{trs}</tbody></table></div></div>
+<div class="mt-6">{activity_panel}</div>"##,
         ESC(&a.get::<String, _>("name")),
         ESC(&asset_state),
         a.get::<Decimal, _>("cost"),

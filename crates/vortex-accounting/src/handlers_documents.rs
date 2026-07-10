@@ -1656,6 +1656,8 @@ onsubmit="return confirm('Reset to draft? You can edit and repost — the docume
     };
 
     let history_panel = vortex_plugin_sdk::framework::render_audit_trail(&db, "acc_move", id).await;
+    // Activity stream: schedule/assign/complete tasks, messages, attachments.
+    let activity_panel = vortex_plugin_sdk::framework::render_chatter_panel("acc_move", id);
     let einvoice_panel = crate::handlers_einvoice::einvoice_widget(&db, id).await;
 
     let class_header = if customer_doc { "<th>Class</th>" } else { "" };
@@ -1755,6 +1757,7 @@ onsubmit="return confirm('Reset to draft? You can edit and repost — the docume
 </div></div>
 {add_line_form}
 {payments_block}
+<div class="mt-6">{activity_panel}</div>
 <div class="mt-6">{history}</div>
 </div>"#,
         family_url = family_url,
@@ -1774,6 +1777,7 @@ onsubmit="return confirm('Reset to draft? You can edit and repost — the docume
         add_line_form = add_line_form,
         payments_block = payments_block,
         history = history_panel,
+        activity_panel = activity_panel,
     );
 
     Html(page_shell(&sidebar, &format!("{number}"), &content)).into_response()

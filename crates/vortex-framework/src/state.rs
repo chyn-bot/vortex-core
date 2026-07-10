@@ -104,6 +104,11 @@ pub struct AppState {
     /// `crate::reports::render_report(state, code, params)` to get
     /// the same bytes without going through HTTP.
     pub reports: Arc<ReportRegistry>,
+    /// Printable-document registry. Built at startup from every plugin's
+    /// `print_docs()` contribution. The `/settings/print-templates` UI lists
+    /// these so users can customise each document's layout; plugin print
+    /// handlers render via `crate::print_layout::render_document`.
+    pub print_docs: Arc<crate::print_layout::PrintDocRegistry>,
     /// File/attachment storage backend (`[files]` in vortex.toml):
     /// local directory by default, S3-compatible object storage for
     /// multi-server deployments. Handlers and plugins store blobs via

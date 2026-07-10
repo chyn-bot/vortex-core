@@ -109,6 +109,9 @@ pub mod prelude {
         RecordPanelDef, HOST_FORM_ID,
     };
 
+    // ── Printable documents (user-customisable print layouts) ──
+    pub use vortex_framework::{DocLayout, LayoutColumn, LayoutConfig, PrintDocRegistry, PrintDocType};
+
     // ── Reports ──
     pub use vortex_framework::{
         ReportDef, ReportFormat, ReportOutput, ReportParams, ReportRegistry,

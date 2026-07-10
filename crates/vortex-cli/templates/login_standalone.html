@@ -1,12 +1,13 @@
 <!DOCTYPE html>
-<html lang="en" data-theme="remicle">
+<html lang="en" data-theme="dark">
 <head>
+    <script>(function(){var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)})()</script>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Login - Remicle</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-    <link href="/static/vortex.css?v=9" rel="stylesheet">
-    <script src="/static/vortex.js?v=9" defer></script>
+    <link href="/static/vortex.css?v=18" rel="stylesheet">
+    <script src="/static/vortex.js?v=18" defer></script>
     <script src="/static/vendor/tailwind.js"></script>
     <script src="/static/vendor/htmx.min.js"></script>
     <script>
@@ -26,36 +27,6 @@
         }
     </script>
     <style>
-        [data-theme="remicle"] {
-            --p: 93 54% 51%;           /* Primary - Remicle Green #8BC53F */
-            --pf: 93 45% 42%;          /* Primary focus - darker green */
-            --pc: 0 0% 100%;           /* Primary content - white */
-            --s: 210 11% 45%;          /* Secondary - Professional slate */
-            --sf: 210 11% 35%;         /* Secondary focus */
-            --sc: 0 0% 100%;           /* Secondary content */
-            --a: 93 54% 51%;           /* Accent - same as primary */
-            --af: 93 45% 42%;          /* Accent focus */
-            --ac: 0 0% 100%;           /* Accent content */
-            --n: 220 13% 26%;          /* Neutral - dark slate */
-            --nf: 220 13% 18%;         /* Neutral focus */
-            --nc: 210 20% 98%;         /* Neutral content */
-            --b1: 0 0% 100%;           /* Base 100 - white */
-            --b2: 210 20% 98%;         /* Base 200 - off-white */
-            --b3: 214 14% 94%;         /* Base 300 - light gray */
-            --bc: 220 13% 26%;         /* Base content - dark text */
-            --in: 212 96% 54%;         /* Info - blue */
-            --inc: 0 0% 100%;          /* Info content */
-            --su: 158 64% 42%;         /* Success - green */
-            --suc: 0 0% 100%;          /* Success content */
-            --wa: 43 96% 50%;          /* Warning - amber */
-            --wac: 0 0% 20%;           /* Warning content */
-            --er: 0 72% 51%;           /* Error - red */
-            --erc: 0 0% 100%;          /* Error content */
-            --rounded-box: 0.75rem;
-            --rounded-btn: 0.5rem;
-            --rounded-badge: 1.5rem;
-            --btn-text-case: none;
-        }
         .htmx-request .htmx-indicator { display: inline-flex !important; }
         .htmx-indicator { display: none; }
     </style>

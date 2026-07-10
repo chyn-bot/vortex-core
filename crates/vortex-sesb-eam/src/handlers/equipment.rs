@@ -478,6 +478,7 @@ async fn edit_equipment(
     if comp_html.is_empty() { comp_html.push_str(r#"<tr><td colspan="3" class="text-base-content/50">No components</td></tr>"#); }
 
     let history = vortex_plugin_sdk::framework::render_audit_trail(&db, "eam_equipment", id).await;
+    let activity_panel = vortex_plugin_sdk::framework::render_chatter_panel("eam_equipment", id);
     let header = format!(
         r#"<div class="flex items-center justify-between mb-3"><div>
 <a href="/sesb-eam/equipment" class="btn btn-ghost btn-sm mb-2">← Back to Equipment</a>
@@ -494,8 +495,9 @@ async fn edit_equipment(
 <div class="flex items-center justify-between mb-2"><h2 class="card-title text-lg">Components</h2>
 <a href="/sesb-eam/components/new?equipment={id}" class="btn btn-primary btn-sm">New Component</a></div>
 <table class="table table-sm"><thead><tr><th>Code</th><th>Name</th><th>Type</th></tr></thead><tbody>{comp_html}</tbody></table></div></div>
+<div class="mt-6">{activity_panel}</div>
 <div class="mt-6">{history}</div></div>"#,
-        header = header, stats = stats, id = id, base_body = base_body, spec_section = spec_section, comp_html = comp_html, history = history);
+        header = header, stats = stats, id = id, base_body = base_body, spec_section = spec_section, comp_html = comp_html, history = history, activity_panel = activity_panel);
     Html(page_shell(&sidebar, &format!("Equipment {}", f.name), &content)).into_response()
 }
 
@@ -708,12 +710,14 @@ async fn edit_component(
 <h1 class="text-2xl font-bold mb-2">{name} <span class="text-base-content/40 font-mono text-sm">{code}</span></h1>"#,
         back = eqid.map(|e| format!("/sesb-eam/equipment/{e}")).unwrap_or_else(|| "/sesb-eam/equipment".into()),
         name = esc(&f.name), code = esc(&code));
+    let activity_panel = vortex_plugin_sdk::framework::render_chatter_panel("eam_component", id);
     let content = format!(
         r#"{form}
 <div class="max-w-4xl mt-6"><div class="card bg-base-100 shadow"><div class="card-body">
 <h2 class="card-title text-lg mb-2">Parts</h2>
 <table class="table table-sm"><thead><tr><th>Name</th><th>Part No</th><th>Qty</th><th>Status</th><th></th></tr></thead><tbody>{parts}</tbody></table>
-{part_form}</div></div></div>"#,
+{part_form}</div></div></div>
+<div class="max-w-4xl mt-6">{activity_panel}</div>"#,
         form = wide_form_page(&format!("/sesb-eam/components/{id}"), &header, &body), parts = part_rows, part_form = part_form);
     let _ = user;
     Html(page_shell(&sidebar, &format!("Component {}", f.name), &content)).into_response()

@@ -253,6 +253,7 @@ async fn edit_wo(
 
     let actions = state_actions(&wstate, id);
     let history = vortex_plugin_sdk::framework::render_audit_trail(&db, "eam_maintenance", id).await;
+    let activity_panel = vortex_plugin_sdk::framework::render_chatter_panel("eam_maintenance", id);
     let header = format!(
         r#"<div class="flex items-center justify-between mb-3"><div>
 <a href="/sesb-eam/maintenance" class="btn btn-ghost btn-sm mb-2">← Back to Work Orders</a>
@@ -264,8 +265,9 @@ async fn edit_wo(
 <form method="POST" action="/sesb-eam/maintenance/{id}"><div class="card bg-base-100 shadow"><div class="card-body">{base}
 <div class="mt-3"><button class="btn btn-primary btn-sm">Save</button></div></div></div></form>
 {checklist}{parts}
+<div class="mt-6">{activity_panel}</div>
 <div class="mt-6">{history}</div></div>"#,
-        header = header, stats = stats, actions = actions, id = id, base = base, checklist = checklist_card, parts = part_card, history = history);
+        header = header, stats = stats, actions = actions, id = id, base = base, checklist = checklist_card, parts = part_card, history = history, activity_panel = activity_panel);
     Html(page_shell(&sidebar, &format!("WO {}", number), &content)).into_response()
 }
 

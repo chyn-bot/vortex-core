@@ -37,6 +37,13 @@ pub struct ModelMeta {
     pub inherits: Option<String>,
     /// Model-level access groups
     pub access_groups: Vec<String>,
+    /// Human-friendly display name for the metadata registry / UI
+    /// (`ir_model.display_name`). Defaults to a humanized registry name.
+    pub label: Option<String>,
+    /// Registry name written to `ir_model.name` (the key the generic views
+    /// and REST API resolve). Defaults to the table name, matching the
+    /// existing convention where `ir_model.name == table_name`.
+    pub registry_name: Option<String>,
 }
 
 impl ModelMeta {
@@ -57,7 +64,15 @@ impl ModelMeta {
             constraints: Vec::new(),
             inherits: None,
             access_groups: Vec::new(),
+            label: None,
+            registry_name: None,
         }
+    }
+
+    /// The registry key (`ir_model.name`) for this model — the explicit
+    /// `registry_name` if set, otherwise the table name.
+    pub fn registry_key(&self) -> &str {
+        self.registry_name.as_deref().unwrap_or(&self.table)
     }
 
     /// Add a field to the model

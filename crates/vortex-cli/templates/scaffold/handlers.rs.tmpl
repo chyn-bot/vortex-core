@@ -279,15 +279,15 @@ async fn item_page(
   </div>
   <p class="mt-4">{description}</p>
 </div></div>
-<!-- Chatter: messages, activities, attachments — one include. -->
-<div hx-get="/partials/chatter/__SNAKE___item/{id}" hx-trigger="load" hx-swap="innerHTML">
-  <span class="loading loading-dots loading-sm"></span>
-</div>"##,
+<!-- Activity stream: messages, activities (schedule/assign/complete),
+     attachments — one reusable core primitive. -->
+{activity}"##,
         name = esc(&name),
         code = esc(code.as_deref().unwrap_or("—")),
         bar = bar,
         duplicate = duplicate_button(&format!("/__KEBAB__/{id}/duplicate")),
         description = esc(description.as_deref().unwrap_or("")),
+        activity = vortex_plugin_sdk::framework::render_chatter_panel("__SNAKE___item", id),
         id = id,
     );
     let sidebar = sidebar_for(&state, &user, &db_ctx);

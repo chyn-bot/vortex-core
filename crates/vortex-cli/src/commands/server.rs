@@ -1216,6 +1216,8 @@ async fn api_create_record(
                 &state.db, &db, &db_ctx.db_name, "record.created",
                 serde_json::json!({"model": model, "id": id, "record": rec}),
             ).await;
+            let _ = vortex_framework::computed_fields::store_values(&db, &model, id).await;
+            let _ = vortex_framework::automation::run_rules(&db, &model, "create", id).await;
             (StatusCode::CREATED, Json(serde_json::json!({"id": id, "record": rec}))).into_response()
         }
         Err(e) => api_error(StatusCode::BAD_REQUEST, "create_failed", &e),
@@ -1283,6 +1285,8 @@ async fn api_update_record(
                 &state.db, &db, &db_ctx.db_name, "record.updated",
                 serde_json::json!({"model": model, "id": id, "record": rec}),
             ).await;
+            let _ = vortex_framework::computed_fields::store_values(&db, &model, id).await;
+            let _ = vortex_framework::automation::run_rules(&db, &model, "update", id).await;
             Json(serde_json::json!({"id": id, "record": rec})).into_response()
         }
         Ok(false) => api_error(StatusCode::NOT_FOUND, "not_found", "No such record."),
@@ -1368,8 +1372,8 @@ fn module_not_installed_page(module_name: &str) -> String {
     format!(r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style><title>Module Not Installed</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=12" rel="stylesheet"/>
-<script src="/static/vortex.js?v=12" defer></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script>
 <script src="/static/vendor/tailwind.js"></script></head>
 <body class="min-h-screen bg-base-200 flex items-center justify-center">
 <div class="card bg-base-100 shadow-xl max-w-md w-full">
@@ -1974,6 +1978,15 @@ pub async fn run(host: String, port: u16, _workers: Option<usize>) -> Result<()>
     }
     let reports = Arc::new(vortex_framework::reports::ReportRegistry::new(all_reports));
 
+    // Collect every plugin's printable document types (quotation, invoice, …)
+    // into a single PrintDocRegistry. The /settings/print-templates UI lists
+    // these; plugin print handlers render through print_layout::render_document.
+    let mut all_print_docs = Vec::new();
+    for plugin in plugin_registry.plugins_iter() {
+        all_print_docs.extend(plugin.print_docs());
+    }
+    let print_docs = Arc::new(vortex_framework::print_layout::PrintDocRegistry::new(all_print_docs));
+
     // ─── i18n / Translations (Phase 0.7) ──────────────────────────────
     // Collect plugin-contributed translations, sync to DB, then build
     // the in-memory TranslationService. Plugin translations are upserted
@@ -2027,6 +2040,7 @@ pub async fn run(host: String, port: u16, _workers: Option<usize>) -> Result<()>
         plugin_registry: plugin_registry.clone(),
         scheduler: scheduler.clone(),
         reports: reports.clone(),
+        print_docs: print_docs.clone(),
         i18n,
         files,
     });
@@ -2108,7 +2122,9 @@ fn build_router(state: Arc<AppState>) -> Router {
     // --- Core routes (always available) ---
     let protected_routes = Router::new()
         .route("/home", get(home_page))
-        .route("/dashboard", get(dashboard_page))
+        // /dashboard merged into /home (role-aware landing). Redirect
+        // keeps old bookmarks and stray links working.
+        .route("/dashboard", get(|| async { Redirect::to("/home") }))
         .route("/auth/logout", post(logout).get(logout))
         .route("/partials/recent-activity", get(recent_activity))
         .route("/partials/system-status", get(system_status))
@@ -2190,6 +2206,20 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/settings", get(settings_index))
         .route("/audit", get(audit_log_page))
         .route("/notifications", get(notifications_page))
+        .route("/settings/custom-fields", get(custom_fields_list))
+        .route("/settings/custom-fields", post(custom_field_create))
+        .route("/settings/custom-fields/delete", post(custom_field_delete))
+        .route("/settings/automation-rules", get(automation_rules_list))
+        .route("/settings/automation-rules", post(automation_rule_create))
+        .route("/settings/automation-rules/delete", post(automation_rule_delete))
+        .route("/settings/computed-fields", get(computed_fields_list))
+        .route("/settings/computed-fields", post(computed_field_create))
+        .route("/settings/computed-fields/delete", post(computed_field_delete))
+        .route("/dashboards", get(dashboards_index).post(dashboard_create))
+        .route("/dashboards/{id}", get(dashboard_view))
+        .route("/dashboards/{id}/delete", post(dashboard_delete))
+        .route("/dashboards/{id}/widget", post(dashboard_widget_create))
+        .route("/dashboards/widget/{id}/delete", post(dashboard_widget_delete))
         .route("/settings/activity-types", get(activity_types_list))
         .route("/settings/activity-types", post(activity_type_create))
         .route("/settings/activity-types/{id}", get(activity_type_edit))
@@ -2273,6 +2303,17 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/settings/webhooks/{id}", post(webhook_update))
         .route("/settings/webhooks/{id}/delete", post(webhook_delete))
         .route("/settings/webhooks/{id}/test", post(webhook_test))
+        // Print layout designer — document branding + per-document templates
+        .route("/settings/document-layout", get(document_layout_page))
+        .route("/settings/document-layout", post(document_layout_save))
+        .route("/settings/document-layout/logo", post(document_layout_logo))
+        .route("/settings/print-templates", get(print_templates_list))
+        .route("/settings/print-templates/{doc_type}", get(print_template_edit))
+        .route("/settings/print-templates/{doc_type}", post(print_template_save))
+        .route("/settings/print-templates/{doc_type}/preview", post(print_template_preview))
+        .route("/settings/print-templates/{doc_type}/visual", post(print_template_visual_save))
+        .route("/settings/print-templates/{doc_type}/visual/preview", post(print_template_visual_preview))
+        .route("/settings/company-logo", get(serve_company_logo))
         // Approvals (generic, cross-module inbox + decisions)
         .route("/approvals", get(approvals_inbox))
         .route("/approvals/{id}/approve", post(approval_approve))
@@ -2997,12 +3038,41 @@ async fn home_page(
         + "modal.showModal=function(){loadAvailableShortcuts();origFn();};"
         + "</script>";
 
+    // Admin-only system overview — folded in from the retired /dashboard.
+    // Live counts (the old dashboard tiles were hardcoded) plus the same
+    // recent-activity / system-status partials the dashboard used.
+    let admin_overview = if user.is_admin() {
+        let active_users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE active = true")
+            .fetch_one(&db).await.unwrap_or(0);
+        let companies: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM companies")
+            .fetch_one(&db).await.unwrap_or(0);
+        let modules = installed.len();
+        let audit_24h: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_log WHERE timestamp > NOW() - INTERVAL '24 hours'")
+            .fetch_one(&db).await.unwrap_or(0);
+        format!(
+            r#"<div class="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+<div class="stat bg-base-100 rounded-lg shadow"><div class="stat-title">Active Users</div><div class="stat-value text-primary">{au}</div></div>
+<div class="stat bg-base-100 rounded-lg shadow"><div class="stat-title">Companies</div><div class="stat-value text-secondary">{co}</div></div>
+<div class="stat bg-base-100 rounded-lg shadow"><div class="stat-title">Modules</div><div class="stat-value text-accent">{mo}</div></div>
+<div class="stat bg-base-100 rounded-lg shadow"><div class="stat-title">Audit Events</div><div class="stat-value text-info">{ae}</div><div class="stat-desc">Last 24h</div></div>
+</div>
+<div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
+<div class="card bg-base-100 shadow"><div class="card-body"><h2 class="card-title text-lg">Recent Activity</h2><div class="overflow-x-auto" hx-get="/partials/recent-activity" hx-trigger="load" hx-swap="innerHTML"><span class="loading loading-spinner loading-sm"></span></div></div></div>
+<div class="card bg-base-100 shadow"><div class="card-body"><h2 class="card-title text-lg">System Status</h2><div hx-get="/partials/system-status" hx-trigger="load" hx-swap="innerHTML"><span class="loading loading-spinner loading-sm"></span></div></div></div>
+</div>"#,
+            au = active_users, co = companies, mo = modules, ae = audit_24h
+        )
+    } else {
+        String::new()
+    };
+
     let html = format!(
         r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style><title>Home - Remicle</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=12" rel="stylesheet"/>
-<script src="/static/vortex.js?v=12" defer></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script>
 <script src="/static/vendor/tailwind.js"></script>
 <script src="/static/vendor/htmx.min.js"></script>
 </head>
@@ -3013,6 +3083,7 @@ async fn home_page(
 <main class="flex-1 p-4 lg:p-6 min-w-0">
 <div class="mb-6"><h1 class="text-2xl font-bold">Welcome, {display_name}</h1><p class="text-base-content/60">Here's what's happening today</p></div>
 
+{admin_overview}
 <!-- Announcements (full width) -->
 <div class="card bg-base-100 shadow mb-6">
 <div class="card-body">
@@ -3064,83 +3135,11 @@ async fn home_page(
 </body></html>"#,
         sidebar = sidebar,
         display_name = html_escape(display_name),
+        admin_overview = admin_overview,
         module_links = module_links,
         shortcuts_modal = shortcuts_modal,
         shortcuts_js = shortcuts_js,
     );
-
-    Html(html)
-}
-
-async fn dashboard_page(
-    State(state): State<Arc<AppState>>,
-    Db(db): Db,
-    Extension(user): Extension<AuthUser>,
-) -> Html<String> {
-    // Get user's role
-    let role_name: Option<String> = sqlx::query_scalar(
-        r#"
-        SELECT r.name FROM roles r
-        JOIN user_roles ur ON r.id = ur.role_id
-        WHERE ur.user_id = $1
-        LIMIT 1
-        "#
-    )
-    .bind(&user.id)
-    .fetch_optional(&db)
-    .await
-    .ok()
-    .flatten();
-
-    let is_system_admin = role_name.as_deref() == Some("System Administrator");
-    let is_admin = is_system_admin || role_name.as_deref() == Some("Administrator");
-
-    // Get the template and inject user info
-    let template = include_str!("../../templates/dashboard_standalone.html");
-
-    // Replace placeholder with actual user info
-    let display_name = user.full_name.as_deref().unwrap_or(&user.username);
-    let initials = get_initials(display_name);
-
-    // Build admin-only sections
-    let admin_nav = if is_system_admin {
-        r#"<li class="menu-title mt-4"><span>Administration</span></li>
-           <li><a href="/users" class="nav-item"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197m9 5.197v-1"/></svg><span class="sidebar-text">Users</span></a></li>
-           <li><a href="/companies" class="nav-item"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5M9 7h1m-1 4h1m4-4h1m-1 4h1m-5 10v-5a1 1 0 011-1h2a1 1 0 011 1v5m-4 0h4"/></svg><span class="sidebar-text">Companies</span></a></li>
-           <li><a href="/roles" class="nav-item"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"/></svg><span class="sidebar-text">Roles</span></a></li>
-           <li><a href="/admin/access" class="nav-item"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/></svg><span class="sidebar-text">Access Control</span></a></li>
-           <li><a href="/settings" class="nav-item"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/></svg><span class="sidebar-text">Settings</span></a></li>"#
-    } else if is_admin {
-        r#"<li class="menu-title mt-4"><span>Administration</span></li>
-           <li><a href="/users" class="nav-item"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197m9 5.197v-1"/></svg><span class="sidebar-text">Users</span></a></li>
-           <li><a href="/companies" class="nav-item"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5M9 7h1m-1 4h1m4-4h1m-1 4h1m-5 10v-5a1 1 0 011-1h2a1 1 0 011 1v5m-4 0h4"/></svg><span class="sidebar-text">Companies</span></a></li>
-           <li><a href="/roles" class="nav-item"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"/></svg><span class="sidebar-text">Roles</span></a></li>
-           <li><a href="/settings" class="nav-item"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/></svg><span class="sidebar-text">Settings</span></a></li>"#
-    } else {
-        ""
-    };
-
-    let system_nav = if is_system_admin {
-        r#"<li class="menu-title mt-4"><span>System</span></li>
-           <li><a href="/audit"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01"/></svg>Audit Log</a></li>
-           <li><a href="/settings"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/></svg>Settings</a></li>"#
-    } else {
-        ""
-    };
-
-    let role_badge = format!(
-        r#"<span class="badge badge-sm {}">{}</span>"#,
-        if is_system_admin { "badge-error" } else if is_admin { "badge-warning" } else { "badge-info" },
-        role_name.as_deref().unwrap_or("User")
-    );
-
-    let html = template
-        .replace("{{user_name}}", display_name)
-        .replace("{{user_initials}}", &initials)
-        .replace("{{username}}", &user.username)
-        .replace("{{admin_nav}}", admin_nav)
-        .replace("{{system_nav}}", system_nav)
-        .replace("{{role_badge}}", &role_badge);
 
     Html(html)
 }
@@ -3739,8 +3738,8 @@ async fn announcements_list(
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style><title>Announcements - Remicle</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=12" rel="stylesheet"/>
-<script src="/static/vortex.js?v=12" defer></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script>
 <script src="/static/vendor/tailwind.js"></script></head>
 <body class="min-h-screen bg-base-200">
 <div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a><button onclick="(function(){{var h=document.documentElement,c=h.getAttribute('data-theme')==='dark'?'corporate':'dark';h.setAttribute('data-theme',c);localStorage.setItem('theme',c);document.querySelectorAll('.theme-icon-sun,.theme-icon-moon').forEach(function(e){{e.classList.toggle('hidden')}})}})();" class="btn btn-ghost btn-sm btn-square ml-auto"><svg class="theme-icon-sun w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5" stroke-width="2"/><path stroke-linecap="round" stroke-width="2" d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg><svg class="theme-icon-moon w-5 h-5 hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg></button></div>
@@ -3775,8 +3774,8 @@ async fn announcement_new(
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style><title>New Announcement - Remicle</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=12" rel="stylesheet"/>
-<script src="/static/vortex.js?v=12" defer></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script>
 <script src="/static/vendor/tailwind.js"></script></head>
 <body class="min-h-screen bg-base-200">
 <div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a><button onclick="(function(){{var h=document.documentElement,c=h.getAttribute('data-theme')==='dark'?'corporate':'dark';h.setAttribute('data-theme',c);localStorage.setItem('theme',c);document.querySelectorAll('.theme-icon-sun,.theme-icon-moon').forEach(function(e){{e.classList.toggle('hidden')}})}})();" class="btn btn-ghost btn-sm btn-square ml-auto"><svg class="theme-icon-sun w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5" stroke-width="2"/><path stroke-linecap="round" stroke-width="2" d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg><svg class="theme-icon-moon w-5 h-5 hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg></button></div>
@@ -3890,8 +3889,8 @@ async fn announcement_edit(
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style><title>Edit Announcement - Remicle</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=12" rel="stylesheet"/>
-<script src="/static/vortex.js?v=12" defer></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script>
 <script src="/static/vendor/tailwind.js"></script></head>
 <body class="min-h-screen bg-base-200">
 <div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a><button onclick="(function(){{var h=document.documentElement,c=h.getAttribute('data-theme')==='dark'?'corporate':'dark';h.setAttribute('data-theme',c);localStorage.setItem('theme',c);document.querySelectorAll('.theme-icon-sun,.theme-icon-moon').forEach(function(e){{e.classList.toggle('hidden')}})}})();" class="btn btn-ghost btn-sm btn-square ml-auto"><svg class="theme-icon-sun w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5" stroke-width="2"/><path stroke-linecap="round" stroke-width="2" d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg><svg class="theme-icon-moon w-5 h-5 hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg></button></div>
@@ -4960,8 +4959,8 @@ async fn access_control_page(
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Access Control - Remicle</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=12" rel="stylesheet"/>
-<script src="/static/vortex.js?v=12" defer></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script>
     <script src="/static/vendor/tailwind.js"></script>
     <script src="/static/vendor/htmx.min.js"></script>
     <script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style>
@@ -5108,9 +5107,9 @@ async fn access_control_page(
                         <span>Main</span>
                     </li>
                     <li>
-                        <a href="/dashboard">
+                        <a href="/home">
                             <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6"></path></svg>
-                            Dashboard
+                            Home
                         </a>
                     </li>
                     <li class="menu-title mt-4">
@@ -5450,8 +5449,8 @@ async fn modules_list_with_filter(
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Apps & Modules - Remicle</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet" type="text/css" />
-<link href="/static/vortex.css?v=12" rel="stylesheet"/>
-<script src="/static/vortex.js?v=12" defer></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script>
     <script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
@@ -5461,13 +5460,13 @@ async fn modules_list_with_filter(
         <!-- Sidebar -->
         <aside id="sidebar-modules" class="w-64 bg-base-100 shadow-lg flex flex-col min-h-screen fixed lg:static top-0 left-0 z-40 h-full -translate-x-full lg:translate-x-0 transition-transform duration-200">
             <div class="p-4 border-b border-base-300">
-                <a href="/dashboard" class="flex justify-center">
+                <a href="/home" class="flex justify-center">
                     <span class="text-xl font-bold"><span class="text-success">re</span><span class="text-base-content/60">micle</span></span>
                 </a>
             </div>
             <nav class="flex-1 overflow-y-auto p-4">
                 <ul class="menu menu-sm gap-1">
-                    <li><a href="/dashboard">Dashboard</a></li>
+                    <li><a href="/home">Home</a></li>
                     <li class="menu-title mt-4"><span>Administration</span></li>
                     <li><a href="/users">Users</a></li>
                     <li><a href="/admin/access">Access Control</a></li>
@@ -5796,8 +5795,8 @@ async fn modules_detail(
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>{name} - Apps & Modules</title>
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet" type="text/css"/>
-<link href="/static/vortex.css?v=12" rel="stylesheet"/>
-<script src="/static/vortex.js?v=12" defer></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script>
 <script src="/static/vendor/tailwind.js"></script></head>
 <body class="min-h-screen bg-base-200"><main class="max-w-4xl mx-auto p-4 lg:p-8">
 <a href="/modules" class="btn btn-ghost btn-sm mb-4 gap-2">← Back to Apps &amp; Modules</a>
@@ -5910,6 +5909,22 @@ async fn modules_refresh(
             message: "Permission denied".to_string(),
             error: Some("Only system administrators can update the apps list".to_string()),
         }).into_response();
+    }
+
+    // Project plugin `#[derive(Model)]` metadata into this tenant's registry
+    // (ir_model / ir_model_field) so refreshing the apps list also refreshes
+    // the generic-view + REST-API metadata. Mirrors the CLI `db migrate` path.
+    {
+        let metas: Vec<&'static vortex_orm::model::ModelMeta> = state
+            .plugin_registry
+            .plugins_iter()
+            .flat_map(|p| p.models())
+            .collect();
+        if !metas.is_empty() {
+            if let Err(e) = vortex_orm::registry_sync::sync_model_registry(&db, &metas).await {
+                error!("model registry sync during apps-list refresh failed: {}", e);
+            }
+        }
     }
 
     match crate::commands::module_sync::sync_plugins_to_installed_modules(&db, &state.plugin_registry).await {
@@ -6359,7 +6374,7 @@ async fn build_sidebar_menu(db: &PgPool, user_roles: &[String], current_model: &
         } else {
             // It's a direct link (like Dashboard)
             let action_url: Option<String> = menu.get("action_url");
-            let href = action_url.unwrap_or_else(|| "/dashboard".to_string());
+            let href = action_url.unwrap_or_else(|| "/home".to_string());
             html.push_str(&format!(r#"<li><a href="{}" class="nav-item">{}<span class="sidebar-text">{}</span></a></li>"#,
                 href, icon_html, name));
         }
@@ -6761,8 +6776,8 @@ async fn generic_list_view(
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style><title>{}</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=12" rel="stylesheet"/>
-<script src="/static/vortex.js?v=12" defer></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script>
 <script src="/static/vendor/tailwind.js"></script>
 <style>
 body {{ background: oklch(var(--b2)); color: oklch(var(--bc)); }}
@@ -7054,8 +7069,8 @@ async fn generic_kanban_view(
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style><title>{} - Kanban</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=12" rel="stylesheet"/>
-<script src="/static/vortex.js?v=12" defer></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script>
 <script src="/static/vendor/tailwind.js"></script>
 <style>
 body {{ background: oklch(var(--b2)); color: oklch(var(--bc)); }}
@@ -7201,8 +7216,8 @@ async fn generic_graph_view(
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style><title>{} - Graph</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=12" rel="stylesheet"/>
-<script src="/static/vortex.js?v=12" defer></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script>
 <script src="/static/vendor/tailwind.js"></script>
 <script src="/static/vendor/chart.umd.js"></script>
 <style>
@@ -7473,8 +7488,8 @@ async fn generic_calendar_view(
     <script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style>
     <title>{} - Calendar</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=12" rel="stylesheet"/>
-<script src="/static/vortex.js?v=12" defer></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script>
     <script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
@@ -8005,8 +8020,8 @@ async fn generic_pivot_view(
     <title>{} - Pivot</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=12" rel="stylesheet"/>
-<script src="/static/vortex.js?v=12" defer></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script>
     <script src="/static/vendor/tailwind.js"></script>
     <style>
         body {{ background: oklch(var(--b2)); color: oklch(var(--bc)); }}
@@ -8589,8 +8604,8 @@ async fn contacts_list(
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style><title>Contacts - Remicle</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=12" rel="stylesheet"/>
-<script src="/static/vortex.js?v=12" defer></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script>
 <script src="/static/vendor/tailwind.js"></script></head>
 <body class="min-h-screen bg-base-200">
 <div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a><button onclick="(function(){{var h=document.documentElement,c=h.getAttribute('data-theme')==='dark'?'corporate':'dark';h.setAttribute('data-theme',c);localStorage.setItem('theme',c);document.querySelectorAll('.theme-icon-sun,.theme-icon-moon').forEach(function(e){{e.classList.toggle('hidden')}})}})();" class="btn btn-ghost btn-sm btn-square ml-auto"><svg class="theme-icon-sun w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5" stroke-width="2"/><path stroke-linecap="round" stroke-width="2" d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg><svg class="theme-icon-moon w-5 h-5 hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg></button></div>
@@ -8624,8 +8639,8 @@ async fn contacts_new(State(state): State<Arc<AppState>>, Db(db): Db, Extension(
     }
 
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style><title>New Contact</title><meta name="viewport" content="width=device-width, initial-scale=1.0"><link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=12" rel="stylesheet"/>
-<script src="/static/vortex.js?v=12" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script>
 <style>
 .country-dropdown {{ position: relative; }}
 .country-dropdown .dropdown-content {{ max-height: 300px; overflow-y: auto; width: 100%; }}
@@ -8928,8 +8943,8 @@ async fn contacts_edit(
     };
 
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style><title>Edit Contact</title><meta name="viewport" content="width=device-width, initial-scale=1.0"><link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=12" rel="stylesheet"/>
-<script src="/static/vortex.js?v=12" defer></script><script src="/static/vendor/tailwind.js"></script><script src="/static/vendor/htmx.min.js"></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script><script src="/static/vendor/htmx.min.js"></script>
 <style>
 .country-dropdown {{ position: relative; }}
 .country-dropdown .dropdown-content {{ max-height: 300px; overflow-y: auto; width: 100%; }}
@@ -9587,43 +9602,23 @@ async fn chatter_partial(
         // Preview button - inline onclick using data attributes
         let eye_icon = r#"<svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/></svg>"#;
 
-        // Watermark: multiple rows of rotated text covering the entire area
-        let preview_btn = if is_pdf {
-            if is_secure {
-                // Secure PDF: grid watermark overlay on top of iframe, no download
-                format!(
-                    r##"<button class="btn btn-ghost btn-xs opacity-0 group-hover:opacity-100" onclick="var m=document.getElementById('preview-modal'),t=document.getElementById('preview-title'),d=document.getElementById('preview-download'),c=document.getElementById('preview-content');t.textContent=this.dataset.t;d.style.display='none';var wt='{} - CONFIDENTIAL';var rows='';for(var i=0;i<20;i++){{rows+='<div style=\'white-space:nowrap\'>'+Array(10).fill(wt).join(' &nbsp; ')+'</div>';}}c.innerHTML='<div style=\'position:relative;width:100%;height:100%\'><iframe src=\''+this.dataset.u+'#toolbar=0\' style=\'width:100%;height:100%;min-height:70vh;border:none\'></iframe><div style=\'position:absolute;top:0;left:0;right:0;bottom:0;z-index:9999;pointer-events:none;overflow:hidden;display:flex;flex-direction:column;justify-content:space-around;transform:rotate(-20deg);transform-origin:center center;font-size:16px;color:rgba(128,128,128,0.3);font-weight:bold;line-height:3\'>'+rows+'</div></div>';m.showModal();" data-t="{}" data-u="/api/chatter/attachments/{}/download" title="Preview (Secure)">
-                        {}
-                    </button>"##,
-                    user.username, name.replace('"', "&quot;").replace('\'', "&#39;"), att_id, eye_icon
-                )
-            } else {
-                // Normal PDF
-                format!(
-                    r#"<button class="btn btn-ghost btn-xs opacity-0 group-hover:opacity-100" onclick="var m=document.getElementById('preview-modal'),t=document.getElementById('preview-title'),d=document.getElementById('preview-download'),c=document.getElementById('preview-content');t.textContent=this.dataset.t;d.style.display='';d.href=this.dataset.u;c.innerHTML='<iframe src=\''+this.dataset.u+'#toolbar=1\' style=\'width:100%;height:100%;min-height:70vh;border:none\'></iframe>';m.showModal();" data-t="{}" data-u="/api/chatter/attachments/{}/download" title="Preview PDF">
-                        {}
-                    </button>"#,
-                    name.replace('"', "&quot;").replace('\'', "&#39;"), att_id, eye_icon
-                )
-            }
-        } else if is_image {
-            if is_secure {
-                // Secure image: grid watermark overlay, no download
-                format!(
-                    r##"<button class="btn btn-ghost btn-xs opacity-0 group-hover:opacity-100" onclick="var m=document.getElementById('preview-modal'),t=document.getElementById('preview-title'),d=document.getElementById('preview-download'),c=document.getElementById('preview-content');t.textContent=this.dataset.t;d.style.display='none';var wt='{} - CONFIDENTIAL';var rows='';for(var i=0;i<20;i++){{rows+='<div style=\'white-space:nowrap\'>'+Array(10).fill(wt).join(' &nbsp; ')+'</div>';}}c.innerHTML='<div style=\'position:relative;width:100%;height:100%;display:flex;align-items:center;justify-content:center;padding:1rem\'><img src=\''+this.dataset.u+'\' style=\'max-width:100%;max-height:100%;object-fit:contain\'><div style=\'position:absolute;top:0;left:0;right:0;bottom:0;z-index:9999;pointer-events:none;overflow:hidden;display:flex;flex-direction:column;justify-content:space-around;transform:rotate(-20deg);transform-origin:center center;font-size:16px;color:rgba(128,128,128,0.3);font-weight:bold;line-height:3\'>'+rows+'</div></div>';m.showModal();" data-t="{}" data-u="/api/chatter/attachments/{}/download" title="Preview (Secure)">
-                        {}
-                    </button>"##,
-                    user.username, name.replace('"', "&quot;").replace('\'', "&#39;"), att_id, eye_icon
-                )
-            } else {
-                // Normal image
-                format!(
-                    r#"<button class="btn btn-ghost btn-xs opacity-0 group-hover:opacity-100" onclick="var m=document.getElementById('preview-modal'),t=document.getElementById('preview-title'),d=document.getElementById('preview-download'),c=document.getElementById('preview-content');t.textContent=this.dataset.t;d.style.display='';d.href=this.dataset.u;c.innerHTML='<div style=\'width:100%;height:100%;display:flex;align-items:center;justify-content:center;padding:1rem\'><img src=\''+this.dataset.u+'\' style=\'max-width:100%;max-height:100%;object-fit:contain\'></div>';m.showModal();" data-t="{}" data-u="/api/chatter/attachments/{}/download" title="Preview Image">
-                        {}
-                    </button>"#,
-                    name.replace('"', "&quot;").replace('\'', "&#39;"), att_id, eye_icon
-                )
-            }
+        // Preview button. All rendering lives in vortex.js
+        // (vortexOpenPreview) — PDFs render via pdf.js to <canvas> so they
+        // display on iOS Safari (which won't show a PDF in an <iframe>) and so
+        // secure docs keep a per-page watermark with no savable file. Here we
+        // just emit the button carrying the data the JS needs.
+        let preview_btn = if is_pdf || is_image {
+            let kind = if is_pdf { "pdf" } else { "image" };
+            let wm = html_escape(&format!("{} - CONFIDENTIAL", user.username));
+            format!(
+                r#"<button type="button" class="btn btn-ghost btn-xs opacity-0 group-hover:opacity-100" onclick="vortexOpenPreview(this)" data-kind="{kind}" data-secure="{secure}" data-t="{name}" data-u="/api/chatter/attachments/{id}/download" data-wm="{wm}" title="Preview">{icon}</button>"#,
+                kind = kind,
+                secure = if is_secure { "1" } else { "0" },
+                name = html_escape(&name),
+                id = att_id,
+                wm = wm,
+                icon = eye_icon,
+            )
         } else {
             String::new()
         };
@@ -9700,8 +9695,10 @@ async fn chatter_partial(
     // Default due date to tomorrow
     let tomorrow = (chrono::Utc::now() + chrono::Duration::days(1)).format("%Y-%m-%d");
 
+    // Plain inline count — a daisyUI badge box overflows the fixed-height
+    // boxed tab on mobile (clips below the tab). "(N)" never overflows.
     let attachment_badge = if attachment_count > 0 {
-        format!(r#"<span class="badge badge-sm">{}</span>"#, attachment_count)
+        format!(r#"<span class="ml-1 opacity-60">({})</span>"#, attachment_count)
     } else {
         String::new()
     };
@@ -10244,8 +10241,8 @@ async fn notifications_page(
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Notifications - Remicle</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=12" rel="stylesheet"/>
-<script src="/static/vortex.js?v=12" defer></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script>
     <script src="/static/vendor/tailwind.js"></script>
     <style>
         body {{ background: oklch(var(--b2)); color: oklch(var(--bc)); }}
@@ -10362,8 +10359,8 @@ async fn settings_index(
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Settings - Remicle</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=12" rel="stylesheet"/>
-<script src="/static/vortex.js?v=12" defer></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script>
     <script src="/static/vendor/tailwind.js"></script>
     <style>
         body {{ background: oklch(var(--b2)); color: oklch(var(--bc)); }}
@@ -10580,6 +10577,52 @@ async fn settings_index(
                     <div class="card-body p-4">
                         <h3 class="card-title text-base md:text-lg">Activity Types</h3>
                         <p class="text-muted text-sm">Activity types for Activity Stream</p>
+                    </div>
+                </a>
+                <a href="/settings/custom-fields" class="card transition-all">
+                    <div class="card-body p-4">
+                        <h3 class="card-title text-base md:text-lg">Custom Fields</h3>
+                        <p class="text-muted text-sm">Add your own fields to any model — no code</p>
+                    </div>
+                </a>
+                <a href="/settings/automation-rules" class="card transition-all">
+                    <div class="card-body p-4">
+                        <h3 class="card-title text-base md:text-lg">Automation Rules</h3>
+                        <p class="text-muted text-sm">React to record changes automatically — no code</p>
+                    </div>
+                </a>
+                <a href="/settings/computed-fields" class="card transition-all">
+                    <div class="card-body p-4">
+                        <h3 class="card-title text-base md:text-lg">Computed Fields</h3>
+                        <p class="text-muted text-sm">Derived fields: formulas &amp; related values — no code</p>
+                    </div>
+                </a>
+                <a href="/dashboards" class="card transition-all">
+                    <div class="card-body p-4">
+                        <h3 class="card-title text-base md:text-lg">Dashboards</h3>
+                        <p class="text-muted text-sm">Build KPI &amp; breakdown boards from any model</p>
+                    </div>
+                </a>
+            </div>
+        </div>
+
+        <!-- Documents Section -->
+        <div class="mb-8">
+            <h2 class="section-title text-lg font-semibold mb-4 flex items-center gap-2">
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+                Documents
+            </h2>
+            <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3 md:gap-4">
+                <a href="/settings/document-layout" class="card transition-all">
+                    <div class="card-body p-4">
+                        <h3 class="card-title text-base md:text-lg">Document Layout</h3>
+                        <p class="text-muted text-sm">Logo, brand colour &amp; footer on printed documents</p>
+                    </div>
+                </a>
+                <a href="/settings/print-templates" class="card transition-all">
+                    <div class="card-body p-4">
+                        <h3 class="card-title text-base md:text-lg">Print Templates</h3>
+                        <p class="text-muted text-sm">Customise the layout of quotations &amp; other documents</p>
                     </div>
                 </a>
             </div>
@@ -10922,8 +10965,8 @@ async fn audit_log_page(
         r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style><title>Audit Log - Remicle</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=12" rel="stylesheet"/>
-<script src="/static/vortex.js?v=12" defer></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script>
 <script src="/static/vendor/tailwind.js"></script></head>
 <body class="min-h-screen bg-base-200">
 <div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a></div>
@@ -10944,6 +10987,944 @@ struct ActivityTypeForm {
     color: Option<String>,
     default_days: Option<i32>,
     sequence: Option<i32>,
+}
+
+// ─── Custom Fields (Initiative #2 admin UI) ──────────────────────────────
+#[derive(serde::Deserialize)]
+struct CustomFieldForm {
+    model: String,
+    name: String,
+    label: String,
+    field_type: String,
+    #[serde(default)]
+    options: Option<String>,
+    #[serde(default)]
+    help: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct CustomFieldDeleteForm {
+    model: String,
+    name: String,
+}
+
+/// Render the Custom Fields settings page, optionally with an error banner.
+async fn render_custom_fields_page(db: &sqlx::PgPool, username: &str, error: Option<&str>) -> String {
+    use vortex_framework::ui::html_escape;
+
+    // Models available to extend (registered in ir_model, now derive-sourced).
+    let models = sqlx::query("SELECT name, display_name FROM ir_model WHERE is_active = true ORDER BY display_name")
+        .fetch_all(db)
+        .await
+        .unwrap_or_default();
+    let mut model_options = String::new();
+    for m in &models {
+        let name: String = m.get("name");
+        let label: String = m.get("display_name");
+        model_options.push_str(&format!(
+            r#"<option value="{}">{} ({})</option>"#,
+            html_escape(&name), html_escape(&label), html_escape(&name)
+        ));
+    }
+
+    // Existing custom fields across all models.
+    let fields = vortex_framework::custom_fields::list_all(db).await;
+    let mut rows_html = String::new();
+    for (model, model_label, f) in &fields {
+        let opts = if f.selection_options.is_empty() {
+            String::from("<span class=\"opacity-40\">—</span>")
+        } else {
+            html_escape(&f.selection_options.join(", "))
+        };
+        rows_html.push_str(&format!(
+            r##"<tr>
+                <td>{model_label} <code class="text-xs opacity-60">{model}</code></td>
+                <td><code class="text-sm">{name}</code></td>
+                <td>{label}</td>
+                <td><span class="badge badge-ghost">{ftype}</span></td>
+                <td class="text-sm">{opts}</td>
+                <td class="text-right">
+                    <form method="post" action="/settings/custom-fields/delete" onsubmit="return confirm('Delete custom field {name}? Stored values are kept but hidden.');" class="inline">
+                        <input type="hidden" name="model" value="{model}"/>
+                        <input type="hidden" name="name" value="{name}"/>
+                        <button type="submit" class="btn btn-ghost btn-xs text-error">Delete</button>
+                    </form>
+                </td>
+            </tr>"##,
+            model_label = html_escape(model_label),
+            model = html_escape(model),
+            name = html_escape(&f.name),
+            label = html_escape(&f.label),
+            ftype = html_escape(&f.field_type),
+            opts = opts,
+        ));
+    }
+    if rows_html.is_empty() {
+        rows_html.push_str(r#"<tr><td colspan="6" class="text-center opacity-60 py-8">No custom fields yet. Add one to extend any model.</td></tr>"#);
+    }
+
+    let mut type_options = String::new();
+    for (code, label) in vortex_framework::custom_fields::CUSTOM_FIELD_TYPES {
+        type_options.push_str(&format!(r#"<option value="{code}">{label}</option>"#));
+    }
+
+    let error_banner = error
+        .map(|e| format!(r#"<div class="alert alert-error mb-4"><span>{}</span></div>"#, html_escape(e)))
+        .unwrap_or_default();
+
+    format!(
+        r##"<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+    <script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Custom Fields - Settings</title>
+    <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
+    <link href="/static/vortex.css?v=18" rel="stylesheet"/>
+    <script src="/static/vortex.js?v=18" defer></script>
+    <script src="/static/vendor/tailwind.js"></script>
+</head>
+<body class="min-h-screen bg-base-200">
+    <div class="navbar bg-base-100 shadow-lg">
+        <div class="flex-1"><a href="/" class="btn btn-ghost text-xl">remicle</a></div>
+        <div class="flex-none"><span class="text-sm">@{username}</span></div>
+    </div>
+    <div class="container mx-auto p-6">
+        <div class="flex justify-between items-center mb-6">
+            <div>
+                <h1 class="text-2xl font-bold">Custom Fields</h1>
+                <p class="text-base-content/60">Add your own fields to any model. They appear on the record form automatically — no code, no deploy.</p>
+            </div>
+            <button class="btn btn-primary" onclick="document.getElementById('create-modal').showModal();">+ New Custom Field</button>
+        </div>
+        {error_banner}
+        <div class="card bg-base-100 shadow">
+            <div class="card-body p-0">
+                <table class="table">
+                    <thead><tr><th>Model</th><th>Field</th><th>Label</th><th>Type</th><th>Options</th><th></th></tr></thead>
+                    <tbody>{rows_html}</tbody>
+                </table>
+            </div>
+        </div>
+        <div class="mt-4"><a href="/settings" class="btn btn-ghost btn-sm">← Back to Settings</a></div>
+    </div>
+
+    <dialog id="create-modal" class="modal">
+        <div class="modal-box">
+            <h3 class="font-bold text-lg mb-4">New Custom Field</h3>
+            <form method="post" action="/settings/custom-fields">
+                <div class="form-control mb-3">
+                    <label class="label"><span class="label-text">Model</span></label>
+                    <select name="model" class="select select-bordered" required>{model_options}</select>
+                </div>
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <div class="form-control mb-3">
+                        <label class="label"><span class="label-text">Field name</span></label>
+                        <input type="text" name="name" class="input input-bordered font-mono" value="x_" placeholder="x_priority" required/>
+                        <span class="label-text-alt opacity-60 mt-1">lowercase, starts with x_</span>
+                    </div>
+                    <div class="form-control mb-3">
+                        <label class="label"><span class="label-text">Label</span></label>
+                        <input type="text" name="label" class="input input-bordered" placeholder="Priority" required/>
+                    </div>
+                </div>
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <div class="form-control mb-3">
+                        <label class="label"><span class="label-text">Type</span></label>
+                        <select name="field_type" class="select select-bordered">{type_options}</select>
+                    </div>
+                    <div class="form-control mb-3">
+                        <label class="label"><span class="label-text">Options</span></label>
+                        <input type="text" name="options" class="input input-bordered" placeholder="low, medium, high"/>
+                        <span class="label-text-alt opacity-60 mt-1">comma-separated · Selection only</span>
+                    </div>
+                </div>
+                <div class="form-control mb-3">
+                    <label class="label"><span class="label-text">Help text (optional)</span></label>
+                    <input type="text" name="help" class="input input-bordered" placeholder="Shown under the field"/>
+                </div>
+                <div class="modal-action">
+                    <button type="button" class="btn" onclick="document.getElementById('create-modal').close();">Cancel</button>
+                    <button type="submit" class="btn btn-primary">Create</button>
+                </div>
+            </form>
+        </div>
+        <form method="dialog" class="modal-backdrop"><button>close</button></form>
+    </dialog>
+</body>
+</html>"##
+    )
+}
+
+async fn custom_fields_list(
+    State(_state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+) -> Response {
+    if !user.is_system_admin() && !user.has_role("Administrator") {
+        return Redirect::to("/settings").into_response();
+    }
+    Html(render_custom_fields_page(&db, &user.username, None).await).into_response()
+}
+
+async fn custom_field_create(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Form(form): Form<CustomFieldForm>,
+) -> Response {
+    if !user.is_system_admin() && !user.has_role("Administrator") {
+        return Redirect::to("/settings").into_response();
+    }
+    let options: Vec<String> = form
+        .options
+        .as_deref()
+        .unwrap_or("")
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let help = form.help.as_deref().map(str::trim).filter(|s| !s.is_empty());
+
+    match vortex_framework::custom_fields::add(
+        &db, form.model.trim(), form.name.trim(), form.label.trim(),
+        form.field_type.trim(), &options, help,
+    ).await {
+        Ok(()) => {
+            let audit = AuditEntry::new(AuditAction::ConfigChanged, AuditSeverity::Info)
+                .with_user(vortex_common::UserId(user.id))
+                .with_username(&user.username)
+                .with_database(&db_ctx.db_name)
+                .with_resource("custom_field", format!("{}.{}", form.model.trim(), form.name.trim()))
+                .with_details(serde_json::json!({
+                    "action": "add", "type": form.field_type.trim(), "label": form.label.trim(),
+                }));
+            let _ = state.audit.log(audit).await;
+            Redirect::to("/settings/custom-fields").into_response()
+        }
+        Err(e) => Html(render_custom_fields_page(&db, &user.username, Some(&e)).await).into_response(),
+    }
+}
+
+async fn custom_field_delete(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Form(form): Form<CustomFieldDeleteForm>,
+) -> Response {
+    if !user.is_system_admin() && !user.has_role("Administrator") {
+        return Redirect::to("/settings").into_response();
+    }
+    if let Err(e) = vortex_framework::custom_fields::delete(&db, form.model.trim(), form.name.trim()).await {
+        return Html(render_custom_fields_page(&db, &user.username, Some(&e)).await).into_response();
+    }
+    let audit = AuditEntry::new(AuditAction::ConfigChanged, AuditSeverity::Info)
+        .with_user(vortex_common::UserId(user.id))
+        .with_username(&user.username)
+        .with_database(&db_ctx.db_name)
+        .with_resource("custom_field", format!("{}.{}", form.model.trim(), form.name.trim()))
+        .with_details(serde_json::json!({ "action": "delete" }));
+    let _ = state.audit.log(audit).await;
+    Redirect::to("/settings/custom-fields").into_response()
+}
+
+// ─── Automation Rules (Initiative #3 admin UI) ───────────────────────────
+#[derive(serde::Deserialize)]
+struct AutomationRuleForm {
+    name: String,
+    model: String,
+    trigger: String,
+    #[serde(default)]
+    condition_field: Option<String>,
+    #[serde(default)]
+    condition_op: Option<String>,
+    #[serde(default)]
+    condition_value: Option<String>,
+    action_field: String,
+    #[serde(default)]
+    action_value: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct AutomationRuleDeleteForm {
+    id: uuid::Uuid,
+}
+
+async fn render_automation_rules_page(db: &sqlx::PgPool, username: &str, error: Option<&str>) -> String {
+    use vortex_framework::ui::html_escape;
+
+    let models = sqlx::query("SELECT name, display_name FROM ir_model WHERE is_active = true ORDER BY display_name")
+        .fetch_all(db).await.unwrap_or_default();
+    let mut model_options = String::new();
+    for m in &models {
+        let name: String = m.get("name");
+        let label: String = m.get("display_name");
+        model_options.push_str(&format!(r#"<option value="{}">{} ({})</option>"#,
+            html_escape(&name), html_escape(&label), html_escape(&name)));
+    }
+    // Convenience datalist of all registered field names.
+    let field_rows = sqlx::query("SELECT DISTINCT name FROM ir_model_field WHERE is_custom = false ORDER BY name")
+        .fetch_all(db).await.unwrap_or_default();
+    let mut field_datalist = String::new();
+    for f in &field_rows {
+        let n: String = f.get("name");
+        field_datalist.push_str(&format!(r#"<option value="{}"></option>"#, html_escape(&n)));
+    }
+
+    let mut trigger_options = String::new();
+    for (code, label) in vortex_framework::automation::TRIGGERS {
+        trigger_options.push_str(&format!(r#"<option value="{code}">{label}</option>"#));
+    }
+    let mut op_options = String::from(r#"<option value="">(no condition)</option>"#);
+    for (code, label) in vortex_framework::automation::OPERATORS {
+        op_options.push_str(&format!(r#"<option value="{code}">{label}</option>"#));
+    }
+    let op_label = |code: &str| vortex_framework::automation::OPERATORS.iter()
+        .find(|(c, _)| *c == code).map(|(_, l)| *l).unwrap_or(code).to_string();
+    let trig_label = |code: &str| vortex_framework::automation::TRIGGERS.iter()
+        .find(|(c, _)| *c == code).map(|(_, l)| *l).unwrap_or(code).to_string();
+
+    let rules = vortex_framework::automation::list_all(db).await;
+    let mut rows_html = String::new();
+    for r in &rules {
+        let condition = match (&r.condition_field, &r.condition_op) {
+            (Some(f), Some(op)) => format!("<code>{}</code> {} <code>{}</code>",
+                html_escape(f), html_escape(&op_label(op)), html_escape(r.condition_value.as_deref().unwrap_or(""))),
+            _ => "<span class=\"opacity-40\">always</span>".to_string(),
+        };
+        let action = format!("set <code>{}</code> = <code>{}</code>",
+            html_escape(&r.action_field), html_escape(r.action_value.as_deref().unwrap_or("∅")));
+        rows_html.push_str(&format!(
+            r##"<tr>
+                <td>{name}</td>
+                <td><code class="text-xs">{model}</code> {trig}</td>
+                <td class="text-sm">{condition}</td>
+                <td class="text-sm">{action}</td>
+                <td class="text-right"><form method="post" action="/settings/automation-rules/delete" onsubmit="return confirm('Delete rule {name}?');" class="inline"><input type="hidden" name="id" value="{id}"/><button class="btn btn-ghost btn-xs text-error">Delete</button></form></td>
+            </tr>"##,
+            name = html_escape(&r.name), model = html_escape(&r.model_name),
+            trig = html_escape(&trig_label(&r.trigger_event)),
+            condition = condition, action = action, id = r.id,
+        ));
+    }
+    if rows_html.is_empty() {
+        rows_html.push_str(r#"<tr><td colspan="5" class="text-center opacity-60 py-8">No automation rules yet. Add one to react to record changes automatically.</td></tr>"#);
+    }
+
+    let error_banner = error.map(|e| format!(r#"<div class="alert alert-error mb-4"><span>{}</span></div>"#, html_escape(e))).unwrap_or_default();
+
+    format!(r##"<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+    <script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script>
+    <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Automation Rules - Settings</title>
+    <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
+    <link href="/static/vortex.css?v=18" rel="stylesheet"/>
+    <script src="/static/vendor/tailwind.js"></script>
+</head>
+<body class="min-h-screen bg-base-200">
+    <div class="navbar bg-base-100 shadow-lg"><div class="flex-1"><a href="/" class="btn btn-ghost text-xl">remicle</a></div><div class="flex-none"><span class="text-sm">@{username}</span></div></div>
+    <div class="container mx-auto p-6">
+        <div class="flex justify-between items-center mb-6">
+            <div><h1 class="text-2xl font-bold">Automation Rules</h1>
+            <p class="text-base-content/60">When a record changes and matches a condition, run an action automatically — no code.</p></div>
+            <button class="btn btn-primary" onclick="document.getElementById('create-modal').showModal();">+ New Rule</button>
+        </div>
+        {error_banner}
+        <div class="card bg-base-100 shadow"><div class="card-body p-0">
+            <table class="table"><thead><tr><th>Name</th><th>When</th><th>Condition</th><th>Action</th><th></th></tr></thead>
+            <tbody>{rows_html}</tbody></table>
+        </div></div>
+        <div class="mt-4"><a href="/settings" class="btn btn-ghost btn-sm">← Back to Settings</a></div>
+    </div>
+    <datalist id="field-list">{field_datalist}</datalist>
+    <dialog id="create-modal" class="modal"><div class="modal-box max-w-2xl">
+        <h3 class="font-bold text-lg mb-4">New Automation Rule</h3>
+        <form method="post" action="/settings/automation-rules">
+            <div class="form-control mb-3"><label class="label"><span class="label-text">Rule name</span></label>
+                <input type="text" name="name" class="input input-bordered" placeholder="Flag VIP customers" required/></div>
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div class="form-control mb-3"><label class="label"><span class="label-text">When this model…</span></label>
+                    <select name="model" class="select select-bordered" required>{model_options}</select></div>
+                <div class="form-control mb-3"><label class="label"><span class="label-text">…is</span></label>
+                    <select name="trigger" class="select select-bordered">{trigger_options}</select></div>
+            </div>
+            <div class="divider text-xs opacity-60">CONDITION (optional)</div>
+            <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                <div class="form-control mb-3"><label class="label"><span class="label-text">Field</span></label>
+                    <input type="text" name="condition_field" list="field-list" class="input input-bordered font-mono" placeholder="contact_type"/></div>
+                <div class="form-control mb-3"><label class="label"><span class="label-text">Operator</span></label>
+                    <select name="condition_op" class="select select-bordered">{op_options}</select></div>
+                <div class="form-control mb-3"><label class="label"><span class="label-text">Value</span></label>
+                    <input type="text" name="condition_value" class="input input-bordered" placeholder="customer"/></div>
+            </div>
+            <div class="divider text-xs opacity-60">ACTION</div>
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div class="form-control mb-3"><label class="label"><span class="label-text">Set field</span></label>
+                    <input type="text" name="action_field" list="field-list" class="input input-bordered font-mono" placeholder="city" required/></div>
+                <div class="form-control mb-3"><label class="label"><span class="label-text">To value</span></label>
+                    <input type="text" name="action_value" class="input input-bordered" placeholder="VIP"/></div>
+            </div>
+            <div class="modal-action">
+                <button type="button" class="btn" onclick="document.getElementById('create-modal').close();">Cancel</button>
+                <button type="submit" class="btn btn-primary">Create rule</button>
+            </div>
+        </form>
+    </div><form method="dialog" class="modal-backdrop"><button>close</button></form></dialog>
+</body></html>"##)
+}
+
+async fn automation_rules_list(
+    State(_state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+) -> Response {
+    if !user.is_admin() {
+        return Redirect::to("/settings").into_response();
+    }
+    Html(render_automation_rules_page(&db, &user.username, None).await).into_response()
+}
+
+async fn automation_rule_create(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Form(form): Form<AutomationRuleForm>,
+) -> Response {
+    if !user.is_admin() {
+        return Redirect::to("/settings").into_response();
+    }
+    let cond_field = form.condition_field.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let cond_op = form.condition_op.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let cond_val = form.condition_value.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let action_val = form.action_value.as_deref().map(str::trim).filter(|s| !s.is_empty());
+
+    match vortex_framework::automation::create(
+        &db, form.name.trim(), form.model.trim(), form.trigger.trim(),
+        cond_field, cond_op, cond_val, form.action_field.trim(), action_val, Some(user.id),
+    ).await {
+        Ok(()) => {
+            let audit = AuditEntry::new(AuditAction::ConfigChanged, AuditSeverity::Info)
+                .with_user(vortex_common::UserId(user.id))
+                .with_username(&user.username)
+                .with_database(&db_ctx.db_name)
+                .with_resource("automation_rule", format!("{}:{}", form.model.trim(), form.name.trim()))
+                .with_details(serde_json::json!({"action": "add", "trigger": form.trigger.trim()}));
+            let _ = state.audit.log(audit).await;
+            Redirect::to("/settings/automation-rules").into_response()
+        }
+        Err(e) => Html(render_automation_rules_page(&db, &user.username, Some(&e)).await).into_response(),
+    }
+}
+
+async fn automation_rule_delete(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Form(form): Form<AutomationRuleDeleteForm>,
+) -> Response {
+    if !user.is_admin() {
+        return Redirect::to("/settings").into_response();
+    }
+    if let Err(e) = vortex_framework::automation::delete(&db, form.id).await {
+        return Html(render_automation_rules_page(&db, &user.username, Some(&e)).await).into_response();
+    }
+    let audit = AuditEntry::new(AuditAction::ConfigChanged, AuditSeverity::Info)
+        .with_user(vortex_common::UserId(user.id))
+        .with_username(&user.username)
+        .with_database(&db_ctx.db_name)
+        .with_resource("automation_rule", form.id.to_string())
+        .with_details(serde_json::json!({"action": "delete"}));
+    let _ = state.audit.log(audit).await;
+    Redirect::to("/settings/automation-rules").into_response()
+}
+
+// ─── Computed Fields (Initiative #5 admin UI) ────────────────────────────
+#[derive(serde::Deserialize)]
+struct ComputedFieldForm {
+    model: String,
+    name: String,
+    label: String,
+    kind: String,
+    expr: String,
+    #[serde(default)]
+    help: Option<String>,
+}
+
+async fn render_computed_fields_page(db: &sqlx::PgPool, username: &str, error: Option<&str>) -> String {
+    use vortex_framework::ui::html_escape;
+
+    let models = sqlx::query("SELECT name, display_name FROM ir_model WHERE is_active = true ORDER BY display_name")
+        .fetch_all(db).await.unwrap_or_default();
+    let mut model_options = String::new();
+    for m in &models {
+        let name: String = m.get("name");
+        let label: String = m.get("display_name");
+        model_options.push_str(&format!(r#"<option value="{}">{} ({})</option>"#,
+            html_escape(&name), html_escape(&label), html_escape(&name)));
+    }
+    let mut kind_options = String::new();
+    for (code, label) in vortex_framework::computed_fields::COMPUTE_KINDS {
+        kind_options.push_str(&format!(r#"<option value="{code}">{label}</option>"#));
+    }
+
+    let fields = vortex_framework::computed_fields::list_all(db).await;
+    let mut rows_html = String::new();
+    for (model, model_label, f) in &fields {
+        let kind_badge = if f.kind == "related" { "related" } else { "formula" };
+        rows_html.push_str(&format!(
+            r##"<tr>
+                <td>{model_label} <code class="text-xs opacity-60">{model}</code></td>
+                <td><code class="text-sm">{name}</code></td>
+                <td>{label}</td>
+                <td><span class="badge badge-ghost">{kind}</span></td>
+                <td><code class="text-sm">{expr}</code></td>
+                <td class="text-right">
+                    <form method="post" action="/settings/computed-fields/delete" onsubmit="return confirm('Delete computed field {name}?');" class="inline">
+                        <input type="hidden" name="model" value="{model}"/>
+                        <input type="hidden" name="name" value="{name}"/>
+                        <button class="btn btn-ghost btn-xs text-error">Delete</button>
+                    </form>
+                </td>
+            </tr>"##,
+            model_label = html_escape(model_label), model = html_escape(model),
+            name = html_escape(&f.name), label = html_escape(&f.label),
+            kind = kind_badge, expr = html_escape(&f.expr),
+        ));
+    }
+    if rows_html.is_empty() {
+        rows_html.push_str(r#"<tr><td colspan="6" class="text-center opacity-60 py-8">No computed fields yet. Add one to derive a value automatically.</td></tr>"#);
+    }
+
+    let error_banner = error.map(|e| format!(r#"<div class="alert alert-error mb-4"><span>{}</span></div>"#, html_escape(e))).unwrap_or_default();
+
+    format!(r##"<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+    <script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script>
+    <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Computed Fields - Settings</title>
+    <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
+    <link href="/static/vortex.css?v=18" rel="stylesheet"/>
+    <script src="/static/vendor/tailwind.js"></script>
+</head>
+<body class="min-h-screen bg-base-200">
+    <div class="navbar bg-base-100 shadow-lg"><div class="flex-1"><a href="/" class="btn btn-ghost text-xl">remicle</a></div><div class="flex-none"><span class="text-sm">@{username}</span></div></div>
+    <div class="container mx-auto p-6">
+        <div class="flex justify-between items-center mb-6">
+            <div><h1 class="text-2xl font-bold">Computed Fields</h1>
+            <p class="text-base-content/60">Derive a read-only value from a formula over this record's number fields, or pull one across a link. Recomputed on every save — no code.</p></div>
+            <button class="btn btn-primary" onclick="document.getElementById('create-modal').showModal();">+ New Computed Field</button>
+        </div>
+        {error_banner}
+        <div class="card bg-base-100 shadow"><div class="card-body p-0">
+            <table class="table"><thead><tr><th>Model</th><th>Field</th><th>Label</th><th>Kind</th><th>Definition</th><th></th></tr></thead>
+            <tbody>{rows_html}</tbody></table>
+        </div></div>
+        <div class="mt-4"><a href="/settings" class="btn btn-ghost btn-sm">← Back to Settings</a></div>
+    </div>
+    <dialog id="create-modal" class="modal"><div class="modal-box max-w-2xl">
+        <h3 class="font-bold text-lg mb-4">New Computed Field</h3>
+        <form method="post" action="/settings/computed-fields">
+            <div class="form-control mb-3"><label class="label"><span class="label-text">Model</span></label>
+                <select name="model" class="select select-bordered" required>{model_options}</select></div>
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div class="form-control mb-3"><label class="label"><span class="label-text">Field name</span></label>
+                    <input type="text" name="name" class="input input-bordered font-mono" value="x_" placeholder="x_line_total" required/>
+                    <span class="label-text-alt opacity-60 mt-1">lowercase, starts with x_</span></div>
+                <div class="form-control mb-3"><label class="label"><span class="label-text">Label</span></label>
+                    <input type="text" name="label" class="input input-bordered" placeholder="Line Total" required/></div>
+            </div>
+            <div class="form-control mb-3"><label class="label"><span class="label-text">Kind</span></label>
+                <select name="kind" class="select select-bordered">{kind_options}</select></div>
+            <div class="form-control mb-3"><label class="label"><span class="label-text">Definition</span></label>
+                <input type="text" name="expr" class="input input-bordered font-mono" placeholder="qty * unit_price   —or—   partner_id.email" required/>
+                <span class="label-text-alt opacity-60 mt-1">Formula: arithmetic on number fields (+ - * / and parentheses). Related: link_field.target_field</span></div>
+            <div class="form-control mb-3"><label class="label"><span class="label-text">Help text (optional)</span></label>
+                <input type="text" name="help" class="input input-bordered" placeholder="Shown under the field"/></div>
+            <div class="modal-action">
+                <button type="button" class="btn" onclick="document.getElementById('create-modal').close();">Cancel</button>
+                <button type="submit" class="btn btn-primary">Create</button>
+            </div>
+        </form>
+    </div><form method="dialog" class="modal-backdrop"><button>close</button></form></dialog>
+</body></html>"##)
+}
+
+async fn computed_fields_list(
+    State(_state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+) -> Response {
+    if !user.is_system_admin() && !user.has_role("Administrator") {
+        return Redirect::to("/settings").into_response();
+    }
+    Html(render_computed_fields_page(&db, &user.username, None).await).into_response()
+}
+
+async fn computed_field_create(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Form(form): Form<ComputedFieldForm>,
+) -> Response {
+    if !user.is_system_admin() && !user.has_role("Administrator") {
+        return Redirect::to("/settings").into_response();
+    }
+    let help = form.help.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    match vortex_framework::computed_fields::add(
+        &db, form.model.trim(), form.name.trim(), form.label.trim(),
+        form.kind.trim(), form.expr.trim(), help,
+    ).await {
+        Ok(()) => {
+            let audit = AuditEntry::new(AuditAction::ConfigChanged, AuditSeverity::Info)
+                .with_user(vortex_common::UserId(user.id))
+                .with_username(&user.username)
+                .with_database(&db_ctx.db_name)
+                .with_resource("computed_field", format!("{}.{}", form.model.trim(), form.name.trim()))
+                .with_details(serde_json::json!({"action": "add", "kind": form.kind.trim(), "expr": form.expr.trim()}));
+            let _ = state.audit.log(audit).await;
+            Redirect::to("/settings/computed-fields").into_response()
+        }
+        Err(e) => Html(render_computed_fields_page(&db, &user.username, Some(&e)).await).into_response(),
+    }
+}
+
+async fn computed_field_delete(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Form(form): Form<CustomFieldDeleteForm>,
+) -> Response {
+    if !user.is_system_admin() && !user.has_role("Administrator") {
+        return Redirect::to("/settings").into_response();
+    }
+    if let Err(e) = vortex_framework::computed_fields::delete(&db, form.model.trim(), form.name.trim()).await {
+        return Html(render_computed_fields_page(&db, &user.username, Some(&e)).await).into_response();
+    }
+    let audit = AuditEntry::new(AuditAction::ConfigChanged, AuditSeverity::Info)
+        .with_user(vortex_common::UserId(user.id))
+        .with_username(&user.username)
+        .with_database(&db_ctx.db_name)
+        .with_resource("computed_field", format!("{}.{}", form.model.trim(), form.name.trim()))
+        .with_details(serde_json::json!({"action": "delete"}));
+    let _ = state.audit.log(audit).await;
+    Redirect::to("/settings/computed-fields").into_response()
+}
+
+// ─── Dashboards (Initiative #4) ──────────────────────────────────────────
+#[derive(serde::Deserialize)]
+struct DashboardForm {
+    name: String,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    shared: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct WidgetForm {
+    title: String,
+    widget_type: String,
+    model: String,
+    #[serde(default)]
+    measure_field: Option<String>,
+    aggregate: String,
+    #[serde(default)]
+    group_field: Option<String>,
+    #[serde(default)]
+    filter_field: Option<String>,
+    #[serde(default)]
+    filter_op: Option<String>,
+    #[serde(default)]
+    filter_value: Option<String>,
+    #[serde(default)]
+    col_span: Option<i32>,
+}
+
+/// The shared page chrome for the dashboards views — the full app shell with
+/// the host sidebar, so Dashboards feels like a first-class section (matching
+/// Reports).
+fn dashboard_full_page(sidebar: &str, title: &str, body: &str) -> String {
+    format!(r##"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><title>{title} - Remicle</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"><link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script></head>
+<body class="min-h-screen bg-base-200"><div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a></div>
+<div id="sidebar-overlay" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
+<div class="flex">{sidebar}<main class="flex-1 p-4 lg:p-6 min-w-0">{body}</main></div></body></html>"##,
+        title = vortex_framework::ui::html_escape(title), sidebar = sidebar, body = body)
+}
+
+async fn dashboards_index(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+) -> Response {
+    use vortex_framework::ui::html_escape;
+    let boards = vortex_framework::dashboards::list_visible(&db, user.id, user.is_admin()).await;
+    let mut cards = String::new();
+    for b in &boards {
+        let shared = if b.is_shared { r#"<span class="badge badge-sm badge-ghost">shared</span>"# } else { "" };
+        cards.push_str(&format!(
+            r##"<a href="/dashboards/{id}" class="card bg-base-100 shadow transition-all hover:shadow-md">
+                <div class="card-body p-5"><div class="flex items-center gap-2"><h3 class="card-title text-lg">{name}</h3>{shared}</div>
+                <p class="text-base-content/60 text-sm">{desc}</p></div></a>"##,
+            id = b.id, name = html_escape(&b.name), shared = shared,
+            desc = html_escape(b.description.as_deref().unwrap_or("")),
+        ));
+    }
+    if cards.is_empty() {
+        cards.push_str(r#"<div class="col-span-full text-center opacity-60 py-12">No dashboards yet. Create one to get started.</div>"#);
+    }
+
+    let body = format!(r##"
+        <div class="flex justify-between items-center mb-6">
+            <div><h1 class="text-2xl font-bold">Dashboards</h1>
+            <p class="text-base-content/60">Assemble KPI and breakdown widgets over any model — no code.</p></div>
+            <button class="btn btn-primary" onclick="document.getElementById('new-dash').showModal();">+ New Dashboard</button>
+        </div>
+        <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">{cards}</div>
+        <dialog id="new-dash" class="modal"><div class="modal-box">
+            <h3 class="font-bold text-lg mb-4">New Dashboard</h3>
+            <form method="post" action="/dashboards">
+                <div class="form-control mb-3"><label class="label"><span class="label-text">Name</span></label>
+                    <input type="text" name="name" class="input input-bordered" placeholder="Sales Overview" required/></div>
+                <div class="form-control mb-3"><label class="label"><span class="label-text">Description (optional)</span></label>
+                    <input type="text" name="description" class="input input-bordered"/></div>
+                <div class="form-control mb-3"><label class="label cursor-pointer justify-start gap-3">
+                    <input type="checkbox" name="shared" class="checkbox checkbox-primary"/>
+                    <span class="label-text">Share with everyone (otherwise only you see it)</span></label></div>
+                <div class="modal-action">
+                    <button type="button" class="btn" onclick="document.getElementById('new-dash').close();">Cancel</button>
+                    <button type="submit" class="btn btn-primary">Create</button>
+                </div>
+            </form>
+        </div><form method="dialog" class="modal-backdrop"><button>close</button></form></dialog>
+    "##, cards = cards);
+    let display_name = user.full_name.as_deref().unwrap_or(&user.username);
+    let initials = get_initials(display_name);
+    let installed = db_ctx.installed_modules.clone();
+    let sidebar = build_sidebar("dashboards", display_name, &initials, &installed, user.is_admin(), &state.plugin_registry, &user.roles);
+    Html(dashboard_full_page(&sidebar, "Dashboards", &body)).into_response()
+}
+
+async fn dashboard_create(
+    State(_state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Form(form): Form<DashboardForm>,
+) -> Response {
+    let shared = matches!(form.shared.as_deref(), Some("on") | Some("true"));
+    match vortex_framework::dashboards::create(
+        &db, form.name.trim(), form.description.as_deref(), user.id, shared,
+    ).await {
+        Ok(id) => Redirect::to(&format!("/dashboards/{id}")).into_response(),
+        Err(_) => Redirect::to("/dashboards").into_response(),
+    }
+}
+
+async fn dashboard_view(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<uuid::Uuid>,
+) -> Response {
+    use vortex_framework::ui::html_escape;
+    let Some(board) = vortex_framework::dashboards::load(&db, id).await else {
+        return Redirect::to("/dashboards").into_response();
+    };
+    let is_admin = user.is_admin();
+    if !board.can_view(user.id, is_admin) {
+        return Redirect::to("/dashboards").into_response();
+    }
+    let can_edit = board.can_edit(user.id, is_admin);
+
+    // Widgets grid.
+    let widgets = vortex_framework::dashboards::widgets_for(&db, id).await;
+    let mut grid = String::new();
+    for w in &widgets {
+        grid.push_str(&vortex_framework::dashboards::render_widget(&db, w, can_edit).await);
+    }
+    if grid.is_empty() {
+        grid.push_str(r#"<div class="col-span-full text-center opacity-60 py-12">No widgets yet.</div>"#);
+    }
+
+    // Edit controls (add widget + delete dashboard) only for editors.
+    let (add_btn, edit_modal, delete_dash) = if can_edit {
+        let models = sqlx::query("SELECT name, display_name FROM ir_model WHERE is_active = true ORDER BY display_name")
+            .fetch_all(&db).await.unwrap_or_default();
+        let mut model_options = String::new();
+        for m in &models {
+            let name: String = m.get("name");
+            let label: String = m.get("display_name");
+            model_options.push_str(&format!(r#"<option value="{}">{} ({})</option>"#,
+                html_escape(&name), html_escape(&label), html_escape(&name)));
+        }
+        let field_rows = sqlx::query("SELECT DISTINCT name FROM ir_model_field WHERE is_custom = false ORDER BY name")
+            .fetch_all(&db).await.unwrap_or_default();
+        let mut field_datalist = String::new();
+        for f in &field_rows {
+            let n: String = f.get("name");
+            field_datalist.push_str(&format!(r#"<option value="{}"></option>"#, html_escape(&n)));
+        }
+        let mut agg_options = String::new();
+        for (code, label) in vortex_framework::dashboards::AGGREGATES {
+            agg_options.push_str(&format!(r#"<option value="{code}">{label}</option>"#));
+        }
+        let mut type_options = String::new();
+        for (code, label) in vortex_framework::dashboards::WIDGET_TYPES {
+            type_options.push_str(&format!(r#"<option value="{code}">{label}</option>"#));
+        }
+        let mut op_options = String::from(r#"<option value="">(no filter)</option>"#);
+        for (code, label) in vortex_framework::dashboards::FILTER_OPS {
+            op_options.push_str(&format!(r#"<option value="{code}">{label}</option>"#));
+        }
+        let add = r#"<button class="btn btn-primary btn-sm" onclick="document.getElementById('add-widget').showModal();">+ Add Widget</button>"#.to_string();
+        let modal = format!(r##"<datalist id="field-list">{field_datalist}</datalist>
+        <dialog id="add-widget" class="modal"><div class="modal-box max-w-2xl">
+            <h3 class="font-bold text-lg mb-4">Add Widget</h3>
+            <form method="post" action="/dashboards/{id}/widget">
+                <div class="form-control mb-3"><label class="label"><span class="label-text">Title</span></label>
+                    <input type="text" name="title" class="input input-bordered" placeholder="Total revenue" required/></div>
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <div class="form-control mb-3"><label class="label"><span class="label-text">Type</span></label>
+                        <select name="widget_type" class="select select-bordered">{type_options}</select></div>
+                    <div class="form-control mb-3"><label class="label"><span class="label-text">Model</span></label>
+                        <select name="model" class="select select-bordered" required>{model_options}</select></div>
+                </div>
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <div class="form-control mb-3"><label class="label"><span class="label-text">Measure</span></label>
+                        <select name="aggregate" class="select select-bordered">{agg_options}</select></div>
+                    <div class="form-control mb-3"><label class="label"><span class="label-text">Number field</span></label>
+                        <input type="text" name="measure_field" list="field-list" class="input input-bordered font-mono" placeholder="(blank for Count)"/></div>
+                </div>
+                <div class="form-control mb-3"><label class="label"><span class="label-text">Break down by (Bars only)</span></label>
+                    <input type="text" name="group_field" list="field-list" class="input input-bordered font-mono" placeholder="contact_type"/></div>
+                <div class="divider text-xs opacity-60">FILTER (optional)</div>
+                <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                    <div class="form-control mb-3"><label class="label"><span class="label-text">Field</span></label>
+                        <input type="text" name="filter_field" list="field-list" class="input input-bordered font-mono"/></div>
+                    <div class="form-control mb-3"><label class="label"><span class="label-text">Operator</span></label>
+                        <select name="filter_op" class="select select-bordered">{op_options}</select></div>
+                    <div class="form-control mb-3"><label class="label"><span class="label-text">Value</span></label>
+                        <input type="text" name="filter_value" class="input input-bordered"/></div>
+                </div>
+                <div class="form-control mb-3"><label class="label"><span class="label-text">Width</span></label>
+                    <select name="col_span" class="select select-bordered">
+                        <option value="1">Small (1 column)</option><option value="2">Medium (2 columns)</option><option value="3">Full width</option>
+                    </select></div>
+                <div class="modal-action">
+                    <button type="button" class="btn" onclick="document.getElementById('add-widget').close();">Cancel</button>
+                    <button type="submit" class="btn btn-primary">Add</button>
+                </div>
+            </form>
+        </div><form method="dialog" class="modal-backdrop"><button>close</button></form></dialog>"##);
+        let del = format!(r#"<form method="post" action="/dashboards/{id}/delete" onsubmit="return confirm('Delete this dashboard and all its widgets?');" class="inline">
+            <button class="btn btn-ghost btn-sm text-error">Delete dashboard</button></form>"#);
+        (add, modal, del)
+    } else {
+        (String::new(), String::new(), String::new())
+    };
+
+    let body = format!(r##"
+        <div class="flex flex-wrap justify-between items-center gap-2 mb-6">
+            <div><a href="/dashboards" class="text-sm opacity-60 hover:underline">← All dashboards</a>
+            <h1 class="text-2xl font-bold">{name}</h1>
+            <p class="text-base-content/60">{desc}</p></div>
+            <div class="flex gap-2">{add_btn}{delete_dash}</div>
+        </div>
+        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">{grid}</div>
+        {edit_modal}
+    "##,
+        name = html_escape(&board.name),
+        desc = html_escape(board.description.as_deref().unwrap_or("")),
+        add_btn = add_btn, delete_dash = delete_dash, grid = grid, edit_modal = edit_modal);
+    let display_name = user.full_name.as_deref().unwrap_or(&user.username);
+    let initials = get_initials(display_name);
+    let installed = db_ctx.installed_modules.clone();
+    let sidebar = build_sidebar("dashboards", display_name, &initials, &installed, user.is_admin(), &state.plugin_registry, &user.roles);
+    Html(dashboard_full_page(&sidebar, &board.name, &body)).into_response()
+}
+
+async fn dashboard_delete(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<uuid::Uuid>,
+) -> Response {
+    let Some(board) = vortex_framework::dashboards::load(&db, id).await else {
+        return Redirect::to("/dashboards").into_response();
+    };
+    if !board.can_edit(user.id, user.is_admin()) {
+        return Redirect::to("/dashboards").into_response();
+    }
+    let _ = vortex_framework::dashboards::delete(&db, id).await;
+    let audit = AuditEntry::new(AuditAction::ConfigChanged, AuditSeverity::Info)
+        .with_user(vortex_common::UserId(user.id))
+        .with_username(&user.username)
+        .with_database(&db_ctx.db_name)
+        .with_resource("dashboard", id.to_string())
+        .with_details(serde_json::json!({"action": "delete"}));
+    let _ = state.audit.log(audit).await;
+    Redirect::to("/dashboards").into_response()
+}
+
+async fn dashboard_widget_create(
+    State(_state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Path(id): Path<uuid::Uuid>,
+    Form(form): Form<WidgetForm>,
+) -> Response {
+    let dest = format!("/dashboards/{id}");
+    let Some(board) = vortex_framework::dashboards::load(&db, id).await else {
+        return Redirect::to("/dashboards").into_response();
+    };
+    if !board.can_edit(user.id, user.is_admin()) {
+        return Redirect::to(&dest).into_response();
+    }
+    let _ = vortex_framework::dashboards::add_widget(
+        &db, id, form.title.trim(), form.widget_type.trim(), form.model.trim(),
+        form.measure_field.as_deref(), form.aggregate.trim(),
+        form.group_field.as_deref(), form.filter_field.as_deref(),
+        form.filter_op.as_deref(), form.filter_value.as_deref(),
+        form.col_span.unwrap_or(1),
+    ).await;
+    Redirect::to(&dest).into_response()
+}
+
+async fn dashboard_widget_delete(
+    State(_state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Path(id): Path<uuid::Uuid>,
+) -> Response {
+    // Resolve the widget's dashboard and check edit rights before deleting.
+    let dash_id: Option<uuid::Uuid> = sqlx::query_scalar(
+        "SELECT dashboard_id FROM dashboard_widget WHERE id = $1")
+        .bind(id).fetch_optional(&db).await.ok().flatten();
+    let Some(dash_id) = dash_id else {
+        return Redirect::to("/dashboards").into_response();
+    };
+    let dest = format!("/dashboards/{dash_id}");
+    if let Some(board) = vortex_framework::dashboards::load(&db, dash_id).await {
+        if board.can_edit(user.id, user.is_admin()) {
+            let _ = vortex_framework::dashboards::delete_widget(&db, id).await;
+        }
+    }
+    Redirect::to(&dest).into_response()
 }
 
 async fn activity_types_list(
@@ -10988,8 +11969,8 @@ async fn activity_types_list(
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Activity Types - Settings</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=12" rel="stylesheet"/>
-<script src="/static/vortex.js?v=12" defer></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script>
     <script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
@@ -11151,8 +12132,8 @@ async fn activity_type_edit(
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{} - Activity Type</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=12" rel="stylesheet"/>
-<script src="/static/vortex.js?v=12" defer></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script>
     <script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
@@ -11285,8 +12266,8 @@ fn settings_write_error(back: &str, msg: &str) -> Response {
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Error</title>
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=12" rel="stylesheet"/>
-<script src="/static/vortex.js?v=12" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script>
 </head><body class="min-h-screen bg-base-200"><div class="container mx-auto p-6 max-w-xl">
 <div class="alert alert-error mb-4"><span>{}</span></div>
 <a href="{}" class="btn btn-ghost btn-sm">← Back</a>
@@ -11304,8 +12285,8 @@ fn settings_write_ok(back: &str, msg: &str) -> Response {
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Done</title>
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=12" rel="stylesheet"/>
-<script src="/static/vortex.js?v=12" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script>
 </head><body class="min-h-screen bg-base-200"><div class="container mx-auto p-6 max-w-xl">
 <div class="alert alert-success mb-4"><span>{}</span></div>
 <a href="{}" class="btn btn-ghost btn-sm">← Back</a>
@@ -11375,8 +12356,8 @@ async fn countries_list(
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Countries - Settings</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=12" rel="stylesheet"/>
-<script src="/static/vortex.js?v=12" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg">
@@ -11529,8 +12510,8 @@ async fn country_edit(
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{name} - Country</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=12" rel="stylesheet"/>
-<script src="/static/vortex.js?v=12" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg">
@@ -11708,8 +12689,8 @@ async fn states_list(
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>States - Settings</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=12" rel="stylesheet"/>
-<script src="/static/vortex.js?v=12" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg">
@@ -11855,8 +12836,8 @@ async fn state_edit(
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{name} - State</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=12" rel="stylesheet"/>
-<script src="/static/vortex.js?v=12" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg">
@@ -12054,8 +13035,8 @@ async fn stages_list(
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Stages - Settings</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=12" rel="stylesheet"/>
-<script src="/static/vortex.js?v=12" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg">
@@ -12214,8 +13195,8 @@ async fn stage_edit(
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{label} - Stage</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=12" rel="stylesheet"/>
-<script src="/static/vortex.js?v=12" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg">
@@ -12466,8 +13447,8 @@ async fn stage_buttons_list(
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Stage Buttons - Settings</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=12" rel="stylesheet"/>
-<script src="/static/vortex.js?v=12" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg">
@@ -12635,8 +13616,8 @@ async fn stage_button_edit(
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{label} - Stage Button</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=12" rel="stylesheet"/>
-<script src="/static/vortex.js?v=12" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg">
@@ -12887,8 +13868,8 @@ async fn approval_rules_list(Db(db): Db, Extension(user): Extension<AuthUser>) -
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Approval Rules - Settings</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=12" rel="stylesheet"/>
-<script src="/static/vortex.js?v=12" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg">
@@ -13090,8 +14071,8 @@ async fn approvals_inbox(
         r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><title>Approvals - Remicle</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=12" rel="stylesheet"/>
-<script src="/static/vortex.js?v=12" defer></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script>
 <script src="/static/vendor/tailwind.js"></script></head>
 <body class="min-h-screen bg-base-200">
 <div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a></div>
@@ -13270,8 +14251,8 @@ async fn email_servers_list(Db(db): Db, Extension(user): Extension<AuthUser>) ->
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Email / SMTP - Settings</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=12" rel="stylesheet"/>
-<script src="/static/vortex.js?v=12" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg">
@@ -13476,8 +14457,8 @@ async fn email_server_edit(
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{name} - Mail Server</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=12" rel="stylesheet"/>
-<script src="/static/vortex.js?v=12" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg">
@@ -13742,8 +14723,8 @@ async fn jobs_list(
 <script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Jobs - Settings</title>
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=12" rel="stylesheet"/>
-<script src="/static/vortex.js?v=12" defer></script><script src="/static/vendor/tailwind.js"></script></head>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script></head>
 <body class="min-h-screen bg-base-200">
 <div class="navbar bg-base-100 shadow-lg"><div class="flex-1"><a href="/" class="btn btn-ghost text-xl">remicle</a></div><div class="flex-none"><span class="text-sm">@{user}</span></div></div>
 <div class="container mx-auto p-6 max-w-5xl">
@@ -13788,8 +14769,8 @@ fn api_tokens_page_shell(user: &AuthUser, inner: &str) -> Html<String> {
 <script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>API Tokens - Settings</title>
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=12" rel="stylesheet"/>
-<script src="/static/vortex.js?v=12" defer></script><script src="/static/vendor/tailwind.js"></script></head>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script></head>
 <body class="min-h-screen bg-base-200">
 <div class="navbar bg-base-100 shadow-lg"><div class="flex-1"><a href="/" class="btn btn-ghost text-xl">remicle</a></div><div class="flex-none"><span class="text-sm">@{user}</span></div></div>
 <div class="container mx-auto p-6 max-w-5xl">{inner}</div></body></html>"##,
@@ -13968,13 +14949,581 @@ fn webhooks_page_shell(user: &AuthUser, title: &str, inner: &str) -> Html<String
 <script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>{title} - Settings</title>
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=12" rel="stylesheet"/>
-<script src="/static/vortex.js?v=12" defer></script><script src="/static/vendor/tailwind.js"></script></head>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script></head>
 <body class="min-h-screen bg-base-200">
 <div class="navbar bg-base-100 shadow-lg"><div class="flex-1"><a href="/" class="btn btn-ghost text-xl">remicle</a></div><div class="flex-none"><span class="text-sm">@{user}</span></div></div>
 <div class="container mx-auto p-6 max-w-4xl">{inner}</div></body></html>"##,
         title = html_escape(title), user = html_escape(&user.username), inner = inner,
     ))
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Print layout designer — document branding (DocLayout) + per-document QWeb
+// templates, on top of vortex_framework::print_layout. Admin-only.
+// ═══════════════════════════════════════════════════════════════════════════
+
+const LOGO_KEY_PL: &str = "company/logo";
+
+/// Serve the uploaded company logo (used by the layout settings + preview).
+async fn serve_company_logo(
+    State(state): State<Arc<AppState>>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+) -> Response {
+    match state.files.get(&db_ctx.db_name, LOGO_KEY_PL).await {
+        Ok(Some(data)) => {
+            let ct = if data.starts_with(&[0xFF, 0xD8, 0xFF]) { "image/jpeg" } else { "image/png" };
+            ([(header::CONTENT_TYPE, ct), (header::CACHE_CONTROL, "no-cache")], data).into_response()
+        }
+        _ => (StatusCode::NOT_FOUND, "no logo").into_response(),
+    }
+}
+
+async fn document_layout_page(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Document Layout"))).into_response();
+    }
+    let l = vortex_framework::print_layout::DocLayout::load(&db).await;
+    let has_logo = matches!(state.files.get(&db_ctx.db_name, LOGO_KEY_PL).await, Ok(Some(_)));
+    let logo_block = if has_logo {
+        r#"<img src="/settings/company-logo" alt="logo" style="max-height:70px;max-width:240px" class="bg-white p-2 rounded border"/>"#.to_string()
+    } else {
+        r#"<span class="text-sm opacity-60">No logo uploaded yet.</span>"#.to_string()
+    };
+    let sel = |v: &str| if l.paper_size == v { "selected" } else { "" };
+    let inner = format!(
+        r##"<div class="mb-4"><a href="/settings/print-templates" class="link text-sm">→ Print templates</a>
+<h1 class="text-2xl font-bold">Document Layout</h1>
+<p class="text-base-content/60">Branding shared by every printed document (quotations, invoices…). Set the logo, colour, font and footer once; every document picks them up.</p></div>
+
+<div class="card bg-base-100 shadow mb-6"><div class="card-body">
+<h2 class="card-title text-lg">Logo</h2>
+<div class="flex items-center gap-4 flex-wrap">{logo_block}
+<form method="post" action="/settings/document-layout/logo" enctype="multipart/form-data" class="flex items-center gap-2">
+<input type="file" name="logo" accept="image/png,image/jpeg" required class="file-input file-input-bordered file-input-sm"/>
+<button class="btn btn-primary btn-sm">Upload</button></form></div>
+<p class="text-xs opacity-50 mt-2">PNG or JPEG, under 512 KB.</p></div></div>
+
+<form method="post" action="/settings/document-layout" class="card bg-base-100 shadow"><div class="card-body grid md:grid-cols-2 gap-4">
+<label class="form-control"><span class="label-text">Brand colour</span>
+<input type="color" name="brand_color" value="{brand}" class="input input-bordered h-12 w-24 p-1"/></label>
+<label class="form-control"><span class="label-text">Paper size</span>
+<select name="paper_size" class="select select-bordered"><option {a4}>A4</option><option {lt}>Letter</option></select></label>
+<label class="form-control md:col-span-2"><span class="label-text">Font family (CSS)</span>
+<input name="font_family" value="{font}" class="input input-bordered"/></label>
+<label class="form-control md:col-span-2"><span class="label-text">Footer (HTML) — shown at the bottom of every document</span>
+<textarea name="footer_html" rows="2" class="textarea textarea-bordered">{footer}</textarea></label>
+<div class="md:col-span-2"><button class="btn btn-primary">Save branding</button></div>
+</div></form>"##,
+        logo_block = logo_block,
+        brand = html_escape(&l.brand_color),
+        a4 = sel("A4"),
+        lt = sel("Letter"),
+        font = html_escape(&l.font_family),
+        footer = html_escape(&l.footer_html),
+    );
+    webhooks_page_shell(&user, "Document Layout", &inner).into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct DocLayoutForm {
+    brand_color: String,
+    font_family: String,
+    footer_html: String,
+    paper_size: String,
+}
+
+async fn document_layout_save(
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Form(f): Form<DocLayoutForm>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Document Layout"))).into_response();
+    }
+    let l = vortex_framework::print_layout::DocLayout {
+        brand_color: f.brand_color,
+        font_family: f.font_family,
+        footer_html: f.footer_html,
+        paper_size: f.paper_size,
+    };
+    let _ = l.save(&db, Some(user.id)).await;
+    Redirect::to("/settings/document-layout").into_response()
+}
+
+async fn document_layout_logo(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    mut multipart: Multipart,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Document Layout"))).into_response();
+    }
+    let mut data: Option<Vec<u8>> = None;
+    while let Ok(Some(field)) = multipart.next_field().await {
+        if field.name() == Some("logo") {
+            if let Ok(bytes) = field.bytes().await {
+                data = Some(bytes.to_vec());
+            }
+        }
+    }
+    let Some(data) = data.filter(|d| !d.is_empty()) else {
+        return Redirect::to("/settings/document-layout").into_response();
+    };
+    if data.len() > 512 * 1024 {
+        return Redirect::to("/settings/document-layout").into_response();
+    }
+    let ct = if data.starts_with(&[0x89, b'P', b'N', b'G']) {
+        "image/png"
+    } else if data.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        "image/jpeg"
+    } else {
+        return Redirect::to("/settings/document-layout").into_response();
+    };
+    let _ = state.files.put(&db_ctx.db_name, LOGO_KEY_PL, &data, Some(ct)).await;
+    Redirect::to("/settings/document-layout").into_response()
+}
+
+async fn print_templates_list(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Print Templates"))).into_response();
+    }
+    let mut rows = String::new();
+    for d in state.print_docs.all() {
+        let custom = vortex_framework::print_layout::get_template(&db, &d.doc_type).await.is_some();
+        let badge = if custom {
+            r#"<span class="badge badge-success badge-sm">Customised</span>"#
+        } else {
+            r#"<span class="badge badge-ghost badge-sm">Default</span>"#
+        };
+        rows.push_str(&format!(
+            r#"<tr><td><a href="/settings/print-templates/{dt}" class="link link-primary font-medium">{label}</a><div class="text-xs opacity-50">{dt}</div></td><td>{badge}</td><td class="text-right"><a href="/settings/print-templates/{dt}" class="btn btn-ghost btn-xs">Edit</a></td></tr>"#,
+            dt = html_escape(&d.doc_type),
+            label = html_escape(&d.label),
+            badge = badge,
+        ));
+    }
+    if state.print_docs.is_empty() {
+        rows.push_str(r#"<tr><td colspan="3" class="text-center opacity-50 py-8">No printable documents are registered by the installed modules.</td></tr>"#);
+    }
+    let inner = format!(
+        r##"<div class="mb-4"><a href="/settings/document-layout" class="link text-sm">→ Document layout (logo &amp; branding)</a>
+<h1 class="text-2xl font-bold">Print Templates</h1>
+<p class="text-base-content/60">Change how each printable document looks — no coding needed. Open one to use the <b>Visual editor</b> (toggle sections, pick columns, rename labels, live preview), or switch to the <b>HTML</b> tab for full control. Branding (logo, colour, footer) comes from the Document Layout page.</p></div>
+<div class="card bg-base-100 shadow"><div class="card-body">
+<table class="table"><thead><tr><th>Document</th><th>Status</th><th></th></tr></thead><tbody>{rows}</tbody></table></div></div>"##,
+        rows = rows,
+    );
+    webhooks_page_shell(&user, "Print Templates", &inner).into_response()
+}
+
+async fn print_template_edit(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Path(doc_type): Path<String>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Print Templates"))).into_response();
+    }
+    let Some(d) = state.print_docs.get(&doc_type) else {
+        return (StatusCode::NOT_FOUND, "Unknown document type").into_response();
+    };
+    let custom = vortex_framework::print_layout::get_template(&db, &doc_type).await;
+    let is_custom = custom.is_some();
+    let body = custom.unwrap_or_else(|| d.default_template.clone());
+    let mut vars = String::new();
+    for (k, v) in &d.variables {
+        vars.push_str(&format!(
+            r#"<tr><td class="font-mono text-xs align-top">{}</td><td class="text-xs">{}</td></tr>"#,
+            html_escape(k),
+            html_escape(v),
+        ));
+    }
+    let status = if is_custom {
+        r#"<span class="badge badge-success badge-sm align-middle">Customised</span>"#
+    } else {
+        r#"<span class="badge badge-ghost badge-sm align-middle">Using default</span>"#
+    };
+    let dt_esc = html_escape(&doc_type);
+
+    // The advanced (raw-HTML) editor panel — always available.
+    let html_panel = format!(
+        r##"<form method="post" action="/settings/print-templates/{dt}/preview" target="_blank" id="tpl-form">
+<div class="grid lg:grid-cols-3 gap-4">
+<div class="lg:col-span-2 card bg-base-100 shadow"><div class="card-body">
+<textarea name="body" id="tpl-body" rows="26" class="textarea textarea-bordered font-mono text-xs w-full" spellcheck="false">{body}</textarea>
+<div class="flex gap-2 mt-3 flex-wrap">
+<button formaction="/settings/print-templates/{dt}" formtarget="_self" class="btn btn-primary btn-sm" name="action" value="save">Save</button>
+<button class="btn btn-outline btn-sm">Preview ↗</button>
+<button type="button" class="btn btn-ghost btn-sm" onclick="document.getElementById('tpl-body').value=document.getElementById('tpl-default').textContent">Load default</button>
+<button formaction="/settings/print-templates/{dt}" formtarget="_self" class="btn btn-ghost btn-sm text-error" name="action" value="reset" onclick="return confirm('Discard the custom template and use the built-in default?')">Reset to default</button>
+</div></div></div>
+<div class="card bg-base-100 shadow"><div class="card-body">
+<h2 class="card-title text-sm">Available variables</h2>
+<table class="table table-xs"><tbody>{vars}</tbody></table>
+<p class="text-xs opacity-60 mt-2">Preview renders with sample data; the real print uses the record's data and your uploaded logo.</p>
+</div></div>
+</div></form>
+<template id="tpl-default">{default}</template>"##,
+        dt = dt_esc,
+        body = html_escape(&body),
+        vars = vars,
+        default = html_escape(&d.default_template),
+    );
+
+    // The no-code Visual panel — only when the document exposes a config.
+    let (tabs, panels, lead) = if let Some(base) = &d.default_config {
+        // Which config populates the form: the saved visual state if any,
+        // else the built-in starting config. If a custom body exists but has
+        // no saved config, it was hand-edited in HTML — warn before overwrite.
+        let saved_cfg =
+            vortex_framework::print_layout::get_layout_config(&db, &doc_type).await;
+        let hand_edited = is_custom && saved_cfg.is_none();
+        let form_cfg = saved_cfg.unwrap_or_else(|| base.clone());
+        let warn = if hand_edited {
+            r#"<div class="alert alert-warning py-2 text-sm mb-3">This template was edited in the HTML tab. Saving from the Visual editor will replace those hand-made changes.</div>"#
+        } else {
+            ""
+        };
+        let form = render_visual_form(&form_cfg);
+        let visual_panel = format!(
+            r##"<div id="panel-visual">
+{warn}
+<form method="post" action="/settings/print-templates/{dt}/visual" id="vis-form">
+<div class="grid lg:grid-cols-2 gap-4">
+<div class="card bg-base-100 shadow"><div class="card-body max-h-[74vh] overflow-y-auto">
+{form}
+<div class="flex gap-2 mt-4 flex-wrap sticky bottom-0 bg-base-100 pt-3">
+<button class="btn btn-primary btn-sm">Save</button>
+<button formaction="/settings/print-templates/{dt}" formtarget="_self" class="btn btn-ghost btn-sm text-error" name="action" value="reset" onclick="return confirm('Discard customisations and use the built-in default?')">Reset to default</button>
+</div>
+</div></div>
+<div class="card bg-base-100 shadow"><div class="card-body">
+<div class="text-xs opacity-60 mb-2">Live preview — sample data</div>
+<iframe id="vis-preview" title="Live preview" sandbox="allow-same-origin" class="w-full rounded border border-base-300 bg-white" style="height:74vh"></iframe>
+</div></div>
+</div></form>
+</div>"##,
+            warn = warn,
+            dt = dt_esc,
+            form = form,
+        );
+        let tabbar = r##"<div role="tablist" class="tabs tabs-boxed mb-4 w-fit">
+<button type="button" id="tabbtn-visual" class="tab tab-active" data-panel="panel-visual">Visual editor</button>
+<button type="button" id="tabbtn-html" class="tab" data-panel="panel-html">HTML (advanced)</button>
+</div>"##
+            .to_string();
+        (
+            tabbar,
+            format!("{visual}<div id=\"panel-html\" style=\"display:none\">{html}</div>", visual = visual_panel, html = html_panel),
+            "Toggle sections and edit labels on the left; the preview updates as you go. Switch to <b>HTML</b> for full control.",
+        )
+    } else {
+        (
+            String::new(),
+            format!("<div id=\"panel-html\">{}</div>", html_panel),
+            "Edit the HTML below and hit Preview to see it with sample data. Save to make it live; Reset restores the built-in default.",
+        )
+    };
+
+    // Combined tab-switch + live-preview script (CSP: script-src 'self'
+    // 'unsafe-inline'). No inline handlers on the tab buttons.
+    let script = PRINT_EDITOR_JS.replace("__DT__", &doc_type.replace('"', ""));
+
+    let inner = format!(
+        r##"<div class="mb-4"><a href="/settings/print-templates" class="link text-sm">← Print templates</a>
+<h1 class="text-2xl font-bold">{label} template {status}</h1>
+<p class="text-base-content/60">{lead}</p></div>
+{tabs}
+{panels}
+<script>{script}</script>"##,
+        label = html_escape(&d.label),
+        status = status,
+        lead = lead,
+        tabs = tabs,
+        panels = panels,
+        script = script,
+    );
+    webhooks_page_shell(&user, &d.label, &inner).into_response()
+}
+
+/// Client script for the print-template editor: tab switching and the Visual
+/// editor's debounced live preview (posts the form, drops the returned HTML
+/// into the preview iframe). `__DT__` is replaced with the document type.
+const PRINT_EDITOR_JS: &str = r#"
+(function(){
+  var btns = document.querySelectorAll('[data-panel]');
+  btns.forEach(function(b){
+    b.addEventListener('click', function(){
+      var target = b.getAttribute('data-panel');
+      document.querySelectorAll('#panel-visual,#panel-html').forEach(function(p){
+        p.style.display = (p.id === target) ? '' : 'none';
+      });
+      btns.forEach(function(x){ x.classList.toggle('tab-active', x === b); });
+    });
+  });
+  var form = document.getElementById('vis-form');
+  var frame = document.getElementById('vis-preview');
+  if(form && frame){
+    var url = '/settings/print-templates/__DT__/visual/preview';
+    var t;
+    function refresh(){
+      var data = new URLSearchParams(new FormData(form));
+      fetch(url, {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:data.toString()})
+        .then(function(r){ return r.text(); })
+        .then(function(html){ frame.srcdoc = html; })
+        .catch(function(){});
+    }
+    form.addEventListener('input', function(){ clearTimeout(t); t=setTimeout(refresh, 250); });
+    form.addEventListener('change', function(){ clearTimeout(t); t=setTimeout(refresh, 250); });
+    refresh();
+  }
+})();
+"#;
+
+#[derive(serde::Deserialize)]
+struct PrintTplForm {
+    body: Option<String>,
+    action: Option<String>,
+}
+
+async fn print_template_save(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Path(doc_type): Path<String>,
+    Form(f): Form<PrintTplForm>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Print Templates"))).into_response();
+    }
+    if state.print_docs.get(&doc_type).is_none() {
+        return (StatusCode::NOT_FOUND, "Unknown document type").into_response();
+    }
+    let body = f.body.unwrap_or_default();
+    if f.action.as_deref() == Some("reset") || body.trim().is_empty() {
+        let _ = vortex_framework::print_layout::clear_template(&db, &doc_type).await;
+    } else {
+        let _ = vortex_framework::print_layout::save_template(&db, &doc_type, &body, Some(user.id)).await;
+    }
+    Redirect::to(&format!("/settings/print-templates/{}", doc_type)).into_response()
+}
+
+async fn print_template_preview(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(doc_type): Path<String>,
+    Form(f): Form<PrintTplForm>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Print Templates"))).into_response();
+    }
+    let Some(d) = state.print_docs.get(&doc_type) else {
+        return (StatusCode::NOT_FOUND, "Unknown document type").into_response();
+    };
+    let layout = vortex_framework::print_layout::DocLayout::load(&db).await;
+    let body = f.body.unwrap_or_default();
+    let body = if body.trim().is_empty() { d.default_template.clone() } else { body };
+    let mut globals = d.sample_globals.clone();
+    if matches!(state.files.get(&db_ctx.db_name, LOGO_KEY_PL).await, Ok(Some(_))) {
+        globals.insert("company.logo".into(), "/settings/company-logo".into());
+    }
+    let title = format!("{} (preview)", d.label);
+    let html = vortex_framework::print_layout::render_body(&layout, &title, &body, &globals, &d.sample_lines);
+    Html(html).into_response()
+}
+
+/// Render the no-code Visual editor form from a [`LayoutConfig`]. Every control
+/// carries the field name that [`layout_config_from_form`] reads back.
+fn render_visual_form(cfg: &vortex_framework::print_layout::LayoutConfig) -> String {
+    let cbx = |name: &str, label: &str, checked: bool| -> String {
+        format!(
+            r#"<label class="label cursor-pointer justify-start gap-3 py-1"><input type="checkbox" name="{n}" class="checkbox checkbox-sm" {c}/><span class="label-text">{l}</span></label>"#,
+            n = name,
+            c = if checked { "checked" } else { "" },
+            l = html_escape(label),
+        )
+    };
+    let txt = |name: &str, label: &str, value: &str| -> String {
+        format!(
+            r#"<label class="form-control w-full"><span class="label-text text-xs opacity-70">{l}</span><input type="text" name="{n}" value="{v}" class="input input-bordered input-sm w-full" maxlength="80"/></label>"#,
+            n = name,
+            l = html_escape(label),
+            v = html_escape(value),
+        )
+    };
+    let section = |title: &str, body: &str| -> String {
+        format!(
+            r#"<div class="mb-4"><div class="text-xs font-semibold uppercase tracking-wide opacity-50 mb-1 border-b border-base-300 pb-1">{t}</div>{b}</div>"#,
+            t = html_escape(title),
+            b = body,
+        )
+    };
+
+    // Header
+    let header = format!(
+        "{title}{logo}{addr}{reg}<div class=\"mt-2 grid grid-cols-1 gap-1\">{num}{date}{val}</div>{vallbl}",
+        title = txt("title", "Document title", &cfg.title),
+        logo = cbx("show_logo", "Show company logo", cfg.show_logo),
+        addr = cbx("show_company_address", "Show company address", cfg.show_company_address),
+        reg = cbx("show_company_reg", "Show company registration no.", cfg.show_company_reg),
+        num = cbx("show_number", "Show document number", cfg.show_number),
+        date = cbx("show_date", "Show date", cfg.show_date),
+        val = cbx("show_validity", "Show validity / due date", cfg.show_validity),
+        vallbl = txt("validity_label", "Validity row label", &cfg.validity_label),
+    );
+
+    // Customer
+    let customer = format!(
+        "{show}{label}",
+        show = cbx("show_customer", "Show bill-to / customer block", cfg.show_customer),
+        label = txt("customer_label", "Bill-to label", &cfg.customer_label),
+    );
+
+    // Columns
+    let mut cols = String::from(r#"<div class="text-xs opacity-60 mb-2">Tick a column to show it; edit its heading.</div>"#);
+    for c in &cfg.columns {
+        cols.push_str(&format!(
+            r#"<div class="flex items-center gap-2 mb-1">{show}<input type="text" name="col_label_{key}" value="{label}" class="input input-bordered input-xs flex-1" maxlength="40"/><span class="badge badge-ghost badge-xs font-mono">{key}</span></div>"#,
+            show = cbx(&format!("col_show_{}", c.key), "", c.show),
+            key = html_escape(&c.key),
+            label = html_escape(&c.label),
+        ));
+    }
+
+    // Totals
+    let totals = format!(
+        "{sub}{subl}{tax}{taxl}{totl}",
+        sub = cbx("show_subtotal", "Show subtotal row", cfg.show_subtotal),
+        subl = txt("subtotal_label", "Subtotal label", &cfg.subtotal_label),
+        tax = cbx("show_tax", "Show tax row", cfg.show_tax),
+        taxl = txt("tax_label", "Tax label", &cfg.tax_label),
+        totl = txt("total_label", "Total label", &cfg.total_label),
+    );
+
+    // Notes & signatures
+    let notes = format!(
+        "{n}{nl}{s}{sl}{sr}",
+        n = cbx("show_notes", "Show notes block", cfg.show_notes),
+        nl = txt("notes_label", "Notes heading", &cfg.notes_label),
+        s = cbx("show_signatures", "Show signature strip", cfg.show_signatures),
+        sl = txt("sign_left", "Left signature label", &cfg.sign_left),
+        sr = txt("sign_right", "Right signature label", &cfg.sign_right),
+    );
+
+    format!(
+        "{}{}{}{}{}",
+        section("Header", &header),
+        section("Bill-to", &customer),
+        section("Line columns", &cols),
+        section("Totals", &totals),
+        section("Notes &amp; signatures", &notes),
+    )
+}
+
+/// Build a [`LayoutConfig`] from the submitted Visual-editor form. Column keys
+/// and order come from `base` (plugin-defined); the form only overrides the
+/// `show` flag and the label of each. Absent checkbox names mean unchecked.
+fn layout_config_from_form(
+    base: &vortex_framework::print_layout::LayoutConfig,
+    f: &std::collections::HashMap<String, String>,
+) -> vortex_framework::print_layout::LayoutConfig {
+    let has = |k: &str| f.contains_key(k);
+    let txt = |k: &str, d: &str| {
+        f.get(k)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| d.to_string())
+    };
+    let mut cfg = base.clone();
+    cfg.title = txt("title", &base.title);
+    cfg.show_logo = has("show_logo");
+    cfg.show_company_address = has("show_company_address");
+    cfg.show_company_reg = has("show_company_reg");
+    cfg.show_customer = has("show_customer");
+    cfg.customer_label = txt("customer_label", &base.customer_label);
+    cfg.show_number = has("show_number");
+    cfg.show_date = has("show_date");
+    cfg.show_validity = has("show_validity");
+    cfg.validity_label = txt("validity_label", &base.validity_label);
+    cfg.show_subtotal = has("show_subtotal");
+    cfg.show_tax = has("show_tax");
+    cfg.subtotal_label = txt("subtotal_label", &base.subtotal_label);
+    cfg.tax_label = txt("tax_label", &base.tax_label);
+    cfg.total_label = txt("total_label", &base.total_label);
+    cfg.show_notes = has("show_notes");
+    cfg.notes_label = txt("notes_label", &base.notes_label);
+    cfg.show_signatures = has("show_signatures");
+    cfg.sign_left = txt("sign_left", &base.sign_left);
+    cfg.sign_right = txt("sign_right", &base.sign_right);
+    for (i, col) in base.columns.iter().enumerate() {
+        cfg.columns[i].show = has(&format!("col_show_{}", col.key));
+        cfg.columns[i].label = txt(&format!("col_label_{}", col.key), &col.label);
+    }
+    cfg
+}
+
+async fn print_template_visual_save(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Path(doc_type): Path<String>,
+    Form(f): Form<std::collections::HashMap<String, String>>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Print Templates"))).into_response();
+    }
+    let Some(d) = state.print_docs.get(&doc_type) else {
+        return (StatusCode::NOT_FOUND, "Unknown document type").into_response();
+    };
+    let Some(base) = &d.default_config else {
+        return (StatusCode::BAD_REQUEST, "This document has no visual editor").into_response();
+    };
+    let cfg = layout_config_from_form(base, &f);
+    let _ = vortex_framework::print_layout::save_layout(&db, &doc_type, &cfg, Some(user.id)).await;
+    Redirect::to(&format!("/settings/print-templates/{}", doc_type)).into_response()
+}
+
+async fn print_template_visual_preview(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(doc_type): Path<String>,
+    Form(f): Form<std::collections::HashMap<String, String>>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Print Templates"))).into_response();
+    }
+    let Some(d) = state.print_docs.get(&doc_type) else {
+        return (StatusCode::NOT_FOUND, "Unknown document type").into_response();
+    };
+    let Some(base) = &d.default_config else {
+        return (StatusCode::BAD_REQUEST, "This document has no visual editor").into_response();
+    };
+    let cfg = layout_config_from_form(base, &f);
+    let body = vortex_framework::print_layout::build_template(&cfg);
+    let layout = vortex_framework::print_layout::DocLayout::load(&db).await;
+    let mut globals = d.sample_globals.clone();
+    if matches!(state.files.get(&db_ctx.db_name, LOGO_KEY_PL).await, Ok(Some(_))) {
+        globals.insert("company.logo".into(), "/settings/company-logo".into());
+    }
+    let title = format!("{} (preview)", d.label);
+    let html = vortex_framework::print_layout::render_body(&layout, &title, &body, &globals, &d.sample_lines);
+    Html(html).into_response()
 }
 
 /// Comma/space/newline separated event types -> Vec, empty -> [] (all events).
@@ -14251,8 +15800,8 @@ async fn sequences_list(
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Sequences - Settings</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=12" rel="stylesheet"/>
-<script src="/static/vortex.js?v=12" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script>
     <script src="/static/vendor/htmx.min.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
@@ -14456,8 +16005,8 @@ async fn sequence_edit(
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{} - Sequence</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=12" rel="stylesheet"/>
-<script src="/static/vortex.js?v=12" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg">
@@ -14648,8 +16197,8 @@ async fn cron_list(
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Scheduled Jobs - Settings</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=12" rel="stylesheet"/>
-<script src="/static/vortex.js?v=12" defer></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script>
     <script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
@@ -14870,8 +16419,8 @@ async fn cron_edit(
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{} - Scheduled Job</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=12" rel="stylesheet"/>
-<script src="/static/vortex.js?v=12" defer></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script>
     <script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
@@ -15446,8 +16995,8 @@ async fn reports_list(Db(db): Db, Extension(user): Extension<AuthUser>) -> Respo
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Reports - Settings</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=12" rel="stylesheet"/>
-<script src="/static/vortex.js?v=12" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg"><div class="flex-1"><a href="/" class="btn btn-ghost text-xl">remicle</a></div><div class="flex-none"><span class="text-sm">@{user}</span></div></div>
@@ -15640,8 +17189,8 @@ async fn report_edit(Db(db): Db, Extension(user): Extension<AuthUser>, Path(id):
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{name} - Report</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=12" rel="stylesheet"/>
-<script src="/static/vortex.js?v=12" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg"><div class="flex-1"><a href="/" class="btn btn-ghost text-xl">remicle</a></div><div class="flex-none"><span class="text-sm">@{user}</span></div></div>
@@ -15853,8 +17402,8 @@ async fn reports_hub(
     let html = format!(
         r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><title>Reports - Remicle</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0"><link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=12" rel="stylesheet"/>
-<script src="/static/vortex.js?v=12" defer></script><script src="/static/vendor/tailwind.js"></script></head>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script></head>
 <body class="min-h-screen bg-base-200"><div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a></div>
 <div id="sidebar-overlay" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
 <div class="flex">{sidebar}<main class="flex-1 p-4 lg:p-6 min-w-0">{content}</main></div></body></html>"#,
@@ -16055,8 +17604,8 @@ async fn report_runs_page(
     let html = format!(
         r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><title>Generated Reports - Remicle</title>{refresh}
 <meta name="viewport" content="width=device-width, initial-scale=1.0"><link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=12" rel="stylesheet"/>
-<script src="/static/vortex.js?v=12" defer></script><script src="/static/vendor/tailwind.js"></script></head>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script></head>
 <body class="min-h-screen bg-base-200"><div class="flex">{sidebar}<main class="flex-1 p-4 lg:p-6 min-w-0">{content}</main></div></body></html>"#,
         refresh = refresh, sidebar = sidebar, content = content,
     );
@@ -16431,8 +17980,8 @@ async fn render_dynamic_form(
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{}</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=12" rel="stylesheet"/>
-<script src="/static/vortex.js?v=12" defer></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script>
     <script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
