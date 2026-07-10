@@ -1,0 +1,5 @@
+# Migration metadata for 137_custom_fields
+module = "core"
+description = "Per-tenant custom fields: ir_model_field.is_custom + ir_custom_value overflow store"
+reversible = true
+dependencies = ["122_model_registry"]
