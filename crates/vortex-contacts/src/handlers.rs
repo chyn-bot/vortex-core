@@ -17,6 +17,51 @@ const CONTACT_SEQ: vortex_plugin_sdk::orm::sequence::SequenceSpec =
     vortex_plugin_sdk::orm::sequence::SequenceSpec::new("contacts.code", "CNT")
         .with_padding(6);
 
+/// Built-in contact fields a custom field can be anchored *after* (rendered
+/// inline right below that field). Any other anchor — or none — falls to the
+/// bottom "Custom Fields" section, so nothing is ever silently dropped.
+const CONTACT_ANCHORS: &[&str] = &[
+    "name", "contact_type", "vat_number", "credit_limit", "email", "phone", "mobile", "notes",
+];
+
+/// The custom-field HTML for a contact form: one inline group per anchor plus
+/// the bottom section for everything unplaced. `record_id` is `None` on create.
+struct ContactCustom {
+    name: String,
+    contact_type: String,
+    vat_number: String,
+    credit_limit: String,
+    email: String,
+    phone: String,
+    mobile: String,
+    notes: String,
+    /// Bottom "Custom Fields" card (unanchored + anchors this form can't place).
+    bottom: String,
+}
+
+async fn contact_custom(db: &vortex_plugin_sdk::sqlx::PgPool, record_id: Option<&str>) -> ContactCustom {
+    use vortex_plugin_sdk::framework::custom_fields as cf;
+    let g = |anchor: &'static str| cf::render_anchor_group(db, "contacts", record_id, anchor);
+    let bottom_inner = cf::render_unplaced_section(db, "contacts", record_id, CONTACT_ANCHORS).await;
+    ContactCustom {
+        name: g("name").await,
+        contact_type: g("contact_type").await,
+        vat_number: g("vat_number").await,
+        credit_limit: g("credit_limit").await,
+        email: g("email").await,
+        phone: g("phone").await,
+        mobile: g("mobile").await,
+        notes: g("notes").await,
+        bottom: if bottom_inner.is_empty() {
+            String::new()
+        } else {
+            format!(
+                r#"<div class="card bg-base-100 shadow mt-6"><div class="card-body">{bottom_inner}</div></div>"#
+            )
+        },
+    }
+}
+
 /// Build the contacts route set.
 pub fn contacts_routes() -> Router<Arc<AppState>> {
     Router::new()
@@ -239,6 +284,11 @@ async fn new_contact_form(
         }
     }
 
+    // Admin-defined custom fields (Initiative #2). Anchored fields render inline
+    // right after their built-in field; the rest fall to the bottom section. A
+    // field added in Settings ▸ Custom Fields shows here without a code change.
+    let cc = contact_custom(&db, None).await;
+
     let content = format!(
         r#"<a href="/contacts" class="btn btn-ghost btn-sm mb-2">← Back to Contacts</a>
 <h1 class="text-2xl font-bold mb-6">New Contact</h1>
@@ -254,6 +304,7 @@ async fn new_contact_form(
 <label class="label"><span class="label-text">Name *</span></label>
 <input name="name" class="input input-bordered input-sm" required/>
 </div>
+{cf_name}
 <div class="form-control mb-3">
 <label class="label"><span class="label-text">Type</span></label>
 <select name="contact_type" class="select select-bordered select-sm">
@@ -263,6 +314,7 @@ async fn new_contact_form(
 <option value="other">Other</option>
 </select>
 </div>
+{cf_ctype}
 <div class="form-control mb-3">
 <label class="cursor-pointer label justify-start gap-3">
 <input type="checkbox" name="is_company" class="checkbox checkbox-sm"/>
@@ -273,10 +325,12 @@ async fn new_contact_form(
 <label class="label"><span class="label-text">VAT Number</span></label>
 <input name="vat_number" class="input input-bordered input-sm"/>
 </div>
+{cf_vat}
 <div class="form-control mb-3">
 <label class="label"><span class="label-text">Credit Limit</span></label>
 <input name="credit_limit" type="number" step="0.01" class="input input-bordered input-sm"/>
 </div>
+{cf_credit}
 <div class="form-control mb-3">
 <label class="cursor-pointer label justify-start gap-3">
 <input type="checkbox" name="active" class="checkbox checkbox-sm" checked/>
@@ -295,14 +349,17 @@ async fn new_contact_form(
 <label class="label"><span class="label-text">Email</span></label>
 <input name="email" type="email" autocomplete="email" class="input input-bordered input-sm"/>
 </div>
+{cf_email}
 <div class="form-control mb-3">
 <label class="label"><span class="label-text">Phone</span></label>
 <input name="phone" type="tel" inputmode="tel" class="input input-bordered input-sm"/>
 </div>
+{cf_phone}
 <div class="form-control mb-3">
 <label class="label"><span class="label-text">Mobile</span></label>
 <input name="mobile" type="tel" inputmode="tel" class="input input-bordered input-sm"/>
 </div>
+{cf_mobile}
 </div>
 </div>
 
@@ -377,13 +434,23 @@ async function loadStates(countryId) {{
 <label class="label"><span class="label-text">Notes</span></label>
 <textarea name="notes" class="textarea textarea-bordered" rows="3"></textarea>
 </div>
-
+{cf_notes}
+{bottom}
 <div class="mt-6 flex gap-2">
 <button type="submit" class="btn btn-primary btn-sm">Create</button>
 <a href="/contacts" class="btn btn-ghost btn-sm">Cancel</a>
 </div>
 </form>"#,
         country_options = country_options,
+        cf_name = cc.name,
+        cf_ctype = cc.contact_type,
+        cf_vat = cc.vat_number,
+        cf_credit = cc.credit_limit,
+        cf_email = cc.email,
+        cf_phone = cc.phone,
+        cf_mobile = cc.mobile,
+        cf_notes = cc.notes,
+        bottom = cc.bottom,
     );
 
     Html(page_shell(&sidebar, "New Contact", &content)).into_response()
@@ -483,6 +550,17 @@ async fn create_contact(
             vortex_plugin_sdk::axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             format!("Failed to create contact: {e}"),
         ).into_response();
+    }
+
+    // Persist admin-defined custom field values (Initiative #2). Non-fatal: the
+    // contact exists either way, so a custom-value hiccup only gets logged.
+    let custom_pairs: Vec<(String, String)> = form.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    if let Err(e) = vortex_plugin_sdk::framework::custom_fields::save_values(
+        &db, "contacts", contact_id, &custom_pairs,
+    )
+    .await
+    {
+        error!(error = %e, "custom field save failed");
     }
 
     // Audit: log the creation via the WORM ledger.
@@ -680,6 +758,11 @@ async fn edit_contact(
     let record_panels =
         vortex_plugin_sdk::framework::render_record_panels(&state, &db, "contacts", id).await;
 
+    // Admin-defined custom fields (Initiative #2), prefilled from stored values.
+    // Anchored ones render inline after their field; the rest sit at the bottom.
+    let ids = id.to_string();
+    let cc = contact_custom(&db, Some(&ids)).await;
+
     let content = format!(
         r#"<div class="flex items-center justify-between mb-6">
 <div>
@@ -708,6 +791,7 @@ async fn edit_contact(
 <label class="label"><span class="label-text">Name *</span></label>
 <input name="name" class="input input-bordered input-sm" value="{name_val}" required/>
 </div>
+{cf_name}
 <div class="form-control mb-3">
 <label class="label"><span class="label-text">Type</span></label>
 <select name="contact_type" class="select select-bordered select-sm">
@@ -717,6 +801,7 @@ async fn edit_contact(
 <option value="other" {sel_other}>Other</option>
 </select>
 </div>
+{cf_ctype}
 <div class="form-control mb-3">
 <label class="cursor-pointer label justify-start gap-3">
 <input type="checkbox" name="is_company" class="checkbox checkbox-sm" {is_company_checked}/>
@@ -727,10 +812,12 @@ async fn edit_contact(
 <label class="label"><span class="label-text">VAT Number</span></label>
 <input name="vat_number" class="input input-bordered input-sm" value="{vat}"/>
 </div>
+{cf_vat}
 <div class="form-control mb-3">
 <label class="label"><span class="label-text">Credit Limit</span></label>
 <input name="credit_limit" type="number" step="0.01" class="input input-bordered input-sm" value="{credit}"/>
 </div>
+{cf_credit}
 <div class="form-control mb-3">
 <label class="cursor-pointer label justify-start gap-3">
 <input type="checkbox" name="active" class="checkbox checkbox-sm" {active_checked}/>
@@ -749,14 +836,17 @@ async fn edit_contact(
 <label class="label"><span class="label-text">Email</span></label>
 <input name="email" type="email" autocomplete="email" class="input input-bordered input-sm" value="{email_val}"/>
 </div>
+{cf_email}
 <div class="form-control mb-3">
 <label class="label"><span class="label-text">Phone</span></label>
 <input name="phone" type="tel" inputmode="tel" class="input input-bordered input-sm" value="{phone_val}"/>
 </div>
+{cf_phone}
 <div class="form-control mb-3">
 <label class="label"><span class="label-text">Mobile</span></label>
 <input name="mobile" type="tel" inputmode="tel" class="input input-bordered input-sm" value="{mobile_val}"/>
 </div>
+{cf_mobile}
 </div>
 </div>
 
@@ -832,7 +922,8 @@ async function loadStates(countryId) {{
 <label class="label"><span class="label-text">Notes</span></label>
 <textarea name="notes" class="textarea textarea-bordered" rows="3">{notes_val}</textarea>
 </div>
-
+{cf_notes}
+{bottom}
 <div class="mt-6 flex gap-2">
 <button type="submit" class="btn btn-primary btn-sm">Save</button>
 <a href="/contacts" class="btn btn-ghost btn-sm">Cancel</a>
@@ -861,6 +952,15 @@ async function loadStates(countryId) {{
         vat = esc(vat_number.as_deref().unwrap_or("")),
         credit = credit_limit.map(|c| format!("{:.2}", c)).unwrap_or_default(),
         notes_val = esc(notes.as_deref().unwrap_or("")),
+        cf_name = cc.name,
+        cf_ctype = cc.contact_type,
+        cf_vat = cc.vat_number,
+        cf_credit = cc.credit_limit,
+        cf_email = cc.email,
+        cf_phone = cc.phone,
+        cf_mobile = cc.mobile,
+        cf_notes = cc.notes,
+        bottom = cc.bottom,
         sel_cust = sel(&contact_type, "customer"),
         sel_supp = sel(&contact_type, "supplier"),
         sel_both = sel(&contact_type, "both"),
@@ -1101,6 +1201,16 @@ async fn update_contact(
         &state, &db, "contacts", id, &pairs, &panel_ctx,
     )
     .await;
+
+    // Persist admin-defined custom field values (Initiative #2) from the same
+    // submission. Non-fatal — the contact update already succeeded.
+    if let Err(e) = vortex_plugin_sdk::framework::custom_fields::save_values(
+        &db, "contacts", id, &pairs,
+    )
+    .await
+    {
+        error!(error = %e, "custom field save failed");
+    }
 
     info!(id = %id, name = %name, "contact updated");
     // Stay on the record — one Save now persists contact + panel

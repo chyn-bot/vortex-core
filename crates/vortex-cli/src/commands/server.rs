@@ -2212,6 +2212,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/settings/custom-fields", get(custom_fields_list))
         .route("/settings/custom-fields", post(custom_field_create))
         .route("/settings/custom-fields/delete", post(custom_field_delete))
+        .route("/settings/custom-fields/reorder", post(custom_field_reorder))
         .route("/settings/automation-rules", get(automation_rules_list))
         .route("/settings/automation-rules", post(automation_rule_create))
         .route("/settings/automation-rules/delete", post(automation_rule_delete))
@@ -11181,6 +11182,10 @@ struct CustomFieldForm {
     #[serde(default)]
     options: Option<String>,
     #[serde(default)]
+    related_model: Option<String>,
+    #[serde(default)]
+    position_after: Option<String>,
+    #[serde(default)]
     help: Option<String>,
 }
 
@@ -11209,15 +11214,77 @@ async fn render_custom_fields_page(db: &sqlx::PgPool, username: &str, error: Opt
         ));
     }
 
+    // Built-in fields per model, for the "Position" dropdown (anchor a custom
+    // field after one of them). Serialized as JSON for the client to filter by
+    // the selected model. Only non-custom fields are offered as anchors.
+    let field_rows = sqlx::query(
+        "SELECT m.name AS model, f.name AS fname, f.display_name AS flabel \
+         FROM ir_model_field f JOIN ir_model m ON m.id = f.model_id \
+         WHERE f.is_custom = false AND m.is_active = true \
+         ORDER BY m.name, f.sequence, f.name",
+    )
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+    let mut mf: std::collections::BTreeMap<String, Vec<serde_json::Value>> = std::collections::BTreeMap::new();
+    for r in &field_rows {
+        let model: String = r.get("model");
+        let fname: String = r.get("fname");
+        let flabel: String = r.get("flabel");
+        mf.entry(model).or_default().push(serde_json::json!([fname, flabel]));
+    }
+    let model_fields_json = serde_json::to_string(
+        &serde_json::Value::Object(mf.into_iter().map(|(k, v)| (k, serde_json::Value::Array(v))).collect()),
+    )
+    .unwrap_or_else(|_| "{}".to_string());
+
     // Existing custom fields across all models.
     let fields = vortex_framework::custom_fields::list_all(db).await;
     let mut rows_html = String::new();
     for (model, model_label, f) in &fields {
-        let opts = if f.selection_options.is_empty() {
+        // "Options" column shows selection values, or the link target for a reference.
+        let opts = if f.field_type == "many2one" {
+            match &f.related_model {
+                Some(t) => format!(r#"<span class="opacity-70">→ <code class="text-xs">{}</code></span>"#, html_escape(t)),
+                None => String::from("<span class=\"opacity-40\">—</span>"),
+            }
+        } else if f.selection_options.is_empty() {
             String::from("<span class=\"opacity-40\">—</span>")
         } else {
             html_escape(&f.selection_options.join(", "))
         };
+        // Reorder controls: swap sequence with the neighbouring custom field.
+        let reorder = format!(
+            r##"<form method="post" action="/settings/custom-fields/reorder" class="inline">
+                    <input type="hidden" name="model" value="{model}"/>
+                    <input type="hidden" name="name" value="{name}"/>
+                    <input type="hidden" name="direction" value="up"/>
+                    <button type="submit" class="btn btn-ghost btn-xs" title="Move up">↑</button>
+                </form>
+                <form method="post" action="/settings/custom-fields/reorder" class="inline">
+                    <input type="hidden" name="model" value="{model}"/>
+                    <input type="hidden" name="name" value="{name}"/>
+                    <input type="hidden" name="direction" value="down"/>
+                    <button type="submit" class="btn btn-ghost btn-xs" title="Move down">↓</button>
+                </form>"##,
+            model = html_escape(model),
+            name = html_escape(&f.name),
+        );
+        // Edit opens the shared modal pre-filled from these data-* attributes.
+        let edit_btn = format!(
+            r#"<button type="button" class="btn btn-ghost btn-xs"
+                data-model="{model}" data-name="{name}" data-label="{label}" data-type="{ftype}"
+                data-options="{opts_raw}" data-related="{related}" data-position="{position}" data-help="{help}"
+                onclick="cfEdit(this)">Edit</button>"#,
+            model = html_escape(model),
+            name = html_escape(&f.name),
+            label = html_escape(&f.label),
+            ftype = html_escape(&f.field_type),
+            opts_raw = html_escape(&f.selection_options.join(", ")),
+            related = html_escape(f.related_model.as_deref().unwrap_or("")),
+            position = html_escape(f.position_after.as_deref().unwrap_or("")),
+            help = html_escape(f.help.as_deref().unwrap_or("")),
+        );
         rows_html.push_str(&format!(
             r##"<tr>
                 <td>{model_label} <code class="text-xs opacity-60">{model}</code></td>
@@ -11225,7 +11292,9 @@ async fn render_custom_fields_page(db: &sqlx::PgPool, username: &str, error: Opt
                 <td>{label}</td>
                 <td><span class="badge badge-ghost">{ftype}</span></td>
                 <td class="text-sm">{opts}</td>
-                <td class="text-right">
+                <td class="text-right whitespace-nowrap">
+                    {reorder}
+                    {edit_btn}
                     <form method="post" action="/settings/custom-fields/delete" onsubmit="return confirm('Delete custom field {name}? Stored values are kept but hidden.');" class="inline">
                         <input type="hidden" name="model" value="{model}"/>
                         <input type="hidden" name="name" value="{name}"/>
@@ -11239,6 +11308,8 @@ async fn render_custom_fields_page(db: &sqlx::PgPool, username: &str, error: Opt
             label = html_escape(&f.label),
             ftype = html_escape(&f.field_type),
             opts = opts,
+            reorder = reorder,
+            edit_btn = edit_btn,
         ));
     }
     if rows_html.is_empty() {
@@ -11278,7 +11349,7 @@ async fn render_custom_fields_page(db: &sqlx::PgPool, username: &str, error: Opt
                 <h1 class="text-2xl font-bold">Custom Fields</h1>
                 <p class="text-base-content/60">Add your own fields to any model. They appear on the record form automatically — no code, no deploy.</p>
             </div>
-            <button class="btn btn-primary" onclick="document.getElementById('create-modal').showModal();">+ New Custom Field</button>
+            <button class="btn btn-primary" onclick="cfNew()">+ New Custom Field</button>
         </div>
         {error_banner}
         <div class="card bg-base-100 shadow">
@@ -11294,46 +11365,122 @@ async fn render_custom_fields_page(db: &sqlx::PgPool, username: &str, error: Opt
 
     <dialog id="create-modal" class="modal">
         <div class="modal-box">
-            <h3 class="font-bold text-lg mb-4">New Custom Field</h3>
+            <h3 class="font-bold text-lg mb-4" id="cf-modal-title">New Custom Field</h3>
             <form method="post" action="/settings/custom-fields">
                 <div class="form-control mb-3">
                     <label class="label"><span class="label-text">Model</span></label>
-                    <select name="model" class="select select-bordered" required>{model_options}</select>
+                    <select name="model" id="cf-model" class="select select-bordered" required onchange="cfModelChange()">{model_options}</select>
+                    <input type="hidden" id="cf-model-hidden"/>
                 </div>
                 <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
                     <div class="form-control mb-3">
                         <label class="label"><span class="label-text">Field name</span></label>
-                        <input type="text" name="name" class="input input-bordered font-mono" value="x_" placeholder="x_priority" required/>
-                        <span class="label-text-alt opacity-60 mt-1">lowercase, starts with x_</span>
+                        <input type="text" name="name" id="cf-name" class="input input-bordered font-mono" value="x_" placeholder="x_priority" required/>
+                        <span class="label-text-alt opacity-60 mt-1" id="cf-name-hint">lowercase, starts with x_</span>
                     </div>
                     <div class="form-control mb-3">
                         <label class="label"><span class="label-text">Label</span></label>
-                        <input type="text" name="label" class="input input-bordered" placeholder="Priority" required/>
+                        <input type="text" name="label" id="cf-label" class="input input-bordered" placeholder="Priority" required/>
                     </div>
                 </div>
                 <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
                     <div class="form-control mb-3">
                         <label class="label"><span class="label-text">Type</span></label>
-                        <select name="field_type" class="select select-bordered">{type_options}</select>
+                        <select name="field_type" id="cf-type" class="select select-bordered" onchange="cfToggle()">{type_options}</select>
                     </div>
                     <div class="form-control mb-3">
+                        <label class="label"><span class="label-text">Position</span></label>
+                        <select name="position_after" id="cf-position" class="select select-bordered"></select>
+                        <span class="label-text-alt opacity-60 mt-1">where it appears on the form</span>
+                    </div>
+                    <div class="form-control mb-3" id="cf-options-wrap">
                         <label class="label"><span class="label-text">Options</span></label>
-                        <input type="text" name="options" class="input input-bordered" placeholder="low, medium, high"/>
+                        <input type="text" name="options" id="cf-options" class="input input-bordered" placeholder="low, medium, high"/>
                         <span class="label-text-alt opacity-60 mt-1">comma-separated · Selection only</span>
+                    </div>
+                    <div class="form-control mb-3" id="cf-target-wrap" style="display:none">
+                        <label class="label"><span class="label-text">Target model</span></label>
+                        <select name="related_model" id="cf-related" class="select select-bordered">{model_options}</select>
+                        <span class="label-text-alt opacity-60 mt-1">the model this field links to · Reference only</span>
                     </div>
                 </div>
                 <div class="form-control mb-3">
                     <label class="label"><span class="label-text">Help text (optional)</span></label>
-                    <input type="text" name="help" class="input input-bordered" placeholder="Shown under the field"/>
+                    <input type="text" name="help" id="cf-help" class="input input-bordered" placeholder="Shown under the field"/>
                 </div>
                 <div class="modal-action">
                     <button type="button" class="btn" onclick="document.getElementById('create-modal').close();">Cancel</button>
-                    <button type="submit" class="btn btn-primary">Create</button>
+                    <button type="submit" class="btn btn-primary" id="cf-submit">Create</button>
                 </div>
             </form>
         </div>
         <form method="dialog" class="modal-backdrop"><button>close</button></form>
     </dialog>
+    <script>
+    var CF_MODEL_FIELDS = {model_fields_json};
+    // Show/hide the Options (selection) and Target model (reference) inputs.
+    function cfToggle() {{
+        var t = document.getElementById('cf-type').value;
+        document.getElementById('cf-options-wrap').style.display = (t === 'selection') ? '' : 'none';
+        document.getElementById('cf-target-wrap').style.display  = (t === 'many2one') ? '' : 'none';
+    }}
+    // Repopulate the Position dropdown from the selected model's built-in fields.
+    function cfPositions(model, selected) {{
+        var sel = document.getElementById('cf-position');
+        sel.innerHTML = '<option value="">Bottom (Custom Fields section)</option>';
+        var list = CF_MODEL_FIELDS[model] || [];
+        for (var i = 0; i < list.length; i++) {{
+            var o = document.createElement('option');
+            o.value = list[i][0];
+            o.textContent = 'After: ' + list[i][1];
+            if (list[i][0] === selected) o.selected = true;
+            sel.appendChild(o);
+        }}
+    }}
+    function cfModelChange() {{
+        cfPositions(document.getElementById('cf-model').value, '');
+    }}
+    // Open the modal in create mode: editable name, blank fields.
+    function cfNew() {{
+        document.getElementById('cf-modal-title').textContent = 'New Custom Field';
+        document.getElementById('cf-submit').textContent = 'Create';
+        var model = document.getElementById('cf-model');
+        model.disabled = false;
+        document.getElementById('cf-model-hidden').removeAttribute('name');
+        var name = document.getElementById('cf-name');
+        name.readOnly = false; name.value = 'x_';
+        document.getElementById('cf-name-hint').style.display = '';
+        document.getElementById('cf-label').value = '';
+        document.getElementById('cf-type').value = 'string';
+        document.getElementById('cf-options').value = '';
+        document.getElementById('cf-help').value = '';
+        cfPositions(model.value, '');
+        cfToggle();
+        document.getElementById('create-modal').showModal();
+    }}
+    // Open the modal in edit mode: model + name locked (they key the record).
+    function cfEdit(btn) {{
+        var d = btn.dataset;
+        document.getElementById('cf-modal-title').textContent = 'Edit Custom Field';
+        document.getElementById('cf-submit').textContent = 'Save changes';
+        var model = document.getElementById('cf-model');
+        model.value = d.model; model.disabled = true;
+        var hidden = document.getElementById('cf-model-hidden');
+        hidden.setAttribute('name', 'model'); hidden.value = d.model;
+        var name = document.getElementById('cf-name');
+        name.value = d.name; name.readOnly = true;
+        document.getElementById('cf-name-hint').style.display = 'none';
+        document.getElementById('cf-label').value = d.label;
+        document.getElementById('cf-type').value = d.type;
+        document.getElementById('cf-options').value = d.options || '';
+        document.getElementById('cf-related').value = d.related || '';
+        document.getElementById('cf-help').value = d.help || '';
+        cfPositions(d.model, d.position || '');
+        cfToggle();
+        document.getElementById('create-modal').showModal();
+    }}
+    cfModelChange();
+    </script>
 </body>
 </html>"##
     )
@@ -11369,10 +11516,12 @@ async fn custom_field_create(
         .filter(|s| !s.is_empty())
         .collect();
     let help = form.help.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let related_model = form.related_model.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let position_after = form.position_after.as_deref().map(str::trim).filter(|s| !s.is_empty());
 
     match vortex_framework::custom_fields::add(
         &db, form.model.trim(), form.name.trim(), form.label.trim(),
-        form.field_type.trim(), &options, help,
+        form.field_type.trim(), &options, related_model, position_after, help,
     ).await {
         Ok(()) => {
             let audit = AuditEntry::new(AuditAction::ConfigChanged, AuditSeverity::Info)
@@ -11410,6 +11559,32 @@ async fn custom_field_delete(
         .with_resource("custom_field", format!("{}.{}", form.model.trim(), form.name.trim()))
         .with_details(serde_json::json!({ "action": "delete" }));
     let _ = state.audit.log(audit).await;
+    Redirect::to("/settings/custom-fields").into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct CustomFieldReorderForm {
+    model: String,
+    name: String,
+    /// "up" moves the field earlier; anything else moves it later.
+    direction: String,
+}
+
+/// POST /settings/custom-fields/reorder — move a custom field up or down within
+/// its model's Custom Fields section (swaps sequence with its neighbour).
+async fn custom_field_reorder(
+    State(_state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Form(form): Form<CustomFieldReorderForm>,
+) -> Response {
+    if !user.is_system_admin() && !user.has_role("Administrator") {
+        return Redirect::to("/settings").into_response();
+    }
+    let _ = vortex_framework::custom_fields::move_field(
+        &db, form.model.trim(), form.name.trim(), form.direction.trim() == "up",
+    )
+    .await;
     Redirect::to("/settings/custom-fields").into_response()
 }
 

@@ -1,0 +1,5 @@
+# Migration metadata for 142_custom_field_position
+module = "core"
+description = "Custom-field placement: ir_model_field.position_after anchors a custom field after a named built-in field (NULL = the bottom Custom Fields section)."
+reversible = true
+dependencies = ["137_custom_fields"]

@@ -213,6 +213,11 @@ pub async fn render_form(
                 widget = widget(field, value, &m2o),
                 error = error.unwrap_or_default(),
             ));
+            // Custom fields anchored to render right after this one (Initiative
+            // #2 placement). Empty unless an admin positioned a field here.
+            body.push_str(
+                &crate::custom_fields::render_anchor_group(db, &config.table, record_id, &field.name).await,
+            );
         }
         body.push_str("</div>");
     }
