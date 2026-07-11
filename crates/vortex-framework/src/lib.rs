@@ -58,6 +58,7 @@ pub mod flash;
 pub mod qr;
 pub mod record_panel;
 pub mod registry;
+pub mod saved_views;
 pub mod report_jobs;
 pub mod reports;
 pub mod scheduler;

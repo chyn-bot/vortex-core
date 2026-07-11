@@ -1,0 +1,5 @@
+# Migration metadata for 141_saved_views
+module = "core"
+description = "Saveable analytic views: saved_view (pivot/graph/kanban/calendar configs as owner/shared user records). Replaces the never-created ir_ui_view tables."
+reversible = true
+dependencies = ["122_model_registry"]

@@ -2182,6 +2182,9 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/graph/{model}", get(generic_graph_view))
         .route("/calendar/{model}", get(generic_calendar_view))
         .route("/pivot/{model}", get(generic_pivot_view))
+        // Saved analytic views (Initiative #4)
+        .route("/views/save", post(saved_view_save))
+        .route("/views/{id}/delete", post(saved_view_delete))
         // Saved filters API
         .route("/api/filters/{model}", get(get_filters))
         .route("/api/filters/{model}", post(save_filter))
@@ -6907,6 +6910,88 @@ body {{ background: oklch(var(--b2)); color: oklch(var(--bc)); }}
 }
 
 // ============================================================================
+// Saved analytic views (Initiative #4)
+// ============================================================================
+// Persist a pivot/graph/kanban/calendar configuration as an owner/shared user
+// record so operators can name and revisit a breakdown. See
+// vortex_framework::saved_views for the registry-checked config model.
+
+/// Pull the `cfg_<key>` fields out of a posted view-save form into a raw config
+/// bag (the module re-validates every key against the registry).
+fn collect_view_config(
+    form: &std::collections::HashMap<String, String>,
+) -> std::collections::BTreeMap<String, String> {
+    form.iter()
+        .filter_map(|(k, v)| k.strip_prefix("cfg_").map(|key| (key.to_string(), v.clone())))
+        .filter(|(_, v)| !v.trim().is_empty())
+        .collect()
+}
+
+/// POST /views/save — validate and persist the current analytic view config,
+/// then redirect back to that view with the saved config applied.
+async fn saved_view_save(
+    State(_state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Form(form): Form<std::collections::HashMap<String, String>>,
+) -> Response {
+    let model = form.get("model").map(String::as_str).unwrap_or("");
+    let view_type = form.get("view_type").map(String::as_str).unwrap_or("");
+    let name = form.get("name").map(String::as_str).unwrap_or("");
+    let is_shared = form.get("is_shared").map(|v| v == "1" || v == "on").unwrap_or(false);
+    let is_default = form.get("is_default").map(|v| v == "1" || v == "on").unwrap_or(false);
+    let fallback = format!("/{}/{}", view_type, model);
+    let redirect = form.get("redirect").map(String::as_str).filter(|s| s.starts_with('/')).unwrap_or(&fallback);
+    let raw = collect_view_config(&form);
+
+    match vortex_framework::saved_views::create(
+        &db, model, view_type, name, &raw, user.id, is_shared, is_default,
+    )
+    .await
+    {
+        Ok(id) => match vortex_framework::saved_views::load(&db, id).await {
+            // Land on the freshly saved view so the user sees it applied.
+            Some(v) => {
+                let qs = v.query_string();
+                let target = if qs.is_empty() { fallback.clone() } else { format!("/{}/{}?{}", view_type, model, qs) };
+                vortex_framework::flash::flash_redirect(
+                    &target,
+                    vortex_framework::flash::FlashKind::Success,
+                    &format!("Saved view “{}”.", v.name),
+                )
+            }
+            None => Redirect::to(redirect).into_response(),
+        },
+        Err(e) => {
+            // Bounce back to the view with the error surfaced as a toast.
+            vortex_framework::flash::flash_redirect(
+                redirect,
+                vortex_framework::flash::FlashKind::Error,
+                &e,
+            )
+        }
+    }
+}
+
+/// POST /views/{id}/delete — remove a saved view the user owns (or any, if admin).
+async fn saved_view_delete(
+    State(_state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Path(id): Path<uuid::Uuid>,
+    Form(form): Form<std::collections::HashMap<String, String>>,
+) -> Response {
+    let redirect = form.get("redirect").map(String::as_str).filter(|s| s.starts_with('/')).unwrap_or("/home").to_string();
+    match vortex_framework::saved_views::load(&db, id).await {
+        Some(v) if v.can_edit(user.id, user.is_admin()) => {
+            let _ = vortex_framework::saved_views::delete(&db, id).await;
+        }
+        _ => return (StatusCode::FORBIDDEN, "Not permitted").into_response(),
+    }
+    Redirect::to(&redirect).into_response()
+}
+
+// ============================================================================
 // Generic Kanban View
 // ============================================================================
 
@@ -6915,6 +7000,7 @@ async fn generic_kanban_view(
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
     Path(model_name): Path<String>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     // Fetch model metadata
     let model_row = match sqlx::query(
@@ -6931,30 +7017,30 @@ async fn generic_kanban_view(
     let model_display_name: String = model_row.get("display_name");
     let table_name: String = model_row.get("table_name");
 
-    // Fetch kanban view configuration
-    let kanban_config = sqlx::query(
-        r#"SELECT k.card_title_field, k.card_subtitle_field, k.group_by_field, k.card_tags_field
-           FROM ir_ui_view v
-           JOIN ir_ui_view_kanban k ON k.view_id = v.id
-           WHERE v.model_id = $1 AND v.view_type = 'kanban' AND v.active = true
-           ORDER BY v.priority LIMIT 1"#
-    )
-    .bind(model_id)
-    .fetch_optional(&db)
-    .await
-    .ok()
-    .flatten();
+    // Kanban grouping: query param → shared default saved view → none. This
+    // replaces the never-created ir_ui_view_kanban join; card title stays the
+    // conventional `name` (records are grouped in-memory, so the column name is
+    // only ever used as a safe map key, never interpolated into SQL).
+    let default_cfg = vortex_framework::saved_views::default_config_for(&db, &model_name, "kanban")
+        .await
+        .unwrap_or_default();
+    let title_field = "name".to_string();
+    let subtitle_field: Option<String> = None;
+    let tags_field: Option<String> = None;
+    let group_by_field: Option<String> = params
+        .get("group_by")
+        .cloned()
+        .or_else(|| default_cfg.get("group_by").cloned());
 
-    // Default config if none defined
-    let title_field = kanban_config.as_ref()
-        .and_then(|r| r.try_get::<String, _>("card_title_field").ok())
-        .unwrap_or_else(|| "name".to_string());
-    let subtitle_field: Option<String> = kanban_config.as_ref()
-        .and_then(|r| r.try_get("card_subtitle_field").ok());
-    let group_by_field: Option<String> = kanban_config.as_ref()
-        .and_then(|r| r.try_get("group_by_field").ok());
-    let tags_field: Option<String> = kanban_config.as_ref()
-        .and_then(|r| r.try_get("card_tags_field").ok());
+    // Saved-views toolbar config (only a chosen grouping is worth saving).
+    let mut current_cfg = std::collections::BTreeMap::new();
+    if let Some(g) = &group_by_field {
+        current_cfg.insert("group_by".to_string(), g.clone());
+    }
+    let view_bar = vortex_framework::saved_views::render_view_bar(
+        &db, &model_name, "kanban", &current_cfg, user.id, user.is_admin(),
+    )
+    .await;
 
     // Fetch field metadata for grouping field options
     let group_options: Vec<(String, String)> = if let Some(ref group_field) = group_by_field {
@@ -7066,7 +7152,7 @@ async fn generic_kanban_view(
     let sidebar_menu = build_sidebar_menu(&db, &user.roles, &model_name).await;
 
     // Build full page
-    Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style><title>{} - Kanban</title>
+    let html = format!(r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style><title>{} - Kanban</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
 <link href="/static/vortex.css?v=18" rel="stylesheet"/>
@@ -7120,6 +7206,7 @@ body {{ background: oklch(var(--b2)); color: oklch(var(--bc)); }}
             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 10h18M3 14h18m-9-4v8m-7 0h14a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg>
         </a>
     </div>
+    <!--VIEW_BAR-->
     <a href="/{}/new" class="btn btn-primary btn-sm" style="background:#8BC53F;border-color:#8BC53F;color:#000">+ New</a>
 </div>
 </div>
@@ -7135,7 +7222,8 @@ body {{ background: oklch(var(--b2)); color: oklch(var(--bc)); }}
         model_display_name,
         model_name, model_name, model_name, model_name, model_name,
         columns_html
-    )).into_response()
+    );
+    Html(html.replace("<!--VIEW_BAR-->", &view_bar)).into_response()
 }
 
 // ============================================================================
@@ -7147,6 +7235,7 @@ async fn generic_graph_view(
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
     Path(model_name): Path<String>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     // Fetch model metadata
     let model_row = match sqlx::query(
@@ -7162,27 +7251,53 @@ async fn generic_graph_view(
     let model_id: uuid::Uuid = model_row.get("id");
     let model_display_name: String = model_row.get("display_name");
     let table_name: String = model_row.get("table_name");
+    if !validate_identifier(&table_name) {
+        return (StatusCode::BAD_REQUEST, Html("Invalid model".to_string())).into_response();
+    }
 
-    // Fetch graph view configuration
-    let graph_config = sqlx::query(
-        r#"SELECT g.graph_type, g.measure_field, g.measure_type, g.group_by_field
-           FROM ir_ui_view v
-           JOIN ir_ui_view_graph g ON g.view_id = v.id
-           WHERE v.model_id = $1 AND v.view_type = 'graph' AND v.active = true
-           ORDER BY v.priority LIMIT 1"#
+    // Registered field names — the allow-list the group-by column must be in, so
+    // it can never become an arbitrary SQL fragment.
+    let field_list: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM ir_model_field WHERE model_id = $1 ORDER BY sequence, name",
     )
     .bind(model_id)
-    .fetch_optional(&db)
+    .fetch_all(&db)
     .await
-    .ok()
-    .flatten();
+    .unwrap_or_default();
+    let field_set: std::collections::HashSet<&str> = field_list.iter().map(String::as_str).collect();
 
-    let graph_type = graph_config.as_ref()
-        .and_then(|r| r.try_get::<String, _>("graph_type").ok())
-        .unwrap_or_else(|| "bar".to_string());
-    let group_by_field = graph_config.as_ref()
-        .and_then(|r| r.try_get::<String, _>("group_by_field").ok())
-        .unwrap_or_else(|| "contact_type".to_string());
+    // Config precedence: explicit query params → shared default saved view →
+    // sensible fallback. This replaces the never-created ir_ui_view join.
+    let default_cfg = vortex_framework::saved_views::default_config_for(&db, &model_name, "graph")
+        .await
+        .unwrap_or_default();
+    let pick = |key: &str| params.get(key).cloned().or_else(|| default_cfg.get(key).cloned());
+
+    let graph_type = match pick("type") {
+        Some(t) if vortex_framework::saved_views::GRAPH_TYPES.iter().any(|(c, _)| *c == t) => t,
+        _ => "bar".to_string(),
+    };
+    // Must be a real, registered column; else fall back to the first field so the
+    // page still renders (never interpolate an unvalidated identifier).
+    let group_by_field = pick("group_by")
+        .filter(|g| field_set.contains(g.as_str()))
+        .or_else(|| {
+            ["contact_type", "state", "record_state"]
+                .iter()
+                .find(|c| field_set.contains(**c))
+                .map(|c| c.to_string())
+                .or_else(|| field_list.first().cloned())
+        })
+        .unwrap_or_else(|| "id".to_string());
+
+    // The config in effect right now, for the "Save current view" action.
+    let mut current_cfg = std::collections::BTreeMap::new();
+    current_cfg.insert("group_by".to_string(), group_by_field.clone());
+    current_cfg.insert("type".to_string(), graph_type.clone());
+    let view_bar = vortex_framework::saved_views::render_view_bar(
+        &db, &model_name, "graph", &current_cfg, user.id, user.is_admin(),
+    )
+    .await;
 
     // Get counts grouped by field
     let query = format!(
@@ -7213,7 +7328,7 @@ async fn generic_graph_view(
     // Build dynamic sidebar
     let sidebar_menu = build_sidebar_menu(&db, &user.roles, &model_name).await;
 
-    Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style><title>{} - Graph</title>
+    let html = format!(r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style><title>{} - Graph</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
 <link href="/static/vortex.css?v=18" rel="stylesheet"/>
@@ -7267,6 +7382,7 @@ body {{ background: oklch(var(--b2)); color: oklch(var(--bc)); }}
             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 10h18M3 14h18m-9-4v8m-7 0h14a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg>
         </a>
     </div>
+    <!--VIEW_BAR-->
     <a href="/{}/new" class="btn btn-primary btn-sm" style="background:#8BC53F;border-color:#8BC53F;color:#000">+ New</a>
 </div>
 </div>
@@ -7334,7 +7450,8 @@ new Chart(document.getElementById('pieChart'), {{
         group_by_field,
         labels_json, data_json, colors_json,
         graph_type
-    )).into_response()
+    );
+    Html(html.replace("<!--VIEW_BAR-->", &view_bar)).into_response()
 }
 
 // ============================================================================
@@ -7362,21 +7479,38 @@ async fn generic_calendar_view(
     let model_id: uuid::Uuid = model_row.get("id");
     let model_display_name: String = model_row.get("display_name");
     let table_name: String = model_row.get("table_name");
+    if !validate_identifier(&table_name) {
+        return (StatusCode::BAD_REQUEST, Html("Invalid model".to_string())).into_response();
+    }
 
-    // Find date field for this model
-    let date_field: String = sqlx::query_scalar(
-        "SELECT field_name FROM ir_model_field WHERE model_id = $1 AND field_type IN ('date', 'datetime') ORDER BY field_name LIMIT 1"
+    // Candidate date columns (registry) — the calendar axis must be one of these
+    // real date/datetime fields, so it is safe to interpolate. (The registry
+    // column is `name`; the old query used a non-existent `field_name` and so
+    // always fell back to created_at.)
+    let date_fields: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM ir_model_field WHERE model_id = $1 AND field_type IN ('date', 'datetime') ORDER BY sequence, name",
     )
     .bind(model_id)
-    .fetch_optional(&db)
+    .fetch_all(&db)
     .await
-    .ok()
-    .flatten()
-    .unwrap_or_else(|| "created_at".to_string());
+    .unwrap_or_default();
 
-    // Find name/title field
+    // Axis: query param → shared default saved view → first date field →
+    // created_at. Replaces the never-created ir_ui_view calendar config.
+    let default_cfg = vortex_framework::saved_views::default_config_for(&db, &model_name, "calendar")
+        .await
+        .unwrap_or_default();
+    let date_field: String = params
+        .get("date_field")
+        .cloned()
+        .or_else(|| default_cfg.get("date_field").cloned())
+        .filter(|d| date_fields.iter().any(|f| f == d))
+        .or_else(|| date_fields.first().cloned())
+        .unwrap_or_else(|| "created_at".to_string());
+
+    // Find name/title field (registry column is `name`).
     let name_field: String = sqlx::query_scalar(
-        "SELECT field_name FROM ir_model_field WHERE model_id = $1 AND field_name IN ('name', 'title', 'subject') LIMIT 1"
+        "SELECT name FROM ir_model_field WHERE model_id = $1 AND name IN ('name', 'title', 'subject') LIMIT 1"
     )
     .bind(model_id)
     .fetch_optional(&db)
@@ -7384,6 +7518,14 @@ async fn generic_calendar_view(
     .ok()
     .flatten()
     .unwrap_or_else(|| "id".to_string());
+
+    // Saved-views toolbar config.
+    let mut current_cfg = std::collections::BTreeMap::new();
+    current_cfg.insert("date_field".to_string(), date_field.clone());
+    let view_bar = vortex_framework::saved_views::render_view_bar(
+        &db, &model_name, "calendar", &current_cfg, user.id, user.is_admin(),
+    )
+    .await;
 
     // Parse year/month from query params or use current
     let now = chrono::Utc::now();
@@ -7482,7 +7624,7 @@ async fn generic_calendar_view(
     // Build dynamic sidebar
     let sidebar_menu = build_sidebar_menu(&db, &user.roles, &model_name).await;
 
-    Html(format!(r##"<!DOCTYPE html>
+    let html = format!(r##"<!DOCTYPE html>
 <html data-theme="dark">
 <head>
     <script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style>
@@ -7521,6 +7663,7 @@ async fn generic_calendar_view(
                         <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"/></svg>
                     </a>
                 </div>
+                <!--VIEW_BAR-->
                 <a href="/{}/new" class="btn btn-primary btn-sm">+ New</a>
             </div>
         </div>
@@ -7556,7 +7699,8 @@ async fn generic_calendar_view(
         month_name, year,
         model_name, next_year, next_month,
         calendar_cells
-    )).into_response()
+    );
+    Html(html.replace("<!--VIEW_BAR-->", &view_bar)).into_response()
 }
 
 // ============================================================================
@@ -7614,13 +7758,31 @@ async fn generic_pivot_view(
         field_info.insert(name, (field_type, display_name, related_model));
     }
 
-    // Get selected fields from params - support multiple row/col groups (comma-separated).
+    // Seed unset params from the shared default saved view for this model
+    // (replaces the never-created ir_ui_view default lookup); explicit query
+    // params always win. `expanded` is transient UI state, never persisted.
+    let default_cfg = vortex_framework::saved_views::default_config_for(&db, &model_name, "pivot")
+        .await
+        .unwrap_or_default();
+    let eff = |key: &str, fallback: &str| -> String {
+        params
+            .get(key)
+            .cloned()
+            .or_else(|| default_cfg.get(key).cloned())
+            .unwrap_or_else(|| fallback.to_string())
+    };
+    let rows_val = eff("rows", "");
+    let cols_val = eff("cols", "");
+    let measure_val = eff("measure", "id");
+    let agg_val = eff("agg", "count");
+
+    // Get selected fields - support multiple row/col groups (comma-separated).
     // Default to empty: the pivot renders with no groups until the user picks one
     // from the "Add Group" dropdown. Don't assume any specific column exists.
-    let row_groups_str = params.get("rows").map(|s| s.as_str()).unwrap_or("");
-    let col_groups_str = params.get("cols").map(|s| s.as_str()).unwrap_or("");
-    let measure_field = params.get("measure").map(|s| s.as_str()).unwrap_or("id");
-    let measure_type = params.get("agg").map(|s| s.as_str()).unwrap_or("count");
+    let row_groups_str = rows_val.as_str();
+    let col_groups_str = cols_val.as_str();
+    let measure_field = measure_val.as_str();
+    let measure_type = agg_val.as_str();
     let expanded_str = params.get("expanded").map(|s| s.as_str()).unwrap_or("");
     // `expanded=*` means "expand all" — every non-leaf row is rendered expanded.
     let expand_all = expanded_str == "*";
@@ -7633,6 +7795,24 @@ async fn generic_pivot_view(
     } else {
         expanded_str.split(',').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect()
     };
+
+    // The config in effect right now, for the "Saved views" toolbar. Only offer
+    // to save once at least one group is chosen (an empty pivot is not a view).
+    let mut current_cfg = std::collections::BTreeMap::new();
+    if !row_groups.is_empty() {
+        current_cfg.insert("rows".to_string(), row_groups.join(","));
+    }
+    if !col_groups.is_empty() {
+        current_cfg.insert("cols".to_string(), col_groups.join(","));
+    }
+    if !current_cfg.is_empty() {
+        current_cfg.insert("measure".to_string(), measure_field.to_string());
+        current_cfg.insert("agg".to_string(), measure_type.to_string());
+    }
+    let view_bar = vortex_framework::saved_views::render_view_bar(
+        &db, &model_name, "pivot", &current_cfg, user.id, user.is_admin(),
+    )
+    .await;
 
     // Build groupable field options for the add-group dropdowns
     let mut groupable_fields: Vec<(&str, &str)> = Vec::new();
@@ -8013,7 +8193,7 @@ async fn generic_pivot_view(
     // Build dynamic sidebar
     let sidebar_menu = build_sidebar_menu(&db, &user.roles, &model_name).await;
 
-    Html(format!(r##"<!DOCTYPE html>
+    let html = format!(r##"<!DOCTYPE html>
 <html data-theme="dark">
 <head>
     <script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style>
@@ -8122,6 +8302,7 @@ async fn generic_pivot_view(
                         <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 10h18M3 14h18m-9-4v8m-7 0h14a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg>
                     </a>
                 </div>
+                <!--VIEW_BAR-->
                 <a href="/{}/new" class="btn btn-sm" style="background:#8BC53F;border-color:#8BC53F;color:#000">+ New</a>
             </div>
         </div>
@@ -8218,7 +8399,8 @@ async fn generic_pivot_view(
         available_field_options,
         // Table
         table_html
-    )).into_response()
+    );
+    Html(html.replace("<!--VIEW_BAR-->", &view_bar)).into_response()
 }
 
 fn format_pivot_number(val: f64, measure_type: &str) -> String {

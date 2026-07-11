@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 #
-# review_build.sh — verify the governed-low-code work (Initiatives #1–#5).
+# review_build.sh — verify the governed-low-code work (Initiatives #1–#5 + the
+# #4 saved-views tail).
 #
 # What it checks, end to end:
 #   Build   — the whole workspace compiles.
@@ -99,6 +100,7 @@ run_unit vortex-framework custom_fields   "custom-fields logic"
 run_unit vortex-framework automation      "automation logic"
 run_unit vortex-framework computed_fields "computed-fields logic"
 run_unit vortex-framework dashboards      "dashboards logic"
+run_unit vortex-framework saved_views     "saved-views logic"
 
 # ── 3. provision throwaway DB ────────────────────────────────────────────────
 hdr "Provision throwaway DB (applies all migrations + derive-sync)"
@@ -177,6 +179,21 @@ if VORTEX_TEST_DB="$DBURL" cargo test -p vortex-framework widget_compute_against
   pass "KPI + bars widgets compute against a registered model"
 else
   fail "dashboard widget compute — see /tmp/rb_dash.log"; grep -E 'panicked|assert|FAILED' /tmp/rb_dash.log | head
+fi
+
+# ── 9. Initiative #4 tail — saveable analytic views ──────────────────────────
+hdr "#4-tail  saveable analytic views (pivot/graph/kanban/calendar)"
+check "migration 141: saved_view table" "$(q "SELECT to_regclass('saved_view') IS NOT NULL;")" "t"
+check "one shared default per (model,view_type)" \
+      "$(q "SELECT COUNT(*) FROM pg_indexes WHERE indexname = 'uq_saved_view_default';")" "1"
+check "no phantom ir_ui_view tables remain referenced" \
+      "$(q "SELECT to_regclass('ir_ui_view') IS NULL;")" "t"
+# Real round-trip: validate a config against the registry, persist, load, default.
+if VORTEX_TEST_DB="$DBURL" cargo test -p vortex-framework saved_view_roundtrip_against_db -- --nocapture >/tmp/rb_views.log 2>&1 \
+   && grep -q "1 passed" /tmp/rb_views.log; then
+  pass "config validate → save → load → default over a registered model"
+else
+  fail "saved-view round-trip — see /tmp/rb_views.log"; grep -E 'panicked|assert|FAILED' /tmp/rb_views.log | head
 fi
 
 # ── summary ──────────────────────────────────────────────────────────────────
