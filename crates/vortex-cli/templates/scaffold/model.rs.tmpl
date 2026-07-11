@@ -1,0 +1,41 @@
+//! The `__PASCAL__Item` model — declared with `#[derive(Model)]`.
+//!
+//! This is the **registry source of truth** for the `__SNAKE___item` table.
+//! `Plugin::models()` returns `__PASCAL__Item::meta()`, and the host projects it
+//! into `ir_model` / `ir_model_field` after migrations (see
+//! `vortex_orm::registry_sync`) — so there is **no hand-seeded registry SQL** in
+//! the migration. The default list and form are *generated* from this metadata
+//! (`FormConfig::from_model_fields` / `ListConfig::from_model` in `handlers.rs`).
+//!
+//! Add a field here and it flows to the registry, the generic REST API, and the
+//! generated screens. `Option<T>` fields are optional; non-`Option` fields are
+//! required.
+
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+use vortex_orm::prelude::Model;
+
+/// Registry projection of the `__SNAKE___item` table.
+#[derive(Debug, Clone, Serialize, Deserialize, Model)]
+#[vortex(table = "__SNAKE___item", module = "__SNAKE__", name = "__SNAKE___item", label = "__DISPLAY__ Item")]
+pub struct __PASCAL__Item {
+    #[vortex(primary_key)]
+    pub id: Uuid,
+
+    /// Stamped from the sequence after insert; not entered on the form.
+    #[vortex(label = "Code", ui_type = "string")]
+    pub code: Option<String>,
+
+    #[vortex(label = "Name", ui_type = "string")]
+    pub name: String,
+
+    #[vortex(label = "Description", ui_type = "text")]
+    pub description: Option<String>,
+
+    /// Managed by the status bar, not the create form.
+    #[vortex(label = "State", selection = "draft,confirmed,done,cancelled")]
+    pub record_state: String,
+
+    #[vortex(label = "Active")]
+    pub active: bool,
+}

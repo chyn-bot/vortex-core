@@ -33,13 +33,18 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/__KEBAB__/{id}/status/{state}", post(change_status))
 }
 
-/// The form, declared once — rendering, validation, and persistence
-/// all derive from this. Add a field here and it exists everywhere.
+/// The create/edit form — *generated* from the `#[derive(Model)]`
+/// metadata (Initiative #6), narrowed to the fields a user actually
+/// types. Add a field in `model.rs`, then list its name here to surface
+/// it (order is honoured). Widgets, labels and required-ness come from
+/// the model; no need to restate them. For a fully hand-built form,
+/// swap this for `FormConfig::new(...).field(...)`.
 fn item_form() -> FormConfig {
-    FormConfig::new("__DISPLAY__ Item", "__SNAKE___item", "/__KEBAB__")
-        .section("Details")
-        .field(FormField::text("name", "Name").required().placeholder("A descriptive name"))
-        .field(FormField::textarea("description", "Description"))
+    FormConfig::from_model_fields(
+        <crate::model::__PASCAL__Item as vortex_plugin_sdk::orm::model::Model>::meta(),
+        "/__KEBAB__",
+        &["name", "description"],
+    )
 }
 
 /// Platform HTML shell: sidebar, vendored assets, mobile layout.
@@ -86,30 +91,19 @@ async fn list_items(
     Query(query): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     use vortex_plugin_sdk::framework::list::{
-        execute_list, render_list, ListColumn, ListConfig, ListParams,
+        execute_list, render_list, ListConfig, ListParams,
     };
 
-    let config = ListConfig::new("__DISPLAY__", "__SNAKE___item")
-        .detail_url("/__KEBAB__/{id}")
-        .create("+ New", "/__KEBAB__/new")
-        .column(ListColumn::new("code", "Code").sortable().code())
-        .column(ListColumn::new("name", "Name").sortable().searchable())
-        .column(
-            ListColumn::new("record_state", "State")
-                .filterable(&[
-                    ("draft", "Draft"),
-                    ("confirmed", "Confirmed"),
-                    ("done", "Done"),
-                    ("cancelled", "Cancelled"),
-                ])
-                .badge(&[
-                    ("draft", "Draft", "badge-neutral"),
-                    ("confirmed", "Confirmed", "badge-info"),
-                    ("done", "Done", "badge-success"),
-                    ("cancelled", "Cancelled", "badge-error"),
-                ]),
-        )
-        .column(ListColumn::new("created_at", "Created").sortable());
+    // Columns are *generated* from the `#[derive(Model)]` metadata
+    // (Initiative #6): scalar fields become sortable/searchable columns,
+    // booleans render as badges. To hand-pick columns, filters and
+    // coloured status badges, swap this for
+    // `ListConfig::new("__DISPLAY__", "__SNAKE___item").column(...)`.
+    let config = ListConfig::from_model(
+        <crate::model::__PASCAL__Item as vortex_plugin_sdk::orm::model::Model>::meta(),
+    )
+    .detail_url("/__KEBAB__/{id}")
+    .create("+ New", "/__KEBAB__/new");
 
     let params = ListParams::from_query(&query);
     let table = match execute_list(&db, &config, &params).await {

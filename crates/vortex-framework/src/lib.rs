@@ -44,6 +44,7 @@ pub mod dashboards;
 pub mod duplicate;
 pub mod files;
 pub mod form;
+pub mod generate;
 pub mod i18n;
 pub mod jobs;
 pub mod list;
