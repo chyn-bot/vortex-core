@@ -2194,6 +2194,8 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/graph/{model}", get(generic_graph_view))
         .route("/calendar/{model}", get(generic_calendar_view))
         .route("/pivot/{model}", get(generic_pivot_view))
+        .route("/pivot/{model}/data", get(generic_pivot_data))
+        .route("/pivot/{model}/values", get(generic_pivot_values))
         // Saved analytic views (Initiative #4)
         .route("/views/save", post(saved_view_save))
         .route("/views/{id}/delete", post(saved_view_delete))
@@ -7730,31 +7732,33 @@ async fn generic_calendar_view(
 }
 
 // ============================================================================
-// Pivot View
+// Generic Pivot View (Excel-style, client-rendered)
 // ============================================================================
+// The page ships a drag-and-drop PivotTable-Fields pane (see /static/pivot.js);
+// aggregation happens server-side in `generic_pivot_data`, which returns a JSON
+// matrix with subtotals/grand-totals computed by SQL ROLLUP.
 
 async fn generic_pivot_view(
-    State(state): State<Arc<AppState>>,
+    State(_state): State<Arc<AppState>>,
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
     Path(model_name): Path<String>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
-    // Fetch model metadata
+    use vortex_framework::ui::html_escape;
+
     let model_row = match sqlx::query(
-        "SELECT id, display_name, table_name, list_url FROM ir_model WHERE name = $1 AND is_active = true"
+        "SELECT id, display_name, table_name, list_url FROM ir_model WHERE name = $1 AND is_active = true",
     )
     .bind(&model_name)
     .fetch_optional(&db)
-    .await {
+    .await
+    {
         Ok(Some(row)) => row,
         _ => return (StatusCode::NOT_FOUND, Html("Model not found")).into_response(),
     };
-
     let model_id: uuid::Uuid = model_row.get("id");
     let model_display_name: String = model_row.get("display_name");
-    let table_name: String = model_row.get("table_name");
-    // Canonical list URL (plugin-provided when present, generic /list/{model} otherwise)
     let list_view_url: String = model_row
         .try_get::<Option<String>, _>("list_url")
         .ok()
@@ -7762,683 +7766,512 @@ async fn generic_pivot_view(
         .filter(|u| !u.is_empty())
         .unwrap_or_else(|| format!("/list/{}", model_name));
 
-    // Fetch available fields for pivot configuration
+    // Fields for the pane: groupable dimensions + numeric measures.
     let fields = sqlx::query(
-        r#"SELECT name, field_type, display_name, related_model
-           FROM ir_model_field
-           WHERE model_id = $1
-           ORDER BY sequence, name"#
+        "SELECT name, field_type, display_name FROM ir_model_field WHERE model_id = $1 ORDER BY sequence, name",
     )
     .bind(model_id)
     .fetch_all(&db)
     .await
     .unwrap_or_default();
-
-    // Build field info map for many2one lookups and display names
-    let mut field_info: std::collections::HashMap<String, (String, String, Option<String>)> = std::collections::HashMap::new();
-    for field in &fields {
-        let name: String = field.get("name");
-        let field_type: String = field.get("field_type");
-        let display_name: String = field.get("display_name");
-        let related_model: Option<String> = field.try_get("related_model").ok();
-        field_info.insert(name, (field_type, display_name, related_model));
+    let mut field_arr: Vec<serde_json::Value> = Vec::new();
+    for f in &fields {
+        let name: String = f.get("name");
+        let ftype: String = f.get("field_type");
+        let label: String = f.get("display_name");
+        let numeric = matches!(ftype.as_str(), "integer" | "float" | "decimal" | "monetary" | "number");
+        let groupable = matches!(
+            ftype.as_str(),
+            "selection" | "string" | "char" | "many2one" | "boolean" | "date" | "datetime"
+        );
+        if groupable || numeric {
+            field_arr.push(serde_json::json!({"name": name, "label": label, "numeric": numeric}));
+        }
     }
+    let fields_json = serde_json::to_string(&field_arr).unwrap_or_else(|_| "[]".to_string());
 
-    // Seed unset params from the shared default saved view for this model
-    // (replaces the never-created ir_ui_view default lookup); explicit query
-    // params always win. `expanded` is transient UI state, never persisted.
+    // Initial config: query params win, else the shared default saved view.
     let default_cfg = vortex_framework::saved_views::default_config_for(&db, &model_name, "pivot")
         .await
         .unwrap_or_default();
-    let eff = |key: &str, fallback: &str| -> String {
-        params
-            .get(key)
-            .cloned()
-            .or_else(|| default_cfg.get(key).cloned())
-            .unwrap_or_else(|| fallback.to_string())
-    };
-    let rows_val = eff("rows", "");
-    let cols_val = eff("cols", "");
-    let measure_val = eff("measure", "id");
-    let agg_val = eff("agg", "count");
+    let pick = |k: &str| params.get(k).cloned().or_else(|| default_cfg.get(k).cloned());
+    let rows_v = pick("rows").unwrap_or_default();
+    let cols_v = pick("cols").unwrap_or_default();
+    let measure_v = pick("measure").unwrap_or_else(|| "id".to_string());
+    let agg_v = pick("agg").unwrap_or_else(|| "count".to_string());
+    // New (all optional): multiple measures, pinned filters, saved collapse state.
+    let vals_v = pick("vals").unwrap_or_default();
+    let filters_v = pick("filters").unwrap_or_default();
+    let collapsed_v = pick("collapsed").unwrap_or_default();
+    let config_json = serde_json::json!({
+        "rows": rows_v.split(',').filter(|s| !s.is_empty()).collect::<Vec<_>>(),
+        "cols": cols_v.split(',').filter(|s| !s.is_empty()).collect::<Vec<_>>(),
+        "measure": measure_v,
+        "agg": agg_v,
+        "vals": vals_v,
+        "filters": filters_v,
+        "collapsed": collapsed_v,
+    })
+    .to_string();
 
-    // Get selected fields - support multiple row/col groups (comma-separated).
-    // Default to empty: the pivot renders with no groups until the user picks one
-    // from the "Add Group" dropdown. Don't assume any specific column exists.
-    let row_groups_str = rows_val.as_str();
-    let col_groups_str = cols_val.as_str();
-    let measure_field = measure_val.as_str();
-    let measure_type = agg_val.as_str();
-    let expanded_str = params.get("expanded").map(|s| s.as_str()).unwrap_or("");
-    // `expanded=*` means "expand all" — every non-leaf row is rendered expanded.
-    let expand_all = expanded_str == "*";
-
-    // Parse row and column groups
-    let row_groups: Vec<&str> = row_groups_str.split(',').filter(|s| !s.is_empty()).collect();
-    let col_groups: Vec<&str> = col_groups_str.split(',').filter(|s| !s.is_empty()).collect();
-    let expanded_paths: std::collections::HashSet<String> = if expand_all {
-        std::collections::HashSet::new()
-    } else {
-        expanded_str.split(',').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect()
-    };
-
-    // The config in effect right now, for the "Saved views" toolbar. Only offer
-    // to save once at least one group is chosen (an empty pivot is not a view).
+    // Saved-views bar reflects the current config. measure+agg are always present
+    // so the save form renders even for a bare pivot; the client keeps the
+    // remaining cfg_* hidden inputs in step with live drag-drop state.
     let mut current_cfg = std::collections::BTreeMap::new();
-    if !row_groups.is_empty() {
-        current_cfg.insert("rows".to_string(), row_groups.join(","));
-    }
-    if !col_groups.is_empty() {
-        current_cfg.insert("cols".to_string(), col_groups.join(","));
-    }
-    if !current_cfg.is_empty() {
-        current_cfg.insert("measure".to_string(), measure_field.to_string());
-        current_cfg.insert("agg".to_string(), measure_type.to_string());
+    current_cfg.insert("measure".to_string(), measure_v.clone());
+    current_cfg.insert("agg".to_string(), agg_v.clone());
+    for (k, v) in [
+        ("rows", &rows_v),
+        ("cols", &cols_v),
+        ("vals", &vals_v),
+        ("filters", &filters_v),
+        ("collapsed", &collapsed_v),
+    ] {
+        if !v.is_empty() {
+            current_cfg.insert(k.to_string(), v.clone());
+        }
     }
     let view_bar = vortex_framework::saved_views::render_view_bar(
         &db, &model_name, "pivot", &current_cfg, user.id, user.is_admin(),
     )
     .await;
 
-    // Build groupable field options for the add-group dropdowns
-    let mut groupable_fields: Vec<(&str, &str)> = Vec::new();
-    for field in &fields {
-        let name: String = field.get("name");
-        let display_name: String = field.get("display_name");
-        let field_type: String = field.get("field_type");
-        if matches!(field_type.as_str(), "selection" | "string" | "char" | "many2one" | "boolean") {
-            // Store references from field_info
-            if let Some((_, dn, _)) = field_info.get(&name) {
-                groupable_fields.push((Box::leak(name.into_boxed_str()), Box::leak(dn.clone().into_boxed_str())));
-            }
-        }
-    }
-
-    // Helper to build SQL expression for a field (handles many2one joins)
-    fn build_field_expr(
-        field_name: &str,
-        idx: usize,
-        field_info: &std::collections::HashMap<String, (String, String, Option<String>)>,
-        joins: &mut Vec<String>,
-        selects: &mut Vec<String>,
-        group_bys: &mut Vec<String>,
-    ) {
-        if let Some((field_type, _, related_model)) = field_info.get(field_name) {
-            if field_type == "many2one" {
-                if let Some(rel_model) = related_model {
-                    let rel_table = rel_model.replace(".", "_");
-                    let join_alias = format!("j{}", idx);
-                    joins.push(format!(
-                        "LEFT JOIN {} {} ON t.{} = {}.id",
-                        rel_table, join_alias, field_name, join_alias
-                    ));
-                    selects.push(format!("COALESCE({}.name, '(empty)') as f{}", join_alias, idx));
-                    group_bys.push(format!("{}.name", join_alias));
-                    return;
-                }
-            }
-        }
-        selects.push(format!("COALESCE(CAST(t.{} AS TEXT), '(empty)') as f{}", field_name, idx));
-        group_bys.push(format!("t.{}", field_name));
-    }
-
-    // Build aggregation function
-    let agg_func = match measure_type {
-        "sum" => format!("COALESCE(SUM(CAST(t.{} AS NUMERIC)), 0)", measure_field),
-        "avg" => format!("COALESCE(AVG(CAST(t.{} AS NUMERIC)), 0)", measure_field),
-        "min" => format!("COALESCE(MIN(CAST(t.{} AS NUMERIC)), 0)", measure_field),
-        "max" => format!("COALESCE(MAX(CAST(t.{} AS NUMERIC)), 0)", measure_field),
-        _ => "COUNT(*)".to_string(),
-    };
-
-    // Data structure for hierarchical pivot
-    // Key: (row_path_tuple, col_path_tuple) -> measure value
-    // row_path_tuple and col_path_tuple are comma-joined strings of group values
-    let mut pivot_data: std::collections::HashMap<(String, String), f64> = std::collections::HashMap::new();
-    let mut all_row_paths: std::collections::BTreeSet<Vec<String>> = std::collections::BTreeSet::new();
-    let mut all_col_paths: std::collections::BTreeSet<Vec<String>> = std::collections::BTreeSet::new();
-
-    // Query all combinations of row and column groups
-    if !row_groups.is_empty() {
-        let mut joins: Vec<String> = Vec::new();
-        let mut selects: Vec<String> = Vec::new();
-        let mut group_bys: Vec<String> = Vec::new();
-
-        // Add row group fields
-        for (i, &field_name) in row_groups.iter().enumerate() {
-            build_field_expr(field_name, i, &field_info, &mut joins, &mut selects, &mut group_bys);
-        }
-
-        // Add column group fields
-        let col_offset = row_groups.len();
-        for (i, &field_name) in col_groups.iter().enumerate() {
-            build_field_expr(field_name, col_offset + i, &field_info, &mut joins, &mut selects, &mut group_bys);
-        }
-
-        selects.push(format!("{} as measure", agg_func));
-
-        let query = format!(
-            "SELECT {} FROM {} t {} WHERE t.active = true GROUP BY {}",
-            selects.join(", "),
-            table_name,
-            joins.join(" "),
-            group_bys.join(", ")
-        );
-
-        if let Ok(results) = sqlx::query(&query).fetch_all(&db).await {
-            for row in results {
-                // Extract row path
-                let mut row_path: Vec<String> = Vec::new();
-                for i in 0..row_groups.len() {
-                    let val: String = row.try_get(&format!("f{}", i) as &str).unwrap_or_default();
-                    row_path.push(val);
-                }
-
-                // Extract col path
-                let mut col_path: Vec<String> = Vec::new();
-                for i in 0..col_groups.len() {
-                    let val: String = row.try_get(&format!("f{}", col_offset + i) as &str).unwrap_or_default();
-                    col_path.push(val);
-                }
-
-                let measure: f64 = row.try_get::<i64, _>("measure")
-                    .map(|v| v as f64)
-                    .or_else(|_| row.try_get::<f64, _>("measure"))
-                    .or_else(|_| row.try_get::<i32, _>("measure").map(|v| v as f64))
-                    .unwrap_or(0.0);
-
-                // Store all partial row paths for subtotals
-                for depth in 1..=row_path.len() {
-                    all_row_paths.insert(row_path[..depth].to_vec());
-                }
-                for depth in 1..=col_path.len() {
-                    all_col_paths.insert(col_path[..depth].to_vec());
-                }
-                if col_path.is_empty() {
-                    all_col_paths.insert(vec![]);
-                }
-
-                let row_key = row_path.join("\x00");
-                let col_key = col_path.join("\x00");
-
-                *pivot_data.entry((row_key, col_key)).or_insert(0.0) += measure;
-            }
-        }
-    }
-
-    // Calculate subtotals for each row path prefix
-    let mut row_subtotals: std::collections::HashMap<String, std::collections::HashMap<String, f64>> = std::collections::HashMap::new();
-    for ((row_key, col_key), val) in &pivot_data {
-        let row_parts: Vec<&str> = row_key.split('\x00').collect();
-        // Add to all prefix subtotals
-        for depth in 0..=row_parts.len() {
-            let prefix = row_parts[..depth].join("\x00");
-            *row_subtotals.entry(prefix).or_insert_with(std::collections::HashMap::new).entry(col_key.clone()).or_insert(0.0) += val;
-        }
-    }
-
-    // Calculate column totals
-    let mut col_totals: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
-    for ((_, col_key), val) in &pivot_data {
-        *col_totals.entry(col_key.clone()).or_insert(0.0) += val;
-    }
-
-    // Grand total
-    let grand_total: f64 = pivot_data.values().sum();
-
-    // Sort column paths
-    let col_paths_sorted: Vec<Vec<String>> = all_col_paths.into_iter().collect();
-
-    // Build the hierarchical pivot table HTML
-    let mut table_html = String::new();
-
-    // Header rows (one per column group level, or just one if no col groups)
-    table_html.push_str("<thead>");
-    if col_groups.is_empty() {
-        table_html.push_str("<tr><th class=\"pivot-header pivot-row-label\"></th><th class=\"pivot-header\">Total</th></tr>");
-    } else {
-        // Build column headers with hierarchy
-        table_html.push_str("<tr><th class=\"pivot-header pivot-row-label\"></th>");
-        for col_path in &col_paths_sorted {
-            if !col_path.is_empty() {
-                let col_label = col_path.last().unwrap_or(&String::new()).clone();
-                table_html.push_str(&format!("<th class=\"pivot-header\">{}</th>", col_label));
-            }
-        }
-        table_html.push_str("<th class=\"pivot-header pivot-total\">Total</th></tr>");
-    }
-    table_html.push_str("</thead>");
-
-    // Data rows with hierarchy
-    table_html.push_str("<tbody>");
-
-    // Collect unique row paths at each depth and sort them
-    let mut row_paths_by_depth: std::collections::BTreeMap<usize, std::collections::BTreeSet<Vec<String>>> = std::collections::BTreeMap::new();
-    for row_path in &all_row_paths {
-        row_paths_by_depth.entry(row_path.len()).or_insert_with(std::collections::BTreeSet::new).insert(row_path.clone());
-    }
-
-    // Recursive function to render row hierarchy
-    fn render_row_hierarchy(
-        table_html: &mut String,
-        current_path: &[String],
-        depth: usize,
-        max_depth: usize,
-        all_row_paths: &std::collections::BTreeSet<Vec<String>>,
-        row_subtotals: &std::collections::HashMap<String, std::collections::HashMap<String, f64>>,
-        col_paths_sorted: &[Vec<String>],
-        expanded_paths: &std::collections::HashSet<String>,
-        expand_all: bool,
-        row_groups: &[&str],
-        model_name: &str,
-        row_groups_str: &str,
-        col_groups_str: &str,
-        measure_field: &str,
-        measure_type: &str,
-    ) {
-        // Find all children at current level
-        let path_key = current_path.join("\x00");
-        let mut children: Vec<Vec<String>> = Vec::new();
-
-        for row_path in all_row_paths {
-            if row_path.len() == depth + 1 && row_path[..depth] == *current_path {
-                children.push(row_path.clone());
-            }
-        }
-        children.sort();
-
-        for child_path in children {
-            let is_leaf = depth + 1 >= max_depth;
-            let child_key = child_path.join("\x00");
-            let is_expanded = expand_all || expanded_paths.contains(&child_key);
-            let has_children = !is_leaf && all_row_paths.iter().any(|p| p.len() > depth + 1 && p[..depth + 1] == child_path[..]);
-
-            // Calculate indent
-            let indent = depth * 20;
-            let label = child_path.last().unwrap_or(&String::new()).clone();
-
-            // Build toggle URL
-            let mut new_expanded = expanded_paths.clone();
-            if is_expanded {
-                new_expanded.remove(&child_key);
-            } else {
-                new_expanded.insert(child_key.clone());
-            }
-            let expanded_param: String = new_expanded.into_iter().collect::<Vec<_>>().join(",");
-
-            // Row styling based on depth
-            let row_class = format!("pivot-row-level{}", depth);
-
-            table_html.push_str(&format!("<tr class=\"{}\">", row_class));
-
-            // Row label cell with expand/collapse
-            table_html.push_str(&format!("<td class=\"pivot-row-header\" style=\"padding-left: {}px;\">", indent + 8));
-
-            if has_children {
-                let toggle_icon = if is_expanded { "▼" } else { "▶" };
-                table_html.push_str(&format!(
-                    "<a href=\"/pivot/{}?rows={}&cols={}&measure={}&agg={}&expanded={}\" class=\"pivot-toggle\">{}</a> ",
-                    model_name, row_groups_str, col_groups_str, measure_field, measure_type, expanded_param, toggle_icon
-                ));
-            } else {
-                table_html.push_str("<span class=\"pivot-toggle-spacer\"></span>");
-            }
-
-            table_html.push_str(&format!("{}</td>", label));
-
-            // Get subtotals for this row
-            let empty_map = std::collections::HashMap::new();
-            let row_data = row_subtotals.get(&child_key).unwrap_or(&empty_map);
-
-            // Data cells
-            if col_paths_sorted.is_empty() || (col_paths_sorted.len() == 1 && col_paths_sorted[0].is_empty()) {
-                let val = row_data.get("").unwrap_or(&0.0);
-                let cell_class = if *val > 0.0 { "pivot-cell pivot-has-value" } else { "pivot-cell" };
-                table_html.push_str(&format!("<td class=\"{}\">{}</td>", cell_class, format_pivot_number(*val, measure_type)));
-            } else {
-                for col_path in col_paths_sorted {
-                    if !col_path.is_empty() {
-                        let col_key = col_path.join("\x00");
-                        let val = row_data.get(&col_key).unwrap_or(&0.0);
-                        let cell_class = if *val > 0.0 { "pivot-cell pivot-has-value" } else { "pivot-cell" };
-                        table_html.push_str(&format!("<td class=\"{}\">{}</td>", cell_class, format_pivot_number(*val, measure_type)));
-                    }
-                }
-                // Row total
-                let row_total: f64 = row_data.values().sum();
-                table_html.push_str(&format!("<td class=\"pivot-cell pivot-total\">{}</td>", format_pivot_number(row_total, measure_type)));
-            }
-
-            table_html.push_str("</tr>");
-
-            // Recursively render children if expanded
-            if is_expanded && has_children {
-                render_row_hierarchy(
-                    table_html,
-                    &child_path,
-                    depth + 1,
-                    max_depth,
-                    all_row_paths,
-                    row_subtotals,
-                    col_paths_sorted,
-                    expanded_paths,
-                    expand_all,
-                    row_groups,
-                    model_name,
-                    row_groups_str,
-                    col_groups_str,
-                    measure_field,
-                    measure_type,
-                );
-            }
-        }
-    }
-
-    // Render the row hierarchy starting from root
-    render_row_hierarchy(
-        &mut table_html,
-        &[],
-        0,
-        row_groups.len(),
-        &all_row_paths,
-        &row_subtotals,
-        &col_paths_sorted,
-        &expanded_paths,
-        expand_all,
-        &row_groups,
-        &model_name,
-        row_groups_str,
-        col_groups_str,
-        measure_field,
-        measure_type,
-    );
-
-    // Footer row with column totals
-    table_html.push_str("<tr class=\"pivot-footer\"><td class=\"pivot-row-header pivot-total\">Total</td>");
-    if col_paths_sorted.is_empty() || (col_paths_sorted.len() == 1 && col_paths_sorted[0].is_empty()) {
-        table_html.push_str(&format!("<td class=\"pivot-cell pivot-grand-total\">{}</td>", format_pivot_number(grand_total, measure_type)));
-    } else {
-        for col_path in &col_paths_sorted {
-            if !col_path.is_empty() {
-                let col_key = col_path.join("\x00");
-                let col_total = col_totals.get(&col_key).unwrap_or(&0.0);
-                table_html.push_str(&format!("<td class=\"pivot-cell pivot-total\">{}</td>", format_pivot_number(*col_total, measure_type)));
-            }
-        }
-        table_html.push_str(&format!("<td class=\"pivot-cell pivot-grand-total\">{}</td>", format_pivot_number(grand_total, measure_type)));
-    }
-    table_html.push_str("</tr>");
-
-    table_html.push_str("</tbody>");
-
-    // Build row/col group tags with remove buttons
-    let mut row_group_tags = String::new();
-    for (i, &group) in row_groups.iter().enumerate() {
-        let display_name = field_info.get(group).map(|(_, dn, _)| dn.as_str()).unwrap_or(group);
-        let remaining: Vec<&str> = row_groups.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, g)| *g).collect();
-        let remaining_str = remaining.join(",");
-        row_group_tags.push_str(&format!(
-            r#"<span class="group-chip"><span>{}</span><a href="/pivot/{}?rows={}&cols={}&measure={}&agg={}" class="group-chip-remove" title="Remove">×</a></span>"#,
-            display_name, model_name, remaining_str, col_groups_str, measure_field, measure_type
-        ));
-    }
-
-    let mut col_group_tags = String::new();
-    for (i, &group) in col_groups.iter().enumerate() {
-        let display_name = field_info.get(group).map(|(_, dn, _)| dn.as_str()).unwrap_or(group);
-        let remaining: Vec<&str> = col_groups.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, g)| *g).collect();
-        let remaining_str = remaining.join(",");
-        col_group_tags.push_str(&format!(
-            r#"<span class="group-chip"><span>{}</span><a href="/pivot/{}?rows={}&cols={}&measure={}&agg={}" class="group-chip-remove" title="Remove">×</a></span>"#,
-            display_name, model_name, row_groups_str, remaining_str, measure_field, measure_type
-        ));
-    }
-
-    // Build add-group dropdown options (excluding already used fields)
-    let used_fields: std::collections::HashSet<&str> = row_groups.iter().chain(col_groups.iter()).cloned().collect();
-    let mut available_field_options = String::new();
-    for (name, display_name) in &groupable_fields {
-        if !used_fields.contains(*name) {
-            available_field_options.push_str(&format!(r#"<option value="{}">{}</option>"#, name, display_name));
-        }
-    }
-
-    // Build measure options
-    let mut measure_options = String::new();
-    measure_options.push_str(&format!(r#"<option value="id"{}>(Count)</option>"#, if measure_field == "id" { " selected" } else { "" }));
-    for field in &fields {
-        let name: String = field.get("name");
-        let display_name: String = field.get("display_name");
-        let field_type: String = field.get("field_type");
-        if matches!(field_type.as_str(), "integer" | "float" | "monetary" | "number") && name != "id" {
-            let selected = if name == measure_field { " selected" } else { "" };
-            measure_options.push_str(&format!(r#"<option value="{}"{}>{}</option>"#, name, selected, display_name));
-        }
-    }
-
-    // Build dynamic sidebar
     let sidebar_menu = build_sidebar_menu(&db, &user.roles, &model_name).await;
 
-    let html = format!(r##"<!DOCTYPE html>
-<html data-theme="dark">
-<head>
-    <script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style>
-    <title>{} - Pivot</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=18" rel="stylesheet"/>
-<script src="/static/vortex.js?v=18" defer></script>
-    <script src="/static/vendor/tailwind.js"></script>
-    <style>
-        body {{ background: oklch(var(--b2)); color: oklch(var(--bc)); }}
-        .top-navbar {{ background: oklch(var(--b1)); border-bottom: 1px solid oklch(var(--b3)); position: sticky; top: 0; z-index: 50; }}
-        .sidebar {{ background: oklch(var(--b1)); border-right: 1px solid oklch(var(--b3)); }}
-        .card {{ background: oklch(var(--b1)); border: 1px solid oklch(var(--b3)); }}
-        .text-muted {{ color: oklch(var(--bc)/0.6); }}
-        .user-badge {{ background: #8BC53F; color: #000; font-weight: 600; }}
-
-        /* Pivot table — Odoo-inspired: compact, bordered, hoverable */
-        .pivot-table {{ width: auto; min-width: 100%; border-collapse: collapse; font-size: 0.85rem; }}
-        .pivot-table th, .pivot-table td {{ padding: 0.35rem 0.75rem; text-align: right; border: 1px solid oklch(var(--b3)); white-space: nowrap; }}
-        .pivot-table tbody tr:hover td {{ background-color: oklch(var(--b2)/0.5); }}
-        .pivot-header {{ background: oklch(var(--b2)); color: oklch(var(--bc)); font-weight: 500; text-align: center !important; position: relative; }}
-        .pivot-header:hover {{ background: oklch(var(--b3)); }}
-        .pivot-row-label {{ text-align: left !important; min-width: 220px; }}
-        .pivot-row-header {{ background: oklch(var(--b1)); font-weight: 400; text-align: left !important; color: oklch(var(--bc)); cursor: pointer; }}
-        .pivot-row-header:hover {{ background: oklch(var(--b2)); }}
-        .pivot-cell {{ color: oklch(var(--bc)/0.6); font-variant-numeric: tabular-nums; }}
-        .pivot-has-value {{ color: oklch(var(--bc)); }}
-        .pivot-total {{ background: oklch(var(--b2)) !important; font-weight: 600; color: oklch(var(--bc)) !important; }}
-        .pivot-grand-total {{ background: oklch(var(--b3)) !important; color: oklch(var(--bc)) !important; font-weight: 700; }}
-        .pivot-footer td {{ border-top: 2px solid oklch(var(--b3)); }}
-
-        /* Row hierarchy levels — subtle depth indicators */
-        .pivot-row-level0 > td.pivot-row-header {{ font-weight: 600; }}
-        .pivot-row-level1 > td.pivot-row-header {{ font-weight: 500; }}
-        .pivot-row-level2 > td.pivot-row-header {{ font-weight: 400; color: oklch(var(--bc)/0.75); }}
-
-        /* Expand/collapse marker */
-        .pivot-toggle {{ color: oklch(var(--bc)/0.6); text-decoration: none; display: inline-block; width: 14px; }}
-        .pivot-toggle:hover {{ color: #8BC53F; }}
-        .pivot-toggle-spacer {{ display: inline-block; width: 14px; }}
-
-        /* Compact toolbar */
-        .pivot-toolbar {{ display: flex; flex-wrap: wrap; align-items: center; gap: 0.25rem; padding: 0.35rem 0.5rem; background: oklch(var(--b1)); border: 1px solid oklch(var(--b3)); border-radius: 0.5rem; margin-bottom: 1rem; }}
-        .pivot-toolbar-group {{ display: flex; gap: 0.25rem; align-items: center; padding: 0 0.5rem; }}
-        .pivot-toolbar-group + .pivot-toolbar-group {{ border-left: 1px solid oklch(var(--b3)); }}
-        .pivot-toolbar label {{ font-size: 0.75rem; color: oklch(var(--bc)/0.6); margin-right: 0.25rem; }}
-        .pivot-toolbar select {{ background: transparent; border: 1px solid oklch(var(--b3)); border-radius: 0.25rem; padding: 0.2rem 0.4rem; font-size: 0.8rem; color: oklch(var(--bc)); }}
-        .pivot-toolbar-btn {{ display: inline-flex; align-items: center; gap: 0.25rem; background: transparent; border: 1px solid oklch(var(--b3)); border-radius: 0.25rem; padding: 0.3rem 0.5rem; font-size: 0.8rem; color: oklch(var(--bc)); cursor: pointer; text-decoration: none; }}
-        .pivot-toolbar-btn:hover {{ background: oklch(var(--b2)); border-color: #8BC53F; color: #8BC53F; }}
-
-        /* Active group chips + add-group trigger */
-        .pivot-groups-row {{ display: flex; flex-wrap: wrap; gap: 0.75rem; margin-bottom: 0.75rem; font-size: 0.8rem; }}
-        .pivot-groups-axis {{ display: inline-flex; align-items: center; gap: 0.25rem; flex-wrap: wrap; }}
-        .pivot-groups-axis-label {{ color: oklch(var(--bc)/0.6); font-weight: 500; margin-right: 0.25rem; }}
-        .group-chip {{ display: inline-flex; align-items: center; gap: 0.35rem; background: oklch(var(--b1)); border: 1px solid oklch(var(--b3)); border-radius: 999px; padding: 0.15rem 0.6rem; color: oklch(var(--bc)); }}
-        .group-chip-remove {{ color: oklch(var(--bc)/0.5); text-decoration: none; }}
-        .group-chip-remove:hover {{ color: #ff6b6b; }}
-        .add-group-select {{ background: transparent; border: 1px dashed oklch(var(--b3)); border-radius: 999px; padding: 0.15rem 0.5rem; color: oklch(var(--bc)/0.6); font-size: 0.75rem; cursor: pointer; }}
-        .add-group-select:hover {{ border-color: #8BC53F; color: #8BC53F; }}
-
-        @media (max-width: 768px) {{
-            .sidebar {{ display: none; }}
-            .pivot-table {{ font-size: 0.75rem; }}
-            .pivot-table th, .pivot-table td {{ padding: 0.3rem 0.45rem; }}
-            .pivot-row-label {{ min-width: 140px; }}
-        }}
-    </style>
-</head>
-<body class="min-h-screen">
-<nav class="top-navbar px-4 py-3 flex items-center justify-between">
-    <div class="flex items-center gap-2"><button class="btn btn-ghost btn-sm btn-square md:hidden" onclick="var s=document.querySelector('.sidebar');s.classList.toggle('hidden');s.classList.toggle('md:block')"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="text-xl font-bold"><span style="color:#8BC53F">re</span><span class="text-muted">micle</span></a></div>
-    <div class="flex items-center gap-2 md:gap-3">
-        <a href="/home" class="text-base-content text-sm hover:underline hidden md:inline">Home</a>
-        <a href="/settings" class="text-base-content text-sm hover:underline hidden md:inline">Settings</a>
-        <a href="/notifications" class="btn btn-ghost btn-circle btn-sm relative" title="Notifications">
-            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9"/></svg>
-            <span class="absolute top-0 right-0 w-2 h-2 bg-red-500 rounded-full"></span>
-        </a>
-        <button onclick="(function(){{var h=document.documentElement,c=h.getAttribute('data-theme')==='dark'?'corporate':'dark';h.setAttribute('data-theme',c);localStorage.setItem('theme',c);document.querySelectorAll('.theme-icon-sun,.theme-icon-moon').forEach(function(e){{e.classList.toggle('hidden')}})}})();" class="btn btn-ghost btn-circle btn-sm" title="Toggle theme"><svg class="theme-icon-sun w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5" stroke-width="2"/><path stroke-linecap="round" stroke-width="2" d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg><svg class="theme-icon-moon w-5 h-5 hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg></button>
-        <div class="user-badge px-3 py-1 rounded-full text-sm">@{}</div>
-    </div>
-</nav>
-<div class="flex">
-    <aside class="sidebar w-64 min-h-screen p-4 hidden md:block">
-        <ul class="menu mt-2">{}</ul>
-    </aside>
-    <main class="flex-1 p-4 md:p-6">
-        <div class="flex flex-col md:flex-row justify-between items-start md:items-center mb-6 gap-4">
-            <div>
-                <h1 class="text-xl md:text-2xl font-bold">{}</h1>
-                <p class="text-muted">Pivot analysis</p>
-            </div>
-            <div class="flex gap-2 flex-wrap">
-                <div class="btn-group">
-                    <a href="{}" class="btn btn-sm" title="List View">
-                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 10h16M4 14h16M4 18h16"/></svg>
-                    </a>
-                    <a href="/kanban/{}" class="btn btn-sm" title="Kanban View">
-                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 17V7m0 10a2 2 0 01-2 2H5a2 2 0 01-2-2V7a2 2 0 012-2h2a2 2 0 012 2m0 10a2 2 0 002 2h2a2 2 0 002-2M9 7a2 2 0 012-2h2a2 2 0 012 2m0 10V7m0 10a2 2 0 002 2h2a2 2 0 002-2V7a2 2 0 00-2-2h-2a2 2 0 00-2 2"/></svg>
-                    </a>
-                    <a href="/graph/{}" class="btn btn-sm" title="Graph View">
-                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/></svg>
-                    </a>
-                    <a href="/pivot/{}" class="btn btn-sm btn-active" title="Pivot View">
-                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 10h18M3 14h18m-9-4v8m-7 0h14a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg>
-                    </a>
-                </div>
-                <!--VIEW_BAR-->
-                <a href="/{}/new" class="btn btn-sm" style="background:#8BC53F;border-color:#8BC53F;color:#000">+ New</a>
-            </div>
-        </div>
-
-        <!-- Compact toolbar: Measure + Aggregation on the left, actions on the right -->
-        <div class="pivot-toolbar">
-            <div class="pivot-toolbar-group">
-                <label>Measure</label>
-                <select onchange="window.location='/pivot/{}?rows={}&cols={}&measure='+this.value+'&agg={}'">
-                    {}
-                </select>
-                <select onchange="window.location='/pivot/{}?rows={}&cols={}&measure={}&agg='+this.value">
-                    <option value="count"{}>Count</option>
-                    <option value="sum"{}>Sum</option>
-                    <option value="avg"{}>Average</option>
-                    <option value="min"{}>Min</option>
-                    <option value="max"{}>Max</option>
-                </select>
-            </div>
-            <div class="pivot-toolbar-group" style="margin-left:auto">
-                <a class="pivot-toolbar-btn" title="Flip axis (swap rows/columns)" href="/pivot/{}?rows={}&cols={}&measure={}&agg={}">
-                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7h12m0 0l-4-4m4 4l-4 4m0 6H4m0 0l4 4m-4-4l4-4"/></svg>
-                    Flip
-                </a>
-                <a class="pivot-toolbar-btn" title="Expand all groups" href="/pivot/{}?rows={}&cols={}&measure={}&agg={}&expanded=*">
-                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 8V4m0 0h4M4 4l5 5m11-5h-4m4 0v4m0-4l-5 5M4 16v4m0 0h4m-4 0l5-5m11 5l-5-5m5 5v-4m0 4h-4"/></svg>
-                    Expand all
-                </a>
-                <a class="pivot-toolbar-btn" title="Collapse all groups" href="/pivot/{}?rows={}&cols={}&measure={}&agg={}">
-                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 9V5m0 0H5m4 0L4 10m11-1h4m0 0V5m0 4l5-5M9 15v4m0 0H5m4 0l-5-5m11 1h4m0 0v4m0-4l5 5"/></svg>
-                    Collapse
-                </a>
-            </div>
-        </div>
-
-        <!-- Active group chips -->
-        <div class="pivot-groups-row">
-            <div class="pivot-groups-axis">
-                <span class="pivot-groups-axis-label">Rows</span>
-                {}
-                <select class="add-group-select" onchange="if(this.value) window.location='/pivot/{}?rows={}'+('{}'?',':'')+this.value+'&cols={}&measure={}&agg={}'">
-                    <option value="">+ add field</option>
-                    {}
-                </select>
-            </div>
-            <div class="pivot-groups-axis">
-                <span class="pivot-groups-axis-label">Columns</span>
-                {}
-                <select class="add-group-select" onchange="if(this.value) window.location='/pivot/{}?rows={}&cols={}'+('{}'?',':'')+this.value+'&measure={}&agg={}'">
-                    <option value="">+ add field</option>
-                    {}
-                </select>
-            </div>
-        </div>
-
-        <!-- Pivot Table -->
-        <div class="card overflow-x-auto">
-            <table class="pivot-table">
-                {}
-            </table>
-        </div>
-    </main>
-</div>
-</body>
-</html>"##,
-        model_display_name,
-        user.username,
-        sidebar_menu,
-        model_display_name,
-        &list_view_url, model_name, model_name, model_name, model_name,
-        // Toolbar — measure dropdown
-        model_name, row_groups_str, col_groups_str, measure_type,
-        measure_options,
-        // Toolbar — aggregation dropdown
-        model_name, row_groups_str, col_groups_str, measure_field,
-        if measure_type == "count" { " selected" } else { "" },
-        if measure_type == "sum" { " selected" } else { "" },
-        if measure_type == "avg" { " selected" } else { "" },
-        if measure_type == "min" { " selected" } else { "" },
-        if measure_type == "max" { " selected" } else { "" },
-        // Toolbar — Flip axis (swaps rows/cols)
-        model_name, col_groups_str, row_groups_str, measure_field, measure_type,
-        // Toolbar — Expand all
-        model_name, row_groups_str, col_groups_str, measure_field, measure_type,
-        // Toolbar — Collapse
-        model_name, row_groups_str, col_groups_str, measure_field, measure_type,
-        // Row groups section
-        row_group_tags,
-        model_name, row_groups_str, row_groups_str, col_groups_str, measure_field, measure_type,
-        available_field_options,
-        // Column groups section
-        col_group_tags,
-        model_name, row_groups_str, col_groups_str, col_groups_str, measure_field, measure_type,
-        available_field_options,
-        // Table
-        table_html
-    );
+    // Shell built by token replacement (not format!) so the inline navbar JS
+    // keeps its braces without escaping. Dynamic JSON goes into HTML-escaped
+    // double-quoted data-* attributes.
+    let html = PIVOT_SHELL
+        .replace("__TITLE__", &html_escape(&model_display_name))
+        .replace("__USER__", &html_escape(&user.username))
+        .replace("__SIDEBAR__", &sidebar_menu)
+        .replace("__LISTURL__", &html_escape(&list_view_url))
+        .replace("__FIELDS__", &html_escape(&fields_json))
+        .replace("__CONFIG__", &html_escape(&config_json))
+        .replace("__MODEL__", &html_escape(&model_name));
     Html(html.replace("<!--VIEW_BAR-->", &view_bar)).into_response()
 }
 
-fn format_pivot_number(val: f64, measure_type: &str) -> String {
-    if val == 0.0 {
-        "-".to_string()
-    } else if measure_type == "count" {
-        format!("{:.0}", val)
-    } else if val == val.floor() {
-        format!("{:.0}", val)
-    } else {
-        format!("{:.2}", val)
+const PIVOT_SHELL: &str = r#"<!DOCTYPE html><html data-theme="dark"><head>
+<script>(function(){var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)})()</script>
+<style>[data-theme="corporate"] .theme-icon-sun{display:none !important}[data-theme="corporate"] .theme-icon-moon{display:inline-block !important}</style>
+<title>__TITLE__ - Pivot</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<link href="/static/pivot.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script>
+<script src="/static/vendor/tailwind.js"></script>
+<style>
+body { background: oklch(var(--b2)); color: oklch(var(--bc)); }
+.top-navbar { background: oklch(var(--b1)); border-bottom: 1px solid oklch(var(--b3)); position: sticky; top: 0; z-index: 50; }
+.sidebar { background: oklch(var(--b1)); border-right: 1px solid oklch(var(--b3)); }
+.text-muted { color: oklch(var(--bc)/0.6); }
+.user-badge { background: #8BC53F; color: #000; font-weight: 600; }
+</style>
+</head><body class="min-h-screen">
+<nav class="top-navbar px-4 py-3 flex items-center justify-between">
+  <div class="flex items-center gap-2">
+    <button class="btn btn-ghost btn-sm btn-square md:hidden" onclick="var s=document.querySelector('.sidebar');s.classList.toggle('hidden');s.classList.toggle('md:block')"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button>
+    <a href="/home" class="text-xl font-bold"><span style="color:#8BC53F">re</span><span class="text-muted">micle</span></a>
+  </div>
+  <div class="flex items-center gap-2 md:gap-3">
+    <a href="/home" class="text-base-content text-sm hover:underline hidden md:inline">Home</a>
+    <a href="/settings" class="text-base-content text-sm hover:underline hidden md:inline">Settings</a>
+    <button onclick="(function(){var h=document.documentElement,c=h.getAttribute('data-theme')==='dark'?'corporate':'dark';h.setAttribute('data-theme',c);localStorage.setItem('theme',c);document.querySelectorAll('.theme-icon-sun,.theme-icon-moon').forEach(function(e){e.classList.toggle('hidden')})})();" class="btn btn-ghost btn-circle btn-sm" title="Toggle theme"><svg class="theme-icon-sun w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5" stroke-width="2"/><path stroke-linecap="round" stroke-width="2" d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg><svg class="theme-icon-moon w-5 h-5 hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg></button>
+    <div class="user-badge px-3 py-1 rounded-full text-sm">@__USER__</div>
+  </div>
+</nav>
+<div class="flex">
+<aside class="sidebar w-64 min-h-screen p-4 hidden md:block"><ul class="menu mt-2">__SIDEBAR__</ul></aside>
+<main class="flex-1 p-4 md:p-6 min-w-0">
+<div class="flex flex-col md:flex-row justify-between items-start md:items-center mb-4 gap-4">
+  <div><h1 class="text-xl md:text-2xl font-bold">__TITLE__</h1><p class="text-muted">Pivot table — drag fields into Rows, Columns and Values</p></div>
+  <div class="flex gap-2 flex-wrap">
+    <div class="btn-group">
+      <a href="__LISTURL__" class="btn btn-sm" title="List View"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 10h16M4 14h16M4 18h16"/></svg></a>
+      <a href="/kanban/__MODEL__" class="btn btn-sm" title="Kanban View"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 17V7m0 10a2 2 0 01-2 2H5a2 2 0 01-2-2V7a2 2 0 012-2h2a2 2 0 012 2m0 10a2 2 0 002 2h2a2 2 0 002-2M9 7a2 2 0 012-2h2a2 2 0 012 2m0 10V7"/></svg></a>
+      <a href="/graph/__MODEL__" class="btn btn-sm" title="Graph View"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/></svg></a>
+      <a href="/calendar/__MODEL__" class="btn btn-sm" title="Calendar View"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"/></svg></a>
+      <a href="/pivot/__MODEL__" class="btn btn-sm btn-active" title="Pivot View"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 10h18M3 14h18m-9-4v8m-7 0h14a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg></a>
+    </div>
+    <!--VIEW_BAR-->
+    <button id="pv-export" class="btn btn-sm gap-1" title="Export to Excel (CSV)"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v2a2 2 0 002 2h12a2 2 0 002-2v-2M7 10l5 5 5-5M12 15V3"/></svg>Excel</button>
+    <a href="/__MODEL__/new" class="btn btn-sm" style="background:#8BC53F;border-color:#8BC53F;color:#000">+ New</a>
+  </div>
+</div>
+<div class="pv-wrap">
+  <div class="pv-main"><div id="pv-table-wrap"><div class="pv-hint">Loading…</div></div></div>
+  <div class="pv-side">
+    <h3>PivotTable Fields</h3>
+    <div id="pv-fields"></div>
+    <div class="pv-zones">
+      <div class="pv-zone" id="pv-zone-filters" style="grid-column:1/-1"><div class="pv-zone-title">&#9660; Filters</div></div>
+      <div class="pv-zone" id="pv-zone-rows"><div class="pv-zone-title">&#9636; Rows</div></div>
+      <div class="pv-zone" id="pv-zone-cols"><div class="pv-zone-title">&#9638; Columns</div></div>
+      <div class="pv-zone" id="pv-zone-values" style="grid-column:1/-1"><div class="pv-zone-title">&#931; Values</div></div>
+    </div>
+  </div>
+</div>
+<div id="pivot-root" data-model="__MODEL__" data-data-url="/pivot/__MODEL__/data" data-fields="__FIELDS__" data-config="__CONFIG__"></div>
+<script src="/static/pivot.js?v=18"></script>
+</main>
+</div></body></html>"#;
+
+/// GET /pivot/{model}/data — aggregated pivot matrix as JSON. Every field name
+/// is allow-listed against the model registry; subtotals and grand totals are
+/// computed by SQL ROLLUP (correct for every aggregate, at every level).
+async fn generic_pivot_data(
+    State(_state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(_user): Extension<AuthUser>,
+    Path(model_name): Path<String>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let fail = |msg: &str| Json(serde_json::json!({"ok": false, "error": msg})).into_response();
+
+    let model_row = match sqlx::query("SELECT id, table_name FROM ir_model WHERE name = $1 AND is_active = true")
+        .bind(&model_name)
+        .fetch_optional(&db)
+        .await
+    {
+        Ok(Some(r)) => r,
+        _ => return fail("Unknown model"),
+    };
+    let model_id: uuid::Uuid = model_row.get("id");
+    let table_name: String = model_row.get("table_name");
+    if !validate_identifier(&table_name) {
+        return fail("Invalid model");
     }
+
+    let frows = sqlx::query("SELECT name, field_type, display_name, related_model FROM ir_model_field WHERE model_id = $1")
+        .bind(model_id)
+        .fetch_all(&db)
+        .await
+        .unwrap_or_default();
+    let mut finfo: std::collections::HashMap<String, (String, String, Option<String>)> = std::collections::HashMap::new();
+    for f in &frows {
+        let n: String = f.get("name");
+        finfo.insert(n, (f.get("field_type"), f.get("display_name"), f.try_get("related_model").ok().flatten()));
+    }
+    let has_active = finfo.contains_key("active");
+    let is_field = |n: &str| -> bool { validate_identifier(n) && finfo.contains_key(n) };
+
+    use base64::Engine as _;
+
+    let parse_list = |key: &str| -> Vec<String> {
+        params
+            .get(key)
+            .map(|s| s.as_str())
+            .unwrap_or("")
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .filter(|s| is_field(s))
+            .collect()
+    };
+    let rows = parse_list("rows");
+    let cols = parse_list("cols");
+
+    let is_numeric = |n: &str| -> bool {
+        finfo
+            .get(n)
+            .map(|(t, _, _)| matches!(t.as_str(), "integer" | "float" | "decimal" | "monetary" | "number"))
+            .unwrap_or(false)
+    };
+    let label_of = |n: &str| -> String {
+        finfo.get(n).map(|(_, d, _)| d.clone()).unwrap_or_else(|| n.to_string())
+    };
+
+    // The text (group-by) expression for a dimension, adding a LEFT JOIN to the
+    // related table for a many2one so grouping/filtering is by human-readable
+    // name rather than opaque id. `jidx` keeps join aliases unique across the
+    // row, column and filter dimensions that share the FROM clause.
+    fn dim_expr(
+        field: &str,
+        finfo: &std::collections::HashMap<String, (String, String, Option<String>)>,
+        joins: &mut Vec<String>,
+        jidx: &mut usize,
+    ) -> String {
+        match finfo.get(field) {
+            Some((ftype, _, Some(rel))) if ftype == "many2one" => {
+                let rel_table = rel.replace('.', "_");
+                if validate_identifier(&rel_table) {
+                    let ja = format!("j{}", *jidx);
+                    *jidx += 1;
+                    joins.push(format!("LEFT JOIN {} {} ON t.{} = {}.id", rel_table, ja, field, ja));
+                    format!("{}.name", ja)
+                } else {
+                    format!("t.{}", field)
+                }
+            }
+            _ => format!("t.{}", field),
+        }
+    }
+
+    let mut joins: Vec<String> = Vec::new();
+    let mut selects: Vec<String> = Vec::new();
+    let mut row_gbs: Vec<String> = Vec::new();
+    let mut col_gbs: Vec<String> = Vec::new();
+    let mut jidx = 0usize;
+
+    // Row/column grouping dimensions: emit the value, its GROUPING() flag, and
+    // record the group-by expression for the ROLLUP.
+    let mut build_group = |field: &str, alias: &str, gbs: &mut Vec<String>, joins: &mut Vec<String>, jidx: &mut usize, selects: &mut Vec<String>| {
+        let gb = dim_expr(field, &finfo, joins, jidx);
+        selects.push(format!("COALESCE(CAST({} AS TEXT), '(empty)') as {}", gb, alias));
+        selects.push(format!("GROUPING({}) as g{}", gb, alias));
+        gbs.push(gb);
+    };
+    for (i, field) in rows.iter().enumerate() {
+        build_group(field, &format!("r{}", i), &mut row_gbs, &mut joins, &mut jidx, &mut selects);
+    }
+    for (i, field) in cols.iter().enumerate() {
+        build_group(field, &format!("c{}", i), &mut col_gbs, &mut joins, &mut jidx, &mut selects);
+    }
+
+    // Measures (Values). `vals` is a comma list of `agg.field`; falls back to the
+    // legacy single `measure`/`agg` params so old saved views/URLs keep working.
+    // Each measure yields one aggregate column m0, m1, … in the SELECT.
+    struct Measure {
+        agg: String,
+        field: String, // "id" == count of records
+        label: String,
+    }
+    let mut measures: Vec<Measure> = Vec::new();
+    let push_measure = |measures: &mut Vec<Measure>, agg: &str, field: &str| {
+        let agg = if ["count", "sum", "avg", "min", "max"].contains(&agg) { agg } else { "count" };
+        // Non-count aggregates need a numeric field; otherwise fall back to count.
+        let (agg, field) = if field == "id" || !is_field(field) {
+            ("count", "id")
+        } else if agg != "count" && !is_numeric(field) {
+            ("count", field)
+        } else {
+            (agg, field)
+        };
+        if measures.len() >= 12 {
+            return;
+        }
+        let label = match (agg, field) {
+            ("count", "id") => "Count".to_string(),
+            ("count", f) => format!("Count of {}", label_of(f)),
+            (a, f) => format!("{}{} of {}", a[..1].to_uppercase(), &a[1..], label_of(f)),
+        };
+        measures.push(Measure { agg: agg.to_string(), field: field.to_string(), label });
+    };
+    if let Some(vals) = params.get("vals").filter(|s| !s.is_empty()) {
+        for tok in vals.split(',').filter(|s| !s.is_empty()) {
+            let (agg, field) = tok.split_once('.').unwrap_or((tok, "id"));
+            push_measure(&mut measures, agg, field);
+        }
+    }
+    if measures.is_empty() {
+        let agg = params.get("agg").map(|s| s.as_str()).unwrap_or("count");
+        let field = params.get("measure").map(|s| s.as_str()).unwrap_or("id");
+        push_measure(&mut measures, agg, field);
+    }
+    for (i, m) in measures.iter().enumerate() {
+        let expr = match m.agg.as_str() {
+            "sum" => format!("SUM(CAST(t.{} AS NUMERIC))", m.field),
+            "avg" => format!("AVG(CAST(t.{} AS NUMERIC))", m.field),
+            "min" => format!("MIN(CAST(t.{} AS NUMERIC))", m.field),
+            "max" => format!("MAX(CAST(t.{} AS NUMERIC))", m.field),
+            _ if m.field == "id" => "COUNT(*)".to_string(),
+            _ => format!("COUNT(t.{})", m.field), // count of non-null values
+        };
+        selects.push(format!("CAST({} AS DOUBLE PRECISION) as m{}", expr, i));
+    }
+
+    // Pinned filters: `filters` is a comma list of `field.b64value`. The value is
+    // matched against the same text/name expression used for grouping, bound as a
+    // query parameter (never interpolated) — so arbitrary data is safe.
+    let mut wheres: Vec<String> = Vec::new();
+    let mut binds: Vec<String> = Vec::new();
+    if has_active {
+        wheres.push("t.active = true".to_string());
+    }
+    if let Some(filters) = params.get("filters").filter(|s| !s.is_empty()) {
+        for tok in filters.split(',').filter(|s| !s.is_empty()).take(20) {
+            let Some((field, b64)) = tok.split_once('.') else { continue };
+            if !is_field(field) {
+                continue;
+            }
+            let value = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(b64)
+                .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(b64))
+                .ok()
+                .and_then(|b| String::from_utf8(b).ok());
+            let Some(value) = value else { continue };
+            let expr = dim_expr(field, &finfo, &mut joins, &mut jidx);
+            binds.push(value);
+            wheres.push(format!(
+                "COALESCE(CAST({} AS TEXT), '(empty)') = ${}",
+                expr,
+                binds.len()
+            ));
+        }
+    }
+
+    let where_sql = if wheres.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", wheres.join(" AND "))
+    };
+    let group_sql = match (row_gbs.is_empty(), col_gbs.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => format!(" GROUP BY ROLLUP({})", row_gbs.join(", ")),
+        (true, false) => format!(" GROUP BY ROLLUP({})", col_gbs.join(", ")),
+        (false, false) => format!(" GROUP BY ROLLUP({}), ROLLUP({})", row_gbs.join(", "), col_gbs.join(", ")),
+    };
+    let query = format!(
+        "SELECT {} FROM {} t {}{}{}",
+        selects.join(", "),
+        table_name,
+        joins.join(" "),
+        where_sql,
+        group_sql
+    );
+
+    let mut q = sqlx::query(&query);
+    for b in &binds {
+        q = q.bind(b);
+    }
+    let results = match q.fetch_all(&db).await {
+        Ok(r) => r,
+        Err(e) => {
+            error!("pivot data query failed: {e}");
+            return fail("Could not compute pivot for these fields.");
+        }
+    };
+
+    let mut cells: Vec<serde_json::Value> = Vec::new();
+    for row in &results {
+        let mut rpath: Vec<String> = Vec::new();
+        for i in 0..rows.len() {
+            let g: i32 = row.try_get::<i32, _>(format!("gr{}", i).as_str()).unwrap_or(1);
+            if g == 0 {
+                rpath.push(row.try_get::<String, _>(format!("r{}", i).as_str()).unwrap_or_default());
+            } else {
+                break;
+            }
+        }
+        let mut cpath: Vec<String> = Vec::new();
+        for i in 0..cols.len() {
+            let g: i32 = row.try_get::<i32, _>(format!("gc{}", i).as_str()).unwrap_or(1);
+            if g == 0 {
+                cpath.push(row.try_get::<String, _>(format!("c{}", i).as_str()).unwrap_or_default());
+            } else {
+                break;
+            }
+        }
+        let vs: Vec<serde_json::Value> = (0..measures.len())
+            .map(|i| match row.try_get::<Option<f64>, _>(format!("m{}", i).as_str()) {
+                Ok(Some(v)) => serde_json::json!(v),
+                _ => serde_json::Value::Null,
+            })
+            .collect();
+        cells.push(serde_json::json!({"r": rpath, "c": cpath, "vs": vs}));
+    }
+
+    let field_meta = |names: &[String]| -> Vec<serde_json::Value> {
+        names
+            .iter()
+            .map(|n| serde_json::json!({"name": n, "label": label_of(n)}))
+            .collect()
+    };
+    let measure_meta: Vec<serde_json::Value> = measures
+        .iter()
+        .map(|m| serde_json::json!({"agg": m.agg, "field": m.field, "label": m.label}))
+        .collect();
+
+    Json(serde_json::json!({
+        "ok": true,
+        "measures": measure_meta,
+        "rowFields": field_meta(&rows),
+        "colFields": field_meta(&cols),
+        "cells": cells,
+    }))
+    .into_response()
+}
+
+/// GET /pivot/{model}/values?field=X — distinct values of a field, for the pivot
+/// Filters zone's value picker. Field name is allow-listed against the registry;
+/// many2one fields resolve to the related record's name.
+async fn generic_pivot_values(
+    State(_state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(_user): Extension<AuthUser>,
+    Path(model_name): Path<String>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let fail = |msg: &str| Json(serde_json::json!({"ok": false, "error": msg})).into_response();
+
+    let model_row = match sqlx::query("SELECT id, table_name FROM ir_model WHERE name = $1 AND is_active = true")
+        .bind(&model_name)
+        .fetch_optional(&db)
+        .await
+    {
+        Ok(Some(r)) => r,
+        _ => return fail("Unknown model"),
+    };
+    let model_id: uuid::Uuid = model_row.get("id");
+    let table_name: String = model_row.get("table_name");
+    if !validate_identifier(&table_name) {
+        return fail("Invalid model");
+    }
+    let field = match params.get("field") {
+        Some(f) if validate_identifier(f) => f.clone(),
+        _ => return fail("Invalid field"),
+    };
+
+    let frow = sqlx::query(
+        "SELECT field_type, related_model FROM ir_model_field WHERE model_id = $1 AND name = $2",
+    )
+    .bind(model_id)
+    .bind(&field)
+    .fetch_optional(&db)
+    .await
+    .ok()
+    .flatten();
+    let Some(frow) = frow else { return fail("Unknown field") };
+    let ftype: String = frow.get("field_type");
+    let related: Option<String> = frow.try_get("related_model").ok().flatten();
+
+    let mut join = String::new();
+    let expr = if ftype == "many2one" {
+        match related.map(|r| r.replace('.', "_")).filter(|t| validate_identifier(t)) {
+            Some(rel_table) => {
+                join = format!(" LEFT JOIN {0} j0 ON t.{1} = j0.id", rel_table, field);
+                "j0.name".to_string()
+            }
+            None => format!("t.{}", field),
+        }
+    } else {
+        format!("t.{}", field)
+    };
+    let has_active = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM ir_model_field WHERE model_id = $1 AND name = 'active'",
+    )
+    .bind(model_id)
+    .fetch_one(&db)
+    .await
+    .map(|n| n > 0)
+    .unwrap_or(false);
+    let where_sql = if has_active { " WHERE t.active = true" } else { "" };
+
+    let query = format!(
+        "SELECT DISTINCT COALESCE(CAST({0} AS TEXT), '(empty)') AS v FROM {1} t{2}{3} ORDER BY v LIMIT 300",
+        expr, table_name, join, where_sql
+    );
+    let rows = match sqlx::query(&query).fetch_all(&db).await {
+        Ok(r) => r,
+        Err(e) => {
+            error!("pivot values query failed: {e}");
+            return fail("Could not read values for this field.");
+        }
+    };
+    let values: Vec<String> = rows.iter().map(|r| r.get::<String, _>("v")).collect();
+    Json(serde_json::json!({"ok": true, "values": values})).into_response()
 }
 
 // ============================================================================

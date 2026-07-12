@@ -56,6 +56,16 @@ enum KeyKind {
     Field,
     /// One of a fixed set of tokens.
     Enum(&'static [&'static str]),
+    /// Pivot `vals`: comma-separated `agg.field` measures. Each token's aggregate
+    /// must be allow-listed and its field must be `id` or a registered column.
+    Measures,
+    /// Pivot `filters`: comma-separated `field.b64value` conditions. The field
+    /// must be registered; the value is base64url-encoded opaque data (checked for
+    /// charset and length only — it never reaches SQL unparameterised).
+    Filters,
+    /// Opaque persisted UI state (pivot `collapsed`): a bounded string over a
+    /// URL-safe charset. Stored and re-emitted verbatim, never used in SQL.
+    Opaque,
 }
 
 fn graph_type_codes() -> Vec<&'static str> {
@@ -71,6 +81,9 @@ fn allowed_keys(view_type: &str) -> Vec<(&'static str, KeyKind)> {
             ("cols", KeyKind::FieldList),
             ("measure", KeyKind::Field),
             ("agg", KeyKind::Enum(AGGREGATES)),
+            ("vals", KeyKind::Measures),
+            ("filters", KeyKind::Filters),
+            ("collapsed", KeyKind::Opaque),
         ],
         "graph" => vec![
             ("group_by", KeyKind::Field),
@@ -89,6 +102,11 @@ fn valid_view_type(t: &str) -> bool {
 /// A SQL-identifier-shaped token: what a field name may look like.
 fn ident(s: &str) -> bool {
     !s.is_empty() && s.len() <= 63 && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// A character allowed in a base64url payload (RFC 4648 §5, `=` padding kept).
+fn is_base64url(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '='
 }
 
 #[derive(Debug, Clone)]
@@ -194,6 +212,41 @@ pub async fn validate_config(
             KeyKind::Enum(allowed) => {
                 if !allowed.contains(&val) {
                     return Err(format!("Invalid value {val:?} for {key}."));
+                }
+            }
+            KeyKind::Measures => {
+                for token in val.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                    let (agg, field) = token.split_once('.').unwrap_or((token, "id"));
+                    if !AGGREGATES.contains(&agg) {
+                        return Err(format!("Invalid aggregate {agg:?} in {key}."));
+                    }
+                    if field != "id" && !is_field(field) {
+                        return Err(format!("{field:?} is not a field of {model}."));
+                    }
+                }
+            }
+            KeyKind::Filters => {
+                if val.len() > 4000 {
+                    return Err("Filter is too long.".into());
+                }
+                for token in val.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                    let Some((field, b64)) = token.split_once('.') else {
+                        return Err(format!("Malformed filter {token:?}."));
+                    };
+                    if !is_field(field) {
+                        return Err(format!("{field:?} is not a field of {model}."));
+                    }
+                    if b64.is_empty() || !b64.chars().all(is_base64url) {
+                        return Err(format!("Malformed filter value for {field}."));
+                    }
+                }
+            }
+            KeyKind::Opaque => {
+                if val.len() > 4000 {
+                    return Err(format!("{key} state is too long."));
+                }
+                if !val.chars().all(|c| is_base64url(c) || c == ',') {
+                    return Err(format!("Malformed {key} state."));
                 }
             }
         }
@@ -520,7 +573,7 @@ mod tests {
     #[test]
     fn allowed_keys_per_type() {
         let keys = |t: &str| allowed_keys(t).into_iter().map(|(k, _)| k).collect::<Vec<_>>();
-        assert_eq!(keys("pivot"), vec!["rows", "cols", "measure", "agg"]);
+        assert_eq!(keys("pivot"), vec!["rows", "cols", "measure", "agg", "vals", "filters", "collapsed"]);
         assert_eq!(keys("graph"), vec!["group_by", "type"]);
         assert_eq!(keys("kanban"), vec!["group_by"]);
         assert_eq!(keys("calendar"), vec!["date_field"]);
@@ -565,6 +618,31 @@ mod tests {
 
         let default = default_config_for(&db, "contacts", "graph").await.expect("default");
         assert_eq!(default.get("group_by").map(String::as_str), Some("contact_type"));
+
+        // Pivot's new keys: multiple measures, base64 filter values, opaque
+        // collapse state — all validated against the same registry.
+        let pv = validate_config(
+            &db,
+            "contacts",
+            "pivot",
+            &cfg(&[
+                ("rows", "contact_type"),
+                ("vals", "sum.credit_limit,count.id"),
+                ("filters", "contact_type.Y3VzdG9tZXI"), // "customer"
+                ("collapsed", "Y3VzdG9tZXI,Ym90aA"),
+            ]),
+        )
+        .await
+        .expect("valid pivot config");
+        assert_eq!(pv.get("vals").map(String::as_str), Some("sum.credit_limit,count.id"));
+        assert!(pv.contains_key("filters") && pv.contains_key("collapsed"));
+        // A bad aggregate, an unknown measure field and a non-field filter are rejected.
+        assert!(validate_config(&db, "contacts", "pivot", &cfg(&[("vals", "median.credit_limit")])).await.is_err());
+        assert!(validate_config(&db, "contacts", "pivot", &cfg(&[("vals", "sum.not_a_field")])).await.is_err());
+        assert!(validate_config(&db, "contacts", "pivot", &cfg(&[("filters", "not_a_field.YWJj")])).await.is_err());
+        // A filter value with SQL-hostile characters is rejected before storage
+        // (must be base64url), and blatant injection in the field is rejected too.
+        assert!(validate_config(&db, "contacts", "pivot", &cfg(&[("filters", "contact_type.a'b;DROP")])).await.is_err());
 
         let visible = list_for(&db, "contacts", "graph", owner, false).await;
         assert!(visible.iter().any(|v| v.id == id));
