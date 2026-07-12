@@ -631,12 +631,18 @@ async fn mobile_login(
         .map(|u| u.active && !u.locked && verify_password(&body.password, &u.password_hash))
         .unwrap_or(false);
 
+    // Client IP for login audit attribution (best-effort).
+    let (client_ip, _ua) = request_fingerprint(&headers);
+
     if !ok {
         // Audit the failure against the tenant chain (best-effort).
-        let entry = AuditEntry::new(AuditAction::LoginFailure, AuditSeverity::Warning)
+        let mut entry = AuditEntry::new(AuditAction::LoginFailure, AuditSeverity::Warning)
             .with_username(&body.username)
             .with_database(&db_name)
             .with_details(serde_json::json!({"database": db_name, "channel": "mobile"}));
+        if let Some(ip) = &client_ip {
+            entry = entry.with_source_ip(ip.clone());
+        }
         let _ = state.audit.log(entry).await;
         return api_error(
             StatusCode::UNAUTHORIZED,
@@ -655,11 +661,14 @@ async fn mobile_login(
         MfaGate::Ok => {}
         MfaGate::Reject(resp) => {
             if matches!(&resp, MfaReject::InvalidCode) {
-                let entry = AuditEntry::new(AuditAction::LoginFailure, AuditSeverity::Warning)
+                let mut entry = AuditEntry::new(AuditAction::LoginFailure, AuditSeverity::Warning)
                     .with_user(vortex_common::UserId(user.id))
                     .with_username(&user.username)
                     .with_database(&db_name)
                     .with_details(serde_json::json!({"database": db_name, "channel": "mobile", "reason": "mfa"}));
+                if let Some(ip) = &client_ip {
+                    entry = entry.with_source_ip(ip.clone());
+                }
                 let _ = state.audit.log(entry).await;
             }
             return resp.into_response(&user.username);
@@ -847,7 +856,7 @@ async fn issue_mobile_session(
     .await
     .unwrap_or_default();
 
-    let entry = AuditEntry::new(AuditAction::LoginSuccess, AuditSeverity::Info)
+    let mut entry = AuditEntry::new(AuditAction::LoginSuccess, AuditSeverity::Info)
         .with_user(vortex_common::UserId(user_id))
         .with_username(username)
         .with_database(db_name)
@@ -856,6 +865,9 @@ async fn issue_mobile_session(
             "database": db_name, "channel": "mobile",
             "device_id": device_id, "family_id": pair.family_id,
         }));
+    if let Some(ip) = &ip {
+        entry = entry.with_source_ip(ip.clone());
+    }
     let _ = state.audit.log(entry).await;
 
     let now = chrono::Utc::now();
@@ -2661,6 +2673,10 @@ async fn login_submit(
     headers: HeaderMap,
     Form(form): Form<LoginForm>,
 ) -> Response {
+    // Client IP (best-effort, first X-Forwarded-For hop) for the login audit —
+    // so successful and failed logins are attributable to a source address.
+    let (client_ip, _ua) = request_fingerprint(&headers);
+
     // Resolve target database
     let db_name = resolve_database(&state, &headers, form.database.as_deref()).await;
 
@@ -2733,7 +2749,7 @@ async fn login_submit(
                 // entry to the tenant's database so each tenant's audit
                 // chain is self-contained. In single-DB mode, db_name
                 // matches the primary and the write goes there anyway.
-                let audit_entry = AuditEntry::new(
+                let mut audit_entry = AuditEntry::new(
                     AuditAction::LoginSuccess,
                     AuditSeverity::Info,
                 )
@@ -2745,6 +2761,9 @@ async fn login_submit(
                     "database": db_name,
                     "session_id": token_hash,
                 }));
+                if let Some(ip) = &client_ip {
+                    audit_entry = audit_entry.with_source_ip(ip.clone());
+                }
                 if let Err(e) = state.audit.log(audit_entry).await {
                     error!("WORM audit write failed for LoginSuccess: {}", e);
                 }
@@ -2772,7 +2791,7 @@ async fn login_submit(
                 .await;
 
                 // Log failed login — WORM ledger.
-                let audit_entry = AuditEntry::new(
+                let mut audit_entry = AuditEntry::new(
                     AuditAction::LoginFailure,
                     AuditSeverity::Warning,
                 )
@@ -2784,6 +2803,9 @@ async fn login_submit(
                     "reason": "invalid_password",
                     "database": db_name,
                 }));
+                if let Some(ip) = &client_ip {
+                    audit_entry = audit_entry.with_source_ip(ip.clone());
+                }
                 if let Err(e) = state.audit.log(audit_entry).await {
                     error!("WORM audit write failed for LoginFailure: {}", e);
                 }
@@ -2793,7 +2815,7 @@ async fn login_submit(
         }
         Ok(None) => {
             // Log failed login attempt for unknown user — WORM ledger.
-            let audit_entry = AuditEntry::new(
+            let mut audit_entry = AuditEntry::new(
                 AuditAction::LoginFailure,
                 AuditSeverity::Warning,
             )
@@ -2804,6 +2826,9 @@ async fn login_submit(
                 "reason": "user_not_found",
                 "database": db_name,
             }));
+            if let Some(ip) = &client_ip {
+                audit_entry = audit_entry.with_source_ip(ip.clone());
+            }
             if let Err(e) = state.audit.log(audit_entry).await {
                 error!("WORM audit write failed for unknown-user LoginFailure: {}", e);
             }
