@@ -2193,6 +2193,15 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/announcements/{id}/edit", get(announcement_edit))
         .route("/announcements/{id}", post(announcement_update))
         .route("/announcements/{id}/delete", post(announcement_delete))
+        // Blueprints — governed runtime model builder (admin-only)
+        .route("/blueprints", get(blueprints_list))
+        .route("/blueprints", post(blueprint_create))
+        .route("/blueprints/new", get(blueprint_new))
+        .route("/blueprints/{model}", get(blueprint_designer))
+        .route("/blueprints/{model}/archive", post(blueprint_archive))
+        .route("/blueprints/{model}/fields", post(blueprint_add_field))
+        .route("/blueprints/{model}/fields/{name}/rename", post(blueprint_rename_field))
+        .route("/blueprints/{model}/fields/{name}/delete", post(blueprint_remove_field))
         // Shortcuts API
         .route("/api/home/shortcuts/available", get(shortcuts_available))
         .route("/api/home/shortcuts", post(shortcut_add))
@@ -5046,6 +5055,346 @@ async fn build_home_calendar(
     Html(html)
 }
 
+// -- Blueprints: governed runtime model builder (admin-only) ------------------
+//
+// Thin HTTP layer over `vortex_framework::blueprint` (which owns the policy +
+// audit + DDL). Routes are admin-gated here (defense in depth); the service
+// additionally enforces the Cedar `blueprint.*` permit.
+
+#[derive(serde::Deserialize)]
+struct BlueprintNewForm {
+    label: String,
+}
+
+#[derive(serde::Deserialize)]
+struct BlueprintFieldForm {
+    label: String,
+    field_type: String,
+}
+
+#[derive(serde::Deserialize)]
+struct BlueprintRenameForm {
+    label: String,
+}
+
+/// The field-type vocabulary the builder offers — scalar types that need no
+/// extra configuration. (many2one/selection need a related model or an options
+/// list, so they are deferred to a later phase.)
+const BLUEPRINT_FIELD_TYPES: &[(&str, &str)] = &[
+    ("string", "Text"),
+    ("text", "Long text"),
+    ("integer", "Number (integer)"),
+    ("decimal", "Decimal"),
+    ("monetary", "Money"),
+    ("boolean", "Checkbox"),
+    ("date", "Date"),
+    ("datetime", "Date & time"),
+];
+
+fn blueprint_type_label(ft: &str) -> String {
+    BLUEPRINT_FIELD_TYPES
+        .iter()
+        .find(|(v, _)| *v == ft)
+        .map(|(_, l)| l.to_string())
+        .unwrap_or_else(|| ft.to_string())
+}
+
+fn blueprint_type_options() -> String {
+    BLUEPRINT_FIELD_TYPES
+        .iter()
+        .map(|(v, l)| format!(r#"<option value="{v}">{l}</option>"#))
+        .collect()
+}
+
+fn blueprint_shell(
+    state: &Arc<AppState>,
+    user: &AuthUser,
+    db_ctx: &DatabaseContext,
+    title: &str,
+    body: &str,
+) -> Response {
+    let display_name = user.full_name.as_deref().unwrap_or(&user.username);
+    let initials = get_initials(display_name);
+    let sidebar = build_sidebar(
+        "blueprints",
+        display_name,
+        &initials,
+        &db_ctx.installed_modules,
+        user.is_admin(),
+        &state.plugin_registry,
+        &user.roles,
+    );
+    Html(vortex_framework::render_app_shell(title, &sidebar, body)).into_response()
+}
+
+fn blueprint_forbidden() -> Response {
+    (StatusCode::FORBIDDEN, Html(forbidden_page("Blueprints"))).into_response()
+}
+
+async fn blueprints_list(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+) -> Response {
+    if !user.is_admin() {
+        return blueprint_forbidden();
+    }
+    let rows = sqlx::query(
+        "SELECT m.name, m.display_name, b.status,
+                (SELECT count(*) FROM ir_model_field f WHERE f.model_id = m.id AND f.source = 'blueprint') AS field_count
+         FROM ir_model m JOIN blueprint b ON b.model_id = m.id
+         WHERE m.source = 'blueprint'
+         ORDER BY m.display_name",
+    )
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default();
+
+    let mut table_rows = String::new();
+    for r in &rows {
+        let name: String = r.get("name");
+        let label: String = r.get("display_name");
+        let status: String = r.get("status");
+        let fields: i64 = r.get("field_count");
+        let badge = if status == "active" { "badge-success" } else { "badge-ghost" };
+        table_rows.push_str(&format!(
+            r#"<tr class="hover"><td><a class="link link-primary" href="/blueprints/{name}">{label}</a></td><td><code class="text-xs">{name}</code></td><td>{fields}</td><td><span class="badge {badge} badge-sm">{status}</span></td><td><a href="/list/{name}" class="btn btn-xs btn-ghost">Open records →</a></td></tr>"#,
+            name = html_escape(&name),
+            label = html_escape(&label),
+            fields = fields,
+            badge = badge,
+            status = html_escape(&status),
+        ));
+    }
+    if table_rows.is_empty() {
+        table_rows = r#"<tr><td colspan="5" class="text-center py-8 opacity-60">No Blueprints yet. Create one to build a model with no deploy.</td></tr>"#.to_string();
+    }
+
+    let body = format!(
+        r#"<div class="flex justify-between items-center mb-6">
+<div><h1 class="text-2xl font-bold">Blueprints</h1><p class="text-base-content/60">Build governed models at runtime — every schema change is policy-checked and written to the audit ledger.</p></div>
+<a href="/blueprints/new" class="btn btn-primary">+ New Blueprint</a>
+</div>
+<div class="card bg-base-100 shadow"><div class="overflow-x-auto">
+<table class="table table-sm"><thead><tr><th>Name</th><th>Technical</th><th>Fields</th><th>Status</th><th>Records</th></tr></thead>
+<tbody>{table_rows}</tbody></table></div></div>"#,
+    );
+    blueprint_shell(&state, &user, &db_ctx, "Blueprints - Remicle", &body)
+}
+
+async fn blueprint_new(
+    State(state): State<Arc<AppState>>,
+    Db(_db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+) -> Response {
+    if !user.is_admin() {
+        return blueprint_forbidden();
+    }
+    let body = r#"<h1 class="text-2xl font-bold mb-6">New Blueprint</h1>
+<form action="/blueprints" method="POST" class="card bg-base-100 shadow p-6 max-w-xl">
+<div class="form-control mb-4"><label class="label"><span class="label-text">Name *</span></label>
+<input name="label" class="input input-bordered" placeholder="e.g. Site Visit" required/>
+<span class="label-text-alt mt-1 opacity-60">A technical name like <code>x_site_visit</code> is generated automatically.</span></div>
+<div class="flex gap-2 mt-4"><a href="/blueprints" class="btn btn-ghost">Cancel</a><button class="btn btn-primary">Create Blueprint</button></div>
+</form>"#;
+    blueprint_shell(&state, &user, &db_ctx, "New Blueprint - Remicle", body)
+}
+
+async fn blueprint_create(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Form(form): Form<BlueprintNewForm>,
+) -> Response {
+    if !user.is_admin() {
+        return blueprint_forbidden();
+    }
+    match vortex_framework::blueprint::create(&state, &db, &db_ctx.db_name, &user, &form.label).await {
+        Ok(model) => Redirect::to(&format!("/blueprints/{model}")).into_response(),
+        Err(e) => error_response(&e),
+    }
+}
+
+async fn blueprint_designer(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(model): Path<String>,
+) -> Response {
+    if !user.is_admin() {
+        return blueprint_forbidden();
+    }
+    let head = sqlx::query(
+        "SELECT m.id, m.display_name, b.status
+         FROM ir_model m JOIN blueprint b ON b.model_id = m.id
+         WHERE m.name = $1 AND m.source = 'blueprint'",
+    )
+    .bind(&model)
+    .fetch_optional(&db)
+    .await
+    .ok()
+    .flatten();
+    let Some(head) = head else {
+        return (StatusCode::NOT_FOUND, Html(forbidden_page("Blueprint not found"))).into_response();
+    };
+    let model_id: uuid::Uuid = head.get("id");
+    let label: String = head.get("display_name");
+    let status: String = head.get("status");
+
+    let fields = sqlx::query(
+        "SELECT name, display_name, field_type FROM ir_model_field
+         WHERE model_id = $1 AND source = 'blueprint' ORDER BY sequence",
+    )
+    .bind(model_id)
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default();
+
+    let mut field_rows = String::new();
+    for f in &fields {
+        let fname: String = f.get("name");
+        let flabel: String = f.get("display_name");
+        let ftype: String = f.get("field_type");
+        field_rows.push_str(&format!(
+            r#"<tr class="hover"><td>{flabel}</td><td><code class="text-xs">{fname}</code></td><td>{tlabel}</td><td>
+<form action="/blueprints/{model}/fields/{fname}/rename" method="POST" class="join">
+<input name="label" class="input input-bordered input-xs join-item" value="{flabel}" required/>
+<button class="btn btn-xs join-item">Rename</button></form></td>
+<td><form action="/blueprints/{model}/fields/{fname}/delete" method="POST" onsubmit="return confirm('Delete field {flabel}?')"><button class="btn btn-xs btn-ghost text-error">Delete</button></form></td></tr>"#,
+            flabel = html_escape(&flabel),
+            fname = html_escape(&fname),
+            tlabel = html_escape(&blueprint_type_label(&ftype)),
+            model = html_escape(&model),
+        ));
+    }
+    if field_rows.is_empty() {
+        field_rows = r#"<tr><td colspan="5" class="text-center py-6 opacity-60">No fields yet — add one below.</td></tr>"#.to_string();
+    }
+
+    let body = format!(
+        r#"<div class="flex justify-between items-center mb-6">
+<div><div class="flex items-center gap-2"><a href="/blueprints" class="btn btn-ghost btn-sm btn-square">←</a><h1 class="text-2xl font-bold">{label}</h1><span class="badge badge-ghost">{status}</span></div>
+<p class="text-base-content/60 mt-1">Technical name <code>{model}</code></p></div>
+<div class="flex gap-2"><a href="/list/{model}" class="btn btn-primary">Open records →</a>
+<form action="/blueprints/{model}/archive" method="POST" onsubmit="return confirm('Archive this Blueprint? Its records are kept.')"><button class="btn btn-ghost text-error">Archive</button></form></div>
+</div>
+<div class="card bg-base-100 shadow mb-6"><div class="card-body p-4 overflow-x-auto">
+<h2 class="card-title text-base mb-2">Fields</h2>
+<table class="table table-sm"><thead><tr><th>Label</th><th>Name</th><th>Type</th><th>Rename</th><th></th></tr></thead>
+<tbody>{field_rows}</tbody></table>
+</div></div>
+<div class="card bg-base-100 shadow max-w-2xl"><div class="card-body p-4">
+<h2 class="card-title text-base mb-2">Add a field</h2>
+<form action="/blueprints/{model}/fields" method="POST" class="flex flex-wrap gap-3 items-end">
+<div class="form-control"><label class="label py-1"><span class="label-text">Label</span></label><input name="label" class="input input-bordered input-sm" placeholder="e.g. Amount" required/></div>
+<div class="form-control"><label class="label py-1"><span class="label-text">Type</span></label><select name="field_type" class="select select-bordered select-sm">{type_options}</select></div>
+<button class="btn btn-primary btn-sm">Add field</button>
+</form></div></div>"#,
+        label = html_escape(&label),
+        status = html_escape(&status),
+        model = html_escape(&model),
+        field_rows = field_rows,
+        type_options = blueprint_type_options(),
+    );
+    blueprint_shell(
+        &state,
+        &user,
+        &db_ctx,
+        &format!("{} - Blueprints", html_escape(&label)),
+        &body,
+    )
+}
+
+async fn blueprint_add_field(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(model): Path<String>,
+    Form(form): Form<BlueprintFieldForm>,
+) -> Response {
+    if !user.is_admin() {
+        return blueprint_forbidden();
+    }
+    match vortex_framework::blueprint::add_field(
+        &state,
+        &db,
+        &db_ctx.db_name,
+        &user,
+        &model,
+        &form.label,
+        &form.field_type,
+    )
+    .await
+    {
+        Ok(()) => Redirect::to(&format!("/blueprints/{model}")).into_response(),
+        Err(e) => error_response(&e),
+    }
+}
+
+async fn blueprint_rename_field(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path((model, name)): Path<(String, String)>,
+    Form(form): Form<BlueprintRenameForm>,
+) -> Response {
+    if !user.is_admin() {
+        return blueprint_forbidden();
+    }
+    match vortex_framework::blueprint::rename_field(
+        &state,
+        &db,
+        &db_ctx.db_name,
+        &user,
+        &model,
+        &name,
+        &form.label,
+    )
+    .await
+    {
+        Ok(()) => Redirect::to(&format!("/blueprints/{model}")).into_response(),
+        Err(e) => error_response(&e),
+    }
+}
+
+async fn blueprint_remove_field(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path((model, name)): Path<(String, String)>,
+) -> Response {
+    if !user.is_admin() {
+        return blueprint_forbidden();
+    }
+    match vortex_framework::blueprint::remove_field(&state, &db, &db_ctx.db_name, &user, &model, &name).await {
+        Ok(()) => Redirect::to(&format!("/blueprints/{model}")).into_response(),
+        Err(e) => error_response(&e),
+    }
+}
+
+async fn blueprint_archive(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(model): Path<String>,
+) -> Response {
+    if !user.is_admin() {
+        return blueprint_forbidden();
+    }
+    match vortex_framework::blueprint::archive(&state, &db, &db_ctx.db_name, &user, &model).await {
+        Ok(()) => Redirect::to("/blueprints").into_response(),
+        Err(e) => error_response(&e),
+    }
+}
+
 // -- Announcement CRUD (admin-only) -------------------------------------------
 
 #[derive(serde::Deserialize)]
@@ -7822,9 +8171,15 @@ async fn generic_list_view(
     let table_name: String = model_row.get("table_name");
 
     // Fetch field metadata
+    // Select only columns that actually exist. The attribute columns the old
+    // query also named — is_searchable / is_filterable / is_groupable /
+    // badge_colors / widget / related_field — exist in NO migration, so
+    // selecting them errored the whole query and `unwrap_or_default()` blanked
+    // every generic list (unnoticed because compiled models use bespoke lists;
+    // Blueprints are the first to depend on the generic list). Derive those
+    // attributes from the field type instead.
     let field_rows = sqlx::query(
-        "SELECT name, display_name, field_type, is_searchable, is_filterable, is_groupable,
-                selection_options, badge_colors, widget, related_model, related_field
+        "SELECT name, display_name, field_type, selection_options, related_model
          FROM ir_model_field WHERE model_id = $1 AND is_visible = true ORDER BY sequence"
     )
     .bind(model_id)
@@ -7832,18 +8187,24 @@ async fn generic_list_view(
     .await
     .unwrap_or_default();
 
-    let fields: Vec<ModelField> = field_rows.iter().map(|r| ModelField {
-        name: r.get("name"),
-        display_name: r.get("display_name"),
-        field_type: r.get("field_type"),
-        is_searchable: r.get("is_searchable"),
-        is_filterable: r.get("is_filterable"),
-        is_groupable: r.get("is_groupable"),
-        selection_options: r.get("selection_options"),
-        badge_colors: r.get("badge_colors"),
-        widget: r.get("widget"),
-        related_model: r.get("related_model"),
-        related_field: r.get("related_field"),
+    let fields: Vec<ModelField> = field_rows.iter().map(|r| {
+        let field_type: String = r.get("field_type");
+        ModelField {
+            name: r.get("name"),
+            display_name: r.get("display_name"),
+            is_searchable: matches!(field_type.as_str(), "string" | "char" | "text"),
+            is_filterable: true,
+            is_groupable: matches!(
+                field_type.as_str(),
+                "selection" | "boolean" | "date" | "datetime" | "many2one"
+            ),
+            selection_options: r.get("selection_options"),
+            badge_colors: None,
+            widget: None,
+            related_model: r.get("related_model"),
+            related_field: if field_type == "many2one" { Some("name".to_string()) } else { None },
+            field_type,
+        }
     }).collect();
 
     // Build WHERE conditions
@@ -7891,14 +8252,19 @@ async fn generic_list_view(
     }
 
     // Build ORDER BY with grouping
+    // Default ordering assumed every model has a `name` column — true for
+    // compiled models, false for Blueprints (arbitrary user fields). Fall back
+    // to `id` (always present) when there is no `name` field, so the records
+    // query can't fail with "column name does not exist".
+    let default_order = if fields.iter().any(|f| f.name == "name") { "name" } else { "id" };
     let order_by = if let Some(ref group_by) = params.group_by {
         if fields.iter().any(|f| f.is_groupable && f.name == *group_by) {
-            format!("{} NULLS LAST, name", group_by)
+            format!("{} NULLS LAST, {}", group_by, default_order)
         } else {
-            "name".to_string()
+            default_order.to_string()
         }
     } else {
-        "name".to_string()
+        default_order.to_string()
     };
 
     // Build JOINs and SELECT for many2one fields
@@ -8041,7 +8407,7 @@ async fn generic_list_view(
             .collect();
 
         rows.push_str(&format!(
-            r#"<tr class="hover cursor-pointer" onclick="window.location='{}'">{}></tr>"#,
+            r#"<tr class="hover cursor-pointer" onclick="window.location='{}'">{}</tr>"#,
             vortex_framework::record_url(&model_name, &id.to_string()), cells
         ));
     }
@@ -20248,19 +20614,43 @@ async fn dynamic_form_create(
         return (StatusCode::NOT_FOUND, Html("Model not found")).into_response();
     };
 
-    // Build INSERT query dynamically
+    // Real columns + their Postgres types, straight from the catalog. This does
+    // three things a bare text-bind loop can't: (1) casts each value to the
+    // column's actual type (`$n::date` / `::numeric` / `::bool`) so date/money/
+    // bool fields don't fail — which they always did before, silently; (2)
+    // whitelists column names, ignoring any form key that isn't a real column
+    // (and closing the interpolated-identifier hole); (3) numbers placeholders
+    // by the count of *accepted* columns, fixing a bind/placeholder mismatch
+    // when any field was skipped. Trusted input: udt_name comes from the
+    // catalog, not the request.
+    let col_types: std::collections::HashMap<String, String> = sqlx::query(
+        "SELECT column_name, udt_name FROM information_schema.columns WHERE table_name = $1",
+    )
+    .bind(&table_name)
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default()
+    .iter()
+    .map(|r| (r.get::<String, _>("column_name"), r.get::<String, _>("udt_name")))
+    .collect();
+
     let mut columns = Vec::new();
     let mut placeholders = Vec::new();
     let mut values: Vec<String> = Vec::new();
 
-    for (i, (key, value)) in form_data.iter().enumerate() {
-        if key != "id" && !value.is_empty() {
-            columns.push(key.clone());
-            placeholders.push(format!("${}", i + 1));
-            // Handle checkbox values
-            let val = if value == "on" { "true".to_string() } else { value.clone() };
-            values.push(val);
+    for (key, value) in form_data.iter() {
+        if key == "id" || value.is_empty() {
+            continue;
         }
+        let Some(udt) = col_types.get(key) else {
+            continue; // not a real column — ignore
+        };
+        let n = values.len() + 1;
+        columns.push(format!("\"{}\"", key));
+        placeholders.push(format!("${}::{}", n, udt));
+        // Handle checkbox values
+        let val = if value == "on" { "true".to_string() } else { value.clone() };
+        values.push(val);
     }
 
     if columns.is_empty() {
@@ -20309,17 +20699,36 @@ async fn dynamic_form_update(
         return (StatusCode::NOT_FOUND, Html("Model not found")).into_response();
     };
 
+    // Real columns + types from the catalog — same rationale as create: cast
+    // to the true column type, whitelist column names, and number placeholders
+    // by accepted-column count (not raw enumerate index).
+    let col_types: std::collections::HashMap<String, String> = sqlx::query(
+        "SELECT column_name, udt_name FROM information_schema.columns WHERE table_name = $1",
+    )
+    .bind(&table_name)
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default()
+    .iter()
+    .map(|r| (r.get::<String, _>("column_name"), r.get::<String, _>("udt_name")))
+    .collect();
+
     // Build UPDATE query dynamically
     let mut set_clauses = Vec::new();
     let mut values: Vec<String> = Vec::new();
 
-    for (i, (key, value)) in form_data.iter().enumerate() {
-        if key != "id" {
-            set_clauses.push(format!("{} = ${}", key, i + 1));
-            // Handle checkbox values - if checkbox is unchecked, it won't be in form_data
-            let val = if value == "on" { "true".to_string() } else { value.clone() };
-            values.push(val);
+    for (key, value) in form_data.iter() {
+        if key == "id" {
+            continue;
         }
+        let Some(udt) = col_types.get(key) else {
+            continue; // not a real column — ignore
+        };
+        let n = values.len() + 1;
+        set_clauses.push(format!("\"{}\" = ${}::{}", key, n, udt));
+        // Handle checkbox values - if checkbox is unchecked, it won't be in form_data
+        let val = if value == "on" { "true".to_string() } else { value.clone() };
+        values.push(val);
     }
 
     if set_clauses.is_empty() {
