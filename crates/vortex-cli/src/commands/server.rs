@@ -2199,6 +2199,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/blueprints/new", get(blueprint_new))
         .route("/blueprints/{model}", get(blueprint_designer))
         .route("/blueprints/{model}/archive", post(blueprint_archive))
+        .route("/blueprints/{model}/history", get(blueprint_history))
         .route("/blueprints/{model}/layout", post(blueprint_set_layout))
         .route("/blueprints/{model}/fields", post(blueprint_add_field))
         .route("/blueprints/{model}/fields/{name}/rename", post(blueprint_rename_field))
@@ -5397,6 +5398,7 @@ async fn blueprint_designer(
 <div><div class="flex items-center gap-2"><a href="/blueprints" class="btn btn-ghost btn-sm btn-square">←</a><h1 class="text-2xl font-bold">{label}</h1><span class="badge badge-ghost">{status}</span></div>
 <p class="text-base-content/60 mt-1">Technical name <code>{model}</code></p></div>
 <div class="flex gap-2"><a href="/list/{model}" class="btn btn-primary">Open records →</a>
+<a href="/blueprints/{model}/history" class="btn btn-ghost">History</a>
 <form action="/blueprints/{model}/archive" method="POST" onsubmit="return confirm('Archive this Blueprint? Its records are kept.')"><button class="btn btn-ghost text-error">Archive</button></form></div>
 </div>
 <div class="card bg-base-100 shadow mb-6"><div class="card-body p-4 overflow-x-auto">
@@ -5519,6 +5521,120 @@ async fn blueprint_archive(
         Ok(()) => Redirect::to("/blueprints").into_response(),
         Err(e) => error_response(&e),
     }
+}
+
+/// GET /blueprints/{model}/history — the schema-history timeline. Renders each
+/// version snapshot (who/when) with the field-level diff against the previous
+/// one, computed by `vortex_framework::blueprint::diff_definitions`. Read-only:
+/// the tamper-evident record of how a Blueprint's schema evolved — a governance
+/// capability Odoo/Frappe's no-code builders don't offer.
+async fn blueprint_history(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(model): Path<String>,
+) -> Response {
+    if !user.is_admin() {
+        return blueprint_forbidden();
+    }
+    let label: Option<String> = sqlx::query_scalar(
+        "SELECT display_name FROM ir_model WHERE name = $1 AND source = 'blueprint'",
+    )
+    .bind(&model)
+    .fetch_optional(&db)
+    .await
+    .ok()
+    .flatten();
+    let Some(label) = label else {
+        return (StatusCode::NOT_FOUND, Html(forbidden_page("Blueprint not found"))).into_response();
+    };
+
+    let versions = sqlx::query(
+        "SELECT bv.version, bv.definition, bv.applied_at, u.username AS applied_by
+         FROM blueprint_version bv
+         JOIN blueprint b ON b.id = bv.blueprint_id
+         JOIN ir_model m ON m.id = b.model_id
+         LEFT JOIN users u ON u.id = bv.applied_by
+         WHERE m.name = $1 AND m.source = 'blueprint'
+         ORDER BY bv.version ASC",
+    )
+    .bind(&model)
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default();
+
+    // Build the diff for each version against its predecessor, then render
+    // newest-first.
+    let mut entries: Vec<String> = Vec::new();
+    let mut prev_def: Option<serde_json::Value> = None;
+    for v in &versions {
+        let vnum: i32 = v.get("version");
+        let def: serde_json::Value = v.get("definition");
+        let applied_by: Option<String> = v.get("applied_by");
+        let applied_at: chrono::DateTime<chrono::Utc> = v.get("applied_at");
+        let changes = vortex_framework::blueprint::diff_definitions(prev_def.as_ref(), &def);
+
+        let change_html = if changes.is_empty() {
+            r#"<span class="opacity-60 text-sm">No field changes</span>"#.to_string()
+        } else {
+            changes
+                .iter()
+                .map(|c| {
+                    let (badge, verb) = match c.kind {
+                        "added" => ("badge-success", "Added"),
+                        "removed" => ("badge-error", "Removed"),
+                        _ => ("badge-warning", "Changed"),
+                    };
+                    let detail = if c.detail.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" <span class=\"opacity-70\">— {}</span>", html_escape(&c.detail))
+                    };
+                    format!(
+                        r#"<div class="text-sm py-0.5"><span class="badge {badge} badge-sm mr-2">{verb}</span><code class="text-xs">{field}</code>{detail}</div>"#,
+                        badge = badge,
+                        verb = verb,
+                        field = html_escape(&c.field),
+                        detail = detail,
+                    )
+                })
+                .collect::<String>()
+        };
+        entries.push(format!(
+            r#"<div class="card bg-base-100 shadow-sm border border-base-300"><div class="card-body p-4">
+<div class="flex items-center justify-between mb-2"><h3 class="font-semibold">Version {vnum}</h3>
+<span class="text-xs opacity-60">{by} · {at}</span></div>
+{changes}</div></div>"#,
+            vnum = vnum,
+            by = html_escape(applied_by.as_deref().unwrap_or("system")),
+            at = applied_at.format("%Y-%m-%d %H:%M UTC"),
+            changes = change_html,
+        ));
+        prev_def = Some(def);
+    }
+    entries.reverse();
+    let timeline = if entries.is_empty() {
+        r#"<p class="opacity-60">No versions recorded yet.</p>"#.to_string()
+    } else {
+        format!(r#"<div class="flex flex-col gap-3 max-w-2xl">{}</div>"#, entries.join(""))
+    };
+
+    let body = format!(
+        r#"<div class="flex items-center gap-2 mb-1"><a href="/blueprints/{model}" class="btn btn-ghost btn-sm btn-square">←</a><h1 class="text-2xl font-bold">{label} — History</h1></div>
+<p class="text-base-content/60 mb-6">Every schema and layout change, in order. Each version is WORM-audited; this is the human-readable timeline.</p>
+{timeline}"#,
+        model = html_escape(&model),
+        label = html_escape(&label),
+        timeline = timeline,
+    );
+    blueprint_shell(
+        &state,
+        &user,
+        &db_ctx,
+        &format!("{} History - Blueprints", html_escape(&label)),
+        &body,
+    )
 }
 
 /// POST /blueprints/{model}/layout — save the field order + list-column layout.

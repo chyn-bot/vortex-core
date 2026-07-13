@@ -26,6 +26,90 @@ fn dberr(e: sqlx::Error) -> String {
     format!("database error: {e}")
 }
 
+/// Per-tenant quota: the most Blueprints a single tenant may hold. Bounds the
+/// generated-schema footprint so a runaway or hostile actor can't schema-bomb
+/// the database (design §3/§9). Generous enough not to constrain real use.
+pub const MAX_BLUEPRINTS_PER_TENANT: i64 = 100;
+
+/// Per-tenant quota: the most fields a single Blueprint may carry (includes the
+/// auto `name` field).
+pub const MAX_FIELDS_PER_BLUEPRINT: i64 = 100;
+
+/// A single field-level change between two Blueprint version snapshots, for the
+/// schema-history view. `kind` is one of `added` / `removed` / `changed`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FieldChange {
+    pub kind: &'static str,
+    pub field: String,
+    pub detail: String,
+}
+
+fn snapshot_fields(def: &serde_json::Value) -> Vec<serde_json::Value> {
+    def.get("fields")
+        .and_then(|f| f.as_array())
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn field_str(f: &serde_json::Value, key: &str) -> String {
+    f.get(key)
+        .map(|v| match v {
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        })
+        .unwrap_or_default()
+}
+
+/// Diff two version definitions into a human-readable change list. `prev = None`
+/// means the first version (everything is `added`). Compares fields by `name`
+/// and reports added/removed fields and changed type/label/list-visibility.
+/// Pure and unit-tested — the history handler renders whatever this returns.
+pub fn diff_definitions(prev: Option<&serde_json::Value>, cur: &serde_json::Value) -> Vec<FieldChange> {
+    let cur_fields = snapshot_fields(cur);
+    let prev_fields = prev.map(snapshot_fields).unwrap_or_default();
+    let name_of = |f: &serde_json::Value| field_str(f, "name");
+
+    let mut changes = Vec::new();
+    // Added / changed.
+    for cf in &cur_fields {
+        let n = name_of(cf);
+        match prev_fields.iter().find(|pf| name_of(pf) == n) {
+            None => changes.push(FieldChange {
+                kind: "added",
+                field: n.clone(),
+                detail: format!("{} field", field_str(cf, "type")),
+            }),
+            Some(pf) => {
+                let mut deltas = Vec::new();
+                if field_str(pf, "type") != field_str(cf, "type") {
+                    deltas.push(format!("type {} → {}", field_str(pf, "type"), field_str(cf, "type")));
+                }
+                if field_str(pf, "label") != field_str(cf, "label") {
+                    deltas.push(format!("renamed “{}” → “{}”", field_str(pf, "label"), field_str(cf, "label")));
+                }
+                if field_str(pf, "in_list") != field_str(cf, "in_list") {
+                    deltas.push(if field_str(cf, "in_list") == "true" {
+                        "shown in list".to_string()
+                    } else {
+                        "hidden from list".to_string()
+                    });
+                }
+                if !deltas.is_empty() {
+                    changes.push(FieldChange { kind: "changed", field: n.clone(), detail: deltas.join(", ") });
+                }
+            }
+        }
+    }
+    // Removed.
+    for pf in &prev_fields {
+        let n = name_of(pf);
+        if !cur_fields.iter().any(|cf| name_of(cf) == n) {
+            changes.push(FieldChange { kind: "removed", field: n, detail: String::new() });
+        }
+    }
+    changes
+}
+
 /// Turn a human label into a safe `[a-z][a-z0-9_]*` slug: lowercase, non-alnum
 /// runs collapse to a single `_`, leading digits/underscores trimmed. The
 /// result is still validated by [`ddl::validate_identifier`] before use.
@@ -195,6 +279,16 @@ pub async fn create(
     let model = format!("{}{}", ddl::TABLE_PREFIX, slug);
     gate(state, user, "blueprint.create", &model).await?;
 
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM blueprint")
+        .fetch_one(db)
+        .await
+        .map_err(dberr)?;
+    if count >= MAX_BLUEPRINTS_PER_TENANT {
+        return Err(format!(
+            "Blueprint limit reached ({MAX_BLUEPRINTS_PER_TENANT} per tenant). Archive an unused Blueprint first."
+        ));
+    }
+
     let mut tx = db.begin().await.map_err(dberr)?;
 
     // No name collision with any existing model (compiled or blueprint).
@@ -348,6 +442,17 @@ pub async fn add_field(
     };
 
     let (model_id, blueprint_id, table) = resolve(db, model).await?;
+
+    let fcount: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM ir_model_field WHERE model_id = $1 AND source = 'blueprint'")
+            .bind(model_id)
+            .fetch_one(db)
+            .await
+            .map_err(dberr)?;
+    if fcount >= MAX_FIELDS_PER_BLUEPRINT {
+        return Err(format!("Field limit reached ({MAX_FIELDS_PER_BLUEPRINT} per Blueprint)."));
+    }
+
     let mut tx = db.begin().await.map_err(dberr)?;
 
     let dup: Option<i32> =
@@ -663,6 +768,36 @@ mod tests {
     fn parse_selection_options_rejects_empty() {
         assert!(parse_selection_options("").is_err());
         assert!(parse_selection_options("\n  \n").is_err());
+    }
+
+    #[test]
+    fn diff_first_version_is_all_added() {
+        let cur = serde_json::json!({"fields": [
+            {"name": "name", "label": "Name", "type": "string", "in_list": true},
+        ]});
+        let d = super::diff_definitions(None, &cur);
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].kind, "added");
+        assert_eq!(d[0].field, "name");
+    }
+
+    #[test]
+    fn diff_detects_add_remove_and_change() {
+        let prev = serde_json::json!({"fields": [
+            {"name": "name", "label": "Name", "type": "string", "in_list": true},
+            {"name": "old", "label": "Old", "type": "integer", "in_list": true},
+        ]});
+        let cur = serde_json::json!({"fields": [
+            {"name": "name", "label": "Title", "type": "string", "in_list": false},
+            {"name": "amount", "label": "Amount", "type": "monetary", "in_list": true},
+        ]});
+        let d = super::diff_definitions(Some(&prev), &cur);
+        let changed = d.iter().find(|c| c.field == "name").unwrap();
+        assert_eq!(changed.kind, "changed");
+        assert!(changed.detail.contains("renamed"));
+        assert!(changed.detail.contains("hidden from list"));
+        assert!(d.iter().any(|c| c.field == "amount" && c.kind == "added"));
+        assert!(d.iter().any(|c| c.field == "old" && c.kind == "removed"));
     }
 
     #[test]
