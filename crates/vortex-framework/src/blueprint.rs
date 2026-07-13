@@ -16,6 +16,7 @@
 use crate::auth::AuthUser;
 use crate::state::AppState;
 use sqlx::{PgPool, Postgres, Row, Transaction};
+use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 use vortex_orm::blueprint as ddl;
 use vortex_policy::{PolicyPrincipal, PolicyResource};
@@ -129,7 +130,7 @@ async fn resolve(db: &PgPool, model: &str) -> Result<(Uuid, Uuid, String), Strin
 /// Snapshot the current blueprint fields as JSON for a version record.
 async fn snapshot(tx: &mut Transaction<'_, Postgres>, model_id: Uuid) -> Result<serde_json::Value, String> {
     let rows = sqlx::query(
-        "SELECT name, display_name, field_type FROM ir_model_field
+        "SELECT name, display_name, field_type, sequence, is_visible FROM ir_model_field
          WHERE model_id = $1 AND source = 'blueprint' ORDER BY sequence",
     )
     .bind(model_id)
@@ -143,6 +144,8 @@ async fn snapshot(tx: &mut Transaction<'_, Postgres>, model_id: Uuid) -> Result<
                 "name": r.get::<String, _>("name"),
                 "label": r.get::<String, _>("display_name"),
                 "type": r.get::<String, _>("field_type"),
+                "sequence": r.get::<i32, _>("sequence"),
+                "in_list": r.get::<bool, _>("is_visible"),
             })
         })
         .collect();
@@ -404,6 +407,100 @@ pub async fn remove_field(
     Ok(())
 }
 
+/// Compute the normalized layout to apply. `existing` is the blueprint's field
+/// names in their current order; `orders` maps a field name to a desired ordinal
+/// (lower = earlier); `list_fields` is the set of fields to keep as generic-list
+/// columns. Every key in `orders`/`list_fields` must be an existing blueprint
+/// field (guards against a tampered form injecting a foreign column name).
+/// Returns `(name, sequence, in_list)` with sequences renormalized to clean,
+/// gap-spaced values in the requested order.
+fn plan_layout(
+    existing: &[String],
+    orders: &HashMap<String, i32>,
+    list_fields: &HashSet<String>,
+) -> Result<Vec<(String, i32, bool)>, String> {
+    let known: HashSet<&str> = existing.iter().map(|s| s.as_str()).collect();
+    for k in orders.keys().chain(list_fields.iter()) {
+        if !known.contains(k.as_str()) {
+            return Err(format!("Unknown field '{k}'"));
+        }
+    }
+    let mut items: Vec<(usize, &String)> = existing.iter().enumerate().collect();
+    items.sort_by(|a, b| {
+        let oa = orders.get(a.1).copied().unwrap_or(a.0 as i32);
+        let ob = orders.get(b.1).copied().unwrap_or(b.0 as i32);
+        oa.cmp(&ob).then_with(|| a.1.cmp(b.1))
+    });
+    Ok(items
+        .into_iter()
+        .enumerate()
+        .map(|(i, (_, name))| (name.clone(), ((i + 1) * 10) as i32, list_fields.contains(name)))
+        .collect())
+}
+
+/// Persist a view/layout change for a Blueprint: field order (`sequence`, which
+/// drives both the generic form and list) and list-column membership
+/// (`is_visible`, which the generic list already honors). Metadata-only — no
+/// DDL runs — but still governed (Cedar `blueprint.alter`), version-snapshotted,
+/// and WORM-audited, so a layout change is as accountable as a schema change.
+pub async fn set_layout(
+    state: &AppState,
+    db: &PgPool,
+    db_name: &str,
+    user: &AuthUser,
+    model: &str,
+    orders: &HashMap<String, i32>,
+    list_fields: &HashSet<String>,
+) -> Result<(), String> {
+    gate(state, user, "blueprint.alter", model).await?;
+
+    let (model_id, blueprint_id, _table) = resolve(db, model).await?;
+    let mut tx = db.begin().await.map_err(dberr)?;
+
+    let rows = sqlx::query(
+        "SELECT name FROM ir_model_field
+         WHERE model_id = $1 AND source = 'blueprint' ORDER BY sequence, name",
+    )
+    .bind(model_id)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(dberr)?;
+    let existing: Vec<String> = rows.iter().map(|r| r.get::<String, _>("name")).collect();
+    if existing.is_empty() {
+        return Err("This Blueprint has no fields to lay out yet".to_string());
+    }
+
+    let plan = plan_layout(&existing, orders, list_fields)?;
+    for (name, seq, in_list) in &plan {
+        sqlx::query(
+            "UPDATE ir_model_field SET sequence = $3, is_visible = $4
+             WHERE model_id = $1 AND name = $2 AND source = 'blueprint'",
+        )
+        .bind(model_id)
+        .bind(name)
+        .bind(*seq)
+        .bind(*in_list)
+        .execute(&mut *tx)
+        .await
+        .map_err(dberr)?;
+    }
+
+    record_version(&mut tx, blueprint_id, model_id, user).await?;
+    tx.commit().await.map_err(dberr)?;
+
+    audit(
+        state,
+        db_name,
+        user,
+        "blueprint_layout_changed",
+        AuditSeverity::Info,
+        model,
+        serde_json::json!({ "fields": plan.len() }),
+    )
+    .await;
+    Ok(())
+}
+
 /// Archive a Blueprint: soft-delete (status='archived', model inactive). The
 /// generated table and its data are preserved — a hard drop is a separate,
 /// deliberate admin path (Phase 1b/later).
@@ -447,7 +544,44 @@ pub async fn archive(
 
 #[cfg(test)]
 mod tests {
-    use super::slugify;
+    use super::{plan_layout, slugify};
+    use std::collections::{HashMap, HashSet};
+
+    #[test]
+    fn plan_layout_reorders_and_renormalizes() {
+        let existing = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        // Ask for b, a, c via ordinals; keep a and c as list columns.
+        let orders = HashMap::from([("a".into(), 2), ("b".into(), 1), ("c".into(), 3)]);
+        let list = HashSet::from(["a".to_string(), "c".to_string()]);
+        let plan = plan_layout(&existing, &orders, &list).unwrap();
+        assert_eq!(
+            plan,
+            vec![
+                ("b".to_string(), 10, false),
+                ("a".to_string(), 20, true),
+                ("c".to_string(), 30, true),
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_layout_rejects_unknown_field() {
+        let existing = vec!["a".to_string()];
+        let orders = HashMap::from([("ghost".to_string(), 1)]);
+        let list = HashSet::new();
+        assert!(plan_layout(&existing, &orders, &list).is_err());
+    }
+
+    #[test]
+    fn plan_layout_ties_break_by_name() {
+        let existing = vec!["zeta".to_string(), "alpha".to_string()];
+        // Same ordinal for both -> deterministic name order.
+        let orders = HashMap::from([("zeta".into(), 5), ("alpha".into(), 5)]);
+        let list = HashSet::new();
+        let plan = plan_layout(&existing, &orders, &list).unwrap();
+        assert_eq!(plan[0].0, "alpha");
+        assert_eq!(plan[1].0, "zeta");
+    }
 
     #[test]
     fn slugify_makes_safe_identifiers() {

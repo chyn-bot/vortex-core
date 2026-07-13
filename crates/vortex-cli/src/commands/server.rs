@@ -2199,6 +2199,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/blueprints/new", get(blueprint_new))
         .route("/blueprints/{model}", get(blueprint_designer))
         .route("/blueprints/{model}/archive", post(blueprint_archive))
+        .route("/blueprints/{model}/layout", post(blueprint_set_layout))
         .route("/blueprints/{model}/fields", post(blueprint_add_field))
         .route("/blueprints/{model}/fields/{name}/rename", post(blueprint_rename_field))
         .route("/blueprints/{model}/fields/{name}/delete", post(blueprint_remove_field))
@@ -5246,13 +5247,32 @@ async fn blueprint_designer(
     let status: String = head.get("status");
 
     let fields = sqlx::query(
-        "SELECT name, display_name, field_type FROM ir_model_field
+        "SELECT name, display_name, field_type, sequence, is_visible FROM ir_model_field
          WHERE model_id = $1 AND source = 'blueprint' ORDER BY sequence",
     )
     .bind(model_id)
     .fetch_all(&db)
     .await
     .unwrap_or_default();
+
+    // Layout rows: an order box + a "list column" checkbox per field, submitted
+    // as one form (order__<f> / list__<f>). Sequence drives order in both the
+    // generic form and list; is_visible drives list-column membership.
+    let mut layout_rows = String::new();
+    for (idx, f) in fields.iter().enumerate() {
+        let fname: String = f.get("name");
+        let flabel: String = f.get("display_name");
+        let in_list: bool = f.get("is_visible");
+        layout_rows.push_str(&format!(
+            r#"<tr class="hover"><td>{flabel} <code class="text-xs opacity-60">{fname}</code></td>
+<td><input type="number" name="order__{fname}" value="{ord}" class="input input-bordered input-xs w-20"/></td>
+<td class="text-center"><input type="checkbox" name="list__{fname}" class="checkbox checkbox-sm"{checked}/></td></tr>"#,
+            flabel = html_escape(&flabel),
+            fname = html_escape(&fname),
+            ord = (idx + 1) * 10,
+            checked = if in_list { " checked" } else { "" },
+        ));
+    }
 
     let mut field_rows = String::new();
     for f in &fields {
@@ -5275,6 +5295,23 @@ async fn blueprint_designer(
         field_rows = r#"<tr><td colspan="5" class="text-center py-6 opacity-60">No fields yet — add one below.</td></tr>"#.to_string();
     }
 
+    let layout_card = if layout_rows.is_empty() {
+        String::new()
+    } else {
+        format!(
+            r#"<div class="card bg-base-100 shadow mb-6 max-w-2xl"><div class="card-body p-4">
+<h2 class="card-title text-base mb-1">Layout</h2>
+<p class="text-sm opacity-60 mb-3">Order drives both the form and the list. Untick <em>List column</em> to hide a field from the list view — it stays editable on the form.</p>
+<form action="/blueprints/{model}/layout" method="POST">
+<table class="table table-sm"><thead><tr><th>Field</th><th>Order</th><th class="text-center">List column</th></tr></thead>
+<tbody>{layout_rows}</tbody></table>
+<div class="mt-3"><button class="btn btn-primary btn-sm">Save layout</button></div>
+</form></div></div>"#,
+            model = html_escape(&model),
+            layout_rows = layout_rows,
+        )
+    };
+
     let body = format!(
         r#"<div class="flex justify-between items-center mb-6">
 <div><div class="flex items-center gap-2"><a href="/blueprints" class="btn btn-ghost btn-sm btn-square">←</a><h1 class="text-2xl font-bold">{label}</h1><span class="badge badge-ghost">{status}</span></div>
@@ -5287,6 +5324,7 @@ async fn blueprint_designer(
 <table class="table table-sm"><thead><tr><th>Label</th><th>Name</th><th>Type</th><th>Rename</th><th></th></tr></thead>
 <tbody>{field_rows}</tbody></table>
 </div></div>
+{layout_card}
 <div class="card bg-base-100 shadow max-w-2xl"><div class="card-body p-4">
 <h2 class="card-title text-base mb-2">Add a field</h2>
 <form action="/blueprints/{model}/fields" method="POST" class="flex flex-wrap gap-3 items-end">
@@ -5298,6 +5336,7 @@ async fn blueprint_designer(
         status = html_escape(&status),
         model = html_escape(&model),
         field_rows = field_rows,
+        layout_card = layout_card,
         type_options = blueprint_type_options(),
     );
     blueprint_shell(
@@ -5391,6 +5430,49 @@ async fn blueprint_archive(
     }
     match vortex_framework::blueprint::archive(&state, &db, &db_ctx.db_name, &user, &model).await {
         Ok(()) => Redirect::to("/blueprints").into_response(),
+        Err(e) => error_response(&e),
+    }
+}
+
+/// POST /blueprints/{model}/layout — save the field order + list-column layout.
+/// The body is flat key/value pairs (`order__<field>=<n>`, `list__<field>=on`);
+/// checkboxes only submit when checked, so an absent `list__<field>` means "not
+/// a list column". Parsed leniently here; the service validates every field name
+/// against the Blueprint's real fields before applying.
+async fn blueprint_set_layout(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(model): Path<String>,
+    Form(pairs): Form<Vec<(String, String)>>,
+) -> Response {
+    if !user.is_admin() {
+        return blueprint_forbidden();
+    }
+    let mut orders: std::collections::HashMap<String, i32> = std::collections::HashMap::new();
+    let mut list_fields: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (k, v) in &pairs {
+        if let Some(name) = k.strip_prefix("order__") {
+            if let Ok(n) = v.trim().parse::<i32>() {
+                orders.insert(name.to_string(), n);
+            }
+        } else if let Some(name) = k.strip_prefix("list__") {
+            list_fields.insert(name.to_string());
+        }
+    }
+    match vortex_framework::blueprint::set_layout(
+        &state,
+        &db,
+        &db_ctx.db_name,
+        &user,
+        &model,
+        &orders,
+        &list_fields,
+    )
+    .await
+    {
+        Ok(()) => Redirect::to(&format!("/blueprints/{model}")).into_response(),
         Err(e) => error_response(&e),
     }
 }
