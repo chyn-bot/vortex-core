@@ -19,6 +19,7 @@ const MIG_008_QUOTE_DISCOUNT: &str = include_str!("../migrations/008_quote_disco
 const MIG_009_LINE_UOM: &str = include_str!("../migrations/009_line_uom/postgres.sql");
 const MIG_010_NOTE_TEMPLATES: &str = include_str!("../migrations/010_note_templates/postgres.sql");
 const MIG_011_PAYMENT_TERM: &str = include_str!("../migrations/011_payment_term/postgres.sql");
+const MIG_012_LIST_URL: &str = include_str!("../migrations/012_list_url/postgres.sql");
 
 pub struct SalesPlugin;
 
@@ -183,6 +184,12 @@ impl Plugin for SalesPlugin {
                 up_sql: MIG_011_PAYMENT_TERM,
                 down_sql: None,
                 requires_core_migration: None,
+            },
+            PluginMigration {
+                name: "012_list_url",
+                up_sql: MIG_012_LIST_URL,
+                down_sql: None,
+                requires_core_migration: Some("123_model_list_url"),
             },
         ]
     }
