@@ -1,0 +1,5 @@
+# Migration metadata for 143_portal_users
+module = "core"
+description = "Portal users: users.is_portal + users.contact_id (FK to contacts) discriminate external customer/vendor self-service logins from internal staff; seeds the 'Portal User' role."
+reversible = true
+dependencies = ["010_contacts"]

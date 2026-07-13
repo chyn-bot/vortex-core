@@ -183,7 +183,9 @@ async fn auth_middleware(
             u.username,
             u.full_name,
             u.active,
-            u.locked
+            u.locked,
+            u.is_portal,
+            u.contact_id
         FROM sessions s
         JOIN users u ON s.user_id = u.id
         WHERE s.token_hash = $1
@@ -211,6 +213,12 @@ async fn auth_middleware(
             if session.locked {
                 warn!("User {} is locked", session.username);
                 return redirect_to_login_with_message("Account locked");
+            }
+            // Hard isolation boundary: an external portal user's session must
+            // never grant access to the internal back-office tree, whatever
+            // roles are attached. Bounce them to their own surface.
+            if session.is_portal {
+                return Redirect::to("/portal").into_response();
             }
 
             // Update last activity (extends session on activity).
@@ -252,6 +260,8 @@ async fn auth_middleware(
                 full_name: session.full_name,
                 session_id: session.session_id,
                 roles,
+                contact_id: session.contact_id,
+                is_portal: session.is_portal,
             };
             request.extensions_mut().insert(auth_user);
 
@@ -299,6 +309,8 @@ struct SessionWithUser {
     full_name: Option<String>,
     active: bool,
     locked: bool,
+    is_portal: bool,
+    contact_id: Option<uuid::Uuid>,
 }
 
 fn redirect_to_login_with_message(_message: &str) -> Response {
@@ -425,6 +437,10 @@ async fn api_auth_middleware(
         full_name: tok.full_name.clone(),
         session_id: tok.token_id, // no session row for tokens; trace by token id
         roles: tok.roles.clone(),
+        // Bearer tokens (mobile / service PAT) are first-party today; portal
+        // logins use the browser session. A portal-scoped token is future work.
+        contact_id: None,
+        is_portal: false,
     };
     request.extensions_mut().insert(auth_user);
     request.extensions_mut().insert(tok); // ResolvedToken — scope checks
@@ -569,6 +585,8 @@ async fn resolve_bearer(
         full_name: tok.full_name.clone(),
         session_id: tok.token_id,
         roles: tok.roles.clone(),
+        contact_id: None,
+        is_portal: false,
     };
     let db_ctx = DatabaseContext {
         db_name,
@@ -2455,6 +2473,30 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/{model}/{id}/duplicate", post(api_duplicate_record))
         .route_layer(middleware::from_fn_with_state(state.clone(), api_auth_middleware));
 
+    // ─── External portal (/portal/*) ──────────────────────────────
+    // Protected surface: only `is_portal` users, guarded by
+    // `portal_auth_middleware`. Separate from the internal tree, whose
+    // `auth_middleware` bounces portal users away.
+    let portal_protected = Router::new()
+        .route("/portal", get(portal_home))
+        .route("/portal/invoices", get(portal_invoices))
+        .route("/portal/invoices/{id}", get(portal_invoice_detail))
+        .route("/portal/orders", get(portal_orders))
+        .route("/portal/statement", get(portal_statement))
+        .route("/portal/logout", post(portal_logout))
+        .route_layer(middleware::from_fn_with_state(state.clone(), portal_auth_middleware));
+
+    // Public portal login (pre-auth), rate-limited like the staff login.
+    let portal_login_limiter = RateLimiter::new(RateLimitConfig {
+        max_requests: 5,
+        window: std::time::Duration::from_secs(60),
+        per_user: false,
+    });
+    let portal_public = Router::new()
+        .route("/portal/login", get(portal_login_page).post(portal_login_submit))
+        .layer(middleware::from_fn(vortex_server::middleware::rate_limit::rate_limit_middleware))
+        .layer(Extension(portal_login_limiter));
+
     // Public routes - no authentication required
     Router::new()
         // Health check
@@ -2482,6 +2524,10 @@ fn build_router(state: Arc<AppState>) -> Router {
 
         // Merge protected routes
         .merge(protected_routes)
+
+        // External portal: public login + protected self-service tree
+        .merge(portal_public)
+        .merge(portal_protected)
 
         // Merge the bearer-authenticated REST API
         .merge(api_routes)
@@ -2842,6 +2888,707 @@ async fn login_submit(
             error_response("Login failed")
         }
     }
+}
+
+// ============================================================================
+// External customer/vendor portal — /portal/*
+// ============================================================================
+//
+// A self-service surface for **portal users** (`users.is_portal = true`, bound
+// to a `contacts` row via `users.contact_id`). It is a hard-isolated tree:
+//
+//   * `portal_auth_middleware` guards every `/portal/*` page and admits ONLY
+//     portal users; the internal `auth_middleware` conversely rejects them.
+//   * Every query is scoped by the partner id derived from the **session**
+//     (`AuthUser::portal_contact_id`), never a request parameter — so a portal
+//     user can only ever see their own partner's documents, and record views
+//     re-check ownership (`WHERE id = $1 AND partner_id = $2`).
+//
+// MVP surfaces: landing, my invoices (+ detail), my orders, my statement
+// (open items / ageing). PDF download and a vendor view are follow-ups.
+
+fn portal_money(v: f64) -> String {
+    // Group thousands with commas, two decimals. Small, dependency-free.
+    let neg = v < 0.0;
+    let s = format!("{:.2}", v.abs());
+    let (int, frac) = s.split_once('.').unwrap_or((s.as_str(), "00"));
+    let mut grouped = String::new();
+    let bytes = int.as_bytes();
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i) % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(*b as char);
+    }
+    format!("{}{}.{}", if neg { "-" } else { "" }, grouped, frac)
+}
+
+/// The mobile-first portal chrome. Self-contained (vendored daisyUI, like the
+/// rest of the served pages); no internal sidebar or admin surfaces.
+fn portal_shell(title: &str, who: &str, active: &str, body: &str) -> String {
+    use vortex_framework::ui::html_escape;
+    let nav = |href: &str, id: &str, label: &str| -> String {
+        let cls = if id == active { "font-semibold text-base-content" } else { "text-base-content/60" };
+        format!(r#"<a href="{href}" class="{cls} hover:text-base-content whitespace-nowrap">{label}</a>"#)
+    };
+    format!(
+        r#"<!DOCTYPE html><html data-theme="dark"><head>
+<script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script>
+<title>{title} · Portal</title>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vendor/tailwind.js"></script>
+<style>
+body {{ background: oklch(var(--b2)); color: oklch(var(--bc)); }}
+.pbar {{ background: oklch(var(--b1)); border-bottom: 1px solid oklch(var(--b3)); position: sticky; top: 0; z-index: 40; }}
+.pcard {{ background: oklch(var(--b1)); border: 1px solid oklch(var(--b3)); border-radius: .6rem; }}
+table.ptbl {{ width: 100%; border-collapse: collapse; font-size: .9rem; }}
+table.ptbl th, table.ptbl td {{ padding: .5rem .6rem; border-bottom: 1px solid oklch(var(--b3)); text-align: left; }}
+table.ptbl td.num, table.ptbl th.num {{ text-align: right; font-variant-numeric: tabular-nums; }}
+</style></head><body class="min-h-screen">
+<nav class="pbar px-4 py-3 flex items-center justify-between gap-4">
+  <a href="/portal" class="text-lg font-bold"><span style="color:#8BC53F">re</span><span class="text-base-content/60">micle</span> <span class="font-normal text-sm text-base-content/50">Portal</span></a>
+  <div class="flex items-center gap-4 text-sm overflow-x-auto">
+    {home}{invoices}{orders}{statement}
+    <span class="text-base-content/40 hidden sm:inline">|</span>
+    <span class="text-base-content/70 hidden sm:inline">{who}</span>
+    <form method="post" action="/portal/logout" class="inline"><button class="text-error hover:underline">Sign out</button></form>
+  </div>
+</nav>
+<main class="max-w-4xl mx-auto p-4 md:p-6">{body}</main>
+</body></html>"#,
+        title = html_escape(title),
+        who = html_escape(who),
+        home = nav("/portal", "home", "Home"),
+        invoices = nav("/portal/invoices", "invoices", "Invoices"),
+        orders = nav("/portal/orders", "orders", "Orders"),
+        statement = nav("/portal/statement", "statement", "Statement"),
+        body = body,
+    )
+}
+
+#[derive(serde::Deserialize)]
+struct PortalLoginForm {
+    username: String,
+    password: String,
+    database: Option<String>,
+}
+
+/// Standalone portal login page (no shell nav — pre-auth). `err` shows a
+/// validation message when re-rendered after a failed attempt.
+fn portal_login_html(err: Option<&str>) -> String {
+    use vortex_framework::ui::html_escape;
+    let err_html = err
+        .map(|e| format!(r#"<div class="alert alert-error text-sm mb-3">{}</div>"#, html_escape(e)))
+        .unwrap_or_default();
+    format!(
+        r#"<!DOCTYPE html><html data-theme="dark"><head>
+<title>Portal Sign in</title><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
+<script src="/static/vendor/tailwind.js"></script>
+<style>body{{background:#0b0f0a;color:#e5e7eb}}</style></head>
+<body class="min-h-screen flex items-center justify-center p-4">
+<div class="w-full max-w-sm" style="background:#12160f;border:1px solid #263019;border-radius:.75rem;padding:1.5rem">
+  <div class="text-center mb-5">
+    <div class="text-2xl font-bold"><span style="color:#8BC53F">re</span><span style="color:#9ca3af">micle</span></div>
+    <div class="text-sm mt-1" style="color:#9ca3af">Customer &amp; supplier portal</div>
+  </div>
+  {err_html}
+  <form method="post" action="/portal/login" class="flex flex-col gap-3">
+    <label class="text-sm">Username
+      <input name="username" required autofocus autocomplete="username" class="input input-bordered w-full mt-1" style="background:#0b0f0a"/>
+    </label>
+    <label class="text-sm">Password
+      <input name="password" type="password" required autocomplete="current-password" class="input input-bordered w-full mt-1" style="background:#0b0f0a"/>
+    </label>
+    <button class="btn mt-2" style="background:#8BC53F;border-color:#8BC53F;color:#000">Sign in</button>
+  </form>
+</div></body></html>"#,
+        err_html = err_html,
+    )
+}
+
+async fn portal_login_page() -> Response {
+    Html(portal_login_html(None)).into_response()
+}
+
+/// POST /portal/login — authenticates ONLY `is_portal` users. An internal
+/// account that tries here is refused (and vice-versa at `/auth/login`).
+async fn portal_login_submit(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Form(form): Form<PortalLoginForm>,
+) -> Response {
+    let (client_ip, _ua) = request_fingerprint(&headers);
+    let db_name = resolve_database(&state, &headers, form.database.as_deref()).await;
+    let pool = match state.pool_manager.get_pool(&db_name).await {
+        Ok(p) => p,
+        Err(e) => {
+            error!("portal login: pool for '{}' failed: {}", db_name, e);
+            return Html(portal_login_html(Some("Service unavailable. Try again shortly."))).into_response();
+        }
+    };
+    let db = pool.pool().clone();
+
+    let row = sqlx::query(
+        "SELECT id, password_hash, full_name, active, locked, is_portal, contact_id \
+         FROM users WHERE username = $1",
+    )
+    .bind(&form.username)
+    .fetch_optional(&db)
+    .await;
+
+    let audit_fail = |state: &Arc<AppState>, user_id: Option<uuid::Uuid>, reason: &'static str| {
+        let mut e = AuditEntry::new(AuditAction::LoginFailure, AuditSeverity::Warning)
+            .with_username(&form.username)
+            .with_database(&db_name)
+            .with_resource("portal_session", user_id.map(|u| u.to_string()).unwrap_or_else(|| "unknown".into()))
+            .with_error(reason)
+            .with_details(serde_json::json!({"reason": reason, "database": db_name, "surface": "portal"}));
+        if let Some(u) = user_id {
+            e = e.with_user(vortex_common::UserId(u));
+        }
+        if let Some(ip) = &client_ip {
+            e = e.with_source_ip(ip.clone());
+        }
+        let audit = state.audit.clone();
+        async move {
+            if let Err(err) = audit.log(e).await {
+                error!("WORM audit write failed for portal LoginFailure: {}", err);
+            }
+        }
+    };
+
+    let bad_creds = "Invalid username or password.";
+    match row {
+        Ok(Some(r)) => {
+            let uid: uuid::Uuid = r.get("id");
+            let is_portal: bool = r.get("is_portal");
+            let active: bool = r.get("active");
+            let locked: bool = r.get("locked");
+            let hash: String = r.get("password_hash");
+            let full_name: Option<String> = r.try_get("full_name").ok().flatten();
+            let contact_id: Option<uuid::Uuid> = r.try_get("contact_id").ok().flatten();
+
+            // Not a portal account → refuse here without confirming the password,
+            // and don't leak that the username exists as a staff login.
+            if !is_portal {
+                audit_fail(&state, Some(uid), "not_portal_user").await;
+                return Html(portal_login_html(Some(bad_creds))).into_response();
+            }
+            if !active || locked {
+                audit_fail(&state, Some(uid), if locked { "locked" } else { "disabled" }).await;
+                return Html(portal_login_html(Some("This account is not active. Contact your account manager."))).into_response();
+            }
+            if !verify_password(&form.password, &hash) {
+                let _ = sqlx::query("UPDATE users SET failed_login_attempts = failed_login_attempts + 1 WHERE id = $1")
+                    .bind(uid).execute(&db).await;
+                audit_fail(&state, Some(uid), "invalid_password").await;
+                return Html(portal_login_html(Some(bad_creds))).into_response();
+            }
+            if contact_id.is_none() {
+                // A portal user with no partner binding is a provisioning bug;
+                // the CHECK constraint should prevent it, but fail safe.
+                audit_fail(&state, Some(uid), "no_contact_binding").await;
+                return Html(portal_login_html(Some("Your portal account is not fully set up. Contact your account manager."))).into_response();
+            }
+
+            let token = generate_session_token();
+            let token_hash = hash_token(&token);
+            if let Err(e) = sqlx::query(
+                "INSERT INTO sessions (user_id, token_hash, expires_at, ip_address) \
+                 VALUES ($1, $2, NOW() + INTERVAL '30 minutes', NULL)",
+            )
+            .bind(uid)
+            .bind(&token_hash)
+            .execute(&db)
+            .await
+            {
+                error!("portal login: session insert failed: {}", e);
+                return Html(portal_login_html(Some("Sign-in failed. Try again."))).into_response();
+            }
+            let _ = sqlx::query("UPDATE users SET last_login_at = NOW(), failed_login_attempts = 0 WHERE id = $1")
+                .bind(uid).execute(&db).await;
+
+            let mut entry = AuditEntry::new(AuditAction::LoginSuccess, AuditSeverity::Info)
+                .with_user(vortex_common::UserId(uid))
+                .with_username(&form.username)
+                .with_database(&db_name)
+                .with_resource("portal_session", uid.to_string())
+                .with_details(serde_json::json!({"database": db_name, "surface": "portal"}));
+            if let Some(ip) = &client_ip {
+                entry = entry.with_source_ip(ip.clone());
+            }
+            if let Err(e) = state.audit.log(entry).await {
+                error!("WORM audit write failed for portal LoginSuccess: {}", e);
+            }
+            let _ = full_name;
+
+            let mut resp_headers = HeaderMap::new();
+            resp_headers.insert(
+                header::SET_COOKIE,
+                format!("session={}|{}; Path=/; HttpOnly; SameSite=Strict; Max-Age=1800", db_name, token)
+                    .parse()
+                    .unwrap(),
+            );
+            (resp_headers, Redirect::to("/portal")).into_response()
+        }
+        Ok(None) => {
+            audit_fail(&state, None, "user_not_found").await;
+            Html(portal_login_html(Some(bad_creds))).into_response()
+        }
+        Err(e) => {
+            error!("portal login: db error: {}", e);
+            Html(portal_login_html(Some("Sign-in failed. Try again."))).into_response()
+        }
+    }
+}
+
+async fn portal_logout(Db(db): Db, jar: HeaderMap) -> Response {
+    // Best-effort session revocation, then clear the cookie.
+    if let Some(cookie) = jar.get(header::COOKIE).and_then(|c| c.to_str().ok()) {
+        if let Some(raw) = cookie.split(';').find_map(|kv| kv.trim().strip_prefix("session=")) {
+            let token = raw.rsplit('|').next().unwrap_or(raw);
+            let th = hash_token(token);
+            let _ = sqlx::query("UPDATE sessions SET revoked = true, revoked_at = NOW(), revoked_reason = 'portal_logout' WHERE token_hash = $1")
+                .bind(&th).execute(&db).await;
+        }
+    }
+    let mut headers = HeaderMap::new();
+    headers.insert(header::SET_COOKIE, "session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0".parse().unwrap());
+    (headers, Redirect::to("/portal/login")).into_response()
+}
+
+fn portal_redirect_login() -> Response {
+    let mut headers = HeaderMap::new();
+    headers.insert(header::SET_COOKIE, "session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0".parse().unwrap());
+    (headers, Redirect::to("/portal/login")).into_response()
+}
+
+/// Guard for `/portal/*`: admits ONLY authenticated `is_portal` users, injects
+/// their `AuthUser` (with `contact_id`) + tenant `DatabaseContext`. Anything
+/// else is bounced to the portal login.
+async fn portal_auth_middleware(
+    State(state): State<Arc<AppState>>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let cookie = request
+        .headers()
+        .get(header::COOKIE)
+        .and_then(|c| c.to_str().ok())
+        .and_then(|c| c.split(';').find_map(|kv| kv.trim().strip_prefix("session=").map(str::to_string)));
+    let Some(raw) = cookie else { return portal_redirect_login() };
+
+    // cookie is `db_name|token` (or a legacy bare token → default DB).
+    let (db_name, token) = match raw.split_once('|') {
+        Some((d, t)) => (d.to_string(), t.to_string()),
+        None => (state.default_db.clone(), raw.clone()),
+    };
+    if !db_name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return portal_redirect_login();
+    }
+    let pool = match state.pool_manager.get_pool(&db_name).await {
+        Ok(p) => p,
+        Err(_) => return portal_redirect_login(),
+    };
+    let db = pool.pool().clone();
+
+    let token_hash = hash_token(&token);
+    let row = sqlx::query(
+        "SELECT s.id as session_id, s.user_id, s.expires_at, s.last_activity_at, s.revoked, \
+                u.username, u.full_name, u.active, u.locked, u.is_portal, u.contact_id \
+         FROM sessions s JOIN users u ON s.user_id = u.id WHERE s.token_hash = $1",
+    )
+    .bind(&token_hash)
+    .fetch_optional(&db)
+    .await;
+
+    let Ok(Some(r)) = row else { return portal_redirect_login() };
+    let revoked: bool = r.get("revoked");
+    let expires_at: chrono::DateTime<chrono::Utc> = r.get("expires_at");
+    let active: bool = r.get("active");
+    let locked: bool = r.get("locked");
+    let is_portal: bool = r.get("is_portal");
+    let contact_id: Option<uuid::Uuid> = r.try_get("contact_id").ok().flatten();
+    if revoked || expires_at < chrono::Utc::now() || !active || locked || !is_portal || contact_id.is_none() {
+        return portal_redirect_login();
+    }
+
+    let session_id: uuid::Uuid = r.get("session_id");
+    let user_id: uuid::Uuid = r.get("user_id");
+    let last_activity: Option<chrono::DateTime<chrono::Utc>> = r.try_get("last_activity_at").ok().flatten();
+    let refresh_due = last_activity.map_or(true, |t| chrono::Utc::now() - t > chrono::Duration::seconds(60));
+    if refresh_due {
+        let _ = sqlx::query("UPDATE sessions SET last_activity_at = NOW(), expires_at = NOW() + INTERVAL '30 minutes' WHERE id = $1")
+            .bind(session_id).execute(&db).await;
+    }
+
+    let db_installed_modules: HashSet<String> = sqlx::query_scalar(
+        "SELECT technical_name FROM installed_modules WHERE state = 'installed'",
+    )
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .collect();
+
+    let auth_user = AuthUser {
+        id: user_id,
+        username: r.get("username"),
+        full_name: r.try_get("full_name").ok().flatten(),
+        session_id,
+        roles: vec!["Portal User".to_string()],
+        contact_id,
+        is_portal: true,
+    };
+    request.extensions_mut().insert(auth_user);
+    request.extensions_mut().insert(pool.clone());
+    request.extensions_mut().insert(DatabaseContext {
+        db_name,
+        pool,
+        installed_modules: db_installed_modules,
+    });
+    next.run(request).await
+}
+
+/// The signed-in portal user's partner id, or a redirect if somehow absent
+/// (the middleware guarantees it, so this is defence-in-depth).
+fn portal_partner(user: &AuthUser) -> Result<uuid::Uuid, Response> {
+    user.portal_contact_id().ok_or_else(portal_redirect_login)
+}
+
+async fn portal_home(Db(db): Db, Extension(user): Extension<AuthUser>) -> Response {
+    use vortex_framework::ui::html_escape;
+    let partner = match portal_partner(&user) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    let name: String = sqlx::query_scalar("SELECT name FROM contacts WHERE id = $1")
+        .bind(partner).fetch_optional(&db).await.ok().flatten().unwrap_or_else(|| user.username.clone());
+
+    // Outstanding balance + open-invoice count (posted customer invoices/credit notes).
+    let outstanding: f64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(amount_residual),0)::float8 FROM acc_move \
+         WHERE partner_id = $1 AND state = 'posted' \
+           AND move_type IN ('customer_invoice','customer_credit_note') \
+           AND payment_state IN ('not_paid','partial')",
+    ).bind(partner).fetch_one(&db).await.unwrap_or(0.0);
+    let open_invoices: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM acc_move WHERE partner_id = $1 AND state='posted' \
+           AND move_type IN ('customer_invoice','customer_credit_note') \
+           AND payment_state IN ('not_paid','partial')",
+    ).bind(partner).fetch_one(&db).await.unwrap_or(0);
+    let open_orders: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sales_order WHERE customer_id = $1 AND state IN ('confirmed','draft')",
+    ).bind(partner).fetch_one(&db).await.unwrap_or(0);
+
+    let body = format!(
+        r#"<h1 class="text-2xl font-bold mb-1">Welcome, {name}</h1>
+<p class="text-base-content/60 mb-5">Your account at a glance.</p>
+<div class="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-6">
+  <a href="/portal/statement" class="pcard p-4 block hover:border-primary">
+    <div class="text-sm text-base-content/60">Outstanding balance</div>
+    <div class="text-2xl font-bold mt-1" style="color:#8BC53F">{outstanding}</div>
+  </a>
+  <a href="/portal/invoices" class="pcard p-4 block hover:border-primary">
+    <div class="text-sm text-base-content/60">Open invoices</div>
+    <div class="text-2xl font-bold mt-1">{open_invoices}</div>
+  </a>
+  <a href="/portal/orders" class="pcard p-4 block hover:border-primary">
+    <div class="text-sm text-base-content/60">Active orders</div>
+    <div class="text-2xl font-bold mt-1">{open_orders}</div>
+  </a>
+</div>
+<div class="pcard p-4">
+  <div class="font-semibold mb-2">Quick links</div>
+  <ul class="list-disc pl-5 text-sm space-y-1">
+    <li><a href="/portal/invoices" class="link">View and track your invoices</a></li>
+    <li><a href="/portal/statement" class="link">See your statement of account</a></li>
+    <li><a href="/portal/orders" class="link">Review your orders</a></li>
+  </ul>
+</div>"#,
+        name = html_escape(&name),
+        outstanding = portal_money(outstanding),
+        open_invoices = open_invoices,
+        open_orders = open_orders,
+    );
+    Html(portal_shell("Home", &name, "home", &body)).into_response()
+}
+
+async fn portal_partner_name(db: &PgPool, partner: uuid::Uuid, fallback: &str) -> String {
+    sqlx::query_scalar("SELECT name FROM contacts WHERE id = $1")
+        .bind(partner).fetch_optional(db).await.ok().flatten().unwrap_or_else(|| fallback.to_string())
+}
+
+async fn portal_invoices(Db(db): Db, Extension(user): Extension<AuthUser>) -> Response {
+    use vortex_framework::ui::html_escape;
+    let partner = match portal_partner(&user) { Ok(p) => p, Err(r) => return r };
+    let name = portal_partner_name(&db, partner, &user.username).await;
+
+    let rows = sqlx::query(
+        "SELECT id, number, move_type, invoice_date, due_date, \
+                total_amount::float8 AS total, amount_residual::float8 AS residual, payment_state \
+         FROM acc_move \
+         WHERE partner_id = $1 AND state = 'posted' \
+           AND move_type IN ('customer_invoice','customer_credit_note') \
+         ORDER BY COALESCE(invoice_date, move_date) DESC, number DESC LIMIT 500",
+    )
+    .bind(partner)
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default();
+
+    let mut trs = String::new();
+    for r in &rows {
+        let id: uuid::Uuid = r.get("id");
+        let number: Option<String> = r.try_get("number").ok().flatten();
+        let mtype: String = r.get("move_type");
+        let inv_date: Option<chrono::NaiveDate> = r.try_get("invoice_date").ok().flatten();
+        let due: Option<chrono::NaiveDate> = r.try_get("due_date").ok().flatten();
+        let total: f64 = r.try_get("total").unwrap_or(0.0);
+        let residual: f64 = r.try_get("residual").unwrap_or(0.0);
+        let pstate: String = r.get("payment_state");
+        let is_cn = mtype == "customer_credit_note";
+        let badge = match pstate.as_str() {
+            "paid" => r#"<span class="badge badge-success badge-sm">Paid</span>"#,
+            "partial" => r#"<span class="badge badge-warning badge-sm">Partial</span>"#,
+            "reversed" => r#"<span class="badge badge-ghost badge-sm">Reversed</span>"#,
+            _ => r#"<span class="badge badge-error badge-sm">Unpaid</span>"#,
+        };
+        trs.push_str(&format!(
+            r#"<tr>
+<td><a class="link" href="/portal/invoices/{id}">{num}</a>{cn}</td>
+<td>{date}</td><td>{due}</td>
+<td class="num">{total}</td><td class="num">{residual}</td><td>{badge}</td></tr>"#,
+            id = id,
+            num = html_escape(number.as_deref().unwrap_or("—")),
+            cn = if is_cn { r#" <span class="badge badge-outline badge-sm">Credit</span>"# } else { "" },
+            date = inv_date.map(|d| d.to_string()).unwrap_or_default(),
+            due = due.map(|d| d.to_string()).unwrap_or_default(),
+            total = portal_money(total),
+            residual = portal_money(residual),
+            badge = badge,
+        ));
+    }
+    if rows.is_empty() {
+        trs = r#"<tr><td colspan="6" class="text-base-content/50 text-center py-6">No invoices yet.</td></tr>"#.to_string();
+    }
+
+    let body = format!(
+        r#"<h1 class="text-2xl font-bold mb-4">Invoices</h1>
+<div class="pcard overflow-x-auto">
+<table class="ptbl"><thead><tr>
+<th>Number</th><th>Date</th><th>Due</th><th class="num">Total</th><th class="num">Balance</th><th>Status</th>
+</tr></thead><tbody>{trs}</tbody></table></div>"#,
+        trs = trs,
+    );
+    Html(portal_shell("Invoices", &name, "invoices", &body)).into_response()
+}
+
+async fn portal_invoice_detail(
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Path(id): Path<uuid::Uuid>,
+) -> Response {
+    use vortex_framework::ui::html_escape;
+    let partner = match portal_partner(&user) { Ok(p) => p, Err(r) => return r };
+    let name = portal_partner_name(&db, partner, &user.username).await;
+
+    // Ownership re-check: the invoice must belong to THIS partner.
+    let head = sqlx::query(
+        "SELECT number, move_type, invoice_date, due_date, \
+                total_amount::float8 AS total, amount_residual::float8 AS residual, payment_state \
+         FROM acc_move WHERE id = $1 AND partner_id = $2 AND state = 'posted' \
+           AND move_type IN ('customer_invoice','customer_credit_note')",
+    )
+    .bind(id)
+    .bind(partner)
+    .fetch_optional(&db)
+    .await
+    .ok()
+    .flatten();
+    let Some(h) = head else {
+        let body = r#"<div class="pcard p-6 text-center text-base-content/60">Invoice not found. <a class="link" href="/portal/invoices">Back to invoices</a>.</div>"#;
+        return (StatusCode::NOT_FOUND, Html(portal_shell("Not found", &name, "invoices", body))).into_response();
+    };
+    let number: Option<String> = h.try_get("number").ok().flatten();
+    let inv_date: Option<chrono::NaiveDate> = h.try_get("invoice_date").ok().flatten();
+    let due: Option<chrono::NaiveDate> = h.try_get("due_date").ok().flatten();
+    let total: f64 = h.try_get("total").unwrap_or(0.0);
+    let residual: f64 = h.try_get("residual").unwrap_or(0.0);
+    let pstate: String = h.get("payment_state");
+
+    // Lines the customer actually cares about: the revenue/tax charges, not the
+    // receivable or payable control lines (which just mirror the total). `credit
+    // - debit` renders each charge as a positive amount on a customer invoice.
+    let lines = sqlx::query(
+        "SELECT l.name, (l.credit - l.debit)::float8 AS amount \
+         FROM acc_move_line l JOIN acc_account a ON a.id = l.account_id \
+         WHERE l.move_id = $1 \
+           AND a.account_type NOT IN ('asset_receivable','liability_payable') \
+           AND (l.debit <> 0 OR l.credit <> 0) \
+         ORDER BY l.sequence, l.id",
+    )
+    .bind(id)
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default();
+    let mut line_html = String::new();
+    for l in &lines {
+        let lbl: Option<String> = l.try_get("name").ok().flatten();
+        let amt: f64 = l.try_get("amount").unwrap_or(0.0);
+        line_html.push_str(&format!(
+            r#"<tr><td>{}</td><td class="num">{}</td></tr>"#,
+            html_escape(lbl.as_deref().unwrap_or("—")),
+            portal_money(amt),
+        ));
+    }
+    if lines.is_empty() {
+        line_html = r#"<tr><td colspan="2" class="text-base-content/50 py-4 text-center">No line detail.</td></tr>"#.to_string();
+    }
+
+    let body = format!(
+        r#"<div class="mb-4"><a class="link text-sm" href="/portal/invoices">&larr; Invoices</a></div>
+<h1 class="text-2xl font-bold mb-1">Invoice {num}</h1>
+<div class="text-base-content/60 mb-4">Issued {date} · Due {due} · Status: {pstate}</div>
+<div class="pcard overflow-x-auto mb-4">
+<table class="ptbl"><thead><tr><th>Description</th><th class="num">Amount</th></tr></thead>
+<tbody>{lines}</tbody>
+<tfoot>
+<tr><th>Total</th><th class="num">{total}</th></tr>
+<tr><th>Balance due</th><th class="num">{residual}</th></tr>
+</tfoot></table></div>"#,
+        num = html_escape(number.as_deref().unwrap_or("—")),
+        date = inv_date.map(|d| d.to_string()).unwrap_or_else(|| "—".into()),
+        due = due.map(|d| d.to_string()).unwrap_or_else(|| "—".into()),
+        pstate = html_escape(&pstate),
+        lines = line_html,
+        total = portal_money(total),
+        residual = portal_money(residual),
+    );
+    Html(portal_shell(&format!("Invoice {}", number.as_deref().unwrap_or("")), &name, "invoices", &body)).into_response()
+}
+
+async fn portal_orders(Db(db): Db, Extension(user): Extension<AuthUser>) -> Response {
+    use vortex_framework::ui::html_escape;
+    let partner = match portal_partner(&user) { Ok(p) => p, Err(r) => return r };
+    let name = portal_partner_name(&db, partner, &user.username).await;
+
+    let rows = sqlx::query(
+        "SELECT number, order_date, state, total_amount::float8 AS total \
+         FROM sales_order WHERE customer_id = $1 \
+         ORDER BY order_date DESC, number DESC LIMIT 500",
+    )
+    .bind(partner)
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default();
+
+    let mut trs = String::new();
+    for r in &rows {
+        let number: Option<String> = r.try_get("number").ok().flatten();
+        let odate: Option<chrono::NaiveDate> = r.try_get("order_date").ok().flatten();
+        let state: String = r.try_get("state").ok().flatten().unwrap_or_default();
+        let total: f64 = r.try_get("total").unwrap_or(0.0);
+        let badge = match state.as_str() {
+            "delivered" => r#"<span class="badge badge-success badge-sm">Delivered</span>"#,
+            "confirmed" => r#"<span class="badge badge-info badge-sm">Confirmed</span>"#,
+            "cancelled" => r#"<span class="badge badge-ghost badge-sm">Cancelled</span>"#,
+            _ => r#"<span class="badge badge-warning badge-sm">Draft</span>"#,
+        };
+        trs.push_str(&format!(
+            r#"<tr><td>{num}</td><td>{date}</td><td>{badge}</td><td class="num">{total}</td></tr>"#,
+            num = html_escape(number.as_deref().unwrap_or("—")),
+            date = odate.map(|d| d.to_string()).unwrap_or_default(),
+            badge = badge,
+            total = portal_money(total),
+        ));
+    }
+    if rows.is_empty() {
+        trs = r#"<tr><td colspan="4" class="text-base-content/50 text-center py-6">No orders yet.</td></tr>"#.to_string();
+    }
+
+    let body = format!(
+        r#"<h1 class="text-2xl font-bold mb-4">Orders</h1>
+<div class="pcard overflow-x-auto">
+<table class="ptbl"><thead><tr><th>Number</th><th>Date</th><th>Status</th><th class="num">Total</th></tr></thead>
+<tbody>{trs}</tbody></table></div>"#,
+        trs = trs,
+    );
+    Html(portal_shell("Orders", &name, "orders", &body)).into_response()
+}
+
+async fn portal_statement(Db(db): Db, Extension(user): Extension<AuthUser>) -> Response {
+    use vortex_framework::ui::html_escape;
+    let partner = match portal_partner(&user) { Ok(p) => p, Err(r) => return r };
+    let name = portal_partner_name(&db, partner, &user.username).await;
+
+    // Open items with ageing, scoped to this partner's receivables.
+    let rows = sqlx::query(
+        "SELECT number, invoice_date, due_date, amount_residual::float8 AS residual, \
+                GREATEST(0, (CURRENT_DATE - due_date))::int AS days_overdue \
+         FROM acc_move \
+         WHERE partner_id = $1 AND state = 'posted' \
+           AND move_type IN ('customer_invoice','customer_credit_note') \
+           AND payment_state IN ('not_paid','partial') AND amount_residual <> 0 \
+         ORDER BY due_date NULLS LAST, invoice_date",
+    )
+    .bind(partner)
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default();
+
+    let mut buckets = [0f64; 4]; // current, 1-30, 31-60, 60+
+    let mut total = 0f64;
+    let mut trs = String::new();
+    for r in &rows {
+        let number: Option<String> = r.try_get("number").ok().flatten();
+        let inv_date: Option<chrono::NaiveDate> = r.try_get("invoice_date").ok().flatten();
+        let due: Option<chrono::NaiveDate> = r.try_get("due_date").ok().flatten();
+        let residual: f64 = r.try_get("residual").unwrap_or(0.0);
+        let overdue: i32 = r.try_get("days_overdue").unwrap_or(0);
+        total += residual;
+        let bucket = if overdue <= 0 { 0 } else if overdue <= 30 { 1 } else if overdue <= 60 { 2 } else { 3 };
+        buckets[bucket] += residual;
+        trs.push_str(&format!(
+            r#"<tr><td>{num}</td><td>{date}</td><td>{due}</td><td class="num">{days}</td><td class="num">{amt}</td></tr>"#,
+            num = html_escape(number.as_deref().unwrap_or("—")),
+            date = inv_date.map(|d| d.to_string()).unwrap_or_default(),
+            due = due.map(|d| d.to_string()).unwrap_or_default(),
+            days = if overdue > 0 { overdue.to_string() } else { "—".to_string() },
+            amt = portal_money(residual),
+        ));
+    }
+    if rows.is_empty() {
+        trs = r#"<tr><td colspan="5" class="text-base-content/50 text-center py-6">Nothing outstanding — your account is settled.</td></tr>"#.to_string();
+    }
+
+    let body = format!(
+        r#"<h1 class="text-2xl font-bold mb-1">Statement of account</h1>
+<p class="text-base-content/60 mb-4">Open items for <strong>{name}</strong>.</p>
+<div class="grid grid-cols-2 sm:grid-cols-5 gap-3 mb-5">
+  <div class="pcard p-3"><div class="text-xs text-base-content/60">Total due</div><div class="font-bold" style="color:#8BC53F">{total}</div></div>
+  <div class="pcard p-3"><div class="text-xs text-base-content/60">Current</div><div class="font-bold">{b0}</div></div>
+  <div class="pcard p-3"><div class="text-xs text-base-content/60">1–30 days</div><div class="font-bold">{b1}</div></div>
+  <div class="pcard p-3"><div class="text-xs text-base-content/60">31–60 days</div><div class="font-bold">{b2}</div></div>
+  <div class="pcard p-3"><div class="text-xs text-base-content/60">60+ days</div><div class="font-bold text-error">{b3}</div></div>
+</div>
+<div class="pcard overflow-x-auto">
+<table class="ptbl"><thead><tr><th>Invoice</th><th>Date</th><th>Due</th><th class="num">Days overdue</th><th class="num">Balance</th></tr></thead>
+<tbody>{trs}</tbody>
+<tfoot><tr><th colspan="4">Total outstanding</th><th class="num">{total}</th></tr></tfoot></table></div>"#,
+        name = html_escape(&name),
+        total = portal_money(total),
+        b0 = portal_money(buckets[0]),
+        b1 = portal_money(buckets[1]),
+        b2 = portal_money(buckets[2]),
+        b3 = portal_money(buckets[3]),
+        trs = trs,
+    );
+    Html(portal_shell("Statement", &name, "statement", &body)).into_response()
 }
 
 // NOTE: error_response / forbidden_page moved to vortex_framework::ui

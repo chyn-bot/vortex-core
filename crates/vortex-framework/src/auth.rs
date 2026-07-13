@@ -36,6 +36,15 @@ pub struct AuthUser {
     pub full_name: Option<String>,
     pub session_id: Uuid,
     pub roles: Vec<String>,
+    /// The `contacts` row this login represents, when it is an **external
+    /// portal user** (customer/vendor self-service). `None` for internal
+    /// staff. Portal document queries scope on this — never on a request
+    /// parameter — so a portal user can only ever see their own partner's data.
+    pub contact_id: Option<Uuid>,
+    /// True for external portal logins. Portal users are confined to the
+    /// `/portal/*` surface: the internal `auth_middleware` rejects them, so a
+    /// portal user can never reach a back-office route regardless of roles.
+    pub is_portal: bool,
 }
 
 impl AuthUser {
@@ -50,8 +59,21 @@ impl AuthUser {
     }
 
     /// Convenience: any admin-flavored role?
+    /// A portal user is never an admin, whatever roles are attached.
     pub fn is_admin(&self) -> bool {
-        self.has_role("System Administrator") || self.has_role("Administrator")
+        !self.is_portal
+            && (self.has_role("System Administrator") || self.has_role("Administrator"))
+    }
+
+    /// The partner (`contacts.id`) a portal login is bound to, if any.
+    /// Returns `None` for internal staff. Portal handlers use this as the
+    /// tamper-proof scope for every query.
+    pub fn portal_contact_id(&self) -> Option<Uuid> {
+        if self.is_portal {
+            self.contact_id
+        } else {
+            None
+        }
     }
 }
 
