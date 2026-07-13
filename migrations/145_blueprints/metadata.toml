@@ -1,0 +1,5 @@
+# Migration metadata for 145_blueprints
+module = "core"
+description = "Vortex Blueprints (Phase 0): a `source` provenance enum (derived|custom|blueprint) + `is_virtual` on the model registry, plus blueprint / blueprint_version / blueprint_ddl_log tables. Foundation for governed runtime model creation — generated `x_*` record tables are created at runtime by the blueprint DDL service, not here."
+reversible = true
+dependencies = ["122_model_registry", "137_custom_fields"]
