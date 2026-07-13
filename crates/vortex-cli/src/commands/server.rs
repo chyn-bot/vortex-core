@@ -4199,7 +4199,20 @@ async fn security_headers_middleware(
     next: Next,
 ) -> Response {
     let mut response = next.run(request).await;
+    // Dynamic HTML must never be reused from the browser cache: these pages are
+    // per-tenant, per-session and data-dependent, so a cached copy shows stale
+    // or empty content until a manual refresh (and would leak ERP data left in
+    // the cache). Static assets are cache-busted with ?v= and keep caching.
+    let is_html = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|ct| ct.starts_with("text/html"))
+        .unwrap_or(false);
     let headers = response.headers_mut();
+    if is_html {
+        headers.insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
+    }
     headers.insert("X-Frame-Options", "DENY".parse().unwrap());
     headers.insert("X-Content-Type-Options", "nosniff".parse().unwrap());
     headers.insert("X-XSS-Protection", "1; mode=block".parse().unwrap());
