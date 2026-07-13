@@ -285,17 +285,22 @@ fn parse_selection_options(raw: &str) -> Result<serde_json::Value, String> {
     Ok(serde_json::Value::Array(opts))
 }
 
-/// Resolve a many2one target: it must be an active Blueprint that carries a
-/// `name` field (the display column the generic picker/JOIN reads). Returns the
-/// target's physical table name. Restricting targets to name-bearing Blueprints
-/// keeps the relation robust — a target without `name` would break the generic
-/// list of the owning model. (Blueprint→compiled targets are a later phase that
-/// hardens the generic JOIN to resolve arbitrary display columns.)
+/// Resolve a many2one target: any active model — Blueprint **or** compiled —
+/// whose physical table carries a `name` column (the display the generic
+/// picker/JOIN reads). Returns the target's table name. Requiring a real `name`
+/// column keeps the relation's label resolution robust across both kinds; the
+/// generic list/form were hardened (Phase 3b) to resolve the target's real
+/// table name and probe for `name`/`active`, so a compiled target whose model
+/// name differs from its table name now works too.
 async fn resolve_relation_target(db: &PgPool, target_model: &str) -> Result<String, String> {
     sqlx::query_scalar::<_, String>(
         "SELECT m.table_name FROM ir_model m
-         WHERE m.name = $1 AND m.source = 'blueprint' AND m.is_active = true
-           AND EXISTS (SELECT 1 FROM ir_model_field f WHERE f.model_id = m.id AND f.name = 'name')",
+         WHERE m.name = $1 AND m.is_active = true
+           AND EXISTS (
+               SELECT 1 FROM information_schema.columns c
+               WHERE c.table_schema = 'public' AND c.table_name = m.table_name
+                 AND c.column_name = 'name'
+           )",
     )
     .bind(target_model)
     .fetch_optional(db)

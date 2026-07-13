@@ -5263,26 +5263,44 @@ async fn blueprint_designer(
     .await
     .unwrap_or_default();
 
-    // Candidate many2one targets: other Blueprints (and self) that carry a
-    // `name` display field, so the generic picker/JOIN can resolve a label.
+    // Candidate many2one targets: any active model — Blueprint or compiled —
+    // whose table carries a `name` column, so the generic picker/JOIN can
+    // resolve a label. Split into two optgroups for scannability.
     let targets = sqlx::query(
-        "SELECT name, display_name FROM ir_model m
-         WHERE m.source = 'blueprint' AND m.is_active = true
-           AND EXISTS (SELECT 1 FROM ir_model_field f WHERE f.model_id = m.id AND f.name = 'name')
-         ORDER BY display_name",
+        "SELECT m.name, m.display_name, m.source FROM ir_model m
+         WHERE m.is_active = true
+           AND EXISTS (
+               SELECT 1 FROM information_schema.columns c
+               WHERE c.table_schema = 'public' AND c.table_name = m.table_name
+                 AND c.column_name = 'name'
+           )
+         ORDER BY (m.source = 'blueprint') DESC, m.display_name",
     )
     .fetch_all(&db)
     .await
     .unwrap_or_default();
-    let mut target_options = String::new();
+    let (mut bp_opts, mut core_opts) = (String::new(), String::new());
     for t in &targets {
         let tname: String = t.get("name");
         let tlabel: String = t.get("display_name");
-        target_options.push_str(&format!(
+        let tsource: String = t.get("source");
+        let opt = format!(
             r#"<option value="{}">{}</option>"#,
             html_escape(&tname),
             html_escape(&tlabel),
-        ));
+        );
+        if tsource == "blueprint" {
+            bp_opts.push_str(&opt);
+        } else {
+            core_opts.push_str(&opt);
+        }
+    }
+    let mut target_options = String::new();
+    if !bp_opts.is_empty() {
+        target_options.push_str(&format!(r#"<optgroup label="Blueprints">{bp_opts}</optgroup>"#));
+    }
+    if !core_opts.is_empty() {
+        target_options.push_str(&format!(r#"<optgroup label="Core records">{core_opts}</optgroup>"#));
     }
 
     // Layout rows: an order box + a "list column" checkbox per field, submitted
@@ -8286,7 +8304,47 @@ struct ModelField {
     badge_colors: Option<serde_json::Value>,
     widget: Option<String>,
     related_model: Option<String>,
-    related_field: Option<String>,
+}
+
+/// Resolved metadata for a many2one target model, used to build a robust JOIN
+/// (generic list) and picker query (generic form) for a relation to *any*
+/// registered model — Blueprint or compiled. It fixes two latent hazards: the
+/// generic list used the related *model name* directly as a table name (wrong
+/// whenever a compiled model's name differs from its `table_name`), and both the
+/// list and form assumed a `name` column (a name-less target errored the whole
+/// query). We resolve the real table and probe `information_schema` for the
+/// `name`/`active` columns, degrading a name-less target to its id.
+struct M2oTarget {
+    table: String,
+    has_name: bool,
+    has_active: bool,
+}
+
+async fn resolve_m2o_target(db: &PgPool, related_model: &str) -> Option<M2oTarget> {
+    let table: String = sqlx::query_scalar(
+        "SELECT table_name FROM ir_model WHERE name = $1 AND is_active = true",
+    )
+    .bind(related_model)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()?;
+    if !validate_identifier(&table) {
+        return None;
+    }
+    let cols: Vec<String> = sqlx::query_scalar(
+        "SELECT column_name FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = $1",
+    )
+    .bind(&table)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+    Some(M2oTarget {
+        has_name: cols.iter().any(|c| c == "name"),
+        has_active: cols.iter().any(|c| c == "active"),
+        table,
+    })
 }
 
 async fn generic_list_view(
@@ -8353,7 +8411,6 @@ async fn generic_list_view(
             badge_colors: None,
             widget: None,
             related_model: r.get("related_model"),
-            related_field: if field_type == "many2one" { Some("name".to_string()) } else { None },
             field_type,
         }
     }).collect();
@@ -8424,15 +8481,25 @@ async fn generic_list_view(
     let mut join_idx = 0;
 
     for field in &fields {
-        if field.field_type == "many2one" {
-            if let (Some(rel_model), Some(rel_field)) = (&field.related_model, &field.related_field) {
-                let alias = format!("_rel{}", join_idx);
-                joins.push_str(&format!(
-                    " LEFT JOIN {} {} ON {}.{} = {}.id",
-                    rel_model, alias, table_name, field.name, alias
-                ));
-                select_cols.push_str(&format!(", {}.{} AS {}_display", alias, rel_field, field.name));
-                join_idx += 1;
+        if field.field_type == "many2one" && validate_identifier(&field.name) {
+            if let Some(rel_model) = &field.related_model {
+                // Resolve the target's real table (not the model name) and its
+                // display column, so a relation to a compiled model whose name
+                // differs from its table, or to a name-less target, both work.
+                if let Some(t) = resolve_m2o_target(&db, rel_model).await {
+                    let alias = format!("_rel{}", join_idx);
+                    let disp = if t.has_name {
+                        format!("{}.name", alias)
+                    } else {
+                        format!("{}.id::text", alias)
+                    };
+                    joins.push_str(&format!(
+                        " LEFT JOIN {} {} ON {}.{} = {}.id",
+                        t.table, alias, table_name, field.name, alias
+                    ));
+                    select_cols.push_str(&format!(", {} AS {}_display", disp, field.name));
+                    join_idx += 1;
+                }
             }
         }
     }
@@ -20582,59 +20649,59 @@ async fn render_dynamic_form(
                 )
             },
             "many2one" => {
-                // Fetch related records for dropdown
-                if let Some(rel_model) = &relation_model {
-                    let rel_table: Option<String> = sqlx::query_scalar("SELECT table_name FROM ir_model WHERE name = $1")
-                        .bind(rel_model)
-                        .fetch_optional(db)
-                        .await
-                        .ok()
-                        .flatten();
+                // Fetch related records for the dropdown. The target may be a
+                // Blueprint or a compiled model; resolve its real table and
+                // probe for `name`/`active` so a name-less or active-less target
+                // degrades gracefully instead of erroring the whole picker.
+                match &relation_model {
+                    Some(rel_model) => match resolve_m2o_target(db, rel_model).await {
+                        Some(t) => {
+                            let disp = if t.has_name { "COALESCE(name, id::text)" } else { "id::text" };
+                            let active_clause = if t.has_active { "WHERE active = true" } else { "" };
+                            let rel_query = if !current_value.is_empty() {
+                                format!(
+                                    "(SELECT id, {disp} as name FROM {tbl} WHERE id::text = $1) \
+                                     UNION \
+                                     (SELECT id, {disp} as name FROM {tbl} {act} ORDER BY name LIMIT 200) \
+                                     ORDER BY name",
+                                    disp = disp, tbl = t.table, act = active_clause
+                                )
+                            } else {
+                                format!(
+                                    "SELECT id, {disp} as name FROM {tbl} {act} ORDER BY name LIMIT 200",
+                                    disp = disp, tbl = t.table, act = active_clause
+                                )
+                            };
+                            let rel_records = if !current_value.is_empty() {
+                                sqlx::query(&rel_query).bind(&current_value).fetch_all(db).await.unwrap_or_default()
+                            } else {
+                                sqlx::query(&rel_query).fetch_all(db).await.unwrap_or_default()
+                            };
 
-                    if let Some(rel_table) = rel_table {
-                        if !validate_identifier(&rel_table) {
-                            return (StatusCode::BAD_REQUEST, Html("Invalid related model")).into_response();
-                        }
-                        // Query includes current value (if any) UNION top 200 by name
-                        let rel_query = if !current_value.is_empty() {
+                            let mut options = String::from(r#"<option value="">-- Select --</option>"#);
+                            for rec in &rel_records {
+                                let rec_id: uuid::Uuid = rec.get("id");
+                                let rec_name: String = rec.get("name");
+                                let selected = if rec_id.to_string() == current_value { " selected" } else { "" };
+                                options.push_str(&format!(
+                                    r#"<option value="{}"{}>{}</option>"#,
+                                    rec_id, selected, html_escape(&rec_name)
+                                ));
+                            }
                             format!(
-                                "(SELECT id, COALESCE(name, id::text) as name FROM {} WHERE id::text = $1) \
-                                 UNION \
-                                 (SELECT id, COALESCE(name, id::text) as name FROM {} WHERE active = true ORDER BY name LIMIT 200) \
-                                 ORDER BY name",
-                                rel_table, rel_table
+                                r#"<select name="{}" class="select select-bordered w-full" {} {}>{}</select>"#,
+                                field_name, required_attr, readonly_attr, options
                             )
-                        } else {
-                            format!("SELECT id, COALESCE(name, id::text) as name FROM {} WHERE active = true ORDER BY name LIMIT 200", rel_table)
-                        };
-                        let rel_records = if !current_value.is_empty() {
-                            sqlx::query(&rel_query).bind(&current_value).fetch_all(db).await.unwrap_or_default()
-                        } else {
-                            sqlx::query(&rel_query).fetch_all(db).await.unwrap_or_default()
-                        };
-
-                        let mut options = String::from(r#"<option value="">-- Select --</option>"#);
-                        for rec in &rel_records {
-                            let rec_id: uuid::Uuid = rec.get("id");
-                            let rec_name: String = rec.get("name");
-                            let selected = if rec_id.to_string() == current_value { " selected" } else { "" };
-                            options.push_str(&format!(r#"<option value="{}"{}>{}  </option>"#, rec_id, selected, rec_name));
                         }
-                        format!(
-                            r#"<select name="{}" class="select select-bordered w-full" {} {}>{}</select>"#,
-                            field_name, required_attr, readonly_attr, options
-                        )
-                    } else {
-                        format!(
+                        None => format!(
                             r#"<input type="text" name="{}" class="input input-bordered w-full" value="{}" {} {} />"#,
-                            field_name, current_value, required_attr, readonly_attr
-                        )
-                    }
-                } else {
-                    format!(
+                            field_name, html_escape(&current_value), required_attr, readonly_attr
+                        ),
+                    },
+                    None => format!(
                         r#"<input type="text" name="{}" class="input input-bordered w-full" value="{}" {} {} />"#,
-                        field_name, current_value, required_attr, readonly_attr
-                    )
+                        field_name, html_escape(&current_value), required_attr, readonly_attr
+                    ),
                 }
             },
             "text" => {
