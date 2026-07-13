@@ -62,6 +62,7 @@ pub mod saved_views;
 pub mod report_jobs;
 pub mod reports;
 pub mod scheduler;
+pub mod shell;
 pub mod sidebar;
 pub mod state;
 pub mod status;
@@ -108,9 +109,10 @@ pub use record_panel::{
     HOST_FORM_ID,
 };
 pub use scheduler::{Schedule, ScheduledAction, ScheduledActionDef, Scheduler};
-pub use sidebar::build_sidebar;
+pub use shell::{render_app_shell, render_app_shell_with};
+pub use sidebar::{build_sidebar, build_sidebar_nav};
 pub use state::{AppState, DatabaseContext};
 pub use ui::{
     build_pagination_html, error_response, format_number, format_time_ago, forbidden_page,
-    get_initials, html_escape,
+    get_initials, html_escape, new_record_url, record_url,
 };

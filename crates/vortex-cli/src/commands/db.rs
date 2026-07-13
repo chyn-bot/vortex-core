@@ -130,6 +130,163 @@ async fn record_migration(pool: &PgPool, name: &str, module: &str, execution_tim
     Ok(())
 }
 
+/// Result of applying one migration's SQL via [`apply_and_record_migration`].
+enum MigApply {
+    /// The whole file applied cleanly in one batch (elapsed ms).
+    Applied(i32),
+    /// The batch tripped an "already exists"; recovered by re-running
+    /// statement-by-statement (`applied` new statements, `existed` skipped).
+    Recovered { applied: usize, existed: usize },
+}
+
+/// Apply one migration's SQL and record it in `vortex_migrations`.
+///
+/// The primary path runs the whole file as a single batch. Postgres executes a
+/// multi-statement simple query in one implicit transaction, so if *any*
+/// statement fails the *entire* batch rolls back. The old code caught an
+/// "already exists" here and simply marked the migration applied — which meant a
+/// migration that (say) creates one existing table and adds one *new* column had
+/// its `ALTER` silently rolled back and never retried: permanent, invisible
+/// schema drift. Instead, on "already exists" we re-run the file
+/// statement-by-statement, swallowing "already exists" per statement so the
+/// genuinely-new statements DO apply. Any other error propagates loudly.
+async fn apply_and_record_migration(
+    pool: &PgPool,
+    key: &str,
+    module: &str,
+    sql: &str,
+) -> Result<MigApply> {
+    let start = std::time::Instant::now();
+    match sqlx::raw_sql(sql).execute(pool).await {
+        Ok(_) => {
+            let ms = start.elapsed().as_millis() as i32;
+            record_migration(pool, key, module, ms).await?;
+            Ok(MigApply::Applied(ms))
+        }
+        Err(e) if e.to_string().contains("already exists") => {
+            let mut applied = 0usize;
+            let mut existed = 0usize;
+            for stmt in split_sql_statements(sql) {
+                match sqlx::raw_sql(&stmt).execute(pool).await {
+                    Ok(_) => applied += 1,
+                    Err(se) if se.to_string().contains("already exists") => existed += 1,
+                    Err(se) => {
+                        return Err(se).with_context(|| {
+                            format!(
+                                "migration '{}': a statement failed while recovering from partial application",
+                                key
+                            )
+                        })
+                    }
+                }
+            }
+            record_migration(pool, key, module, 0).await?;
+            Ok(MigApply::Recovered { applied, existed })
+        }
+        Err(e) => Err(e).with_context(|| format!("Failed to apply migration '{}'", key)),
+    }
+}
+
+/// Split a SQL script into individual statements on top-level semicolons,
+/// ignoring semicolons inside single-quoted strings, dollar-quoted bodies
+/// (`$$…$$` / `$tag$…$tag$`), and line/block comments. Used only by the
+/// "already exists" recovery path in [`apply_and_record_migration`], so a
+/// partially-applied migration's remaining statements can each be run alone.
+fn split_sql_statements(sql: &str) -> Vec<String> {
+    let b = sql.as_bytes();
+    let n = b.len();
+    let mut i = 0usize;
+    let mut start = 0usize;
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |from: usize, to: usize| {
+        let t = sql[from..to].trim();
+        if !t.is_empty() {
+            out.push(t.to_string());
+        }
+    };
+    while i < n {
+        match b[i] {
+            b'\'' => {
+                // single-quoted string; '' is an escaped quote
+                i += 1;
+                while i < n {
+                    if b[i] == b'\'' {
+                        if i + 1 < n && b[i + 1] == b'\'' {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'-' if i + 1 < n && b[i + 1] == b'-' => {
+                i += 2;
+                while i < n && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if i + 1 < n && b[i + 1] == b'*' => {
+                i += 2;
+                let mut depth = 1; // Postgres block comments nest
+                while i < n && depth > 0 {
+                    if b[i] == b'/' && i + 1 < n && b[i + 1] == b'*' {
+                        depth += 1;
+                        i += 2;
+                    } else if b[i] == b'*' && i + 1 < n && b[i + 1] == b'/' {
+                        depth -= 1;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            b'$' => {
+                if let Some(tag_end) = dollar_tag_end(b, i) {
+                    let tag = &b[i..tag_end]; // "$$" or "$name$"
+                    i = tag_end;
+                    while i < n {
+                        if b[i] == b'$' && i + tag.len() <= n && &b[i..i + tag.len()] == tag {
+                            i += tag.len();
+                            break;
+                        }
+                        i += 1;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            b';' => {
+                push(start, i);
+                i += 1;
+                start = i;
+            }
+            _ => i += 1,
+        }
+    }
+    push(start, n);
+    out
+}
+
+/// If `b[i]` (a `$`) begins a valid dollar-quote opening tag (`$$` or
+/// `$ident$`), return the byte index just past its closing `$`; else `None`.
+fn dollar_tag_end(b: &[u8], i: usize) -> Option<usize> {
+    let n = b.len();
+    let mut j = i + 1;
+    if j < n && (b[j].is_ascii_alphabetic() || b[j] == b'_') {
+        j += 1;
+        while j < n && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+            j += 1;
+        }
+    }
+    if j < n && b[j] == b'$' {
+        Some(j + 1)
+    } else {
+        None
+    }
+}
+
 pub async fn run(command: DbCommands) -> Result<()> {
     match command {
         DbCommands::Init { drop } => {
@@ -263,31 +420,20 @@ pub async fn run(command: DbCommands) -> Result<()> {
                 let sql = std::fs::read_to_string(&sql_path)?;
 
                 println!("  Applying migration '{}'...", migration_name);
-                let start = std::time::Instant::now();
-
-                // Execute migration - use raw_sql for multiple statements
-                let result = sqlx::raw_sql(&sql)
-                    .execute(&pool)
-                    .await;
-
-                let elapsed = start.elapsed().as_millis() as i32;
-
-                match result {
-                    Ok(_) => {
-                        // Record migration
-                        record_migration(&pool, &migration_name, &module, elapsed).await?;
-                        println!("  Applied '{}' ({}ms)", migration_name, elapsed);
+                match apply_and_record_migration(&pool, &migration_name, &module, &sql).await? {
+                    MigApply::Applied(ms) => {
+                        println!("  Applied '{}' ({}ms)", migration_name, ms);
                         applied_count += 1;
                     }
-                    Err(e) => {
-                        let err_msg = e.to_string();
-                        // Check if error is "already exists" - mark as applied
-                        if err_msg.contains("already exists") {
-                            println!("  Migration '{}' objects already exist, marking as applied", migration_name);
-                            record_migration(&pool, &migration_name, &module, 0).await?;
-                            skipped_count += 1;
+                    MigApply::Recovered { applied, existed } => {
+                        println!(
+                            "  Recovered '{}' — {} statement(s) applied, {} already present",
+                            migration_name, applied, existed
+                        );
+                        if applied > 0 {
+                            applied_count += 1;
                         } else {
-                            return Err(e).with_context(|| format!("Failed to apply migration '{}'", migration_name));
+                            skipped_count += 1;
                         }
                     }
                 }
@@ -776,30 +922,17 @@ async fn run_plugin_migrations(pool: &PgPool) -> Result<(usize, usize)> {
             }
 
             println!("  Applying plugin migration '{}'...", key);
-            let start = std::time::Instant::now();
-            match sqlx::raw_sql(mig.up_sql).execute(pool).await {
-                Ok(_) => {
-                    let elapsed = start.elapsed().as_millis() as i32;
-                    record_migration(pool, &key, module, elapsed).await?;
-                    println!("  Applied '{}' ({}ms)", key, elapsed);
+            match apply_and_record_migration(pool, &key, module, mig.up_sql).await? {
+                MigApply::Applied(ms) => {
+                    println!("  Applied '{}' ({}ms)", key, ms);
                     applied += 1;
                 }
-                Err(e) => {
-                    let err_msg = e.to_string();
-                    if err_msg.contains("already exists") {
-                        // Dev-DB transition path: the old filesystem
-                        // migration created the tables, so we just
-                        // record the new key as applied.
-                        println!(
-                            "  Plugin migration '{}' objects already exist, marking as applied",
-                            key
-                        );
-                        record_migration(pool, &key, module, 0).await?;
-                        skipped += 1;
+                MigApply::Recovered { applied: a, existed } => {
+                    println!("  Recovered '{}' — {} applied, {} already present", key, a, existed);
+                    if a > 0 {
+                        applied += 1;
                     } else {
-                        return Err(e).with_context(|| {
-                            format!("Failed to apply plugin migration '{}'", key)
-                        });
+                        skipped += 1;
                     }
                 }
             }
@@ -861,22 +994,13 @@ pub async fn install_plugin_schema(pool: &PgPool, technical_name: &str) -> Resul
             skipped += 1;
             continue;
         }
-        let start = std::time::Instant::now();
-        match sqlx::raw_sql(mig.up_sql).execute(pool).await {
-            Ok(_) => {
-                let elapsed = start.elapsed().as_millis() as i32;
-                record_migration(pool, &key, module, elapsed).await?;
-                applied += 1;
-            }
-            Err(e) => {
-                if e.to_string().contains("already exists") {
-                    // Objects already present (e.g. created out of band):
-                    // record the key so we don't keep retrying.
-                    record_migration(pool, &key, module, 0).await?;
-                    skipped += 1;
+        match apply_and_record_migration(pool, &key, module, mig.up_sql).await? {
+            MigApply::Applied(_) => applied += 1,
+            MigApply::Recovered { applied: a, .. } => {
+                if a > 0 {
+                    applied += 1;
                 } else {
-                    return Err(e)
-                        .with_context(|| format!("Failed to apply plugin migration '{}'", key));
+                    skipped += 1;
                 }
             }
         }
@@ -937,22 +1061,12 @@ async fn run_all_migrations(pool: &PgPool) -> Result<()> {
 
         let sql = std::fs::read_to_string(&sql_path)?;
         println!("  Applying migration '{}'...", migration_name);
-        let start = std::time::Instant::now();
-
-        match sqlx::raw_sql(&sql).execute(pool).await {
-            Ok(_) => {
-                let elapsed = start.elapsed().as_millis() as i32;
-                record_migration(pool, &migration_name, &module, elapsed).await?;
-                println!("  Applied '{}' ({}ms)", migration_name, elapsed);
-            }
-            Err(e) => {
-                let err_msg = e.to_string();
-                if err_msg.contains("already exists") {
-                    record_migration(pool, &migration_name, &module, 0).await?;
-                } else {
-                    return Err(e).with_context(|| format!("Failed to apply migration '{}'", migration_name));
-                }
-            }
+        match apply_and_record_migration(pool, &migration_name, &module, &sql).await? {
+            MigApply::Applied(ms) => println!("  Applied '{}' ({}ms)", migration_name, ms),
+            MigApply::Recovered { applied, existed } => println!(
+                "  Recovered '{}' — {} applied, {} already present",
+                migration_name, applied, existed
+            ),
         }
     }
 
@@ -963,4 +1077,66 @@ async fn run_all_migrations(pool: &PgPool) -> Result<()> {
     // Project plugin model metadata into ir_model / ir_model_field.
     let _ = sync_model_registries(pool, &build_migration_registry()).await;
     Ok(())
+}
+
+#[cfg(test)]
+mod split_sql_tests {
+    use super::split_sql_statements;
+
+    #[test]
+    fn plain_statements() {
+        let s = split_sql_statements("CREATE TABLE a (id int); ALTER TABLE b ADD COLUMN c int;");
+        assert_eq!(s, vec!["CREATE TABLE a (id int)", "ALTER TABLE b ADD COLUMN c int"]);
+    }
+
+    #[test]
+    fn trailing_statement_without_semicolon() {
+        let s = split_sql_statements("SELECT 1;\nSELECT 2");
+        assert_eq!(s, vec!["SELECT 1", "SELECT 2"]);
+    }
+
+    #[test]
+    fn semicolon_inside_single_quoted_string_is_ignored() {
+        let s = split_sql_statements("INSERT INTO t VALUES ('a;b;c'); SELECT 1;");
+        assert_eq!(s, vec!["INSERT INTO t VALUES ('a;b;c')", "SELECT 1"]);
+    }
+
+    #[test]
+    fn escaped_quote_inside_string() {
+        let s = split_sql_statements("INSERT INTO t VALUES ('O''Brien; Co'); SELECT 2;");
+        assert_eq!(s, vec!["INSERT INTO t VALUES ('O''Brien; Co')", "SELECT 2"]);
+    }
+
+    #[test]
+    fn dollar_quoted_body_with_semicolons() {
+        let sql = "CREATE FUNCTION f() RETURNS trigger AS $$ BEGIN a := 1; b := 2; RETURN NEW; END $$ LANGUAGE plpgsql; SELECT 9;";
+        let s = split_sql_statements(sql);
+        assert_eq!(s.len(), 2, "function body semicolons must not split: {:?}", s);
+        assert!(s[0].contains("$$ BEGIN a := 1; b := 2;"));
+        assert_eq!(s[1], "SELECT 9");
+    }
+
+    #[test]
+    fn tagged_dollar_quote() {
+        let sql = "DO $mig$ BEGIN PERFORM 1; PERFORM 2; END $mig$; CREATE INDEX i ON t (c);";
+        let s = split_sql_statements(sql);
+        assert_eq!(s.len(), 2);
+        assert!(s[0].contains("$mig$"));
+        assert_eq!(s[1], "CREATE INDEX i ON t (c)");
+    }
+
+    #[test]
+    fn line_and_block_comments_with_semicolons() {
+        let sql = "-- a; b; c\nSELECT 1; /* x; y */ SELECT 2;";
+        let s = split_sql_statements(sql);
+        assert_eq!(s.len(), 2);
+        assert!(s[0].contains("SELECT 1"));
+        assert!(s[1].contains("SELECT 2"));
+    }
+
+    #[test]
+    fn empty_and_whitespace_only_statements_dropped() {
+        let s = split_sql_statements(";\n  ;\nSELECT 1;;\n");
+        assert_eq!(s, vec!["SELECT 1"]);
+    }
 }

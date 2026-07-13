@@ -169,6 +169,55 @@ async fn sync_one(pool: &PgPool, meta: &ModelMeta) -> Result<(), sqlx::Error> {
         .await?;
     }
 
+    // Prune registry rows for struct fields that no longer exist. Without
+    // this, dropping or renaming a `#[derive(Model)]` field leaves a stale
+    // `ir_model_field` row behind forever (the upserts above only ever add
+    // or update) — the "two registries can drift" gap. We delete only rows
+    // this sync owns: `is_custom = false`. Low-code custom fields
+    // (`is_custom = true`) and every other model's rows are untouched.
+    //
+    // Guarded two ways: an empty `current` set is skipped (so a
+    // metadata-less model can never blank its own registry), and a DB that
+    // predates the `is_custom` column (migration 137) errors on the DELETE,
+    // which we log and swallow — the upserts already ran, so the registry is
+    // current, just not pruned.
+    let current: Vec<String> = meta
+        .fields_ordered()
+        .filter(|f| is_registrable(f))
+        .map(|f| f.name.clone())
+        .collect();
+    if !current.is_empty() {
+        let prune = sqlx::query(
+            r#"
+            DELETE FROM ir_model_field
+            WHERE model_id = $1
+              AND is_custom = false
+              AND name <> ALL($2)
+            "#,
+        )
+        .bind(model_id)
+        .bind(&current)
+        .execute(pool)
+        .await;
+        match prune {
+            Ok(r) if r.rows_affected() > 0 => {
+                tracing::info!(
+                    model = %reg_name,
+                    pruned = r.rows_affected(),
+                    "registry sync pruned stale field rows"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(
+                    model = %reg_name,
+                    error = %e,
+                    "registry field prune skipped (legacy DB without is_custom?)"
+                );
+            }
+        }
+    }
+
     Ok(())
 }
 

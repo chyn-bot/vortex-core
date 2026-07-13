@@ -38,10 +38,14 @@ pub const VIEW_TYPES: &[(&str, &str)] = &[
 
 /// Graph shapes offered to a saved graph view, as `(code, label)`.
 pub const GRAPH_TYPES: &[(&str, &str)] = &[
-    ("bar", "Bar"),
+    ("bar", "Column"),
+    ("hbar", "Bar"),
     ("line", "Line"),
+    ("area", "Area"),
     ("pie", "Pie"),
-    ("doughnut", "Doughnut"),
+    ("doughnut", "Donut"),
+    ("stacked", "Stacked"),
+    ("stackedarea", "Stacked area"),
 ];
 
 /// Aggregate functions a pivot measure may use.
@@ -74,7 +78,7 @@ fn graph_type_codes() -> Vec<&'static str> {
 
 /// The keys a given view type may persist, and how each is validated.
 fn allowed_keys(view_type: &str) -> Vec<(&'static str, KeyKind)> {
-    static GRAPH_TYPE_CODES: &[&str] = &["bar", "line", "pie", "doughnut"];
+    static GRAPH_TYPE_CODES: &[&str] = &["bar", "hbar", "line", "area", "pie", "doughnut", "stacked", "stackedarea"];
     match view_type {
         "pivot" => vec![
             ("rows", KeyKind::FieldList),
@@ -93,11 +97,36 @@ fn allowed_keys(view_type: &str) -> Vec<(&'static str, KeyKind)> {
             ("coldesc", KeyKind::Enum(&["1"])),
         ],
         "graph" => vec![
-            ("group_by", KeyKind::Field),
+            // X-axis dimension (accepts `field:gran` for date bucketing); single.
+            ("group_by", KeyKind::FieldList),
+            // Optional breakdown dimension → one series per distinct value.
+            ("series", KeyKind::FieldList),
+            ("vals", KeyKind::Measures),
+            ("filters", KeyKind::Filters),
             ("type", KeyKind::Enum(GRAPH_TYPE_CODES)),
         ],
-        "kanban" => vec![("group_by", KeyKind::Field)],
-        "calendar" => vec![("date_field", KeyKind::Field)],
+        "kanban" => vec![
+            ("group_by", KeyKind::Field),
+            // Fields to show on each card, in order.
+            ("cards", KeyKind::FieldList),
+            // Optional per-column total: aggregate of a numeric field.
+            ("measure", KeyKind::Field),
+            ("agg", KeyKind::Enum(AGGREGATES)),
+            // Whether drag-to-change-stage is enabled ("1") or off ("0").
+            ("drag", KeyKind::Enum(&["0", "1"])),
+        ],
+        "calendar" => vec![
+            // The date/datetime field that positions an event (its start).
+            ("date_field", KeyKind::Field),
+            // Optional end date/datetime field → events span a range.
+            ("end_field", KeyKind::Field),
+            // Field used as the event label on each chip.
+            ("title_field", KeyKind::Field),
+            // Optional field whose distinct values color-code events + a legend.
+            ("color_field", KeyKind::Field),
+            // Display mode: month grid, week columns, or single-day agenda.
+            ("mode", KeyKind::Enum(&["month", "week", "day"])),
+        ],
         _ => vec![],
     }
 }
@@ -549,7 +578,7 @@ mod tests {
         assert!(ident("contact_type"));
         assert!(!ident("a; DROP TABLE x"));
         assert!(!ident(""));
-        assert_eq!(graph_type_codes(), vec!["bar", "line", "pie", "doughnut"]);
+        assert_eq!(graph_type_codes(), vec!["bar", "hbar", "line", "area", "pie", "doughnut", "stacked", "stackedarea"]);
     }
 
     #[test]
@@ -596,9 +625,9 @@ mod tests {
     fn allowed_keys_per_type() {
         let keys = |t: &str| allowed_keys(t).into_iter().map(|(k, _)| k).collect::<Vec<_>>();
         assert_eq!(keys("pivot"), vec!["rows", "cols", "measure", "agg", "vals", "mx", "filters", "collapsed", "coldesc"]);
-        assert_eq!(keys("graph"), vec!["group_by", "type"]);
-        assert_eq!(keys("kanban"), vec!["group_by"]);
-        assert_eq!(keys("calendar"), vec!["date_field"]);
+        assert_eq!(keys("graph"), vec!["group_by", "series", "vals", "filters", "type"]);
+        assert_eq!(keys("kanban"), vec!["group_by", "cards", "measure", "agg", "drag"]);
+        assert_eq!(keys("calendar"), vec!["date_field", "end_field", "title_field", "color_field", "mode"]);
         assert!(keys("bogus").is_empty());
     }
 

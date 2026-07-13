@@ -1964,6 +1964,28 @@ pub async fn run(host: String, port: u16, _workers: Option<usize>) -> Result<()>
     // state so a plugin that was already marked `installed` stays so.
     crate::commands::module_sync::sync_plugins_best_effort(&db, &plugin_registry).await;
 
+    // ─── Boot-time model-registry sync (§2 #3) ────────────────────────
+    // `#[derive(Model)]` → `ir_model` is the single source of truth for the
+    // generic views and REST API, but the sync otherwise only fires on three
+    // triggers (apps-refresh, `db migrate`, install). A struct that changed
+    // without one of those would leave the primary DB's `ir_model_field`
+    // stale until the next trigger. Running the (idempotent, now self-pruning)
+    // sync here closes that window to a single restart. Primary DB only,
+    // mirroring `sync_plugins_best_effort`; tenant DBs self-heal on their own
+    // triggers. Non-fatal — a legacy DB predating migration 122 just warns.
+    {
+        let metas: Vec<&'static vortex_orm::model::ModelMeta> = plugin_registry
+            .plugins_iter()
+            .flat_map(|p| p.models())
+            .collect();
+        if !metas.is_empty() {
+            match vortex_orm::registry_sync::sync_model_registry(&db, &metas).await {
+                Ok(n) => info!(models = n as i64, "model registry synced at startup"),
+                Err(e) => warn!(error = %e, "startup model registry sync failed"),
+            }
+        }
+    }
+
     // ─── Scheduler (Phase 0.7) ────────────────────────────────────────
     // Collect every plugin's scheduled actions, build the scheduler's
     // handler map, and upsert definitions into `scheduled_actions`. The
@@ -2209,8 +2231,10 @@ fn build_router(state: Arc<AppState>) -> Router {
         // Generic model views
         .route("/list/{model}", get(generic_list_view))
         .route("/kanban/{model}", get(generic_kanban_view))
+        .route("/kanban/{model}/move", post(kanban_move))
         .route("/graph/{model}", get(generic_graph_view))
         .route("/calendar/{model}", get(generic_calendar_view))
+        .route("/calendar/{model}/data", get(generic_calendar_data))
         .route("/pivot/{model}", get(generic_pivot_view))
         .route("/pivot/{model}/data", get(generic_pivot_data))
         .route("/pivot/{model}/values", get(generic_pivot_values))
@@ -4436,20 +4460,8 @@ async fn home_page(
         String::new()
     };
 
-    let html = format!(
-        r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style><title>Home - Remicle</title>
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=18" rel="stylesheet"/>
-<script src="/static/vortex.js?v=18" defer></script>
-<script src="/static/vendor/tailwind.js"></script>
-<script src="/static/vendor/htmx.min.js"></script>
-</head>
-<body class="min-h-screen bg-base-200">
-<div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a><button onclick="(function(){{var h=document.documentElement,c=h.getAttribute('data-theme')==='dark'?'corporate':'dark';h.setAttribute('data-theme',c);localStorage.setItem('theme',c);document.querySelectorAll('.theme-icon-sun,.theme-icon-moon').forEach(function(e){{e.classList.toggle('hidden')}})}})();" class="btn btn-ghost btn-sm btn-square ml-auto"><svg class="theme-icon-sun w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5" stroke-width="2"/><path stroke-linecap="round" stroke-width="2" d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg><svg class="theme-icon-moon w-5 h-5 hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg></button></div>
-<div id="sidebar-overlay" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
-<div class="flex">{sidebar}
-<main class="flex-1 p-4 lg:p-6 min-w-0">
+    let body = format!(
+        r#"
 <div class="mb-6"><h1 class="text-2xl font-bold">Welcome, {display_name}</h1><p class="text-base-content/60">Here's what's happening today</p></div>
 
 {admin_overview}
@@ -4499,15 +4511,18 @@ async fn home_page(
 
 </div></div>
 {shortcuts_modal}
-</main></div>
-{shortcuts_js}
-</body></html>"#,
-        sidebar = sidebar,
+"#,
         display_name = html_escape(display_name),
         admin_overview = admin_overview,
         module_links = module_links,
         shortcuts_modal = shortcuts_modal,
-        shortcuts_js = shortcuts_js,
+    );
+    let html = vortex_framework::render_app_shell_with(
+        "Home - Remicle",
+        &sidebar,
+        &body,
+        "<script src=\"/static/vendor/htmx.min.js\"></script>\n",
+        &format!("\n{}\n", shortcuts_js),
     );
 
     Html(html)
@@ -5104,17 +5119,7 @@ async fn announcements_list(
         ));
     }
 
-    Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style><title>Announcements - Remicle</title>
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=18" rel="stylesheet"/>
-<script src="/static/vortex.js?v=18" defer></script>
-<script src="/static/vendor/tailwind.js"></script></head>
-<body class="min-h-screen bg-base-200">
-<div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a><button onclick="(function(){{var h=document.documentElement,c=h.getAttribute('data-theme')==='dark'?'corporate':'dark';h.setAttribute('data-theme',c);localStorage.setItem('theme',c);document.querySelectorAll('.theme-icon-sun,.theme-icon-moon').forEach(function(e){{e.classList.toggle('hidden')}})}})();" class="btn btn-ghost btn-sm btn-square ml-auto"><svg class="theme-icon-sun w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5" stroke-width="2"/><path stroke-linecap="round" stroke-width="2" d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg><svg class="theme-icon-moon w-5 h-5 hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg></button></div>
-<div id="sidebar-overlay" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
-<div class="flex">{sidebar}
-<main class="flex-1 p-4 lg:p-6 min-w-0">
+    let body = format!(r#"
 <div class="flex justify-between items-center mb-6">
 <div><h1 class="text-2xl font-bold">Announcements</h1><p class="text-base-content/60">Manage company announcements shown on the home screen</p></div>
 <a href="/announcements/new" class="btn btn-primary">+ New Announcement</a>
@@ -5122,7 +5127,8 @@ async fn announcements_list(
 <div class="card bg-base-100 shadow"><div class="overflow-x-auto">
 <table class="table table-sm"><thead><tr><th>Title</th><th>Severity</th><th>Status</th><th>Author</th><th>Created</th><th>Actions</th></tr></thead>
 <tbody>{table_rows}</tbody></table></div></div>
-</main></div></body></html>"#)).into_response()
+"#);
+    Html(vortex_framework::render_app_shell("Announcements - Remicle", &sidebar, &body)).into_response()
 }
 
 async fn announcement_new(
@@ -5140,17 +5146,7 @@ async fn announcement_new(
     let installed = db_ctx.installed_modules.clone();
     let sidebar = build_sidebar("home", display_name, &initials, &installed, user.is_admin(), &state.plugin_registry, &user.roles);
 
-    Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style><title>New Announcement - Remicle</title>
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=18" rel="stylesheet"/>
-<script src="/static/vortex.js?v=18" defer></script>
-<script src="/static/vendor/tailwind.js"></script></head>
-<body class="min-h-screen bg-base-200">
-<div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a><button onclick="(function(){{var h=document.documentElement,c=h.getAttribute('data-theme')==='dark'?'corporate':'dark';h.setAttribute('data-theme',c);localStorage.setItem('theme',c);document.querySelectorAll('.theme-icon-sun,.theme-icon-moon').forEach(function(e){{e.classList.toggle('hidden')}})}})();" class="btn btn-ghost btn-sm btn-square ml-auto"><svg class="theme-icon-sun w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5" stroke-width="2"/><path stroke-linecap="round" stroke-width="2" d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg><svg class="theme-icon-moon w-5 h-5 hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg></button></div>
-<div id="sidebar-overlay" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
-<div class="flex">{sidebar}
-<main class="flex-1 p-4 lg:p-6 min-w-0"><h1 class="text-2xl font-bold mb-6">New Announcement</h1>
+    let body = format!(r#"<h1 class="text-2xl font-bold mb-6">New Announcement</h1>
 <form action="/announcements" method="POST" class="card bg-base-100 shadow p-6 max-w-2xl">
 <div class="form-control mb-4"><label class="label"><span class="label-text">Title *</span></label><input name="title" class="input input-bordered" required/></div>
 <div class="form-control mb-4"><label class="label"><span class="label-text">Body *</span></label><textarea name="body" class="textarea textarea-bordered h-32" required></textarea></div>
@@ -5163,7 +5159,8 @@ async fn announcement_new(
 <div class="form-control"><label class="label"><span class="label-text">Expire At (leave empty for never)</span></label><input name="expire_at" type="datetime-local" class="input input-bordered"/></div>
 </div>
 <div class="flex gap-2 mt-4"><a href="/announcements" class="btn btn-ghost">Cancel</a><button class="btn btn-primary">Create Announcement</button></div>
-</form></main></div></body></html>"#)).into_response()
+</form>"#);
+    Html(vortex_framework::render_app_shell("New Announcement - Remicle", &sidebar, &body)).into_response()
 }
 
 async fn announcement_create(
@@ -5255,17 +5252,7 @@ async fn announcement_edit(
     let installed = db_ctx.installed_modules.clone();
     let sidebar = build_sidebar("home", display_name, &initials, &installed, user.is_admin(), &state.plugin_registry, &user.roles);
 
-    Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style><title>Edit Announcement - Remicle</title>
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=18" rel="stylesheet"/>
-<script src="/static/vortex.js?v=18" defer></script>
-<script src="/static/vendor/tailwind.js"></script></head>
-<body class="min-h-screen bg-base-200">
-<div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a><button onclick="(function(){{var h=document.documentElement,c=h.getAttribute('data-theme')==='dark'?'corporate':'dark';h.setAttribute('data-theme',c);localStorage.setItem('theme',c);document.querySelectorAll('.theme-icon-sun,.theme-icon-moon').forEach(function(e){{e.classList.toggle('hidden')}})}})();" class="btn btn-ghost btn-sm btn-square ml-auto"><svg class="theme-icon-sun w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5" stroke-width="2"/><path stroke-linecap="round" stroke-width="2" d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg><svg class="theme-icon-moon w-5 h-5 hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg></button></div>
-<div id="sidebar-overlay" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
-<div class="flex">{sidebar}
-<main class="flex-1 p-4 lg:p-6 min-w-0"><h1 class="text-2xl font-bold mb-6">Edit Announcement</h1>
+    let page_body = format!(r#"<h1 class="text-2xl font-bold mb-6">Edit Announcement</h1>
 <form action="/announcements/{id}" method="POST" class="card bg-base-100 shadow p-6 max-w-2xl">
 <div class="form-control mb-4"><label class="label"><span class="label-text">Title *</span></label><input name="title" class="input input-bordered" value="{title}" required/></div>
 <div class="form-control mb-4"><label class="label"><span class="label-text">Body *</span></label><textarea name="body" class="textarea textarea-bordered h-32" required>{body}</textarea></div>
@@ -5278,7 +5265,7 @@ async fn announcement_edit(
 <div class="form-control"><label class="label"><span class="label-text">Expire At</span></label><input name="expire_at" type="datetime-local" class="input input-bordered" value="{expire_val}"/></div>
 </div>
 <div class="flex gap-2 mt-4"><a href="/announcements" class="btn btn-ghost">Cancel</a><button class="btn btn-primary">Save Changes</button></div>
-</form></main></div></body></html>"#,
+</form>"#,
         id = id,
         title = html_escape(&title),
         body = html_escape(&body),
@@ -5286,7 +5273,8 @@ async fn announcement_edit(
         pinned_checked = pinned_checked,
         publish_val = publish_val,
         expire_val = expire_val,
-    )).into_response()
+    );
+    Html(vortex_framework::render_app_shell("Edit Announcement - Remicle", &sidebar, &page_body)).into_response()
 }
 
 async fn announcement_update(
@@ -7653,6 +7641,26 @@ async fn module_upgrade(
 // Dynamic Sidebar Menu Helper
 // ============================================================================
 
+/// Sidebar `<li>` items for the generic model views (list/kanban/graph/
+/// calendar/pivot). These reuse the same aggregated plugin-registry menu as
+/// every plugin page — via [`vortex_framework::build_sidebar_nav`] — instead
+/// of the sparse `ir_ui_menu` fallback in [`build_sidebar_menu`], so the
+/// left-hand menu no longer vanishes when switching into a non-list view.
+fn generic_view_sidebar(
+    state: &AppState,
+    user: &AuthUser,
+    db_ctx: &DatabaseContext,
+    active: &str,
+) -> String {
+    vortex_framework::build_sidebar_nav(
+        active,
+        &db_ctx.installed_modules,
+        user.is_admin(),
+        &state.plugin_registry,
+        &user.roles,
+    )
+}
+
 async fn build_sidebar_menu(db: &PgPool, user_roles: &[String], current_model: &str) -> String {
     // Fetch menu items
     let menus = sqlx::query(
@@ -7785,6 +7793,7 @@ async fn generic_list_view(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
     Path(model_name): Path<String>,
     Query(params): Query<GenericListQuery>,
 ) -> Response {
@@ -8014,17 +8023,26 @@ async fn generic_list_view(
                     "many2one" => record.try_get::<String, _>(col_name.as_str()).unwrap_or_else(|_|
                         record.try_get::<Option<String>, _>(col_name.as_str()).ok().flatten().unwrap_or_else(|| "-".to_string())
                     ),
-                    _ => record.try_get::<String, _>(col_name.as_str()).unwrap_or_else(|_|
-                        record.try_get::<Option<String>, _>(col_name.as_str()).ok().flatten().unwrap_or_else(|| "-".to_string())
-                    ),
+                    // Text, and any non-string scalar (numeric/date/bool columns
+                    // otherwise render as "-" because only String was tried).
+                    _ => record.try_get::<String, _>(col_name.as_str())
+                        .or_else(|_| record.try_get::<Option<String>, _>(col_name.as_str()).map(|v| v.unwrap_or_default()))
+                        .or_else(|_| record.try_get::<i32, _>(col_name.as_str()).map(|v| v.to_string()))
+                        .or_else(|_| record.try_get::<i64, _>(col_name.as_str()).map(|v| v.to_string()))
+                        .or_else(|_| record.try_get::<sqlx::types::Decimal, _>(col_name.as_str()).map(|v| v.to_string()))
+                        .or_else(|_| record.try_get::<f64, _>(col_name.as_str()).map(|v| v.to_string()))
+                        .or_else(|_| record.try_get::<chrono::NaiveDate, _>(col_name.as_str()).map(|v| v.to_string()))
+                        .or_else(|_| record.try_get::<chrono::NaiveDateTime, _>(col_name.as_str()).map(|v| v.format("%Y-%m-%d %H:%M").to_string()))
+                        .or_else(|_| record.try_get::<chrono::DateTime<chrono::Utc>, _>(col_name.as_str()).map(|v| v.format("%Y-%m-%d %H:%M").to_string()))
+                        .unwrap_or_else(|_| "-".to_string()),
                 };
                 format!("<td>{}</td>", cell_val)
             })
             .collect();
 
         rows.push_str(&format!(
-            r#"<tr class="hover cursor-pointer" onclick="window.location='/{}/{}'">{}></tr>"#,
-            model_name, id, cells
+            r#"<tr class="hover cursor-pointer" onclick="window.location='{}'">{}></tr>"#,
+            vortex_framework::record_url(&model_name, &id.to_string()), cells
         ));
     }
 
@@ -8123,7 +8141,7 @@ async fn generic_list_view(
     }
 
     // Build dynamic sidebar
-    let sidebar_menu = build_sidebar_menu(&db, &user.roles, &model_name).await;
+    let sidebar_menu = generic_view_sidebar(&state, &user, &db_ctx, &model_name);
 
     // Fetch saved filters for this model
     let saved_filters = sqlx::query(
@@ -8207,7 +8225,7 @@ body {{ background: oklch(var(--b2)); color: oklch(var(--bc)); }}
             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 10h18M3 14h18m-9-4v8m-7 0h14a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg>
         </a>
     </div>
-    <a href="/{}/new" class="btn btn-primary btn-sm">+ New</a>
+    <a href="{}" class="btn btn-primary btn-sm">+ New</a>
 </div>
 </div>
 <div class="card mb-4">
@@ -8241,7 +8259,8 @@ body {{ background: oklch(var(--b2)); color: oklch(var(--bc)); }}
         user.username,
         sidebar_menu,
         model_display_name, model_display_name.to_lowercase(),
-        model_name, model_name, model_name, model_name, model_name, model_name,
+        model_name, model_name, model_name, model_name,
+        vortex_framework::new_record_url(&model_name), model_name,
         saved_filters_options, filter_controls, model_name, headers, rows,
         {
             // Build base_url for pagination links, preserving search/filter/group_by/per_page params
@@ -8361,236 +8380,453 @@ async fn saved_view_delete(
 // Generic Kanban View
 // ============================================================================
 
+#[derive(serde::Deserialize)]
+struct KanbanMove {
+    id: String,
+    field: String,
+    value: String,
+}
+
+/// POST /kanban/{model}/move — drag-to-change-stage. Sets one registered field
+/// on one record, routed through the same guarded path as any edit: the ORM
+/// allow-lists the column (`api::update_record`), the change is written to the
+/// audit ledger, and automation rules + webhooks fire (the platform's
+/// declarative side-effects). Empty value clears the field (unset a many2one).
+async fn kanban_move(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(model): Path<String>,
+    Form(form): Form<KanbanMove>,
+) -> Response {
+    let id = match uuid::Uuid::parse_str(form.id.trim()) {
+        Ok(i) => i,
+        Err(_) => return api_error(StatusCode::BAD_REQUEST, "bad_id", "Invalid record id."),
+    };
+    if !validate_identifier(&form.field) {
+        return api_error(StatusCode::BAD_REQUEST, "bad_field", "Invalid field.");
+    }
+    let val = if form.value.trim().is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::Value::String(form.value.clone())
+    };
+    let body = serde_json::json!({ form.field.clone(): val });
+    match vortex_framework::api::update_record(&db, &model, id, &body).await {
+        Ok(true) => {
+            api_audit(
+                &state, &db_ctx.db_name, &user,
+                AuditAction::RecordUpdated, AuditSeverity::Info, &model, Some(&id.to_string()),
+                serde_json::json!({"via": "kanban", "field": form.field, "value": form.value}),
+            ).await;
+            let rec = vortex_framework::api::get_record(&db, &model, id).await.ok().flatten();
+            vortex_framework::webhooks::emit(
+                &state.db, &db, &db_ctx.db_name, "record.updated",
+                serde_json::json!({"model": model, "id": id, "record": rec}),
+            ).await;
+            let _ = vortex_framework::computed_fields::store_values(&db, &model, id).await;
+            let _ = vortex_framework::automation::run_rules(&db, &model, "update", id).await;
+            Json(serde_json::json!({"ok": true})).into_response()
+        }
+        Ok(false) => api_error(StatusCode::NOT_FOUND, "not_found", "No such record."),
+        Err(e) => api_error(StatusCode::BAD_REQUEST, "update_failed", &e),
+    }
+}
+
 async fn generic_kanban_view(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
     Path(model_name): Path<String>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
-    // Fetch model metadata
+    let fail = |code: StatusCode, msg: &str| (code, Html(msg.to_string())).into_response();
+
     let model_row = match sqlx::query(
-        "SELECT id, display_name, table_name FROM ir_model WHERE name = $1 AND is_active = true"
+        "SELECT id, display_name, table_name, list_url FROM ir_model WHERE name = $1 AND is_active = true",
     )
     .bind(&model_name)
     .fetch_optional(&db)
-    .await {
+    .await
+    {
         Ok(Some(row)) => row,
-        _ => return (StatusCode::NOT_FOUND, Html("Model not found")).into_response(),
+        _ => return fail(StatusCode::NOT_FOUND, "Model not found"),
     };
-
     let model_id: uuid::Uuid = model_row.get("id");
     let model_display_name: String = model_row.get("display_name");
     let table_name: String = model_row.get("table_name");
+    if !validate_identifier(&table_name) {
+        return fail(StatusCode::BAD_REQUEST, "Invalid model");
+    }
+    let list_view_url: String = model_row
+        .try_get::<Option<String>, _>("list_url")
+        .ok()
+        .flatten()
+        .filter(|u| !u.is_empty())
+        .unwrap_or_else(|| format!("/list/{}", model_name));
 
-    // Kanban grouping: query param → shared default saved view → none. This
-    // replaces the never-created ir_ui_view_kanban join; card title stays the
-    // conventional `name` (records are grouped in-memory, so the column name is
-    // only ever used as a safe map key, never interpolated into SQL).
+    // Field registry: type, label, selection options, related model.
+    struct KField {
+        ftype: String,
+        label: String,
+        options: Option<serde_json::Value>,
+        related: Option<String>,
+    }
+    let frows = sqlx::query(
+        "SELECT name, field_type, display_name, selection_options, related_model
+         FROM ir_model_field WHERE model_id = $1 ORDER BY sequence, name",
+    )
+    .bind(model_id)
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default();
+    let mut finfo: std::collections::HashMap<String, KField> = std::collections::HashMap::new();
+    let mut order: Vec<String> = Vec::new();
+    for f in &frows {
+        let n: String = f.get("name");
+        order.push(n.clone());
+        finfo.insert(n, KField {
+            ftype: f.get("field_type"),
+            label: f.get("display_name"),
+            options: f.try_get("selection_options").ok(),
+            related: f.try_get("related_model").ok().flatten(),
+        });
+    }
+    let is_field = |n: &str| validate_identifier(n) && finfo.contains_key(n);
+    let is_numeric = |n: &str| finfo.get(n).map(|k| matches!(k.ftype.as_str(), "integer" | "float" | "decimal" | "monetary" | "number")).unwrap_or(false);
+    let is_groupable = |n: &str| finfo.get(n).map(|k| matches!(k.ftype.as_str(), "selection" | "string" | "char" | "many2one" | "boolean")).unwrap_or(false);
+    let label_of = |n: &str| finfo.get(n).map(|k| k.label.clone()).unwrap_or_else(|| n.to_string());
+    // Real table columns — the kanban only ever reads/writes actual columns
+    // (registered fields can be computed/related and would break a raw SELECT).
+    let real_cols: std::collections::HashSet<String> = sqlx::query_scalar::<_, String>(
+        "SELECT column_name FROM information_schema.columns WHERE table_name = $1",
+    )
+    .bind(&table_name)
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .collect();
+    let is_col = |n: &str| real_cols.contains(n);
+    let has_active = real_cols.contains("active");
+    let where_active = if has_active { " WHERE t.active = true" } else { "" };
+    // Title column: the first conventional label column the table actually has.
+    let title_col = ["name", "title", "display_name", "number", "reference", "code", "quote_number"]
+        .iter()
+        .find(|c| is_col(c))
+        .map(|c| c.to_string());
+
+    // Selection value -> label lookup for a field.
+    let sel_label = |field: &str, val: &str| -> String {
+        finfo.get(field)
+            .and_then(|k| k.options.as_ref())
+            .and_then(|v| v.as_array())
+            .and_then(|arr| arr.iter().find(|o| o.get("value").and_then(|x| x.as_str()) == Some(val)))
+            .and_then(|o| o.get("label").and_then(|x| x.as_str()))
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| val.to_string())
+    };
+
+    // ---- config -----------------------------------------------------------
     let default_cfg = vortex_framework::saved_views::default_config_for(&db, &model_name, "kanban")
         .await
         .unwrap_or_default();
-    let title_field = "name".to_string();
-    let subtitle_field: Option<String> = None;
-    let tags_field: Option<String> = None;
-    let group_by_field: Option<String> = params
-        .get("group_by")
-        .cloned()
-        .or_else(|| default_cfg.get("group_by").cloned());
+    let pick = |k: &str| params.get(k).cloned().or_else(|| default_cfg.get(k).cloned());
 
-    // Saved-views toolbar config (only a chosen grouping is worth saving).
+    // Group-by: config → first stage-like field → first groupable field.
+    let group_by = pick("group_by").filter(|g| is_field(g) && is_groupable(g) && is_col(g)).unwrap_or_else(|| {
+        ["stage", "state", "status", "record_state", "kanban_state"]
+            .iter()
+            .find(|c| is_field(c) && is_groupable(c) && is_col(c))
+            .map(|c| c.to_string())
+            .or_else(|| order.iter().find(|n| is_groupable(n) && is_col(n)).cloned())
+            .unwrap_or_default()
+    });
+    let card_fields: Vec<String> = pick("cards")
+        .unwrap_or_default()
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .filter(|s| is_field(s) && is_col(s) && *s != group_by)
+        .map(|s| s.to_string())
+        .collect();
+    let measure = pick("measure").filter(|m| is_field(m) && is_numeric(m) && is_col(m));
+    let agg = pick("agg").filter(|a| ["count", "sum", "avg", "min", "max"].contains(&a.as_str())).unwrap_or_else(|| "sum".to_string());
+    let drag_enabled = pick("drag").as_deref() != Some("0");
+
+    let sidebar_menu = generic_view_sidebar(&state, &user, &db_ctx, &model_name);
     let mut current_cfg = std::collections::BTreeMap::new();
-    if let Some(g) = &group_by_field {
-        current_cfg.insert("group_by".to_string(), g.clone());
-    }
+    if !group_by.is_empty() { current_cfg.insert("group_by".to_string(), group_by.clone()); }
     let view_bar = vortex_framework::saved_views::render_view_bar(
         &db, &model_name, "kanban", &current_cfg, user.id, user.is_admin(),
     )
     .await;
 
-    // Fetch field metadata for grouping field options
-    let group_options: Vec<(String, String)> = if let Some(ref group_field) = group_by_field {
-        let field_meta = sqlx::query(
-            "SELECT selection_options FROM ir_model_field WHERE model_id = $1 AND name = $2"
-        )
-        .bind(model_id)
-        .bind(group_field)
-        .fetch_optional(&db)
-        .await
-        .ok()
-        .flatten();
+    // Field list for the client config controls (groupable dims + numeric).
+    let mut field_arr: Vec<serde_json::Value> = Vec::new();
+    for n in &order {
+        let k = &finfo[n];
+        let numeric = is_numeric(n);
+        if is_groupable(n) || numeric {
+            field_arr.push(serde_json::json!({"name": n, "label": k.label, "numeric": numeric, "groupable": is_groupable(n)}));
+        }
+    }
+    let fields_json = serde_json::to_string(&field_arr).unwrap_or_else(|_| "[]".to_string());
+    let config_json = serde_json::json!({
+        "group_by": group_by,
+        "cards": card_fields.join(","),
+        "measure": measure.clone().unwrap_or_default(),
+        "agg": agg,
+        "drag": if drag_enabled { "1" } else { "0" },
+    })
+    .to_string();
 
-        if let Some(row) = field_meta {
-            let opts: Option<serde_json::Value> = row.get("selection_options");
-            opts.as_ref()
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|o| {
-                            let val = o.get("value")?.as_str()?;
-                            let label = o.get("label")?.as_str()?;
-                            Some((val.to_string(), label.to_string()))
-                        })
-                        .collect()
-                })
-                .unwrap_or_default()
-        } else {
-            vec![]
+    // ---- build columns -----------------------------------------------------
+    // A column is (value_key, label). `value_key` is what a drag posts as the
+    // new field value; for a many2one it's the related id, for a selection the
+    // option value, etc.
+    let gtype = finfo.get(&group_by).map(|k| k.ftype.clone()).unwrap_or_default();
+    let mut columns: Vec<(String, String)> = Vec::new();
+    if group_by.is_empty() {
+        // no groupable field — render a single bucket
+        columns.push((String::new(), "All".to_string()));
+    } else if gtype == "boolean" {
+        columns.push(("true".to_string(), "Yes".to_string()));
+        columns.push(("false".to_string(), "No".to_string()));
+    } else if gtype == "many2one" {
+        if let Some(rel) = finfo.get(&group_by).and_then(|k| k.related.clone()) {
+            let rel_table = rel.replace('.', "_");
+            if validate_identifier(&rel_table) {
+                let q = format!(
+                    "SELECT DISTINCT r.id::text AS v, COALESCE(r.name, '(unnamed)') AS l \
+                     FROM {table} t JOIN {rel} r ON t.{gf} = r.id{wa} ORDER BY l",
+                    table = table_name, rel = rel_table, gf = group_by, wa = where_active,
+                );
+                for row in sqlx::query(&q).fetch_all(&db).await.unwrap_or_default() {
+                    columns.push((row.get::<String, _>("v"), row.get::<String, _>("l")));
+                }
+            }
+        }
+    } else if gtype == "selection" {
+        // selection_options come in two shapes: [{value,label}] OR a flat
+        // ["value", ...] array. Only the former was handled, so a flat-array
+        // field produced zero columns → an empty board. Support both, then
+        // append any stored value the options list doesn't cover so no card is
+        // silently dropped (stored states can drift from the declared options).
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        if let Some(arr) = finfo.get(&group_by).and_then(|k| k.options.as_ref()).and_then(|v| v.as_array()) {
+            for o in arr {
+                let vl = match o {
+                    serde_json::Value::String(s) => Some((s.clone(), s.clone())),
+                    serde_json::Value::Object(_) => match (
+                        o.get("value").and_then(|x| x.as_str()),
+                        o.get("label").and_then(|x| x.as_str()),
+                    ) {
+                        (Some(v), Some(l)) => Some((v.to_string(), l.to_string())),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some((v, l)) = vl {
+                    if seen.insert(v.clone()) {
+                        columns.push((v, l));
+                    }
+                }
+            }
+        }
+        let q = format!(
+            "SELECT DISTINCT CAST(t.{gf} AS TEXT) AS v FROM {table} t \
+             WHERE t.{gf} IS NOT NULL{active} ORDER BY v",
+            table = table_name, gf = group_by,
+            active = if has_active { " AND t.active = true" } else { "" },
+        );
+        for row in sqlx::query(&q).fetch_all(&db).await.unwrap_or_default() {
+            let v: String = row.get("v");
+            if seen.insert(v.clone()) {
+                columns.push((v.clone(), v));
+            }
         }
     } else {
-        vec![]
+        // text / status: distinct present values
+        let q = format!(
+            "SELECT DISTINCT CAST(t.{gf} AS TEXT) AS v FROM {table} t \
+             WHERE t.{gf} IS NOT NULL{active} ORDER BY v",
+            table = table_name, gf = group_by,
+            active = if has_active { " AND t.active = true" } else { "" },
+        );
+        for row in sqlx::query(&q).fetch_all(&db).await.unwrap_or_default() {
+            let v: String = row.get("v");
+            columns.push((v.clone(), v));
+        }
+    }
+
+    // ---- fetch records into an explicit, text-safe projection --------------
+    let title_sel = title_col
+        .as_ref()
+        .map(|c| format!("CAST(t.{} AS TEXT)", c))
+        .unwrap_or_else(|| "t.id::text".to_string());
+    let mut selects: Vec<String> = vec![
+        "t.id::text AS __id".to_string(),
+        format!("{} AS __title", title_sel),
+    ];
+    if !group_by.is_empty() {
+        selects.push(format!("CAST(t.{} AS TEXT) AS __grp", group_by));
+    } else {
+        selects.push("'' AS __grp".to_string());
+    }
+    if let Some(m) = &measure {
+        selects.push(format!("CAST(t.{} AS DOUBLE PRECISION) AS __m", m));
+    }
+    for (i, cf) in card_fields.iter().enumerate() {
+        selects.push(format!("CAST(t.{} AS TEXT) AS c{}", cf, i));
+    }
+    let rec_q = format!(
+        "SELECT {} FROM {} t{} ORDER BY 2 LIMIT 500",
+        selects.join(", "), table_name, where_active,
+    );
+    let records = sqlx::query(&rec_q).fetch_all(&db).await.unwrap_or_default();
+
+    // Group cards + accumulate the per-column measure.
+    let mut cards_by_col: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut count_by_col: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    let mut vals_by_col: std::collections::HashMap<String, Vec<f64>> = std::collections::HashMap::new();
+    let mut has_none = false;
+    for r in &records {
+        let id: String = r.try_get("__id").unwrap_or_default();
+        let title: String = r.try_get::<Option<String>, _>("__title").ok().flatten().unwrap_or_else(|| "(untitled)".to_string());
+        let grp: String = r.try_get::<Option<String>, _>("__grp").ok().flatten().unwrap_or_default();
+        let col_key = grp.clone();
+        if col_key.is_empty() { has_none = true; }
+        let mut m_attr = String::new();
+        if measure.is_some() {
+            if let Ok(Some(v)) = r.try_get::<Option<f64>, _>("__m") {
+                vals_by_col.entry(col_key.clone()).or_default().push(v);
+                m_attr = format!(r#" data-m="{}""#, v);
+            }
+        }
+        *count_by_col.entry(col_key.clone()).or_insert(0) += 1;
+
+        // Card body: title + configured field chips.
+        let mut chips = String::new();
+        for (i, cf) in card_fields.iter().enumerate() {
+            let raw: String = r.try_get::<Option<String>, _>(format!("c{}", i).as_str()).ok().flatten().unwrap_or_default();
+            if raw.is_empty() { continue; }
+            let disp = if finfo.get(cf).map(|k| k.ftype == "selection").unwrap_or(false) { sel_label(cf, &raw) } else { raw };
+            chips.push_str(&format!(
+                r#"<div class="kb-chip"><span class="kb-chip-k">{}</span> {}</div>"#,
+                html_escape(&label_of(cf)), html_escape(&disp),
+            ));
+        }
+        let card = format!(
+            r#"<div class="kb-card" draggable="true" data-id="{id}" data-url="{url}"{m}><div class="kb-card-title">{title}</div>{chips}</div>"#,
+            id = html_escape(&id),
+            url = html_escape(&vortex_framework::record_url(&model_name, &id)),
+            title = html_escape(&title), chips = chips, m = m_attr,
+        );
+        cards_by_col.entry(col_key).or_default().push_str(&card);
+    }
+    if has_none {
+        columns.push((String::new(), "(None)".to_string()));
+    }
+
+    let fmt_total = |vals: Option<&Vec<f64>>, count: i64| -> String {
+        if measure.is_none() { return String::new(); }
+        let v = vals.map(|xs| {
+            match agg.as_str() {
+                "count" => count as f64,
+                "avg" => if xs.is_empty() { 0.0 } else { xs.iter().sum::<f64>() / xs.len() as f64 },
+                "min" => xs.iter().cloned().fold(f64::INFINITY, f64::min),
+                "max" => xs.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+                _ => xs.iter().sum(),
+            }
+        }).unwrap_or(0.0);
+        let disp = if v.fract() == 0.0 && v.abs() < 1e15 { format!("{}", v as i64) } else { format!("{:.2}", v) };
+        format!(r#" · <span class="kb-total">{}</span>"#, html_escape(&disp))
     };
 
-    // Fetch records
-    if !validate_identifier(&table_name) {
-        return (StatusCode::BAD_REQUEST, Html("Invalid model".to_string())).into_response();
-    }
-    let query = format!("SELECT * FROM {} WHERE active = true ORDER BY name LIMIT 200", table_name);
-    let records = sqlx::query(&query)
-        .fetch_all(&db)
-        .await
-        .unwrap_or_default();
-
-    // Group records by the group_by_field
-    let mut columns: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
-
-    // Initialize columns from group_options
-    for (val, _label) in &group_options {
-        columns.insert(val.clone(), Vec::new());
-    }
-
-    // Build cards and group them
-    for record in &records {
-        let id: uuid::Uuid = record.get("id");
-        let title: String = record.try_get(title_field.as_str()).unwrap_or_default();
-        let subtitle: String = subtitle_field.as_ref()
-            .and_then(|f| record.try_get::<Option<String>, _>(f.as_str()).ok().flatten())
-            .unwrap_or_default();
-        let tag_value: String = tags_field.as_ref()
-            .and_then(|f| record.try_get::<String, _>(f.as_str()).ok())
-            .unwrap_or_default();
-        let group_value: String = group_by_field.as_ref()
-            .and_then(|f| record.try_get::<String, _>(f.as_str()).ok())
-            .unwrap_or_else(|| "other".to_string());
-
-        let tag_badge = match tag_value.as_str() {
-            "approved" => r#"<span class="badge badge-success badge-xs">Approved</span>"#,
-            "draft" => r#"<span class="badge badge-warning badge-xs">Draft</span>"#,
-            _ => "",
-        };
-
-        let card_html = format!(
-            r#"<div class="card bg-base-100 shadow-sm mb-2 cursor-pointer hover:shadow-md transition-shadow" onclick="window.location='/{}/{}'">
-                <div class="card-body p-3">
-                    <h3 class="card-title text-sm">{}</h3>
-                    <p class="text-xs opacity-60">{}</p>
-                    <div class="mt-1">{}</div>
-                </div>
-            </div>"#,
-            model_name, id, title, subtitle, tag_badge
-        );
-
-        columns.entry(group_value).or_insert_with(Vec::new).push(card_html);
-    }
-
-    // Build column HTML
-    let mut columns_html = String::new();
-    for (val, label) in &group_options {
-        let cards = columns.get(val).map(|v| v.join("")).unwrap_or_default();
-        let count = columns.get(val).map(|v| v.len()).unwrap_or(0);
-        columns_html.push_str(&format!(
-            r#"<div class="flex-1 min-w-[280px] max-w-[320px]">
-                <div class="bg-base-200 rounded-lg p-3">
-                    <div class="flex justify-between items-center mb-3">
-                        <h3 class="font-semibold text-sm uppercase tracking-wide">{}</h3>
-                        <span class="badge badge-ghost badge-sm">{}</span>
-                    </div>
-                    <div class="space-y-2 min-h-[100px]">
-                        {}
-                    </div>
-                </div>
-            </div>"#,
-            label, count, cards
+    let mut board = String::new();
+    for (val, label) in &columns {
+        let cards = cards_by_col.get(val).cloned().unwrap_or_default();
+        let count = *count_by_col.get(val).unwrap_or(&0);
+        let total = fmt_total(vals_by_col.get(val), count);
+        board.push_str(&format!(
+            r#"<div class="kb-col"><div class="kb-col-head"><span class="kb-col-title">{label}</span><span class="kb-col-meta">{count}{total}</span></div><div class="kb-col-body" data-value="{val}">{cards}</div></div>"#,
+            label = html_escape(label), count = count, total = total, val = html_escape(val), cards = cards,
         ));
     }
+    if columns.is_empty() {
+        board.push_str(r#"<div class="kb-empty">No groupable field to build a board. Pick a Group-by field.</div>"#);
+    }
 
-    // Build dynamic sidebar
-    let sidebar_menu = build_sidebar_menu(&db, &user.roles, &model_name).await;
+    let html = KANBAN_SHELL
+        .replace("__TITLE__", &html_escape(&model_display_name))
+        .replace("__USER__", &html_escape(&user.username))
+        .replace("__SIDEBAR__", &sidebar_menu)
+        .replace("__LISTURL__", &html_escape(&list_view_url))
+        .replace("__FIELDS__", &html_escape(&fields_json))
+        .replace("__CONFIG__", &html_escape(&config_json))
+        .replace("__GROUP__", &html_escape(&group_by))
+        .replace("__DRAG__", if drag_enabled { "1" } else { "0" })
+        .replace("__BOARD__", &board)
+        .replace("__MODEL__", &html_escape(&model_name))
+        .replace("__NEWURL__", &html_escape(&vortex_framework::new_record_url(&model_name)));
+    Html(html.replace("<!--VIEW_BAR-->", &view_bar)).into_response()
+}
 
-    // Build full page
-    let html = format!(r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style><title>{} - Kanban</title>
+const KANBAN_SHELL: &str = r#"<!DOCTYPE html><html data-theme="dark"><head>
+<script>(function(){var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)})()</script>
+<style>[data-theme="corporate"] .theme-icon-sun{display:none !important}[data-theme="corporate"] .theme-icon-moon{display:inline-block !important}</style>
+<title>__TITLE__ - Kanban</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
 <link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<link href="/static/kanban.css?v=1" rel="stylesheet"/>
 <script src="/static/vortex.js?v=18" defer></script>
 <script src="/static/vendor/tailwind.js"></script>
 <style>
-body {{ background: oklch(var(--b2)); color: oklch(var(--bc)); }}
-.top-navbar {{ background: oklch(var(--b1)); border-bottom: 1px solid oklch(var(--b3)); position: sticky; top: 0; z-index: 50; }}
-.sidebar {{ background: oklch(var(--b1)); border-right: 1px solid oklch(var(--b3)); }}
-.card {{ background: oklch(var(--b1)); border: 1px solid oklch(var(--b3)); }}
-.text-muted {{ color: oklch(var(--bc)/0.6); }}
-.user-badge {{ background: #8BC53F; color: #000; font-weight: 600; }}
-.kanban-col {{ background: oklch(var(--b1)); }}
-@media (max-width: 768px) {{ .sidebar {{ display: none; }} }}
+body { background: oklch(var(--b2)); color: oklch(var(--bc)); }
+.top-navbar { background: oklch(var(--b1)); border-bottom: 1px solid oklch(var(--b3)); position: sticky; top: 0; z-index: 50; }
+.sidebar { background: oklch(var(--b1)); border-right: 1px solid oklch(var(--b3)); }
+.text-muted { color: oklch(var(--bc)/0.6); }
+.user-badge { background: #8BC53F; color: #000; font-weight: 600; }
 </style>
 </head><body class="min-h-screen">
 <nav class="top-navbar px-4 py-3 flex items-center justify-between">
-    <div class="flex items-center gap-2"><button class="btn btn-ghost btn-sm btn-square md:hidden" onclick="var s=document.querySelector('.sidebar');s.classList.toggle('hidden');s.classList.toggle('md:block')"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="text-xl font-bold"><span style="color:#8BC53F">re</span><span class="text-muted">micle</span></a></div>
-    <div class="flex items-center gap-2 md:gap-3">
-        <a href="/home" class="text-base-content text-sm hover:underline hidden md:inline">Home</a>
-        <a href="/settings" class="text-base-content text-sm hover:underline hidden md:inline">Settings</a>
-        <a href="/notifications" class="btn btn-ghost btn-circle btn-sm relative" title="Notifications">
-            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9"/></svg>
-            <span class="absolute top-0 right-0 w-2 h-2 bg-red-500 rounded-full"></span>
-        </a>
-        <button onclick="(function(){{var h=document.documentElement,c=h.getAttribute('data-theme')==='dark'?'corporate':'dark';h.setAttribute('data-theme',c);localStorage.setItem('theme',c);document.querySelectorAll('.theme-icon-sun,.theme-icon-moon').forEach(function(e){{e.classList.toggle('hidden')}})}})();" class="btn btn-ghost btn-circle btn-sm" title="Toggle theme"><svg class="theme-icon-sun w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5" stroke-width="2"/><path stroke-linecap="round" stroke-width="2" d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg><svg class="theme-icon-moon w-5 h-5 hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg></button>
-        <div class="user-badge px-3 py-1 rounded-full text-sm">@{}</div>
-    </div>
+  <div class="flex items-center gap-2">
+    <button class="btn btn-ghost btn-sm btn-square md:hidden" onclick="var s=document.querySelector('.sidebar');s.classList.toggle('hidden');s.classList.toggle('md:block')"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button>
+    <a href="/home" class="text-xl font-bold"><span style="color:#8BC53F">re</span><span class="text-muted">micle</span></a>
+  </div>
+  <div class="flex items-center gap-2 md:gap-3">
+    <a href="/home" class="text-base-content text-sm hover:underline hidden md:inline">Home</a>
+    <a href="/settings" class="text-base-content text-sm hover:underline hidden md:inline">Settings</a>
+    <button onclick="(function(){var h=document.documentElement,c=h.getAttribute('data-theme')==='dark'?'corporate':'dark';h.setAttribute('data-theme',c);localStorage.setItem('theme',c);document.querySelectorAll('.theme-icon-sun,.theme-icon-moon').forEach(function(e){e.classList.toggle('hidden')})})();" class="btn btn-ghost btn-circle btn-sm" title="Toggle theme"><svg class="theme-icon-sun w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5" stroke-width="2"/><path stroke-linecap="round" stroke-width="2" d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg><svg class="theme-icon-moon w-5 h-5 hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg></button>
+    <div class="user-badge px-3 py-1 rounded-full text-sm">@__USER__</div>
+  </div>
 </nav>
 <div class="flex">
-<aside class="sidebar w-64 min-h-screen p-4 hidden md:block">
-<ul class="menu mt-2">
-{}
-</ul>
-</aside>
-<main class="flex-1 p-4 md:p-6">
-<div class="flex flex-col md:flex-row justify-between items-start md:items-center mb-6 gap-4">
-<div><h1 class="text-xl md:text-2xl font-bold">{}</h1><p class="text-muted">Kanban view</p></div>
-<div class="flex gap-2 flex-wrap">
+<aside class="sidebar w-64 min-h-screen p-4 hidden md:block"><ul class="menu mt-2">__SIDEBAR__</ul></aside>
+<main class="flex-1 p-4 md:p-6 min-w-0">
+<div class="flex flex-col md:flex-row justify-between items-start md:items-center mb-4 gap-4">
+  <div><h1 class="text-xl md:text-2xl font-bold">__TITLE__</h1><p class="text-muted">Kanban — drag cards between columns to change stage</p></div>
+  <div class="flex gap-2 flex-wrap">
     <div class="btn-group">
-        <a href="/list/{}" class="btn btn-sm" title="List View">
-            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 10h16M4 14h16M4 18h16"/></svg>
-        </a>
-        <a href="/kanban/{}" class="btn btn-sm btn-active" title="Kanban View">
-            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 17V7m0 10a2 2 0 01-2 2H5a2 2 0 01-2-2V7a2 2 0 012-2h2a2 2 0 012 2m0 10a2 2 0 002 2h2a2 2 0 002-2M9 7a2 2 0 012-2h2a2 2 0 012 2m0 10V7m0 10a2 2 0 002 2h2a2 2 0 002-2V7a2 2 0 00-2-2h-2a2 2 0 00-2 2"/></svg>
-        </a>
-        <a href="/graph/{}" class="btn btn-sm" title="Graph View">
-            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/></svg>
-        </a>
-        <a href="/pivot/{}" class="btn btn-sm" title="Pivot View">
-            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 10h18M3 14h18m-9-4v8m-7 0h14a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg>
-        </a>
+      <a href="__LISTURL__" class="btn btn-sm" title="List View"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 10h16M4 14h16M4 18h16"/></svg></a>
+      <a href="/kanban/__MODEL__" class="btn btn-sm btn-active" title="Kanban View"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 17V7m0 10a2 2 0 01-2 2H5a2 2 0 01-2-2V7a2 2 0 012-2h2a2 2 0 012 2m0 10a2 2 0 002 2h2a2 2 0 002-2M9 7a2 2 0 012-2h2a2 2 0 012 2m0 10V7"/></svg></a>
+      <a href="/graph/__MODEL__" class="btn btn-sm" title="Graph View"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/></svg></a>
+      <a href="/pivot/__MODEL__" class="btn btn-sm" title="Pivot View"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 10h18M3 14h18m-9-4v8m-7 0h14a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg></a>
     </div>
     <!--VIEW_BAR-->
-    <a href="/{}/new" class="btn btn-primary btn-sm" style="background:#8BC53F;border-color:#8BC53F;color:#000">+ New</a>
+    <a href="__NEWURL__" class="btn btn-sm" style="background:#8BC53F;border-color:#8BC53F;color:#000">+ New</a>
+  </div>
 </div>
-</div>
-<div class="flex gap-4 overflow-x-auto pb-4">
-{}
-</div>
+<div id="kb-config" class="kb-config"></div>
+<div id="kanban-root" class="kb-board" data-model="__MODEL__" data-group="__GROUP__" data-drag="__DRAG__" data-fields="__FIELDS__" data-config="__CONFIG__">__BOARD__</div>
 </main>
 </div>
-</body></html>"#,
-        model_display_name,
-        user.username,
-        sidebar_menu,
-        model_display_name,
-        model_name, model_name, model_name, model_name, model_name,
-        columns_html
-    );
-    Html(html.replace("<!--VIEW_BAR-->", &view_bar)).into_response()
-}
+<div id="kb-toast" class="kb-toast"></div>
+<script src="/static/kanban.js?v=1"></script>
+</body></html>"#;
 
 // ============================================================================
 // Generic Graph View
@@ -8600,225 +8836,205 @@ async fn generic_graph_view(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
     Path(model_name): Path<String>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
-    // Fetch model metadata
     let model_row = match sqlx::query(
-        "SELECT id, display_name, table_name FROM ir_model WHERE name = $1 AND is_active = true"
+        "SELECT id, display_name, table_name, list_url FROM ir_model WHERE name = $1 AND is_active = true",
     )
     .bind(&model_name)
     .fetch_optional(&db)
-    .await {
+    .await
+    {
         Ok(Some(row)) => row,
         _ => return (StatusCode::NOT_FOUND, Html("Model not found")).into_response(),
     };
-
     let model_id: uuid::Uuid = model_row.get("id");
     let model_display_name: String = model_row.get("display_name");
     let table_name: String = model_row.get("table_name");
     if !validate_identifier(&table_name) {
         return (StatusCode::BAD_REQUEST, Html("Invalid model".to_string())).into_response();
     }
+    let list_view_url: String = model_row
+        .try_get::<Option<String>, _>("list_url")
+        .ok()
+        .flatten()
+        .filter(|u| !u.is_empty())
+        .unwrap_or_else(|| format!("/list/{}", model_name));
 
-    // Registered field names — the allow-list the group-by column must be in, so
-    // it can never become an arbitrary SQL fragment.
-    let field_list: Vec<String> = sqlx::query_scalar(
-        "SELECT name FROM ir_model_field WHERE model_id = $1 ORDER BY sequence, name",
+    // Fields for the pane: groupable dimensions (X-axis / series) + numeric
+    // measures — the same shape the pivot pane uses, so the graph shares its
+    // aggregation engine (/pivot/{model}/data).
+    let fields = sqlx::query(
+        "SELECT name, field_type, display_name FROM ir_model_field WHERE model_id = $1 ORDER BY sequence, name",
     )
     .bind(model_id)
     .fetch_all(&db)
     .await
     .unwrap_or_default();
-    let field_set: std::collections::HashSet<&str> = field_list.iter().map(String::as_str).collect();
+    let mut field_arr: Vec<serde_json::Value> = Vec::new();
+    let mut groupable_names: Vec<String> = Vec::new();
+    for f in &fields {
+        let name: String = f.get("name");
+        let ftype: String = f.get("field_type");
+        let label: String = f.get("display_name");
+        let numeric = matches!(ftype.as_str(), "integer" | "float" | "decimal" | "monetary" | "number");
+        let date = matches!(ftype.as_str(), "date" | "datetime");
+        let groupable = matches!(
+            ftype.as_str(),
+            "selection" | "string" | "char" | "many2one" | "boolean" | "date" | "datetime"
+        );
+        if groupable {
+            groupable_names.push(name.clone());
+        }
+        if groupable || numeric {
+            field_arr.push(serde_json::json!({"name": name, "label": label, "numeric": numeric, "date": date}));
+        }
+    }
+    let fields_json = serde_json::to_string(&field_arr).unwrap_or_else(|_| "[]".to_string());
 
-    // Config precedence: explicit query params → shared default saved view →
-    // sensible fallback. This replaces the never-created ir_ui_view join.
+    // Initial config: query params win, else the shared default saved view.
     let default_cfg = vortex_framework::saved_views::default_config_for(&db, &model_name, "graph")
         .await
         .unwrap_or_default();
-    let pick = |key: &str| params.get(key).cloned().or_else(|| default_cfg.get(key).cloned());
+    let pick = |k: &str| params.get(k).cloned().or_else(|| default_cfg.get(k).cloned());
 
-    let graph_type = match pick("type") {
-        Some(t) if vortex_framework::saved_views::GRAPH_TYPES.iter().any(|(c, _)| *c == t) => t,
-        _ => "bar".to_string(),
-    };
-    // Must be a real, registered column; else fall back to the first field so the
-    // page still renders (never interpolate an unvalidated identifier).
-    let group_by_field = pick("group_by")
-        .filter(|g| field_set.contains(g.as_str()))
-        .or_else(|| {
-            ["contact_type", "state", "record_state"]
-                .iter()
-                .find(|c| field_set.contains(**c))
-                .map(|c| c.to_string())
-                .or_else(|| field_list.first().cloned())
-        })
-        .unwrap_or_else(|| "id".to_string());
+    // Default the X-axis to a sensible dimension so a chart appears on first
+    // open; the client can change it. (Falls back to the first groupable field.)
+    let group_by_v = pick("group_by").filter(|s| !s.is_empty()).unwrap_or_else(|| {
+        ["state", "record_state", "status", "stage", "contact_type"]
+            .iter()
+            .find(|c| groupable_names.iter().any(|n| n == *c))
+            .map(|c| c.to_string())
+            .or_else(|| groupable_names.first().cloned())
+            .unwrap_or_default()
+    });
+    let series_v = pick("series").unwrap_or_default();
+    let vals_v = pick("vals").unwrap_or_default();
+    let filters_v = pick("filters").unwrap_or_default();
+    let type_v = pick("type")
+        .filter(|t| vortex_framework::saved_views::GRAPH_TYPES.iter().any(|(c, _)| c == t))
+        .unwrap_or_else(|| "bar".to_string());
 
-    // The config in effect right now, for the "Save current view" action.
+    let config_json = serde_json::json!({
+        "group_by": group_by_v,
+        "series": series_v,
+        "vals": vals_v,
+        "filters": filters_v,
+        "type": type_v,
+    })
+    .to_string();
+
+    // Saved-views bar reflects the current config; `type` is always present so
+    // the save form renders even for a bare chart.
     let mut current_cfg = std::collections::BTreeMap::new();
-    current_cfg.insert("group_by".to_string(), group_by_field.clone());
-    current_cfg.insert("type".to_string(), graph_type.clone());
+    current_cfg.insert("type".to_string(), type_v.clone());
+    for (k, v) in [
+        ("group_by", &group_by_v),
+        ("series", &series_v),
+        ("vals", &vals_v),
+        ("filters", &filters_v),
+    ] {
+        if !v.is_empty() {
+            current_cfg.insert(k.to_string(), v.clone());
+        }
+    }
     let view_bar = vortex_framework::saved_views::render_view_bar(
         &db, &model_name, "graph", &current_cfg, user.id, user.is_admin(),
     )
     .await;
 
-    // Get counts grouped by field
-    let query = format!(
-        "SELECT {}, COUNT(*) as count FROM {} WHERE active = true GROUP BY {} ORDER BY count DESC",
-        group_by_field, table_name, group_by_field
-    );
-    let results = sqlx::query(&query)
-        .fetch_all(&db)
-        .await
-        .unwrap_or_default();
+    let sidebar_menu = generic_view_sidebar(&state, &user, &db_ctx, &model_name);
 
-    // Build chart data
-    let mut labels = Vec::new();
-    let mut data = Vec::new();
-    let colors = ["#22c55e", "#3b82f6", "#f59e0b", "#ef4444", "#8b5cf6", "#ec4899"];
+    let html = GRAPH_SHELL
+        .replace("__TITLE__", &html_escape(&model_display_name))
+        .replace("__USER__", &html_escape(&user.username))
+        .replace("__SIDEBAR__", &sidebar_menu)
+        .replace("__LISTURL__", &html_escape(&list_view_url))
+        .replace("__FIELDS__", &html_escape(&fields_json))
+        .replace("__CONFIG__", &html_escape(&config_json))
+        .replace("__MODEL__", &html_escape(&model_name))
+        .replace("__NEWURL__", &html_escape(&vortex_framework::new_record_url(&model_name)));
+    Html(html.replace("<!--VIEW_BAR-->", &view_bar)).into_response()
+}
 
-    for (i, row) in results.iter().enumerate() {
-        let label: String = row.try_get(group_by_field.as_str()).unwrap_or_else(|_| "Other".to_string());
-        let count: i64 = row.get("count");
-        labels.push(format!("\"{}\"", label));
-        data.push(count.to_string());
-    }
-
-    let labels_json = labels.join(", ");
-    let data_json = data.join(", ");
-    let colors_json = colors.iter().take(data.len()).map(|c| format!("\"{}\"", c)).collect::<Vec<_>>().join(", ");
-
-    // Build dynamic sidebar
-    let sidebar_menu = build_sidebar_menu(&db, &user.roles, &model_name).await;
-
-    let html = format!(r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style><title>{} - Graph</title>
+const GRAPH_SHELL: &str = r#"<!DOCTYPE html><html data-theme="dark"><head>
+<script>(function(){var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)})()</script>
+<style>[data-theme="corporate"] .theme-icon-sun{display:none !important}[data-theme="corporate"] .theme-icon-moon{display:inline-block !important}</style>
+<title>__TITLE__ - Graph</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
 <link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<link href="/static/pivot.css?v=25" rel="stylesheet"/>
+<link href="/static/graph.css?v=2" rel="stylesheet"/>
 <script src="/static/vortex.js?v=18" defer></script>
 <script src="/static/vendor/tailwind.js"></script>
-<script src="/static/vendor/chart.umd.js"></script>
 <style>
-body {{ background: oklch(var(--b2)); color: oklch(var(--bc)); }}
-.top-navbar {{ background: oklch(var(--b1)); border-bottom: 1px solid oklch(var(--b3)); position: sticky; top: 0; z-index: 50; }}
-.sidebar {{ background: oklch(var(--b1)); border-right: 1px solid oklch(var(--b3)); }}
-.card {{ background: oklch(var(--b1)); border: 1px solid oklch(var(--b3)); }}
-.text-muted {{ color: oklch(var(--bc)/0.6); }}
-.user-badge {{ background: #8BC53F; color: #000; font-weight: 600; }}
-@media (max-width: 768px) {{ .sidebar {{ display: none; }} .chart-grid {{ grid-template-columns: 1fr; }} }}
+body { background: oklch(var(--b2)); color: oklch(var(--bc)); }
+.top-navbar { background: oklch(var(--b1)); border-bottom: 1px solid oklch(var(--b3)); position: sticky; top: 0; z-index: 50; }
+.sidebar { background: oklch(var(--b1)); border-right: 1px solid oklch(var(--b3)); }
+.text-muted { color: oklch(var(--bc)/0.6); }
+.user-badge { background: #8BC53F; color: #000; font-weight: 600; }
 </style>
 </head><body class="min-h-screen">
 <nav class="top-navbar px-4 py-3 flex items-center justify-between">
-    <div class="flex items-center gap-2"><button class="btn btn-ghost btn-sm btn-square md:hidden" onclick="var s=document.querySelector('.sidebar');s.classList.toggle('hidden');s.classList.toggle('md:block')"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="text-xl font-bold"><span style="color:#8BC53F">re</span><span class="text-muted">micle</span></a></div>
-    <div class="flex items-center gap-2 md:gap-3">
-        <a href="/home" class="text-base-content text-sm hover:underline hidden md:inline">Home</a>
-        <a href="/settings" class="text-base-content text-sm hover:underline hidden md:inline">Settings</a>
-        <a href="/notifications" class="btn btn-ghost btn-circle btn-sm relative" title="Notifications">
-            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9"/></svg>
-            <span class="absolute top-0 right-0 w-2 h-2 bg-red-500 rounded-full"></span>
-        </a>
-        <button onclick="(function(){{var h=document.documentElement,c=h.getAttribute('data-theme')==='dark'?'corporate':'dark';h.setAttribute('data-theme',c);localStorage.setItem('theme',c);document.querySelectorAll('.theme-icon-sun,.theme-icon-moon').forEach(function(e){{e.classList.toggle('hidden')}})}})();" class="btn btn-ghost btn-circle btn-sm" title="Toggle theme"><svg class="theme-icon-sun w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5" stroke-width="2"/><path stroke-linecap="round" stroke-width="2" d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg><svg class="theme-icon-moon w-5 h-5 hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg></button>
-        <div class="user-badge px-3 py-1 rounded-full text-sm">@{}</div>
-    </div>
+  <div class="flex items-center gap-2">
+    <button class="btn btn-ghost btn-sm btn-square md:hidden" onclick="var s=document.querySelector('.sidebar');s.classList.toggle('hidden');s.classList.toggle('md:block')"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button>
+    <a href="/home" class="text-xl font-bold"><span style="color:#8BC53F">re</span><span class="text-muted">micle</span></a>
+  </div>
+  <div class="flex items-center gap-2 md:gap-3">
+    <a href="/home" class="text-base-content text-sm hover:underline hidden md:inline">Home</a>
+    <a href="/settings" class="text-base-content text-sm hover:underline hidden md:inline">Settings</a>
+    <button onclick="(function(){var h=document.documentElement,c=h.getAttribute('data-theme')==='dark'?'corporate':'dark';h.setAttribute('data-theme',c);localStorage.setItem('theme',c);document.querySelectorAll('.theme-icon-sun,.theme-icon-moon').forEach(function(e){e.classList.toggle('hidden')})})();" class="btn btn-ghost btn-circle btn-sm" title="Toggle theme"><svg class="theme-icon-sun w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5" stroke-width="2"/><path stroke-linecap="round" stroke-width="2" d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg><svg class="theme-icon-moon w-5 h-5 hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg></button>
+    <div class="user-badge px-3 py-1 rounded-full text-sm">@__USER__</div>
+  </div>
 </nav>
 <div class="flex">
-<aside class="sidebar w-64 min-h-screen p-4 hidden md:block">
-<ul class="menu mt-2">
-{}
-</ul>
-</aside>
-<main class="flex-1 p-4 md:p-6">
-<div class="flex flex-col md:flex-row justify-between items-start md:items-center mb-6 gap-4">
-<div><h1 class="text-xl md:text-2xl font-bold">{}</h1><p class="text-muted">Graph view - by {}</p></div>
-<div class="flex gap-2 flex-wrap">
+<aside class="sidebar w-64 min-h-screen p-4 hidden md:block"><ul class="menu mt-2">__SIDEBAR__</ul></aside>
+<main class="flex-1 p-4 md:p-6 min-w-0">
+<div class="flex flex-col md:flex-row justify-between items-start md:items-center mb-4 gap-4">
+  <div><h1 class="text-xl md:text-2xl font-bold">__TITLE__</h1><p class="text-muted">Graph — drag fields into X-axis, Series and Measures</p></div>
+  <div class="flex gap-2 flex-wrap">
     <div class="btn-group">
-        <a href="/list/{}" class="btn btn-sm" title="List View">
-            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 10h16M4 14h16M4 18h16"/></svg>
-        </a>
-        <a href="/kanban/{}" class="btn btn-sm" title="Kanban View">
-            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 17V7m0 10a2 2 0 01-2 2H5a2 2 0 01-2-2V7a2 2 0 012-2h2a2 2 0 012 2m0 10a2 2 0 002 2h2a2 2 0 002-2M9 7a2 2 0 012-2h2a2 2 0 012 2m0 10V7m0 10a2 2 0 002 2h2a2 2 0 002-2V7a2 2 0 00-2-2h-2a2 2 0 00-2 2"/></svg>
-        </a>
-        <a href="/graph/{}" class="btn btn-sm btn-active" title="Graph View">
-            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/></svg>
-        </a>
-        <a href="/pivot/{}" class="btn btn-sm" title="Pivot View">
-            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 10h18M3 14h18m-9-4v8m-7 0h14a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg>
-        </a>
+      <a href="__LISTURL__" class="btn btn-sm" title="List View"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 10h16M4 14h16M4 18h16"/></svg></a>
+      <a href="/kanban/__MODEL__" class="btn btn-sm" title="Kanban View"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 17V7m0 10a2 2 0 01-2 2H5a2 2 0 01-2-2V7a2 2 0 012-2h2a2 2 0 012 2m0 10a2 2 0 002 2h2a2 2 0 002-2M9 7a2 2 0 012-2h2a2 2 0 012 2m0 10V7"/></svg></a>
+      <a href="/graph/__MODEL__" class="btn btn-sm btn-active" title="Graph View"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/></svg></a>
+      <a href="/calendar/__MODEL__" class="btn btn-sm" title="Calendar View"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"/></svg></a>
+      <a href="/pivot/__MODEL__" class="btn btn-sm" title="Pivot View"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 10h18M3 14h18m-9-4v8m-7 0h14a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg></a>
     </div>
     <!--VIEW_BAR-->
-    <a href="/{}/new" class="btn btn-primary btn-sm" style="background:#8BC53F;border-color:#8BC53F;color:#000">+ New</a>
+    <div class="dropdown dropdown-end">
+      <div tabindex="0" role="button" class="btn btn-sm gap-1" title="Export chart"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v2a2 2 0 002 2h12a2 2 0 002-2v-2M7 10l5 5 5-5M12 15V3"/></svg>Export</div>
+      <ul tabindex="0" class="dropdown-content z-10 menu p-2 shadow bg-base-100 rounded-box w-40 mt-1 border border-base-300">
+        <li><a id="g-export-png">PNG image</a></li>
+        <li><a id="g-export-pdf">PDF document</a></li>
+      </ul>
+    </div>
+    <a href="__NEWURL__" class="btn btn-sm" style="background:#8BC53F;border-color:#8BC53F;color:#000">+ New</a>
+  </div>
 </div>
+<div class="g-wrap">
+  <div class="g-main">
+    <div id="g-types" class="g-types"></div>
+    <div id="g-chart-wrap" class="g-chart-wrap"><canvas id="g-canvas"></canvas></div>
+  </div>
+  <div class="pv-side">
+    <h3>Chart Fields</h3>
+    <div id="g-fields" class="pv-fields"></div>
+    <div class="pv-zones">
+      <div class="pv-zone" id="g-zone-filters" style="grid-column:1/-1"><div class="pv-zone-title">&#9660; Filters</div></div>
+      <div class="pv-zone" id="g-zone-x"><div class="pv-zone-title">&#9636; X-axis</div></div>
+      <div class="pv-zone" id="g-zone-series"><div class="pv-zone-title">&#9638; Series</div></div>
+      <div class="pv-zone" id="g-zone-values" style="grid-column:1/-1"><div class="pv-zone-title">&#931; Measures</div></div>
+    </div>
+  </div>
 </div>
-<div class="grid grid-cols-1 md:grid-cols-2 gap-4 md:gap-6 chart-grid">
-<div class="card">
-<div class="card-body">
-<h2 class="card-title text-sm">By {}</h2>
-<canvas id="barChart"></canvas>
-</div>
-</div>
-<div class="card">
-<div class="card-body">
-<h2 class="card-title text-sm">Distribution</h2>
-<canvas id="pieChart"></canvas>
-</div>
-</div>
-</div>
+<div id="graph-root" data-model="__MODEL__" data-data-url="/pivot/__MODEL__/data" data-fields="__FIELDS__" data-config="__CONFIG__"></div>
+<script src="/static/vendor/chart.umd.js"></script>
+<script src="/static/graph.js?v=2"></script>
 </main>
-</div>
-<script>
-const labels = [{}];
-const data = [{}];
-const colors = [{}];
-
-new Chart(document.getElementById('barChart'), {{
-    type: '{}',
-    data: {{
-        labels: labels,
-        datasets: [{{
-            label: 'Count',
-            data: data,
-            backgroundColor: colors,
-            borderColor: colors,
-            borderWidth: 1
-        }}]
-    }},
-    options: {{
-        responsive: true,
-        plugins: {{ legend: {{ display: false }} }},
-        scales: {{ y: {{ beginAtZero: true }} }}
-    }}
-}});
-
-new Chart(document.getElementById('pieChart'), {{
-    type: 'doughnut',
-    data: {{
-        labels: labels,
-        datasets: [{{
-            data: data,
-            backgroundColor: colors
-        }}]
-    }},
-    options: {{
-        responsive: true,
-        plugins: {{ legend: {{ position: 'bottom' }} }}
-    }}
-}});
-</script>
-</body></html>"#,
-        model_display_name,
-        user.username,
-        sidebar_menu,
-        model_display_name, group_by_field,
-        model_name, model_name, model_name, model_name, model_name,
-        group_by_field,
-        labels_json, data_json, colors_json,
-        graph_type
-    );
-    Html(html.replace("<!--VIEW_BAR-->", &view_bar)).into_response()
-}
+</div></body></html>"#;
 
 // ============================================================================
 // Calendar View
@@ -8828,246 +9044,441 @@ async fn generic_calendar_view(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
     Path(model_name): Path<String>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
-    // Fetch model metadata
+    use vortex_framework::ui::html_escape;
+
     let model_row = match sqlx::query(
-        "SELECT id, display_name, table_name FROM ir_model WHERE name = $1 AND is_active = true"
+        "SELECT id, display_name, table_name, list_url FROM ir_model WHERE name = $1 AND is_active = true",
     )
     .bind(&model_name)
     .fetch_optional(&db)
-    .await {
+    .await
+    {
         Ok(Some(row)) => row,
         _ => return (StatusCode::NOT_FOUND, Html("Model not found")).into_response(),
     };
-
     let model_id: uuid::Uuid = model_row.get("id");
     let model_display_name: String = model_row.get("display_name");
     let table_name: String = model_row.get("table_name");
     if !validate_identifier(&table_name) {
         return (StatusCode::BAD_REQUEST, Html("Invalid model".to_string())).into_response();
     }
+    let list_view_url: String = model_row
+        .try_get::<Option<String>, _>("list_url")
+        .ok()
+        .flatten()
+        .filter(|u| !u.is_empty())
+        .unwrap_or_else(|| format!("/list/{}", model_name));
 
-    // Candidate date columns (registry) — the calendar axis must be one of these
-    // real date/datetime fields, so it is safe to interpolate. (The registry
-    // column is `name`; the old query used a non-existent `field_name` and so
-    // always fell back to created_at.)
-    let date_fields: Vec<String> = sqlx::query_scalar(
-        "SELECT name FROM ir_model_field WHERE model_id = $1 AND field_type IN ('date', 'datetime') ORDER BY sequence, name",
+    // Field registry (type + label).
+    let frows = sqlx::query(
+        "SELECT name, field_type, display_name FROM ir_model_field WHERE model_id = $1 ORDER BY sequence, name",
     )
     .bind(model_id)
     .fetch_all(&db)
     .await
     .unwrap_or_default();
+    let mut ftype: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut flabel: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut order: Vec<String> = Vec::new();
+    for f in &frows {
+        let n: String = f.get("name");
+        order.push(n.clone());
+        ftype.insert(n.clone(), f.get("field_type"));
+        flabel.insert(n, f.get("display_name"));
+    }
+    // Real columns — the calendar only ever reads actual columns (registered
+    // fields can be computed/related and would break a raw SELECT).
+    let real_cols: std::collections::HashSet<String> = sqlx::query_scalar::<_, String>(
+        "SELECT column_name FROM information_schema.columns WHERE table_name = $1",
+    )
+    .bind(&table_name)
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .collect();
+    let is_col = |n: &str| real_cols.contains(n);
+    let is_date = |n: &str| ftype.get(n).map(|t| matches!(t.as_str(), "date" | "datetime")).unwrap_or(false);
+    let is_colorable = |n: &str| {
+        ftype.get(n).map(|t| matches!(t.as_str(), "selection" | "many2one" | "boolean" | "string" | "char")).unwrap_or(false)
+    };
+    let label_of = |n: &str| flabel.get(n).cloned().unwrap_or_else(|| n.to_string());
 
-    // Axis: query param → shared default saved view → first date field →
-    // created_at. Replaces the never-created ir_ui_view calendar config.
+    // ---- config: query params win, else the shared default saved view -------
     let default_cfg = vortex_framework::saved_views::default_config_for(&db, &model_name, "calendar")
         .await
         .unwrap_or_default();
-    let date_field: String = params
-        .get("date_field")
-        .cloned()
-        .or_else(|| default_cfg.get("date_field").cloned())
-        .filter(|d| date_fields.iter().any(|f| f == d))
-        .or_else(|| date_fields.first().cloned())
-        .unwrap_or_else(|| "created_at".to_string());
+    let pick = |k: &str| params.get(k).cloned().or_else(|| default_cfg.get(k).cloned());
 
-    // Find name/title field (registry column is `name`).
-    let name_field: String = sqlx::query_scalar(
-        "SELECT name FROM ir_model_field WHERE model_id = $1 AND name IN ('name', 'title', 'subject') LIMIT 1"
-    )
-    .bind(model_id)
-    .fetch_optional(&db)
-    .await
-    .ok()
-    .flatten()
-    .unwrap_or_else(|| "id".to_string());
+    let date_field = pick("date_field")
+        .filter(|d| is_date(d) && is_col(d))
+        .or_else(|| order.iter().find(|n| is_date(n) && is_col(n)).cloned())
+        .or_else(|| if is_col("created_at") { Some("created_at".to_string()) } else { None })
+        .unwrap_or_default();
+    let end_field = pick("end_field").filter(|d| is_date(d) && is_col(d) && *d != date_field);
+    let title_field = pick("title_field")
+        .filter(|t| is_col(t))
+        .or_else(|| {
+            ["name", "title", "subject", "display_name", "number", "reference", "code", "quote_number"]
+                .iter()
+                .find(|c| is_col(c))
+                .map(|c| c.to_string())
+        })
+        .unwrap_or_else(|| "id".to_string());
+    let color_field = pick("color_field").filter(|c| is_colorable(c) && is_col(c));
+    let mode = pick("mode")
+        .filter(|m| ["month", "week", "day"].contains(&m.as_str()))
+        .unwrap_or_else(|| "month".to_string());
 
-    // Saved-views toolbar config.
+    // Saved-views toolbar config — captures whatever is currently configured so
+    // "Save view" persists the full calendar layout.
     let mut current_cfg = std::collections::BTreeMap::new();
-    current_cfg.insert("date_field".to_string(), date_field.clone());
+    if !date_field.is_empty() {
+        current_cfg.insert("date_field".to_string(), date_field.clone());
+    }
+    if let Some(e) = &end_field {
+        current_cfg.insert("end_field".to_string(), e.clone());
+    }
+    current_cfg.insert("title_field".to_string(), title_field.clone());
+    if let Some(c) = &color_field {
+        current_cfg.insert("color_field".to_string(), c.clone());
+    }
+    current_cfg.insert("mode".to_string(), mode.clone());
     let view_bar = vortex_framework::saved_views::render_view_bar(
         &db, &model_name, "calendar", &current_cfg, user.id, user.is_admin(),
     )
     .await;
 
-    // Parse year/month from query params or use current
-    let now = chrono::Utc::now();
-    let year: i32 = params.get("year").and_then(|y| y.parse().ok()).unwrap_or(now.year());
-    let month: u32 = params.get("month").and_then(|m| m.parse().ok()).unwrap_or(now.month());
-
-    // Calculate first and last day of month
-    let first_day = chrono::NaiveDate::from_ymd_opt(year, month, 1).unwrap();
-    let last_day = if month == 12 {
-        chrono::NaiveDate::from_ymd_opt(year + 1, 1, 1).unwrap().pred_opt().unwrap()
-    } else {
-        chrono::NaiveDate::from_ymd_opt(year, month + 1, 1).unwrap().pred_opt().unwrap()
-    };
-
-    // Fetch records for this month
-    let query = format!(
-        "SELECT id, {}, {}::date as event_date FROM {} WHERE {}::date >= $1 AND {}::date <= $2 ORDER BY {} ASC",
-        name_field, date_field, table_name, date_field, date_field, date_field
-    );
-    let records = sqlx::query(&query)
-        .bind(first_day)
-        .bind(last_day)
-        .fetch_all(&db)
-        .await
-        .unwrap_or_default();
-
-    // Group records by date
-    let mut events_by_date: std::collections::HashMap<chrono::NaiveDate, Vec<(uuid::Uuid, String)>> = std::collections::HashMap::new();
-    for row in &records {
-        let id: uuid::Uuid = row.get("id");
-        let name: String = row.try_get(&name_field as &str).unwrap_or_else(|_| id.to_string());
-        let date: chrono::NaiveDate = row.get("event_date");
-        events_by_date.entry(date).or_default().push((id, name));
-    }
-
-    // Build calendar grid
-    let weekday_of_first = first_day.weekday().num_days_from_sunday();
-    let days_in_month = last_day.day();
-
-    let mut calendar_cells = String::new();
-
-    // Empty cells before first day
-    for _ in 0..weekday_of_first {
-        calendar_cells.push_str(r#"<div class="h-24 bg-base-200/50"></div>"#);
-    }
-
-    // Days of month
-    for day in 1..=days_in_month {
-        let date = chrono::NaiveDate::from_ymd_opt(year, month, day).unwrap();
-        let is_today = date == now.date_naive();
-        let today_class = if is_today { "ring-2 ring-primary" } else { "" };
-
-        let mut events_html = String::new();
-        if let Some(events) = events_by_date.get(&date) {
-            for (id, name) in events.iter().take(3) {
-                events_html.push_str(&format!(
-                    r##"<a href="/{}/{}" class="block text-xs bg-primary/20 text-primary rounded px-1 py-0.5 truncate hover:bg-primary/30">{}</a>"##,
-                    model_name, id, name
-                ));
-            }
-            if events.len() > 3 {
-                events_html.push_str(&format!(
-                    r#"<span class="text-xs text-base-content/50">+{} more</span>"#,
-                    events.len() - 3
-                ));
-            }
+    // Field list for the client config controls.
+    let mut field_arr: Vec<serde_json::Value> = Vec::new();
+    for n in &order {
+        if !is_col(n) {
+            continue;
         }
-
-        calendar_cells.push_str(&format!(
-            r#"<div class="h-24 bg-base-100 p-1 border border-base-300 {}">
-                <div class="font-semibold text-sm {}">{}</div>
-                <div class="space-y-0.5 mt-1">{}</div>
-            </div>"#,
-            today_class,
-            if is_today { "text-primary" } else { "" },
-            day,
-            events_html
-        ));
+        let t = ftype.get(n).cloned().unwrap_or_default();
+        field_arr.push(serde_json::json!({
+            "name": n,
+            "label": label_of(n),
+            "type": t,
+            "date": is_date(n),
+            "colorable": is_colorable(n),
+        }));
     }
+    let fields_json = serde_json::to_string(&field_arr).unwrap_or_else(|_| "[]".to_string());
+    let config_json = serde_json::json!({
+        "date_field": date_field,
+        "end_field": end_field.clone().unwrap_or_default(),
+        "title_field": title_field,
+        "color_field": color_field.clone().unwrap_or_default(),
+        "mode": mode,
+    })
+    .to_string();
 
-    // Empty cells after last day
-    let total_cells = weekday_of_first + days_in_month;
-    let remaining = (7 - (total_cells % 7)) % 7;
-    for _ in 0..remaining {
-        calendar_cells.push_str(r#"<div class="h-24 bg-base-200/50"></div>"#);
-    }
+    let sidebar_menu = generic_view_sidebar(&state, &user, &db_ctx, &model_name);
 
-    // Navigation links
-    let (prev_year, prev_month) = if month == 1 { (year - 1, 12) } else { (year, month - 1) };
-    let (next_year, next_month) = if month == 12 { (year + 1, 1) } else { (year, month + 1) };
-
-    let month_names = ["", "January", "February", "March", "April", "May", "June",
-                       "July", "August", "September", "October", "November", "December"];
-    let month_name = month_names[month as usize];
-
-    // Build dynamic sidebar
-    let sidebar_menu = build_sidebar_menu(&db, &user.roles, &model_name).await;
-
-    let html = format!(r##"<!DOCTYPE html>
-<html data-theme="dark">
-<head>
-    <script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style>
-    <title>{} - Calendar</title>
-    <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=18" rel="stylesheet"/>
-<script src="/static/vortex.js?v=18" defer></script>
-    <script src="/static/vendor/tailwind.js"></script>
-</head>
-<body class="min-h-screen bg-base-200">
-<div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar-inline').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay-inline').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a><button onclick="(function(){{var h=document.documentElement,c=h.getAttribute('data-theme')==='dark'?'corporate':'dark';h.setAttribute('data-theme',c);localStorage.setItem('theme',c);document.querySelectorAll('.theme-icon-sun,.theme-icon-moon').forEach(function(e){{e.classList.toggle('hidden')}})}})();" class="btn btn-ghost btn-sm btn-square ml-auto"><svg class="theme-icon-sun w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5" stroke-width="2"/><path stroke-linecap="round" stroke-width="2" d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg><svg class="theme-icon-moon w-5 h-5 hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg></button></div>
-<div id="sidebar-overlay-inline" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar-inline').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
-<div class="flex">
-    <aside id="sidebar-inline" class="w-64 bg-base-100 shadow-lg min-h-screen p-4 fixed lg:static top-0 left-0 z-40 h-full -translate-x-full lg:translate-x-0 transition-transform duration-200">
-        <div class="text-xl font-bold mb-6"><span class="text-success">re</span><span class="opacity-60">micle</span></div>
-        <ul class="menu">{}</ul>
-    </aside>
-    <main class="flex-1 p-4 lg:p-6 min-w-0">
-        <div class="flex justify-between items-center mb-6">
-            <div>
-                <h1 class="text-2xl font-bold">{}</h1>
-                <p class="opacity-60">Calendar view - by {}</p>
-            </div>
-            <div class="flex gap-2">
-                <div class="btn-group">
-                    <a href="/list/{}" class="btn btn-sm" title="List View">
-                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 10h16M4 14h16M4 18h16"/></svg>
-                    </a>
-                    <a href="/kanban/{}" class="btn btn-sm" title="Kanban View">
-                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 17V7m0 10a2 2 0 01-2 2H5a2 2 0 01-2-2V7a2 2 0 012-2h2a2 2 0 012 2m0 10a2 2 0 002 2h2a2 2 0 002-2M9 7a2 2 0 012-2h2a2 2 0 012 2m0 10V7m0 10a2 2 0 002 2h2a2 2 0 002-2V7a2 2 0 00-2-2h-2a2 2 0 00-2 2"/></svg>
-                    </a>
-                    <a href="/graph/{}" class="btn btn-sm" title="Graph View">
-                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/></svg>
-                    </a>
-                    <a href="/calendar/{}" class="btn btn-sm btn-active" title="Calendar View">
-                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"/></svg>
-                    </a>
-                </div>
-                <!--VIEW_BAR-->
-                <a href="/{}/new" class="btn btn-primary btn-sm">+ New</a>
-            </div>
-        </div>
-
-        <div class="card bg-base-100 shadow">
-            <div class="card-body">
-                <div class="flex justify-between items-center mb-4">
-                    <a href="/calendar/{}?year={}&month={}" class="btn btn-ghost btn-sm">← Prev</a>
-                    <h2 class="text-xl font-bold">{} {}</h2>
-                    <a href="/calendar/{}?year={}&month={}" class="btn btn-ghost btn-sm">Next →</a>
-                </div>
-                <div class="grid grid-cols-7 gap-px">
-                    <div class="text-center font-semibold py-2 bg-base-200">Sun</div>
-                    <div class="text-center font-semibold py-2 bg-base-200">Mon</div>
-                    <div class="text-center font-semibold py-2 bg-base-200">Tue</div>
-                    <div class="text-center font-semibold py-2 bg-base-200">Wed</div>
-                    <div class="text-center font-semibold py-2 bg-base-200">Thu</div>
-                    <div class="text-center font-semibold py-2 bg-base-200">Fri</div>
-                    <div class="text-center font-semibold py-2 bg-base-200">Sat</div>
-                    {}
-                </div>
-            </div>
-        </div>
-    </main>
-</div>
-</body>
-</html>"##,
-        model_display_name,
-        sidebar_menu,
-        model_display_name, date_field,
-        model_name, model_name, model_name, model_name, model_name,
-        model_name, prev_year, prev_month,
-        month_name, year,
-        model_name, next_year, next_month,
-        calendar_cells
-    );
+    let html = CALENDAR_SHELL
+        .replace("__TITLE__", &html_escape(&model_display_name))
+        .replace("__USER__", &html_escape(&user.username))
+        .replace("__SIDEBAR__", &sidebar_menu)
+        .replace("__LISTURL__", &html_escape(&list_view_url))
+        .replace("__FIELDS__", &html_escape(&fields_json))
+        .replace("__CONFIG__", &html_escape(&config_json))
+        .replace("__MODEL__", &html_escape(&model_name))
+        .replace("__NEWURL__", &html_escape(&vortex_framework::new_record_url(&model_name)));
     Html(html.replace("<!--VIEW_BAR-->", &view_bar)).into_response()
 }
+
+/// GET /calendar/{model}/data — events overlapping the `[start,end]` range as
+/// JSON. Every field name is registry-validated and must be a real column
+/// before it is interpolated; the range bounds are bound parameters cast to
+/// `date` in SQL. An event's `[start,end]` span intersects the range when
+/// `start <= range_end AND end >= range_start` (a point event has `end = start`).
+async fn generic_calendar_data(
+    State(_state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(_user): Extension<AuthUser>,
+    Path(model_name): Path<String>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let fail = |msg: &str| Json(serde_json::json!({"ok": false, "error": msg})).into_response();
+
+    struct CF {
+        ftype: String,
+        related: Option<String>,
+        options: Option<serde_json::Value>,
+    }
+    // Selection value → human label; boolean 't'/'f' → Yes/No; else verbatim.
+    fn color_label(field: &str, val: &str, finfo: &std::collections::HashMap<String, CF>) -> String {
+        match finfo.get(field) {
+            Some(c) if c.ftype == "boolean" => {
+                if val == "t" || val == "true" { "Yes".to_string() } else { "No".to_string() }
+            }
+            Some(c) if c.ftype == "selection" => c
+                .options
+                .as_ref()
+                .and_then(|v| v.as_array())
+                .and_then(|arr| arr.iter().find(|o| o.get("value").and_then(|x| x.as_str()) == Some(val)))
+                .and_then(|o| o.get("label").and_then(|x| x.as_str()))
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| val.to_string()),
+            _ => val.to_string(),
+        }
+    }
+
+    let model_row = match sqlx::query("SELECT id, table_name FROM ir_model WHERE name = $1 AND is_active = true")
+        .bind(&model_name)
+        .fetch_optional(&db)
+        .await
+    {
+        Ok(Some(r)) => r,
+        _ => return fail("Unknown model"),
+    };
+    let model_id: uuid::Uuid = model_row.get("id");
+    let table_name: String = model_row.get("table_name");
+    if !validate_identifier(&table_name) {
+        return fail("Invalid model");
+    }
+
+    let frows = sqlx::query(
+        "SELECT name, field_type, related_model, selection_options FROM ir_model_field WHERE model_id = $1",
+    )
+    .bind(model_id)
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default();
+    let mut finfo: std::collections::HashMap<String, CF> = std::collections::HashMap::new();
+    for f in &frows {
+        let n: String = f.get("name");
+        finfo.insert(n, CF {
+            ftype: f.get("field_type"),
+            related: f.try_get("related_model").ok().flatten(),
+            options: f.try_get("selection_options").ok(),
+        });
+    }
+    let real_cols: std::collections::HashSet<String> = sqlx::query_scalar::<_, String>(
+        "SELECT column_name FROM information_schema.columns WHERE table_name = $1",
+    )
+    .bind(&table_name)
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .collect();
+    let is_col = |n: &str| validate_identifier(n) && real_cols.contains(n);
+    let is_date = |n: &str| finfo.get(n).map(|c| matches!(c.ftype.as_str(), "date" | "datetime")).unwrap_or(false);
+    let is_datetime = |n: &str| finfo.get(n).map(|c| c.ftype == "datetime").unwrap_or(false);
+
+    // Resolve fields — every one must be a real column.
+    let date_field = match params.get("date_field").filter(|d| is_date(d) && is_col(d)).cloned() {
+        Some(d) => d,
+        None => return fail("No valid date field"),
+    };
+    let end_field = params
+        .get("end_field")
+        .filter(|d| is_date(d) && is_col(d) && d.as_str() != date_field)
+        .cloned();
+    let title_field = params
+        .get("title_field")
+        .filter(|t| is_col(t))
+        .cloned()
+        .unwrap_or_else(|| "id".to_string());
+    let color_field = params.get("color_field").filter(|c| is_col(c)).cloned();
+    let has_active = real_cols.contains("active");
+
+    // Range bounds. The client always sends both as ISO dates; validate the
+    // shape (they are bound, not interpolated, and cast to date in SQL).
+    let start = params.get("start").cloned().unwrap_or_default();
+    let end = params.get("end").cloned().unwrap_or_default();
+    let iso_ok = |s: &str| {
+        s.len() == 10
+            && s.as_bytes().iter().enumerate().all(|(i, b)| {
+                if i == 4 || i == 7 { *b == b'-' } else { b.is_ascii_digit() }
+            })
+    };
+    if !iso_ok(&start) || !iso_ok(&end) {
+        return fail("Invalid range");
+    }
+
+    // Projection expressions. A many2one title/color resolves to the related
+    // record's name via a LEFT JOIN, so the chip shows "Acme Corp" rather than
+    // the raw foreign-key UUID.
+    let mut title_join = String::new();
+    let title_sel = if title_field == "id" {
+        "t.id::text".to_string()
+    } else {
+        match finfo.get(&title_field).map(|c| (c.ftype.clone(), c.related.clone())) {
+            Some((ft, Some(rel))) if ft == "many2one" => {
+                let rel_table = rel.replace('.', "_");
+                if validate_identifier(&rel_table) {
+                    title_join = format!(" LEFT JOIN {rt} titlerel ON t.{tf} = titlerel.id", rt = rel_table, tf = title_field);
+                    "titlerel.name".to_string()
+                } else {
+                    format!("CAST(t.{} AS TEXT)", title_field)
+                }
+            }
+            _ => format!("CAST(t.{} AS TEXT)", title_field),
+        }
+    };
+    let start_date_sel = format!("t.{}::date", date_field);
+    let start_time_sel = if is_datetime(&date_field) {
+        format!("to_char(t.{}, 'HH24:MI')", date_field)
+    } else {
+        "NULL::text".to_string()
+    };
+    let (end_date_sel, end_time_sel) = match &end_field {
+        Some(e) => (
+            format!("t.{}::date", e),
+            if is_datetime(e) { format!("to_char(t.{}, 'HH24:MI')", e) } else { "NULL::text".to_string() },
+        ),
+        None => ("NULL::date".to_string(), "NULL::text".to_string()),
+    };
+
+    // Color group: join the related table for a many2one (group by its name);
+    // otherwise the raw column value as text.
+    let mut color_join = String::new();
+    let color_sel = match &color_field {
+        Some(cf) => match finfo.get(cf).map(|c| (c.ftype.clone(), c.related.clone())) {
+            Some((ft, Some(rel))) if ft == "many2one" => {
+                let rel_table = rel.replace('.', "_");
+                if validate_identifier(&rel_table) {
+                    color_join = format!(" LEFT JOIN {rt} crel ON t.{cf} = crel.id", rt = rel_table, cf = cf);
+                    "crel.name".to_string()
+                } else {
+                    format!("CAST(t.{} AS TEXT)", cf)
+                }
+            }
+            _ => format!("CAST(t.{} AS TEXT)", cf),
+        },
+        None => "NULL::text".to_string(),
+    };
+
+    // Overlap test; with no end field the effective end equals the start.
+    let effective_end = match &end_field {
+        Some(e) => format!("t.{}::date", e),
+        None => start_date_sel.clone(),
+    };
+    let where_active = if has_active { " AND t.active = true" } else { "" };
+    let q = format!(
+        "SELECT t.id::text AS id, {title} AS title, {sd} AS sdate, {st} AS stime, \
+         {ed} AS edate, {et} AS etime, {color} AS grp \
+         FROM {table} t{tjoin}{cjoin} \
+         WHERE {sdcmp} <= $2::date AND {eff} >= $1::date{active} \
+         ORDER BY {sdcmp} ASC LIMIT 2000",
+        title = title_sel,
+        sd = start_date_sel,
+        st = start_time_sel,
+        ed = end_date_sel,
+        et = end_time_sel,
+        color = color_sel,
+        table = table_name,
+        tjoin = title_join,
+        cjoin = color_join,
+        sdcmp = start_date_sel,
+        eff = effective_end,
+        active = where_active,
+    );
+    let rows = match sqlx::query(&q).bind(&start).bind(&end).fetch_all(&db).await {
+        Ok(r) => r,
+        Err(e) => return fail(&format!("query failed: {}", e)),
+    };
+
+    let mut events: Vec<serde_json::Value> = Vec::new();
+    for row in &rows {
+        let id: String = row.get("id");
+        let sdate = match row.try_get::<Option<chrono::NaiveDate>, _>("sdate").ok().flatten() {
+            Some(d) => d,
+            None => continue,
+        };
+        let title: Option<String> = row.try_get::<Option<String>, _>("title").ok().flatten();
+        let stime: Option<String> = row.try_get::<Option<String>, _>("stime").ok().flatten();
+        let edate: Option<chrono::NaiveDate> = row.try_get::<Option<chrono::NaiveDate>, _>("edate").ok().flatten();
+        let etime: Option<String> = row.try_get::<Option<String>, _>("etime").ok().flatten();
+        let grp: Option<String> = row.try_get::<Option<String>, _>("grp").ok().flatten();
+        let grp_label = match (&color_field, &grp) {
+            (Some(cf), Some(g)) => Some(color_label(cf, g, &finfo)),
+            _ => None,
+        };
+        events.push(serde_json::json!({
+            "id": id,
+            "title": title.clone().unwrap_or_else(|| id.clone()),
+            "start": sdate.to_string(),
+            "startTime": stime,
+            "end": edate.map(|d| d.to_string()),
+            "endTime": etime,
+            "group": grp,
+            "groupLabel": grp_label,
+        }));
+    }
+
+    Json(serde_json::json!({
+        "ok": true,
+        "events": events,
+        "color_field": color_field,
+    }))
+    .into_response()
+}
+
+const CALENDAR_SHELL: &str = r#"<!DOCTYPE html><html data-theme="dark"><head>
+<script>(function(){var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)})()</script>
+<style>[data-theme="corporate"] .theme-icon-sun{display:none !important}[data-theme="corporate"] .theme-icon-moon{display:inline-block !important}</style>
+<title>__TITLE__ - Calendar</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<link href="/static/calendar.css?v=1" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script>
+<script src="/static/vendor/tailwind.js"></script>
+<style>
+body { background: oklch(var(--b2)); color: oklch(var(--bc)); }
+.top-navbar { background: oklch(var(--b1)); border-bottom: 1px solid oklch(var(--b3)); position: sticky; top: 0; z-index: 50; }
+.sidebar { background: oklch(var(--b1)); border-right: 1px solid oklch(var(--b3)); }
+.text-muted { color: oklch(var(--bc)/0.6); }
+.user-badge { background: #8BC53F; color: #000; font-weight: 600; }
+</style>
+</head><body class="min-h-screen">
+<nav class="top-navbar px-4 py-3 flex items-center justify-between">
+  <div class="flex items-center gap-2">
+    <button class="btn btn-ghost btn-sm btn-square md:hidden" onclick="var s=document.querySelector('.sidebar');s.classList.toggle('hidden');s.classList.toggle('md:block')"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button>
+    <a href="/home" class="text-xl font-bold"><span style="color:#8BC53F">re</span><span class="text-muted">micle</span></a>
+  </div>
+  <div class="flex items-center gap-2 md:gap-3">
+    <a href="/home" class="text-base-content text-sm hover:underline hidden md:inline">Home</a>
+    <a href="/settings" class="text-base-content text-sm hover:underline hidden md:inline">Settings</a>
+    <button onclick="(function(){var h=document.documentElement,c=h.getAttribute('data-theme')==='dark'?'corporate':'dark';h.setAttribute('data-theme',c);localStorage.setItem('theme',c);document.querySelectorAll('.theme-icon-sun,.theme-icon-moon').forEach(function(e){e.classList.toggle('hidden')})})();" class="btn btn-ghost btn-circle btn-sm" title="Toggle theme"><svg class="theme-icon-sun w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5" stroke-width="2"/><path stroke-linecap="round" stroke-width="2" d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg><svg class="theme-icon-moon w-5 h-5 hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg></button>
+    <div class="user-badge px-3 py-1 rounded-full text-sm">@__USER__</div>
+  </div>
+</nav>
+<div class="flex">
+<aside class="sidebar w-64 min-h-screen p-4 hidden md:block"><ul class="menu mt-2">__SIDEBAR__</ul></aside>
+<main class="flex-1 p-4 md:p-6 min-w-0">
+<div class="flex flex-col md:flex-row justify-between items-start md:items-center mb-4 gap-4">
+  <div><h1 class="text-xl md:text-2xl font-bold">__TITLE__</h1><p class="text-muted">Calendar — click a day to add, drag fields to reconfigure</p></div>
+  <div class="flex gap-2 flex-wrap">
+    <div class="btn-group">
+      <a href="__LISTURL__" class="btn btn-sm" title="List View"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 10h16M4 14h16M4 18h16"/></svg></a>
+      <a href="/kanban/__MODEL__" class="btn btn-sm" title="Kanban View"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 17V7m0 10a2 2 0 01-2 2H5a2 2 0 01-2-2V7a2 2 0 012-2h2a2 2 0 012 2m0 10a2 2 0 002 2h2a2 2 0 002-2M9 7a2 2 0 012-2h2a2 2 0 012 2m0 10V7"/></svg></a>
+      <a href="/graph/__MODEL__" class="btn btn-sm" title="Graph View"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/></svg></a>
+      <a href="/calendar/__MODEL__" class="btn btn-sm btn-active" title="Calendar View"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"/></svg></a>
+      <a href="/pivot/__MODEL__" class="btn btn-sm" title="Pivot View"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 10h18M3 14h18m-9-4v8m-7 0h14a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg></a>
+    </div>
+    <!--VIEW_BAR-->
+    <a href="__NEWURL__" class="btn btn-sm" style="background:#8BC53F;border-color:#8BC53F;color:#000">+ New</a>
+  </div>
+</div>
+<div id="cal-config" class="cal-config"></div>
+<div id="cal-toolbar" class="cal-toolbar"></div>
+<div id="cal-legend" class="cal-legend" style="display:none"></div>
+<div id="cal-body" class="cal-body">
+  <div id="calendar-root" data-model="__MODEL__" data-fields="__FIELDS__" data-config="__CONFIG__"></div>
+</div>
+<script src="/static/calendar.js?v=2"></script>
+</main>
+</div>
+</body></html>"#;
 
 // ============================================================================
 // Generic Pivot View (Excel-style, client-rendered)
@@ -9077,9 +9488,10 @@ async fn generic_calendar_view(
 // matrix with subtotals/grand-totals computed by SQL ROLLUP.
 
 async fn generic_pivot_view(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
     Path(model_name): Path<String>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
@@ -9181,7 +9593,7 @@ async fn generic_pivot_view(
     )
     .await;
 
-    let sidebar_menu = build_sidebar_menu(&db, &user.roles, &model_name).await;
+    let sidebar_menu = generic_view_sidebar(&state, &user, &db_ctx, &model_name);
 
     // Shell built by token replacement (not format!) so the inline navbar JS
     // keeps its braces without escaping. Dynamic JSON goes into HTML-escaped
@@ -9193,7 +9605,8 @@ async fn generic_pivot_view(
         .replace("__LISTURL__", &html_escape(&list_view_url))
         .replace("__FIELDS__", &html_escape(&fields_json))
         .replace("__CONFIG__", &html_escape(&config_json))
-        .replace("__MODEL__", &html_escape(&model_name));
+        .replace("__MODEL__", &html_escape(&model_name))
+        .replace("__NEWURL__", &html_escape(&vortex_framework::new_record_url(&model_name)));
     Html(html.replace("<!--VIEW_BAR-->", &view_bar)).into_response()
 }
 
@@ -9242,7 +9655,7 @@ body { background: oklch(var(--b2)); color: oklch(var(--bc)); }
     </div>
     <!--VIEW_BAR-->
     <button id="pv-export" class="btn btn-sm gap-1" title="Export to Excel (CSV)"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v2a2 2 0 002 2h12a2 2 0 002-2v-2M7 10l5 5 5-5M12 15V3"/></svg>Excel</button>
-    <a href="/__MODEL__/new" class="btn btn-sm" style="background:#8BC53F;border-color:#8BC53F;color:#000">+ New</a>
+    <a href="__NEWURL__" class="btn btn-sm" style="background:#8BC53F;border-color:#8BC53F;color:#000">+ New</a>
   </div>
 </div>
 <div class="pv-wrap">
@@ -10218,17 +10631,7 @@ async fn contacts_list(
         ));
     }
 
-    Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style><title>Contacts - Remicle</title>
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=18" rel="stylesheet"/>
-<script src="/static/vortex.js?v=18" defer></script>
-<script src="/static/vendor/tailwind.js"></script></head>
-<body class="min-h-screen bg-base-200">
-<div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a><button onclick="(function(){{var h=document.documentElement,c=h.getAttribute('data-theme')==='dark'?'corporate':'dark';h.setAttribute('data-theme',c);localStorage.setItem('theme',c);document.querySelectorAll('.theme-icon-sun,.theme-icon-moon').forEach(function(e){{e.classList.toggle('hidden')}})}})();" class="btn btn-ghost btn-sm btn-square ml-auto"><svg class="theme-icon-sun w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5" stroke-width="2"/><path stroke-linecap="round" stroke-width="2" d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg><svg class="theme-icon-moon w-5 h-5 hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg></button></div>
-<div id="sidebar-overlay" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
-<div class="flex">{sidebar}
-<main class="flex-1 p-4 lg:p-6 min-w-0">
+    let body = format!(r#"
 <div class="flex justify-between items-center mb-6">
 <div><h1 class="text-2xl font-bold">Contacts</h1><p class="text-base-content/60">Manage customers, suppliers, and stakeholders</p></div>
 <a href="/contacts/new" class="btn btn-primary">+ New Contact</a>
@@ -10239,7 +10642,8 @@ async fn contacts_list(
 <thead><tr><th>Name</th><th>Display Name</th><th>Type</th><th>Email</th><th>Phone</th><th>City</th><th>Status</th></tr></thead>
 <tbody>{rows}</tbody>
 </table></div></div>
-</main></div></body></html>"#)).into_response()
+"#);
+    Html(vortex_framework::render_app_shell("Contacts - Remicle", &sidebar, &body)).into_response()
 }
 
 async fn contacts_new(State(state): State<Arc<AppState>>, Db(db): Db, Extension(_user): Extension<AuthUser>) -> Response {
@@ -12584,21 +12988,7 @@ async fn audit_log_page(
         next = next_link,
     );
 
-    let html = format!(
-        r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style><title>Audit Log - Remicle</title>
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=18" rel="stylesheet"/>
-<script src="/static/vortex.js?v=18" defer></script>
-<script src="/static/vendor/tailwind.js"></script></head>
-<body class="min-h-screen bg-base-200">
-<div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a></div>
-<div id="sidebar-overlay" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
-<div class="flex">{sidebar}
-<main class="flex-1 p-4 lg:p-6 min-w-0">{content}</main></div></body></html>"#,
-        sidebar = sidebar,
-        content = content,
-    );
+    let html = vortex_framework::render_app_shell("Audit Log - Remicle", &sidebar, &content);
     Html(html).into_response()
 }
 
@@ -13451,14 +13841,8 @@ struct WidgetForm {
 /// the host sidebar, so Dashboards feels like a first-class section (matching
 /// Reports).
 fn dashboard_full_page(sidebar: &str, title: &str, body: &str) -> String {
-    format!(r##"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><title>{title} - Remicle</title>
-<meta name="viewport" content="width=device-width, initial-scale=1.0"><link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=18" rel="stylesheet"/>
-<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script></head>
-<body class="min-h-screen bg-base-200"><div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a></div>
-<div id="sidebar-overlay" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
-<div class="flex">{sidebar}<main class="flex-1 p-4 lg:p-6 min-w-0">{body}</main></div></body></html>"##,
-        title = vortex_framework::ui::html_escape(title), sidebar = sidebar, body = body)
+    let title = format!("{} - Remicle", vortex_framework::ui::html_escape(title));
+    vortex_framework::render_app_shell(&title, sidebar, body)
 }
 
 async fn dashboards_index(
@@ -15864,21 +16248,7 @@ async fn approvals_inbox(
         rows = rows,
     );
 
-    let html = format!(
-        r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><title>Approvals - Remicle</title>
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=18" rel="stylesheet"/>
-<script src="/static/vortex.js?v=18" defer></script>
-<script src="/static/vendor/tailwind.js"></script></head>
-<body class="min-h-screen bg-base-200">
-<div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a></div>
-<div id="sidebar-overlay" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
-<div class="flex">{sidebar}
-<main class="flex-1 p-4 lg:p-6 min-w-0">{content}</main></div></body></html>"#,
-        sidebar = sidebar,
-        content = content,
-    );
+    let html = vortex_framework::render_app_shell("Approvals - Remicle", &sidebar, &content);
     Html(html).into_response()
 }
 
@@ -19196,16 +19566,7 @@ async fn reports_hub(
         <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">{cards}</div>"##,
         author_btn = author_btn, cards = cards,
     );
-    let html = format!(
-        r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><title>Reports - Remicle</title>
-<meta name="viewport" content="width=device-width, initial-scale=1.0"><link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=18" rel="stylesheet"/>
-<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script></head>
-<body class="min-h-screen bg-base-200"><div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a></div>
-<div id="sidebar-overlay" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
-<div class="flex">{sidebar}<main class="flex-1 p-4 lg:p-6 min-w-0">{content}</main></div></body></html>"#,
-        sidebar = sidebar, content = content,
-    );
+    let html = vortex_framework::render_app_shell("Reports - Remicle", &sidebar, &content);
     Html(html).into_response()
 }
 
@@ -19398,13 +19759,12 @@ async fn report_runs_page(
         <tbody>{trs}</tbody></table></div></div>"##,
         days = vortex_framework::report_jobs::retention_days(), who_th = who_th, trs = trs,
     );
-    let html = format!(
-        r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><title>Generated Reports - Remicle</title>{refresh}
-<meta name="viewport" content="width=device-width, initial-scale=1.0"><link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=18" rel="stylesheet"/>
-<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script></head>
-<body class="min-h-screen bg-base-200"><div class="flex">{sidebar}<main class="flex-1 p-4 lg:p-6 min-w-0">{content}</main></div></body></html>"#,
-        refresh = refresh, sidebar = sidebar, content = content,
+    let html = vortex_framework::render_app_shell_with(
+        "Generated Reports - Remicle",
+        &sidebar,
+        &content,
+        &refresh,
+        "",
     );
     Html(html).into_response()
 }
@@ -19543,8 +19903,10 @@ async fn dynamic_form_new(
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
     Path(model_name): Path<String>,
+    Query(prefill): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
-    render_dynamic_form(&db, &user, &model_name, None).await
+    let _ = &state;
+    render_dynamic_form(&db, &user, &model_name, None, &prefill).await
 }
 
 async fn dynamic_form_edit(
@@ -19553,7 +19915,8 @@ async fn dynamic_form_edit(
     Extension(user): Extension<AuthUser>,
     Path((model_name, record_id)): Path<(String, uuid::Uuid)>,
 ) -> Response {
-    render_dynamic_form(&db, &user, &model_name, Some(record_id)).await
+    let _ = &state;
+    render_dynamic_form(&db, &user, &model_name, Some(record_id), &std::collections::HashMap::new()).await
 }
 
 async fn render_dynamic_form(
@@ -19561,6 +19924,10 @@ async fn render_dynamic_form(
     user: &AuthUser,
     model_name: &str,
     record_id: Option<uuid::Uuid>,
+    // Query-param seed values for a brand-new record (e.g. the calendar's
+    // "click a day to create" pre-fills the date field). Only keys that match a
+    // registered, editable field are applied.
+    prefill: &std::collections::HashMap<String, String>,
 ) -> Response {
     // Fetch model metadata
     let model_row = match sqlx::query(
@@ -19581,17 +19948,39 @@ async fn render_dynamic_form(
         return (StatusCode::BAD_REQUEST, Html("Invalid model")).into_response();
     }
 
-    // Fetch field definitions
-    let fields = sqlx::query(
-        "SELECT name, display_name, field_type, selection_options, related_model, widget
+    // Fetch field definitions. NB: do not SELECT `widget` — that column is
+    // absent on some drifted tenant DBs, and its value was read but never used,
+    // so dropping it makes the generic form robust to that drift.
+    //
+    // Fail loud, don't blank: a query error (or an empty registry) used to fall
+    // through `unwrap_or_default()` to zero rows, rendering a silently-empty
+    // form that drops every field on save. Both cases are now surfaced as an
+    // error page instead of a plausible-looking blank form (§2 #2).
+    let fields = match sqlx::query(
+        "SELECT name, display_name, field_type, selection_options, related_model
          FROM ir_model_field
          WHERE model_id = $1 AND name NOT IN ('id', 'created_at', 'updated_at', 'active')
          ORDER BY sequence, display_name"
     )
     .bind(model_id)
     .fetch_all(db)
-    .await
-    .unwrap_or_default();
+    .await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!(model = model_name, error = %e, "generic form: field-definition query failed");
+            return error_response(&format!(
+                "Could not load the field layout for '{}'. The model registry may be out of sync — try Update Apps List, or contact an administrator.",
+                model_name
+            ));
+        }
+    };
+    if fields.is_empty() {
+        tracing::error!(model = model_name, "generic form: no registered fields (registry drift)");
+        return error_response(&format!(
+            "No editable fields are registered for '{}'. The model registry is out of sync with the database schema.",
+            model_name
+        ));
+    }
 
     // Fetch existing record if editing
     let record_data: std::collections::HashMap<String, String> = if let Some(rid) = record_id {
@@ -19605,6 +19994,17 @@ async fn render_dynamic_form(
                     .or_else(|_| row.try_get::<i32, _>(col_name).map(|v| v.to_string()))
                     .or_else(|_| row.try_get::<i64, _>(col_name).map(|v| v.to_string()))
                     .or_else(|_| row.try_get::<bool, _>(col_name).map(|v| v.to_string()))
+                    // Date/datetime columns must be extracted explicitly, else
+                    // they fall through to `unwrap_or_default()` and the edit
+                    // form shows a blank date (e.g. a calendar event's date).
+                    .or_else(|_| row.try_get::<chrono::NaiveDate, _>(col_name).map(|v| v.to_string()))
+                    .or_else(|_| row.try_get::<chrono::NaiveDateTime, _>(col_name).map(|v| v.format("%Y-%m-%dT%H:%M").to_string()))
+                    .or_else(|_| row.try_get::<chrono::DateTime<chrono::Utc>, _>(col_name).map(|v| v.format("%Y-%m-%dT%H:%M").to_string()))
+                    // Numeric columns: NUMERIC/DECIMAL decode as Decimal, double
+                    // precision as f64. Without these arms a monetary/decimal
+                    // field renders blank and is silently dropped on save.
+                    .or_else(|_| row.try_get::<sqlx::types::Decimal, _>(col_name).map(|v| v.to_string()))
+                    .or_else(|_| row.try_get::<f64, _>(col_name).map(|v| v.to_string()))
                     .or_else(|_| row.try_get::<uuid::Uuid, _>(col_name).map(|v| v.to_string()))
                     .unwrap_or_default();
                 data.insert(col_name.to_string(), value);
@@ -19614,7 +20014,14 @@ async fn render_dynamic_form(
             std::collections::HashMap::new()
         }
     } else {
-        std::collections::HashMap::new()
+        // New record: seed only from query params that name a registered field.
+        let known: std::collections::HashSet<String> =
+            fields.iter().map(|f| f.get::<String, _>("name")).collect();
+        prefill
+            .iter()
+            .filter(|(k, _)| known.contains(k.as_str()))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
     };
 
     // Build form fields HTML
@@ -19625,7 +20032,6 @@ async fn render_dynamic_form(
         let field_type: String = field.get("field_type");
         let selection_options: Option<serde_json::Value> = field.get("selection_options");
         let relation_model: Option<String> = field.get("related_model");
-        let widget: Option<String> = field.get("widget");
 
         let current_value = record_data.get(&field_name).cloned().unwrap_or_default();
         let required_attr = "";  // Can add required logic later based on field metadata
