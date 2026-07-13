@@ -159,7 +159,9 @@ async fn edit_region(
     let active: bool = row.try_get("active").unwrap_or(true);
     let header = form_header("/sesb-eam/regions", "Back to Regions", &format!("Edit {}", name));
     let body = region_body(&db, &code, &name, &seq.to_string(), &division, mgr, desc.as_deref().unwrap_or(""), active, false).await;
-    Html(page_shell(&sidebar, "Edit Region", &form_page(&format!("/sesb-eam/regions/{id}"), &header, &body))).into_response()
+    let activity_panel = vortex_plugin_sdk::framework::render_chatter_panel("eam_region", id);
+    let content = format!("{}<div class=\"mt-6\">{activity_panel}</div>", form_page(&format!("/sesb-eam/regions/{id}"), &header, &body));
+    Html(page_shell(&sidebar, "Edit Region", &content)).into_response()
 }
 
 async fn update_region(
@@ -266,7 +268,9 @@ async fn edit_zon(
     let active: bool = row.try_get("active").unwrap_or(true);
     let header = form_header("/sesb-eam/zones", "Back to Zones", &format!("Edit {}", name));
     let body = zon_body(&db, &code, &name, &seq.to_string(), region, mgr, desc.as_deref().unwrap_or(""), active, false).await;
-    Html(page_shell(&sidebar, "Edit Zon", &form_page(&format!("/sesb-eam/zones/{id}"), &header, &body))).into_response()
+    let activity_panel = vortex_plugin_sdk::framework::render_chatter_panel("eam_zon", id);
+    let content = format!("{}<div class=\"mt-6\">{activity_panel}</div>", form_page(&format!("/sesb-eam/zones/{id}"), &header, &body));
+    Html(page_shell(&sidebar, "Edit Zon", &content)).into_response()
 }
 
 async fn update_zon(
@@ -377,7 +381,9 @@ async fn edit_kawasan(
     let active: bool = row.try_get("active").unwrap_or(true);
     let header = form_header("/sesb-eam/kawasans", "Back to Kawasans", &format!("Edit {}", name));
     let body = kawasan_body(&db, &code, &name, &seq.to_string(), zon, region, mgr, desc.as_deref().unwrap_or(""), active, false).await;
-    Html(page_shell(&sidebar, "Edit Kawasan", &form_page(&format!("/sesb-eam/kawasans/{id}"), &header, &body))).into_response()
+    let activity_panel = vortex_plugin_sdk::framework::render_chatter_panel("eam_kawasan", id);
+    let content = format!("{}<div class=\"mt-6\">{activity_panel}</div>", form_page(&format!("/sesb-eam/kawasans/{id}"), &header, &body));
+    Html(page_shell(&sidebar, "Edit Kawasan", &content)).into_response()
 }
 
 async fn update_kawasan(
@@ -541,13 +547,15 @@ async fn edit_site(
     let body = site_body(&db, &code, &name, region, kawasan, zon, &stype, &sstate,
         addr.as_deref().unwrap_or(""), lat.as_deref().unwrap_or(""), lng.as_deref().unwrap_or(""),
         cdate.as_deref().unwrap_or(""), ddate.as_deref().unwrap_or(""), notes.as_deref().unwrap_or(""), active, false).await;
+    let activity_panel = vortex_plugin_sdk::framework::render_chatter_panel("eam_site", id);
     let content = format!(
         r#"{form}
 <div class="max-w-4xl mt-6"><div class="card bg-base-100 shadow"><div class="card-body">
 <div class="flex items-center justify-between mb-2"><h2 class="card-title text-lg">Substations</h2>
 <a href="/sesb-eam/substations/new?site={id}" class="btn btn-primary btn-sm">New Substation</a></div>
 <table class="table table-sm"><thead><tr><th>Code</th><th>Name</th><th>Verification</th></tr></thead><tbody>{sub_html}</tbody></table>
-</div></div></div>"#,
+</div></div></div>
+<div class="max-w-4xl mt-6">{activity_panel}</div>"#,
         form = wide_form_page(&format!("/sesb-eam/sites/{id}"), &header, &body), id = id, sub_html = sub_html);
     Html(page_shell(&sidebar, &format!("Site {}", name), &content)).into_response()
 }
@@ -806,6 +814,7 @@ async fn edit_substation(
     if bay_html.is_empty() { bay_html.push_str(r#"<tr><td colspan="4" class="text-base-content/50">No bays</td></tr>"#); }
 
     let history = vortex_plugin_sdk::framework::render_audit_trail(&db, "eam_substation", id).await;
+    let activity_panel = vortex_plugin_sdk::framework::render_chatter_panel("eam_substation", id);
     let header = format!(
         r#"<div class="flex items-center justify-between mb-4"><div>
 <a href="/sesb-eam/substations" class="btn btn-ghost btn-sm mb-2">← Back to Substations</a>
@@ -821,9 +830,10 @@ async fn edit_substation(
 <a href="/sesb-eam/bays/new?substation={id}" class="btn btn-primary btn-sm">New Bay</a></div>
 <table class="table table-sm"><thead><tr><th>Code</th><th>Name</th><th>Type</th><th>Verification</th></tr></thead><tbody>{bay_html}</tbody></table>
 </div></div>
+<div class="mt-6">{activity_panel}</div>
 <div class="mt-6">{history}</div>
 </div>"#,
-        header = header, derived = derived, id = id, body = body, bay_html = bay_html, history = history);
+        header = header, derived = derived, id = id, body = body, bay_html = bay_html, history = history, activity_panel = activity_panel);
     Html(page_shell(&sidebar, &format!("Substation {}", f.name), &content)).into_response()
 }
 
@@ -994,8 +1004,9 @@ async fn edit_bay(
         name = esc(&f.name), code = esc(&f.code), badge = vstate_badge(&vstate));
     let body = bay_body(&db, &f, None, false).await;
     let history = vortex_plugin_sdk::framework::render_audit_trail(&db, "eam_bay", id).await;
-    let content = format!("{}<div class=\"mt-6 max-w-4xl\">{}</div>",
-        wide_form_page(&format!("/sesb-eam/bays/{id}"), &header, &body), history);
+    let activity_panel = vortex_plugin_sdk::framework::render_chatter_panel("eam_bay", id);
+    let content = format!("{}<div class=\"mt-6 max-w-4xl\">{}</div><div class=\"mt-6 max-w-4xl\">{}</div>",
+        wide_form_page(&format!("/sesb-eam/bays/{id}"), &header, &body), activity_panel, history);
     Html(page_shell(&sidebar, &format!("Bay {}", f.name), &content)).into_response()
 }
 

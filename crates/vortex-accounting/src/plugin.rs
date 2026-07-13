@@ -7,7 +7,7 @@ use vortex_plugin_sdk::prelude::*;
 
 use crate::{
     handlers, handlers_assets, handlers_banking, handlers_closing, handlers_currency,
-    handlers_documents, handlers_einvoice, handlers_tax,
+    handlers_documents, handlers_einvoice, handlers_payment_terms, handlers_tax,
 };
 
 const MIG_001_ACCOUNTING: &str = include_str!("../migrations/001_accounting/postgres.sql");
@@ -38,6 +38,8 @@ const MIG_013_CLASSIFICATION_CODES: &str =
 const MIG_014_UNPOST: &str = include_str!("../migrations/014_unpost/postgres.sql");
 const MIG_015_LINE_PRODUCT: &str =
     include_str!("../migrations/015_line_product/postgres.sql");
+const MIG_016_PAYMENT_TERMS: &str =
+    include_str!("../migrations/016_payment_terms/postgres.sql");
 
 pub struct AccountingPlugin;
 
@@ -57,6 +59,16 @@ impl Default for AccountingPlugin {
 impl Plugin for AccountingPlugin {
     fn technical_name(&self) -> &'static str {
         "accounting"
+    }
+
+    /// Accounting models projected into the metadata registry from their
+    /// `#[derive(Model)]` structs — supersedes migration `003_accounting_registry`.
+    fn models(&self) -> Vec<&'static vortex_orm::model::ModelMeta> {
+        use vortex_orm::model::Model;
+        vec![
+            crate::model::AccMove::meta(),
+            crate::model::AccAccount::meta(),
+        ]
     }
 
     fn display_name(&self) -> &'static str {
@@ -101,6 +113,7 @@ impl Plugin for AccountingPlugin {
             .merge(handlers_banking::banking_routes())
             .merge(handlers_assets::asset_routes())
             .merge(handlers_closing::closing_routes())
+            .merge(handlers_payment_terms::payment_term_routes())
     }
 
     /// Menu mirrors the sub-ledger mental model (AutoCount/SQL style):
@@ -127,6 +140,13 @@ impl Plugin for AccountingPlugin {
                 "accounting.ar.einvoice",
                 "e-Invoice Queue (LHDN)",
                 "/accounting/einvoice",
+                MenuGroup::Operations,
+            )
+            .under("accounting.ar"),
+            MenuEntry::new(
+                "accounting.ar.statement",
+                "Statement of Account",
+                "/accounting/statement",
                 MenuGroup::Operations,
             )
             .under("accounting.ar"),
@@ -216,6 +236,13 @@ impl Plugin for AccountingPlugin {
                 "accounting.config.journals",
                 "Journals",
                 "/accounting/journals",
+                MenuGroup::Operations,
+            )
+            .under("accounting.config"),
+            MenuEntry::new(
+                "accounting.config.payment_terms",
+                "Payment Terms",
+                "/accounting/payment-terms",
                 MenuGroup::Operations,
             )
             .under("accounting.config"),
@@ -423,6 +450,12 @@ impl Plugin for AccountingPlugin {
                 down_sql: None,
                 requires_core_migration: Some("119_commerce_primitives"),
             },
+            PluginMigration {
+                name: "016_payment_terms",
+                up_sql: MIG_016_PAYMENT_TERMS,
+                down_sql: None,
+                requires_core_migration: Some("119_commerce_primitives"),
+            },
         ]
     }
 
@@ -593,7 +626,7 @@ impl Plugin for AccountingPlugin {
             // Snapshot → save → diff, so the CONTACT's history shows
             // exactly which tax fields changed (same entry shape the
             // field tracker writes).
-            const FIELDS: [(&str, &str); 9] = [
+            const FIELDS: [(&str, &str); 10] = [
                 ("tin", "TIN"),
                 ("id_type", "ID Type"),
                 ("id_value", "BRN/NRIC No."),
@@ -603,6 +636,7 @@ impl Plugin for AccountingPlugin {
                 ("einvoice_optout", "Consolidated e-Invoice Only"),
                 ("receivable_account", "Receivable Account"),
                 ("payable_account", "Payable Account"),
+                ("payment_term", "Payment Terms"),
             ];
             let snapshot = |row: Option<&vortex_plugin_sdk::sqlx::postgres::PgRow>| {
                 FIELDS
@@ -625,10 +659,12 @@ impl Plugin for AccountingPlugin {
             let select = "SELECT p.tin, p.id_type, p.id_value, p.sst_registration, p.msic_code, \
                           p.einvoice_email, p.einvoice_optout, \
                           COALESCE(ar.code || ' ' || ar.name, '') AS receivable_account, \
-                          COALESCE(ap.code || ' ' || ap.name, '') AS payable_account \
+                          COALESCE(ap.code || ' ' || ap.name, '') AS payable_account, \
+                          COALESCE(pt.name, '') AS payment_term \
                           FROM acc_partner_tax_profile p \
                           LEFT JOIN acc_account ar ON ar.id = p.receivable_account_id \
                           LEFT JOIN acc_account ap ON ap.id = p.payable_account_id \
+                          LEFT JOIN payment_term pt ON pt.id = p.payment_term_id \
                           WHERE p.contact_id = $1";
             let before_row = vortex_plugin_sdk::sqlx::query(select)
                 .bind(contact_id)
@@ -686,7 +722,7 @@ impl Plugin for AccountingPlugin {
                 // Control-account overrides (saved by the single Save
                 // via the tax panel's hook — same record-form).
                 let profile = vortex_plugin_sdk::sqlx::query(
-                    "SELECT receivable_account_id, payable_account_id \
+                    "SELECT receivable_account_id, payable_account_id, payment_term_id \
                      FROM acc_partner_tax_profile WHERE contact_id = $1",
                 )
                 .bind(contact_id)
@@ -757,6 +793,14 @@ impl Plugin for AccountingPlugin {
                     &load_accounts("liability_payable").await,
                 );
 
+                // Default payment terms — pre-fills new quotations for this
+                // partner. Options come from Accounting Setup ▸ Payment Terms.
+                let pt_opts = handlers_payment_terms::payment_term_options(
+                    &db,
+                    selected("payment_term_id"),
+                )
+                .await;
+
                 // Bank accounts list + add row. The bank itself comes
                 // from the user-configurable master (Setup ▸ Banks).
                 let bank_options: String = vortex_plugin_sdk::sqlx::query(
@@ -807,7 +851,11 @@ impl Plugin for AccountingPlugin {
                     )
                 };
                 Ok(format!(
-                    r#"<div class="grid grid-cols-2 md:grid-cols-4 gap-3">{ar}{ap}</div>
+                    r#"<div class="grid grid-cols-2 md:grid-cols-4 gap-3">
+<label class="form-control col-span-2"><span class="label-text text-xs mb-1">Default Payment Terms</span>
+<select name="payment_term_id" form="record-form" class="select select-bordered select-sm w-full">{pt_opts}</select></label>
+</div>
+<div class="grid grid-cols-2 md:grid-cols-4 gap-3 mt-3">{ar}{ap}</div>
 <div class="divider text-xs opacity-60 my-2">Bank Accounts</div>
 {bank_table}
 <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mt-2 items-end">
@@ -821,6 +869,59 @@ impl Plugin for AccountingPlugin {
 <button form="record-form" formmethod="post" formaction="/accounting/partner-banks/{contact_id}/add" class="btn btn-sm btn-outline" title="Also saves the accounting fields above">Add Bank Account</button>
 </div>
 <p class="text-xs opacity-50 mt-1">SWIFT fills in from the bank master — manage the list under Accounting Setup ▸ Banks.</p>"#,
+                ))
+            },
+        ),
+        RecordPanel::new(
+            RecordPanelDef {
+                model: "contacts",
+                title: "Statement of Account",
+                priority: 70,
+            },
+            |_state, db, contact_id| async move {
+                // Net posted AR/AP balance for this partner (debit − credit):
+                // positive = a customer owes us, negative = we owe a vendor.
+                let bal: vortex_plugin_sdk::rust_decimal::Decimal =
+                    vortex_plugin_sdk::sqlx::query_scalar(
+                        "SELECT COALESCE(SUM(l.debit - l.credit), 0) FROM acc_move_line l \
+                         JOIN acc_move m ON m.id = l.move_id AND m.state = 'posted' \
+                         JOIN acc_account a ON a.id = l.account_id \
+                         WHERE l.partner_id = $1 \
+                           AND a.account_type IN ('asset_receivable', 'liability_payable')",
+                    )
+                    .bind(contact_id)
+                    .fetch_one(&db)
+                    .await
+                    .unwrap_or_default();
+                let zero = vortex_plugin_sdk::rust_decimal::Decimal::ZERO;
+                let hint = if bal > zero {
+                    "owed to you (receivable)"
+                } else if bal < zero {
+                    "you owe (payable)"
+                } else {
+                    "nothing outstanding"
+                };
+                Ok(format!(
+                    r#"<div class="flex items-center justify-between flex-wrap gap-3">
+<div><div class="text-2xl font-bold font-mono">{bal:.2}</div><div class="text-xs opacity-60">Outstanding balance — {hint}</div></div>
+<div class="flex gap-2">
+<a href="/reports/accounting.statement_of_account?partner={cid}" target="_blank" class="btn btn-sm btn-primary">View statement</a>
+{pdf}
+<a href="/reports/accounting.statement_of_account?partner={cid}&amp;format=csv" class="btn btn-sm btn-outline">CSV</a>
+<a href="/accounting/statement?partner={cid}" class="btn btn-sm btn-ghost">Date range…</a>
+</div>
+</div>"#,
+                    bal = bal,
+                    hint = hint,
+                    cid = contact_id,
+                    pdf = if vortex_plugin_sdk::framework::pdf::available() {
+                        format!(
+                            r#"<a href="/accounting/statement/pdf?partner={cid}" class="btn btn-sm btn-outline">PDF</a>"#,
+                            cid = contact_id,
+                        )
+                    } else {
+                        String::new()
+                    },
                 ))
             },
         )]

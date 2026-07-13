@@ -1,0 +1,71 @@
+/* Configurable calendar view. Theme-aware via daisyUI oklch custom properties. */
+
+/* Config bar (field pickers) */
+.cal-config { display: flex; flex-wrap: wrap; gap: .6rem 1.25rem; align-items: center; margin-bottom: .75rem; padding: .6rem .75rem; background: oklch(var(--b1)); border: 1px solid oklch(var(--b3)); border-radius: .5rem; }
+.cal-ctl { display: flex; align-items: center; gap: .4rem; font-size: .78rem; }
+.cal-ctl-k { opacity: .6; text-transform: uppercase; letter-spacing: .03em; font-size: .68rem; font-weight: 600; }
+.cal-config select { font-size: .8rem; background: oklch(var(--b2)); border: 1px solid oklch(var(--b3)); border-radius: .3rem; padding: .2rem .4rem; }
+
+/* Toolbar (navigation + period + mode switch) */
+.cal-toolbar { display: flex; flex-wrap: wrap; gap: .75rem 1rem; align-items: center; justify-content: space-between; margin-bottom: .5rem; }
+.cal-nav { display: inline-flex; gap: .25rem; align-items: center; }
+.cal-nav .btn { min-width: 2rem; }
+.cal-period { font-size: 1.05rem; font-weight: 700; flex: 1; text-align: center; min-width: 12rem; }
+
+/* Legend */
+.cal-legend { display: flex; flex-wrap: wrap; gap: .35rem .9rem; align-items: center; margin-bottom: .75rem; font-size: .76rem; }
+.cal-leg-item { display: inline-flex; align-items: center; gap: .35rem; }
+.cal-leg-dot { width: .7rem; height: .7rem; border-radius: 2px; display: inline-block; }
+
+/* Body loading state */
+.cal-body { position: relative; }
+.cal-loading { opacity: .5; transition: opacity .12s; }
+.cal-empty { opacity: .6; font-size: .9rem; padding: 2.5rem; text-align: center; cursor: pointer; }
+
+/* ---- Month grid ---- */
+.cal-month { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 1px; background: oklch(var(--b3)); border: 1px solid oklch(var(--b3)); border-radius: .5rem; overflow: hidden; }
+.cal-dow { background: oklch(var(--b2)); text-align: center; font-weight: 600; font-size: .72rem; text-transform: uppercase; letter-spacing: .03em; padding: .45rem 0; opacity: .8; }
+.cal-cell { background: oklch(var(--b1)); min-height: 6.5rem; padding: .3rem; display: flex; flex-direction: column; gap: .2rem; cursor: pointer; transition: background .1s; }
+.cal-cell:hover { background: oklch(var(--b2)/.6); }
+.cal-out { background: oklch(var(--b2)/.4); }
+.cal-out .cal-daynum { opacity: .4; }
+.cal-today { outline: 2px solid oklch(var(--p)); outline-offset: -2px; }
+.cal-cell-head { display: flex; justify-content: flex-end; }
+.cal-daynum { font-size: .78rem; font-weight: 600; width: 1.55rem; height: 1.55rem; border-radius: 999px; display: inline-flex; align-items: center; justify-content: center; background: transparent; border: none; cursor: pointer; color: inherit; }
+.cal-daynum:hover { background: oklch(var(--p)); color: oklch(var(--pc)); }
+.cal-today .cal-daynum { background: oklch(var(--p)); color: oklch(var(--pc)); }
+.cal-cell-events { display: flex; flex-direction: column; gap: .15rem; overflow: hidden; }
+
+/* Event chip */
+.cal-chip { display: block; font-size: .72rem; line-height: 1.3; padding: .1rem .35rem; border-radius: .25rem; background: oklch(var(--p)/.16); color: oklch(var(--bc)); text-decoration: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; border-left: 3px solid oklch(var(--p)); }
+.cal-chip:hover { filter: brightness(1.08); text-decoration: none; }
+.cal-chip-colored { color: #fff; border-left: none; }
+.cal-chip-t { font-variant-numeric: tabular-nums; opacity: .85; margin-right: .3rem; font-weight: 600; }
+.cal-more { font-size: .68rem; opacity: .7; text-align: left; background: none; border: none; cursor: pointer; padding: .05rem .35rem; color: inherit; }
+.cal-more:hover { opacity: 1; text-decoration: underline; }
+
+/* ---- Week ---- */
+.cal-week { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 1px; background: oklch(var(--b3)); border: 1px solid oklch(var(--b3)); border-radius: .5rem; overflow: hidden; min-height: 60vh; }
+.cal-wcol { background: oklch(var(--b1)); display: flex; flex-direction: column; }
+.cal-wcol-head { text-align: center; padding: .45rem 0; border-bottom: 1px solid oklch(var(--b3)); display: flex; flex-direction: column; gap: .1rem; position: sticky; top: 0; background: oklch(var(--b1)); }
+.cal-wcol-dow { font-size: .68rem; text-transform: uppercase; opacity: .7; }
+.cal-wcol-num { font-size: 1.1rem; font-weight: 700; }
+.cal-wcol-body { flex: 1; padding: .35rem; display: flex; flex-direction: column; gap: .2rem; overflow-y: auto; cursor: pointer; }
+.cal-week .cal-today .cal-wcol-num { color: oklch(var(--p)); }
+.cal-week .cal-chip { white-space: normal; }
+
+/* ---- Day agenda ---- */
+.cal-day { display: flex; flex-direction: column; gap: .4rem; background: oklch(var(--b1)); border: 1px solid oklch(var(--b3)); border-radius: .5rem; padding: 1rem; min-height: 40vh; }
+.cal-agenda-row { display: flex; align-items: center; gap: .75rem; }
+.cal-agenda-time { font-variant-numeric: tabular-nums; font-weight: 600; font-size: .8rem; opacity: .8; width: 4rem; text-align: right; flex: 0 0 4rem; }
+.cal-agenda-chip { flex: 1; padding: .4rem .6rem; font-size: .85rem; }
+.cal-add { align-self: flex-start; margin-top: .5rem; }
+
+/* ---- "+N more" popover ---- */
+.cal-pop { position: absolute; z-index: 60; min-width: 200px; max-width: 280px; max-height: 320px; overflow-y: auto; background: oklch(var(--b1)); border: 1px solid oklch(var(--b3)); border-radius: .5rem; padding: .5rem; box-shadow: 0 10px 30px rgba(0,0,0,.35); display: flex; flex-direction: column; gap: .2rem; }
+.cal-pop-head { font-weight: 700; font-size: .78rem; opacity: .7; padding: .1rem .2rem .3rem; }
+
+@media (max-width: 640px) {
+  .cal-cell { min-height: 4.5rem; }
+  .cal-period { order: -1; width: 100%; }
+}

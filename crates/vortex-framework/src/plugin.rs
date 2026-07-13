@@ -248,6 +248,21 @@ pub trait Plugin: Send + Sync {
         Vec::new()
     }
 
+    /// Return the models this plugin contributes to the metadata registry.
+    ///
+    /// Each entry is the `&'static ModelMeta` produced by a `#[derive(Model)]`
+    /// struct (via `Model::meta()`). The host projects these into the
+    /// `ir_model` / `ir_model_field` tables after migrations — so a plugin's
+    /// `#[derive(Model)]` structs are the single source of truth for the
+    /// generic views and the public REST API, instead of hand-written
+    /// `INSERT INTO ir_model …` SQL that silently drifts from the struct.
+    ///
+    /// Default: no models — the plugin registers its models the legacy way
+    /// (a seed migration) or contributes none.
+    fn models(&self) -> Vec<&'static vortex_orm::model::ModelMeta> {
+        Vec::new()
+    }
+
     /// Return the translations this plugin contributes. Each
     /// entry is a `(locale, module, key, value)` tuple. The host
     /// aggregates translations from every plugin during startup
@@ -286,6 +301,26 @@ pub trait Plugin: Send + Sync {
     ///
     /// Default: no reports.
     fn reports(&self) -> Vec<ReportDef> {
+        Vec::new()
+    }
+
+    /// Return the printable document types this plugin contributes (e.g. a
+    /// quotation or invoice). Each [`crate::print_layout::PrintDocType`] pairs
+    /// a stable key with a human label, a built-in default QWeb template, and
+    /// the variables an author may use.
+    ///
+    /// The host aggregates these into a single
+    /// [`crate::print_layout::PrintDocRegistry`] on [`AppState`]; the
+    /// `/settings/print-templates` UI lists them so users can customise the
+    /// layout, and the plugin's own print handler renders via
+    /// [`crate::print_layout::render_document`] (custom template if saved, this
+    /// default otherwise).
+    ///
+    /// Namespace keys with the plugin's technical name — e.g.
+    /// `sales.quotation` — so two plugins cannot collide.
+    ///
+    /// Default: no printable documents.
+    fn print_docs(&self) -> Vec<crate::print_layout::PrintDocType> {
         Vec::new()
     }
 

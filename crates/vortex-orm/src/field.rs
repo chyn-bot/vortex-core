@@ -90,6 +90,21 @@ pub struct FieldDef {
     pub encrypted: bool,
     /// Field-level access groups
     pub access_groups: Vec<String>,
+    /// Human-friendly display label for the UI / metadata registry.
+    /// When absent, a humanized version of `name` is used.
+    #[serde(default)]
+    pub label: Option<String>,
+    /// UI/semantic type override for the metadata registry (`ir_model_field`),
+    /// e.g. `"monetary"`, `"string"`, `"text"`, `"number"`. When absent the
+    /// storage `field_type` determines the registry type. This is how a
+    /// storage `Decimal`/`Double` becomes a `monetary` widget, or a short
+    /// `String` becomes `string` rather than `text`.
+    #[serde(default)]
+    pub ui_type: Option<String>,
+    /// Explicit selection options. A non-empty list renders the field as a
+    /// `selection` in the metadata registry with these values.
+    #[serde(default)]
+    pub selection: Vec<String>,
 }
 
 impl FieldDef {
@@ -110,7 +125,28 @@ impl FieldDef {
             depends_on: Vec::new(),
             encrypted: false,
             access_groups: Vec::new(),
+            label: None,
+            ui_type: None,
+            selection: Vec::new(),
         }
+    }
+
+    /// Set the display label (builder).
+    pub fn with_label(mut self, label: impl Into<String>) -> Self {
+        self.label = Some(label.into());
+        self
+    }
+
+    /// Set the UI/semantic registry type override (builder).
+    pub fn with_ui_type(mut self, ui_type: impl Into<String>) -> Self {
+        self.ui_type = Some(ui_type.into());
+        self
+    }
+
+    /// Set selection options (builder).
+    pub fn with_selection(mut self, options: Vec<String>) -> Self {
+        self.selection = options;
+        self
     }
 
     /// Get the database column name

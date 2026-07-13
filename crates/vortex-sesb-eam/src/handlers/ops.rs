@@ -9,6 +9,7 @@ use vortex_plugin_sdk::axum::extract::Form;
 use vortex_plugin_sdk::axum::http::StatusCode;
 use vortex_plugin_sdk::axum::response::Redirect;
 use vortex_plugin_sdk::prelude::*;
+use vortex_plugin_sdk::serde_json::json;
 use vortex_plugin_sdk::sqlx::{PgPool, Row};
 use vortex_plugin_sdk::tracing::error;
 use vortex_plugin_sdk::uuid::Uuid;
@@ -45,6 +46,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/sesb-eam/inspections/{id}", get(edit_inspection))
         .route("/sesb-eam/inspections/{id}", post(update_inspection))
         .route("/sesb-eam/inspections/{id}/action/{action}", post(inspection_action))
+        .route("/sesb-eam/inspections/{id}/duplicate", post(duplicate_inspection))
         // Condition monitoring
         .route("/sesb-eam/condition-monitoring", get(list_cm))
         .route("/sesb-eam/condition-monitoring/new", get(new_cm))
@@ -197,13 +199,14 @@ async fn edit_defect(
     let body = defect_body(&db, &v, None, false).await;
     let actions = defect_actions(&dstate, id, repair_mid);
     let history = vortex_plugin_sdk::framework::render_audit_trail(&db, "eam_defect", id).await;
+    let activity_panel = vortex_plugin_sdk::framework::render_chatter_panel("eam_defect", id);
     let header = format!(
         r#"<div class="flex items-center justify-between mb-3"><div>
 <a href="/sesb-eam/defects" class="btn btn-ghost btn-sm mb-2">← Back to Defects</a>
 <h1 class="text-2xl font-bold">{title} <span class="font-mono text-sm opacity-50">{num}</span> {badge}</h1></div></div>"#,
         title = esc(&title), num = esc(number.as_deref().unwrap_or("")), badge = badge(&dstate, DEFECT_STATE_BADGES));
-    let content = format!("<div class=\"max-w-3xl\">{}{}{}<div class=\"mt-6\">{}</div></div>",
-        header, actions, wide_form_page(&format!("/sesb-eam/defects/{id}"), "", &body), history);
+    let content = format!("<div class=\"max-w-3xl\">{}{}{}<div class=\"mt-6\">{}</div><div class=\"mt-6\">{}</div></div>",
+        header, actions, wide_form_page(&format!("/sesb-eam/defects/{id}"), "", &body), activity_panel, history);
     Html(page_shell(&sidebar, &format!("Defect {}", title), &content)).into_response()
 }
 
@@ -396,8 +399,10 @@ async fn edit_inspection(
     };
     let header = format!(r#"<a href="/sesb-eam/inspections" class="btn btn-ghost btn-sm mb-3">← Back to Inspections</a>
 <h1 class="text-2xl font-bold mb-3">Inspection <span class="font-mono text-sm opacity-50">{num}</span> {badge}</h1>"#, num = esc(number.as_deref().unwrap_or("")), badge = badge(&istate, INSP_STATE_BADGES));
-    let actions_bar = if actions.is_empty() { String::new() } else { format!(r#"<div class="flex gap-2 mb-4">{}</div>"#, actions) };
-    let content = format!("<div class=\"max-w-4xl\">{}{}{}</div>", header, actions_bar, wide_form_page(&format!("/sesb-eam/inspections/{id}"), "", &body));
+    let dup = duplicate_button(&format!("/sesb-eam/inspections/{id}/duplicate"));
+    let actions_bar = format!(r#"<div class="flex gap-2 mb-4">{}{}</div>"#, actions, dup);
+    let activity_panel = vortex_plugin_sdk::framework::render_chatter_panel("eam_inspection", id);
+    let content = format!("<div class=\"max-w-4xl\">{}{}{}<div class=\"mt-6\">{activity_panel}</div></div>", header, actions_bar, wide_form_page(&format!("/sesb-eam/inspections/{id}"), "", &body));
     Html(page_shell(&sidebar, "Inspection", &content)).into_response()
 }
 
@@ -434,6 +439,51 @@ async fn inspection_action(
         _ => return (StatusCode::BAD_REQUEST, "Unknown action").into_response(),
     }
     Redirect::to(&format!("/sesb-eam/inspections/{id}")).into_response()
+}
+
+/// POST /sesb-eam/inspections/{id}/duplicate — copy an inspection into a
+/// fresh draft dated today: new INS number, all recorded results/checks and
+/// the approval cleared. The inspector is kept deliberately — a routine
+/// inspection is re-run by the same inspector on the same equipment.
+async fn duplicate_inspection(
+    State(state): State<Arc<AppState>>, Db(db): Db,
+    Extension(user): Extension<AuthUser>, Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<Uuid>,
+) -> Response {
+    let number = match vortex_plugin_sdk::orm::sequence::next(&state.pool, &INS_SEQ).await {
+        Ok(n) => n,
+        Err(_) => return bad("Failed to generate number"),
+    };
+    let today = vortex_plugin_sdk::chrono::Utc::now().date_naive();
+    let spec = DuplicateSpec::new("eam_inspection")
+        .set("name", json!(number))
+        .set("inspection_date", json!(today.to_string()))
+        // lifecycle → DB default: state 'draft'
+        .skip("state")
+        // recorded results / measurements
+        .skip("overall_condition").skip("condition_score")
+        .skip("visual_check").skip("cleanliness_check").skip("corrosion_check")
+        .skip("oil_leak_check").skip("connection_check").skip("labeling_check")
+        .skip("temperature_c").skip("humidity_percent").skip("noise_level_db")
+        .skip("findings").skip("defects_found").skip("recommendations")
+        .skip("immediate_action_required")
+        // sign-off + source work-order link stay with the source
+        .skip("approved_by").skip("approved_date").skip("maintenance_id");
+    match spec.execute(&db, id, Some(user.id)).await {
+        Ok(new_id) => {
+            let entry = vortex_plugin_sdk::security::AuditEntry::new(
+                vortex_plugin_sdk::security::AuditAction::RecordCreated, vortex_plugin_sdk::security::AuditSeverity::Info,
+            ).with_user(vortex_plugin_sdk::common::UserId(user.id)).with_username(&user.username)
+             .with_database(&db_ctx.db_name).with_resource("eam_inspection", new_id.to_string()).with_resource_name(&number)
+             .with_details(json!({"duplicated_from": id, "number": number}));
+            let _ = state.audit.log(entry).await;
+            Redirect::to(&format!("/sesb-eam/inspections/{new_id}")).into_response()
+        }
+        Err(e) => {
+            error!(error=%e, "inspection duplicate");
+            (StatusCode::INTERNAL_SERVER_ERROR, "Duplicate failed").into_response()
+        }
+    }
 }
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -570,7 +620,8 @@ async fn edit_cm(
     let body = cm_body(&db, &v, None, false).await;
     let header = format!(r#"<a href="/sesb-eam/condition-monitoring" class="btn btn-ghost btn-sm mb-3">← Back</a>
 <h1 class="text-2xl font-bold mb-3">CM Test <span class="font-mono text-sm opacity-50">{}</span></h1>"#, esc(number.as_deref().unwrap_or("")));
-    let content = format!("<div class=\"max-w-4xl\">{}{}{}</div>", header, diag, wide_form_page(&format!("/sesb-eam/condition-monitoring/{id}"), "", &body));
+    let activity_panel = vortex_plugin_sdk::framework::render_chatter_panel("eam_cm", id);
+    let content = format!("<div class=\"max-w-4xl\">{}{}{}<div class=\"mt-6\">{activity_panel}</div></div>", header, diag, wide_form_page(&format!("/sesb-eam/condition-monitoring/{id}"), "", &body));
     Html(page_shell(&sidebar, "CM Test", &content)).into_response()
 }
 
@@ -690,7 +741,9 @@ async fn edit_patrol(
     let number: Option<String> = row.try_get("name").ok();
     let body = patrol_body(&db, &v, false).await;
     let header = form_header("/sesb-eam/patrols", "Back to Patrols", &format!("Patrol {}", number.as_deref().unwrap_or("")));
-    Html(page_shell(&sidebar, "Patrol", &wide_form_page(&format!("/sesb-eam/patrols/{id}"), &header, &body))).into_response()
+    let activity_panel = vortex_plugin_sdk::framework::render_chatter_panel("eam_patrol", id);
+    let content = format!("{}<div class=\"max-w-4xl mt-6\">{activity_panel}</div>", wide_form_page(&format!("/sesb-eam/patrols/{id}"), &header, &body));
+    Html(page_shell(&sidebar, "Patrol", &content)).into_response()
 }
 
 async fn update_patrol(
@@ -812,7 +865,9 @@ async fn edit_outage(
     let number: Option<String> = row.try_get("name").ok();
     let body = outage_body(&db, &v, false).await;
     let header = form_header("/sesb-eam/outages", "Back to Outages", &format!("Outage {}", number.as_deref().unwrap_or("")));
-    Html(page_shell(&sidebar, "Outage", &wide_form_page(&format!("/sesb-eam/outages/{id}"), &header, &body))).into_response()
+    let activity_panel = vortex_plugin_sdk::framework::render_chatter_panel("eam_outage", id);
+    let content = format!("{}<div class=\"max-w-4xl mt-6\">{activity_panel}</div>", wide_form_page(&format!("/sesb-eam/outages/{id}"), &header, &body));
+    Html(page_shell(&sidebar, "Outage", &content)).into_response()
 }
 
 async fn update_outage(
@@ -912,7 +967,9 @@ async fn edit_veg(
     }
     let body = veg_body(&db, &v, false).await;
     let header = form_header("/sesb-eam/vegetation", "Back to Vegetation", "Edit Vegetation Section");
-    Html(page_shell(&sidebar, "Vegetation Section", &wide_form_page(&format!("/sesb-eam/vegetation/{id}"), &header, &body))).into_response()
+    let activity_panel = vortex_plugin_sdk::framework::render_chatter_panel("eam_veg", id);
+    let content = format!("{}<div class=\"max-w-4xl mt-6\">{activity_panel}</div>", wide_form_page(&format!("/sesb-eam/vegetation/{id}"), &header, &body));
+    Html(page_shell(&sidebar, "Vegetation Section", &content)).into_response()
 }
 
 async fn update_veg(
@@ -1007,7 +1064,9 @@ async fn edit_tsr(
     let active: bool = row.try_get("active").unwrap_or(true);
     let header = form_header("/sesb-eam/troubleshooting", "Back to Rules", &format!("Edit {}", name));
     let body = tsr_body(&name, &priority, cat.as_deref().unwrap_or(""), keywords.as_deref().unwrap_or(""), &guidance, active, false);
-    Html(page_shell(&sidebar, "Edit Rule", &form_page(&format!("/sesb-eam/troubleshooting/{id}"), &header, &body))).into_response()
+    let activity_panel = vortex_plugin_sdk::framework::render_chatter_panel("eam_tsr", id);
+    let content = format!("{}<div class=\"mt-6\">{activity_panel}</div>", form_page(&format!("/sesb-eam/troubleshooting/{id}"), &header, &body));
+    Html(page_shell(&sidebar, "Edit Rule", &content)).into_response()
 }
 
 async fn update_tsr(

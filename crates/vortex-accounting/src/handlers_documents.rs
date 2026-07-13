@@ -13,8 +13,8 @@ use vortex_plugin_sdk::uuid::Uuid;
 
 use crate::documents::{self, NewPayment, PaymentDirection};
 use crate::handlers::{
-    audit_move, audit_move_changes, date_or_today, dec_or_zero, default_company, money, opt_str,
-    page_shell, redirect, render_sidebar,
+    audit_move, audit_move_changes, audit_move_duplicated, date_or_today, dec_or_zero,
+    default_company, money, opt_str, page_shell, redirect, render_sidebar,
 };
 
 pub fn document_routes() -> Router<Arc<AppState>> {
@@ -39,8 +39,12 @@ pub fn document_routes() -> Router<Arc<AppState>> {
         .route("/accounting/documents/{id}/print", get(print_document))
         .route("/accounting/documents/{id}/email", post(email_document))
         .route("/accounting/documents/{id}/cancel", post(cancel_document_action))
+        .route("/accounting/documents/{id}/duplicate", post(duplicate_document))
         .route("/accounting/documents/{id}/reset-draft", post(reset_draft_action))
-        .route("/accounting/payments", get(list_payments))
+        .route("/accounting/payments", get(list_payments).post(create_payment))
+        .route("/accounting/payments/new", get(new_payment_form))
+        .route("/accounting/statement", get(statement_form))
+        .route("/accounting/statement/pdf", get(statement_pdf))
 }
 
 /// Queue "email the PDF to the partner" — validated up front so the
@@ -216,6 +220,93 @@ async fn reset_draft_action(
             )
         }
         Err(e) => flash_redirect(&back, FlashKind::Error, &format!("Not reset — {e}")),
+    }
+}
+
+/// The four AR/AP document types — what the Duplicate action applies
+/// to. Not payments (re-registered, never copied) or plain entries.
+fn is_arap_document(move_type: &str) -> bool {
+    matches!(
+        move_type,
+        "customer_invoice" | "customer_credit_note" | "vendor_bill" | "vendor_credit_note"
+    )
+}
+
+/// POST /accounting/documents/{id}/duplicate — copy a document (any
+/// state, posted included) into a fresh DRAFT: no number (drawn per
+/// journal at posting), today's dates, no payment/reversal/e-invoice
+/// baggage. Commercial lines ride along; GL lines are regenerated at
+/// posting, so they are deliberately NOT copied.
+async fn duplicate_document(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<Uuid>,
+) -> Response {
+    let back = format!("/accounting/documents/{id}");
+    let move_type: Option<String> = vortex_plugin_sdk::sqlx::query_scalar(
+        "SELECT move_type FROM acc_move WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&db)
+    .await
+    .ok()
+    .flatten();
+    let Some(move_type) = move_type else {
+        return flash_redirect(&back, FlashKind::Error, "Document not found.");
+    };
+    if !is_arap_document(&move_type) {
+        return flash_redirect(
+            &back,
+            FlashKind::Error,
+            "Only invoices, bills and credit notes can be duplicated.",
+        );
+    }
+
+    let today = vortex_plugin_sdk::chrono::Utc::now().date_naive();
+    let spec = DuplicateSpec::new("acc_move")
+        // Lifecycle back to the DB defaults: draft, unnumbered, unpaid.
+        .skip("number") // drawn from the journal sequence at posting
+        .skip("state") // default 'draft'
+        .skip("payment_state") // default 'not_paid'
+        .skip("amount_residual") // default 0; set by post_invoice
+        .skip("amount_residual_currency") // NULL; set at posting for FX docs
+        .skip("currency_rate") // fixed at the copy's own posting date
+        .skip("posted_by")
+        .skip("posted_at")
+        // Provenance stays with the source: the copy reverses nothing
+        // and was not produced by an adopting module (sales/purchase
+        // origin_refs must keep pointing at exactly one document).
+        .skip("reversed_move_id")
+        .skip("origin_ref")
+        // Fresh dates — a copy is a new commercial event, not a reissue.
+        .set("move_date", vortex_plugin_sdk::serde_json::json!(today))
+        .set("invoice_date", vortex_plugin_sdk::serde_json::json!(today))
+        .skip("due_date")
+        .set("updated_by", vortex_plugin_sdk::serde_json::json!(user.id))
+        // Commercial lines: everything (qty, price, tax, account,
+        // LHDN class, product) copies verbatim — fresh ids, re-pointed.
+        .child(ChildCopy::new("acc_invoice_line", "move_id"));
+    match spec.execute(&db, id, Some(user.id)).await {
+        Ok(new_id) => {
+            // Stored totals through the module's own recompute path —
+            // tax setup may have changed since the source was created.
+            if let Err(e) = documents::refresh_document_totals(&db, new_id).await {
+                error!("duplicate totals refresh failed: {e}");
+            }
+            audit_move_duplicated(&state, &db_ctx, &db, user.id, &user.username, new_id, id)
+                .await;
+            flash_redirect(
+                &format!("/accounting/documents/{new_id}"),
+                FlashKind::Success,
+                "Duplicated — this is a new draft; review the dates and lines, then post.",
+            )
+        }
+        Err(e) => {
+            error!("document duplicate failed: {e}");
+            flash_redirect(&back, FlashKind::Error, "Duplicate failed.")
+        }
     }
 }
 
@@ -571,33 +662,6 @@ fn doc_type_label(t: &str) -> &'static str {
     DOC_TYPES.iter().find(|(k, _)| *k == t).map(|(_, l)| *l).unwrap_or("Document")
 }
 
-async fn doc_partner_options(
-    db: &vortex_plugin_sdk::sqlx::PgPool,
-    kind: &str,
-    selected: Option<Uuid>,
-) -> String {
-    let esc = vortex_plugin_sdk::framework::html_escape;
-    let sql = if kind == "customer" {
-        "SELECT id, name FROM contacts WHERE active AND contact_type IN ('customer','both') ORDER BY name"
-    } else {
-        "SELECT id, name FROM contacts WHERE active AND contact_type IN ('supplier','both') ORDER BY name"
-    };
-    let rows = vortex_plugin_sdk::sqlx::query(sql).fetch_all(db).await.unwrap_or_default();
-    let mut out = String::new();
-    for row in rows {
-        let id: Uuid = row.get("id");
-        let name: String = row.get("name");
-        let sel = if Some(id) == selected { " selected" } else { "" };
-        out.push_str(&format!(
-            r#"<option value="{id}"{sel}>{name}</option>"#,
-            id = id,
-            sel = sel,
-            name = esc(&name)
-        ));
-    }
-    out
-}
-
 /// Side-appropriate GL accounts for a line override: revenue accounts
 /// on customer documents; expense + asset accounts on vendor bills
 /// (capex and prepayments are billed too). `(id, "code name")` pairs.
@@ -865,6 +929,7 @@ async fn list_payments(
     };
     let sidebar = render_sidebar(&state, &user, &db_ctx);
     let config = ListConfig::new("Payments", "acc_move")
+        .create("New Payment", "/accounting/payments/new")
         .custom_from(
             "acc_move m JOIN acc_journal j ON j.id = m.journal_id \
              LEFT JOIN contacts p ON p.id = m.partner_id",
@@ -918,7 +983,25 @@ async fn new_document_form(
     let sidebar = render_sidebar(&state, &user, &db_ctx);
     let kind = query.get("kind").map(String::as_str).unwrap_or("customer_invoice");
     let (family_title, family_url, partner_kind) = doc_family(kind);
-    let partners = doc_partner_options(&db, partner_kind, None).await;
+    // Partner is a typeahead over contacts (thousands of rows), scoped to the
+    // right side of the ledger. The descriptor is signed server-side, so this
+    // filter can't be tampered with by the browser.
+    let partner_filter = if partner_kind == "customer" {
+        "contact_type IN ('customer','both')"
+    } else {
+        "contact_type IN ('supplier','both')"
+    };
+    let partner_src =
+        vortex_plugin_sdk::framework::form::LookupSource::with_filter("contacts", "name", partner_filter);
+    let partner_widget = vortex_plugin_sdk::framework::form::typeahead_widget(
+        "partner_id",
+        &partner_src.encode(),
+        "",
+        "",
+        true,
+        false,
+        Some("Search partner…"),
+    );
 
     let type_options: String = DOC_TYPES
         .iter()
@@ -960,7 +1043,7 @@ async fn new_document_form(
 </div>
 <div class="form-control mb-3">
 <label class="label"><span class="label-text">Partner *</span></label>
-<select name="partner_id" class="select select-bordered select-sm" required>{partners}</select>
+{partner_widget}
 </div>
 <div class="grid grid-cols-2 gap-3">
 <div class="form-control mb-3">
@@ -985,7 +1068,7 @@ async fn new_document_form(
         family_title = family_title,
         label = doc_type_label(kind),
         type_options = type_options,
-        partners = partners,
+        partner_widget = partner_widget,
         currency_options = currency_options,
     );
     Html(page_shell(&sidebar, "New Document", &content)).into_response()
@@ -1436,23 +1519,25 @@ async fn document_detail(
             ));
         }
     }
+    // Duplicate — every state: copying a posted invoice into a fresh
+    // draft is the everyday "same invoice again" flow. Documents only;
+    // payments are re-registered, never copied.
+    if is_arap_document(&move_type) {
+        actions.push_str(&duplicate_button(&format!(
+            "/accounting/documents/{id}/duplicate"
+        )));
+        actions.push(' ');
+    }
     if is_draft {
         actions.push_str(&format!(
             r#"<form method="POST" action="/accounting/documents/{id}/post" style="display:inline">
 <button class="btn btn-success btn-sm">Post</button></form>"#
         ));
     } else if doc_state == "posted" && (payment_state == "not_paid" || payment_state == "partial") {
+        // Goes to the dedicated allocation page (partial / multi-invoice /
+        // credit-note knock-off) with this document pre-selected.
         actions.push_str(&format!(
-            r#"<form method="POST" action="/accounting/documents/{id}/pay" class="flex items-center gap-2">
-<span class="vortex-m-label">Amount</span>
-<input name="amount" type="number" step="0.01" min="0.01" value="{residual}" class="input input-bordered input-sm w-32"/>
-<span class="vortex-m-label">Pay via</span>
-<select name="journal_code" class="select select-bordered select-sm w-24">
-<option value="BNK">Bank</option><option value="CSH">Cash</option>
-</select>
-<button class="btn btn-primary btn-sm">Register Payment</button>
-</form>"#,
-            residual = money(residual),
+            r#"<a href="/accounting/payments/new?doc={id}" class="btn btn-primary btn-sm">Register Payment</a>"#
         ));
         if payment_state == "not_paid" {
             // Pre-LHDN: Malaysian practice allows reset to draft and
@@ -1571,6 +1656,8 @@ onsubmit="return confirm('Reset to draft? You can edit and repost — the docume
     };
 
     let history_panel = vortex_plugin_sdk::framework::render_audit_trail(&db, "acc_move", id).await;
+    // Activity stream: schedule/assign/complete tasks, messages, attachments.
+    let activity_panel = vortex_plugin_sdk::framework::render_chatter_panel("acc_move", id);
     let einvoice_panel = crate::handlers_einvoice::einvoice_widget(&db, id).await;
 
     let class_header = if customer_doc { "<th>Class</th>" } else { "" };
@@ -1670,6 +1757,7 @@ onsubmit="return confirm('Reset to draft? You can edit and repost — the docume
 </div></div>
 {add_line_form}
 {payments_block}
+<div class="mt-6">{activity_panel}</div>
 <div class="mt-6">{history}</div>
 </div>"#,
         family_url = family_url,
@@ -1689,6 +1777,7 @@ onsubmit="return confirm('Reset to draft? You can edit and repost — the docume
         add_line_form = add_line_form,
         payments_block = payments_block,
         history = history_panel,
+        activity_panel = activity_panel,
     );
 
     Html(page_shell(&sidebar, &format!("{number}"), &content)).into_response()
@@ -2210,5 +2299,726 @@ async fn pay_document(
             )),
         )
             .into_response(),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Register Payment — dedicated allocation page
+//
+// One page settles a partner's open items together: pay invoices/bills in
+// full or part, across several documents, and knock off credit notes — with
+// the net cash (if any) posted as a single bank/cash payment. All the ledger
+// mechanics live in `documents::settle_documents`; this is just the UI.
+// ─────────────────────────────────────────────────────────────────────────
+
+struct OpenDoc {
+    id: Uuid,
+    number: String,
+    move_type: String,
+    date: String,
+    /// Open amount in the settlement currency (document currency for FX, MYR
+    /// otherwise) — what the user allocates against.
+    residual: Decimal,
+}
+
+/// Posted, still-open items for a partner on the relevant side of the ledger:
+/// invoices/bills to settle, plus the credits that can offset them — credit
+/// notes and unapplied advance payments (deposits). Customer side for a
+/// receipt, vendor side for a payment. FX documents are excluded (settled
+/// one-by-one). A deposit is a `payment` move that was left unreconciled; its
+/// reconcilable line sits on the credit side for a customer, debit for a
+/// vendor, which is how we pick the right ones.
+/// Open items for a partner on the relevant side, in one settlement currency.
+/// `currency` is `None`/`"MYR"` for company-currency documents, else an ISO
+/// code (`"USD"`, …) for that foreign currency — the residual returned and the
+/// amounts the caller allocates are then in the document currency.
+async fn partner_open_docs(
+    db: &vortex_plugin_sdk::sqlx::PgPool,
+    partner_id: Uuid,
+    inbound: bool,
+    currency: Option<&str>,
+) -> Vec<OpenDoc> {
+    let (target, offset) = if inbound {
+        ("customer_invoice", "customer_credit_note")
+    } else {
+        ("vendor_bill", "vendor_credit_note")
+    };
+    let is_fx = matches!(currency, Some(c) if c != "MYR");
+    // Foreign settlements match in document currency; company-currency ones in
+    // MYR. `currency_rate IS NULL` marks a company-currency document.
+    let (ccy_filter, residual_col) = if is_fx {
+        (
+            "m.currency_rate IS NOT NULL AND cur.code = $5",
+            "COALESCE(m.amount_residual_currency, 0)",
+        )
+    } else {
+        ("m.currency_rate IS NULL AND $5 = $5", "m.amount_residual")
+    };
+    let sql = format!(
+        "SELECT m.id, COALESCE(m.number, '/') AS number, m.move_type, \
+                m.move_date::text AS date, {residual_col} AS residual \
+         FROM acc_move m LEFT JOIN currencies cur ON cur.id = m.currency_id \
+         WHERE m.partner_id = $1 AND m.state = 'posted' \
+           AND m.payment_state IN ('not_paid','partial') AND {residual_col} > 0 \
+           AND {ccy_filter} \
+           AND m.move_type IN ($2, $3) \
+         UNION ALL \
+         SELECT m.id, COALESCE(m.number, '/') AS number, 'payment' AS move_type, \
+                m.move_date::text AS date, {residual_col} AS residual \
+         FROM acc_move m LEFT JOIN currencies cur ON cur.id = m.currency_id \
+         WHERE m.partner_id = $1 AND m.state = 'posted' AND m.move_type = 'payment' \
+           AND m.payment_state IN ('not_paid','partial') AND {residual_col} > 0 \
+           AND {ccy_filter} \
+           AND EXISTS (SELECT 1 FROM acc_move_line l JOIN acc_account a ON a.id = l.account_id \
+                       WHERE l.move_id = m.id AND a.reconcile \
+                         AND (($4 AND l.credit > 0) OR (NOT $4 AND l.debit > 0))) \
+         ORDER BY 4, 2"
+    );
+    let rows = vortex_plugin_sdk::sqlx::query(&sql)
+        .bind(partner_id)
+        .bind(target)
+        .bind(offset)
+        .bind(inbound)
+        .bind(currency.unwrap_or("MYR"))
+        .fetch_all(db)
+        .await
+        .unwrap_or_default();
+    rows.iter()
+        .map(|r| OpenDoc {
+            id: r.get("id"),
+            number: r.get("number"),
+            move_type: r.get("move_type"),
+            date: r.get("date"),
+            residual: r.get("residual"),
+        })
+        .collect()
+}
+
+/// Partner + direction chooser, shown when the page is opened standalone
+/// (no `?doc` / `?partner`). A GET form reloads the page with the choice.
+fn payment_partner_picker() -> String {
+    let token = vortex_plugin_sdk::framework::form::LookupSource::new("contacts", "name").encode();
+    let partner = vortex_plugin_sdk::framework::form::typeahead_widget(
+        "partner",
+        &token,
+        "",
+        "",
+        true,
+        false,
+        Some("Search partner…"),
+    );
+    format!(
+        r#"<div class="max-w-md">
+<h1 class="text-2xl font-bold mb-6">Register Payment</h1>
+<form method="get" action="/accounting/payments/new" class="card bg-base-100 shadow"><div class="card-body">
+<label class="form-control mb-3"><div class="label"><span class="label-text">Partner</span></div>{partner}</label>
+<div class="form-control mb-3"><div class="label"><span class="label-text">Direction</span></div>
+<label class="label cursor-pointer justify-start gap-2"><input type="radio" name="dir" value="inbound" class="radio radio-sm" checked/> <span>Receive from customer</span></label>
+<label class="label cursor-pointer justify-start gap-2"><input type="radio" name="dir" value="outbound" class="radio radio-sm"/> <span>Pay to vendor</span></label>
+</div>
+<div class="card-actions justify-end mt-2"><button type="submit" class="btn btn-primary">Continue</button></div>
+</div></form></div>"#
+    )
+}
+
+/// Statement-of-Account launcher: a customer typeahead + date range that
+/// generates the AR/AP ledger report (`accounting.statement_of_account`) in a
+/// new tab. Reached from the sidebar or the "Statement of Account" card on a
+/// contact (which pre-fills `?partner=`).
+async fn statement_form(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let sidebar = render_sidebar(&state, &user, &db_ctx);
+    let esc = vortex_plugin_sdk::framework::html_escape;
+
+    // Optional pre-fill when arriving from a contact's statement card.
+    let (pid, pname) = match query.get("partner").and_then(|s| Uuid::parse_str(s).ok()) {
+        Some(id) => {
+            let name: String = vortex_plugin_sdk::sqlx::query_scalar(
+                "SELECT COALESCE(name,'') FROM contacts WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_optional(&db)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+            (id.to_string(), name)
+        }
+        None => (String::new(), String::new()),
+    };
+    let token = vortex_plugin_sdk::framework::form::LookupSource::new("contacts", "name").encode();
+    let partner = vortex_plugin_sdk::framework::form::typeahead_widget(
+        "partner",
+        &token,
+        &pid,
+        &pname,
+        true,
+        false,
+        Some("Search customer / vendor…"),
+    );
+    let pdf_btn = if vortex_plugin_sdk::framework::pdf::available() {
+        r#"<button type="submit" name="format" value="pdf" formaction="/accounting/statement/pdf" formtarget="_self" class="btn btn-outline">Download PDF</button>"#
+    } else {
+        ""
+    };
+    let content = format!(
+        r#"<div class="max-w-xl">
+<h1 class="text-2xl font-bold mb-1">Statement of Account</h1>
+<p class="opacity-70 mb-6">A partner's posted invoices, credit notes and payments with a running balance — the statement you send for collections.</p>
+<form method="get" action="/reports/accounting.statement_of_account" class="card bg-base-100 shadow"><div class="card-body">
+<label class="form-control mb-3"><div class="label py-0"><span class="label-text">Customer / vendor</span></div>{partner}</label>
+<div class="grid grid-cols-2 gap-3 mb-3">
+<label class="form-control"><div class="label py-0"><span class="label-text">From</span></div><input type="date" name="from" class="input input-bordered input-sm"/></label>
+<label class="form-control"><div class="label py-0"><span class="label-text">To</span></div><input type="date" name="to" class="input input-bordered input-sm"/></label>
+</div>
+<div class="card-actions justify-end gap-2">
+<button type="submit" name="format" value="html" formtarget="_blank" class="btn btn-primary">View</button>
+<button type="submit" name="format" value="csv" formtarget="_self" class="btn btn-outline">CSV</button>
+{pdf_btn}
+</div>
+</div></form>
+<p class="text-xs opacity-60 mt-3">Leave the dates blank for all time. View opens in a new tab; PDF (same generator as invoices) downloads.</p>
+</div>"#,
+        partner = partner,
+        pdf_btn = pdf_btn,
+    );
+    Html(page_shell(&sidebar, "Statement of Account", &content)).into_response()
+}
+
+/// Statement of Account as a PDF, rendered through the SAME headless-Chromium
+/// engine invoices use (`framework::pdf`). Drives the existing statement report
+/// (HTML) via `render_report`, then converts — so the letterhead, logo and
+/// ageing are identical to the on-screen statement.
+async fn statement_pdf(
+    State(state): State<Arc<AppState>>,
+    Extension(_db_ctx): Extension<DatabaseContext>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let back = match q.get("partner") {
+        Some(p) if !p.is_empty() => format!("/accounting/statement?partner={p}"),
+        _ => "/accounting/statement".to_string(),
+    };
+    if q.get("partner").map(|s| s.trim().is_empty()).unwrap_or(true) {
+        return flash_redirect(&back, FlashKind::Error, "Choose a customer for the statement.");
+    }
+    if !vortex_plugin_sdk::framework::pdf::available() {
+        return flash_redirect(
+            &back,
+            FlashKind::Error,
+            "PDF engine not enabled on this server — use View and the browser's Save as PDF.",
+        );
+    }
+    let params = vortex_plugin_sdk::framework::ReportParams {
+        format: vortex_plugin_sdk::framework::ReportFormat::Html,
+        query: q.clone(),
+    };
+    let output = match vortex_plugin_sdk::framework::render_report(
+        &state,
+        "accounting.statement_of_account",
+        params,
+    )
+    .await
+    {
+        Ok(o) => o,
+        Err(e) => {
+            return flash_redirect(&back, FlashKind::Error, &format!("Could not build statement: {e}"))
+        }
+    };
+    let html = String::from_utf8_lossy(&output.bytes);
+    let opts = vortex_plugin_sdk::framework::pdf::PdfOptions::default();
+    match vortex_plugin_sdk::framework::pdf::html_to_pdf(&html, &opts).await {
+        Ok(bytes) => (
+            [
+                (
+                    vortex_plugin_sdk::axum::http::header::CONTENT_TYPE,
+                    "application/pdf".to_string(),
+                ),
+                (
+                    vortex_plugin_sdk::axum::http::header::CONTENT_DISPOSITION,
+                    "attachment; filename=\"statement-of-account.pdf\"".to_string(),
+                ),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Err(e) => {
+            error!("statement pdf render failed: {e}");
+            flash_redirect(
+                &back,
+                FlashKind::Error,
+                "PDF rendering failed — check the server's Chromium (VORTEX_CHROMIUM).",
+            )
+        }
+    }
+}
+
+async fn new_payment_form(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let sidebar = render_sidebar(&state, &user, &db_ctx);
+    let esc = vortex_plugin_sdk::framework::html_escape;
+
+    let doc_param = query.get("doc").and_then(|s| Uuid::parse_str(s).ok());
+    let (partner_id, inbound, partner_name): (Uuid, bool, String) = if let Some(doc_id) = doc_param {
+        let row = vortex_plugin_sdk::sqlx::query(
+            "SELECT m.partner_id, m.move_type, COALESCE(c.name,'') AS pname \
+             FROM acc_move m LEFT JOIN contacts c ON c.id = m.partner_id WHERE m.id = $1",
+        )
+        .bind(doc_id)
+        .fetch_optional(&db)
+        .await
+        .ok()
+        .flatten();
+        let resolved = row.and_then(|r| {
+            let pid: Option<Uuid> = r.get("partner_id");
+            pid.map(|pid| {
+                let mt: String = r.get("move_type");
+                let name: String = r.get("pname");
+                let customer = mt.starts_with("customer");
+                let cn = mt.ends_with("credit_note");
+                (pid, customer ^ cn, name)
+            })
+        });
+        match resolved {
+            Some(t) => t,
+            None => {
+                return flash_redirect(
+                    "/accounting/payments",
+                    FlashKind::Error,
+                    "Document has no partner to pay.",
+                )
+            }
+        }
+    } else if let Some(pid) = query.get("partner").and_then(|s| Uuid::parse_str(s).ok()) {
+        let inbound = query.get("dir").map(|d| d != "outbound").unwrap_or(true);
+        let name: String = vortex_plugin_sdk::sqlx::query_scalar(
+            "SELECT COALESCE(name,'') FROM contacts WHERE id = $1",
+        )
+        .bind(pid)
+        .fetch_optional(&db)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+        (pid, inbound, name)
+    } else {
+        return Html(page_shell(&sidebar, "Register Payment", &payment_partner_picker()))
+            .into_response();
+    };
+
+    // Settlement currency: MYR (company) by default, or a foreign code chosen
+    // in the selector. Open documents, amounts and the residual are all in this
+    // currency; changing it reloads the page (see the JS currency nav).
+    let sel_currency = query
+        .get("currency")
+        .map(|s| s.trim().to_uppercase())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "MYR".to_string());
+    let is_fx = sel_currency != "MYR";
+
+    let docs = partner_open_docs(&db, partner_id, inbound, Some(&sel_currency)).await;
+    let back = match doc_param {
+        Some(d) => format!("/accounting/documents/{d}"),
+        None => "/accounting/payments".to_string(),
+    };
+    let today = vortex_plugin_sdk::chrono::Utc::now().date_naive().to_string();
+
+    // Currency options — MYR plus every active currency.
+    let ccy_codes: Vec<String> = vortex_plugin_sdk::sqlx::query_scalar(
+        "SELECT code FROM currencies WHERE active ORDER BY (code='MYR') DESC, code",
+    )
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default();
+    let ccy_options: String = if ccy_codes.is_empty() {
+        r#"<option value="MYR" selected>MYR</option>"#.to_string()
+    } else {
+        ccy_codes
+            .iter()
+            .map(|c| {
+                let sel = if *c == sel_currency { " selected" } else { "" };
+                format!(r#"<option value="{c}"{sel}>{c}</option>"#, c = esc(c), sel = sel)
+            })
+            .collect()
+    };
+    let reload_base = match doc_param {
+        Some(d) => format!("/accounting/payments/new?doc={d}"),
+        None => format!(
+            "/accounting/payments/new?partner={partner_id}&dir={}",
+            if inbound { "inbound" } else { "outbound" }
+        ),
+    };
+
+    // Write-off account choices (company-currency settlements only).
+    let writeoff_accounts: Vec<(Uuid, String, String)> = if is_fx {
+        Vec::new()
+    } else {
+        vortex_plugin_sdk::sqlx::query_as::<_, (Uuid, String, String)>(
+            "SELECT id, COALESCE(code,''), COALESCE(name,'') FROM acc_account \
+             WHERE (account_type LIKE 'income%' OR account_type LIKE 'expense%') \
+             ORDER BY code",
+        )
+        .fetch_all(&db)
+        .await
+        .unwrap_or_default()
+    };
+
+    let rows: String = docs
+        .iter()
+        .map(|d| {
+            let is_cn = d.move_type.ends_with("credit_note");
+            let is_advance = d.move_type == "payment";
+            // Credit notes and unapplied deposits both offset the cash owed.
+            let is_offset = is_cn || is_advance;
+            let type_label = if is_advance {
+                "Advance"
+            } else if is_cn {
+                "Credit Note"
+            } else if inbound {
+                "Invoice"
+            } else {
+                "Bill"
+            };
+            let badge = if is_advance {
+                "badge-info"
+            } else if is_cn {
+                "badge-warning"
+            } else {
+                "badge-ghost"
+            };
+            // Pre-tick + pre-fill the document the user came in from.
+            let checked = if Some(d.id) == doc_param { "checked" } else { "" };
+            let alloc_default = if Some(d.id) == doc_param {
+                money(d.residual)
+            } else {
+                String::new()
+            };
+            format!(
+                r#"<tr data-pay-row>
+<td class="w-8"><input type="checkbox" name="pick_{id}" value="1" {checked} data-vortex-pay-pick data-open="{open}" data-date="{rawdate}" data-offset="{off}" class="checkbox checkbox-sm"/></td>
+<td><span class="badge {badge} badge-sm">{type_label}</span></td>
+<td class="font-mono" data-pay-text>{number}</td>
+<td>{date}</td>
+<td class="text-right">{residual}</td>
+<td class="text-right"><input type="number" step="0.01" min="0" name="alloc_{id}" value="{alloc_default}" data-vortex-pay-alloc class="input input-bordered input-sm w-28 text-right font-mono" placeholder="0.00"/></td>
+</tr>"#,
+                badge = badge,
+                type_label = type_label,
+                number = esc(&d.number),
+                date = esc(&d.date),
+                rawdate = esc(&d.date),
+                residual = money(d.residual),
+                open = d.residual,
+                id = d.id,
+                off = if is_offset { 1 } else { 0 },
+                checked = checked,
+                alloc_default = alloc_default,
+            )
+        })
+        .collect();
+
+    let table = if docs.is_empty() {
+        format!(
+            r#"<div class="alert text-sm">No open {sel_currency} invoices or bills for this partner. Enter an amount above to record a standalone advance / deposit — it stays as an open credit to apply later.</div>"#,
+            sel_currency = esc(&sel_currency),
+        )
+    } else {
+        format!(
+            r#"<label class="input input-bordered input-sm flex items-center gap-2 mb-3 max-w-sm">
+<span class="opacity-50">Search</span>
+<input type="text" data-vortex-pay-search class="grow" placeholder="filter documents…"/>
+</label>
+<table class="table table-sm">
+<thead><tr>
+<th class="w-8"><input type="checkbox" data-vortex-pay-all class="checkbox checkbox-sm" title="Select all"/></th>
+<th>Type</th><th>Document</th><th>Date</th><th class="text-right">Open</th><th class="text-right">Applied</th>
+</tr></thead>
+<tbody>{rows}</tbody></table>"#
+        )
+    };
+
+    let dir_phrase = if inbound { "Receive from" } else { "Pay to" };
+    let amount_label = if inbound { "Amount received" } else { "Amount paid" };
+    let doc_hidden = match doc_param {
+        Some(d) => format!(r#"<input type="hidden" name="doc" value="{d}"/>"#),
+        None => String::new(),
+    };
+
+    // Write-off block (company-currency only). FX settlements post their
+    // realised gain/loss automatically and don't offer a manual write-off.
+    let writeoff_block = if is_fx {
+        format!(
+            r#"<div class="divider my-3"></div>
+<div class="alert alert-info text-xs"><span>Foreign-currency settlement in <strong>{ccy}</strong>: documents are matched in {ccy} and any realised FX gain/loss posts automatically at the payment-date rate. Manual write-off isn't available for FX.</span></div>"#,
+            ccy = esc(&sel_currency),
+        )
+    } else {
+        let acct_options: String = std::iter::once(
+            r#"<option value="">— none —</option>"#.to_string(),
+        )
+        .chain(writeoff_accounts.iter().map(|(id, code, name)| {
+            format!(
+                r#"<option value="{id}">{code} {name}</option>"#,
+                id = id,
+                code = esc(code),
+                name = esc(name),
+            )
+        }))
+        .collect();
+        format!(
+            r#"<div class="divider my-3">Difference (optional)</div>
+<div class="grid grid-cols-1 sm:grid-cols-2 gap-4 max-w-2xl">
+<label class="form-control"><div class="label py-0"><span class="label-text">Write-off / adjustment account</span></div>
+<select name="writeoff_account" data-vortex-pay-writeoff-acct class="select select-bordered select-sm">{acct_options}</select></label>
+<label class="form-control"><div class="label py-0"><span class="label-text">Difference amount</span></div>
+<input name="writeoff_amount" type="number" step="0.01" min="0" data-vortex-pay-writeoff class="input input-bordered input-sm text-right font-mono" placeholder="0.00"/></label>
+</div>
+<p class="text-xs opacity-60 mt-1">Use when the customer short-pays by a settlement discount, bank charge or rounding — the shortfall is written off to the chosen account and the invoice marked fully paid.</p>"#,
+        )
+    };
+
+    let content = format!(
+        r#"<div class="max-w-4xl">
+<a href="{back}" class="btn btn-ghost btn-sm mb-4">← Cancel</a>
+<h1 class="text-2xl font-bold mb-1">Register Payment</h1>
+<p class="opacity-70 mb-6">{dir_phrase} <strong>{partner_name}</strong></p>
+<form method="POST" action="/accounting/payments" data-vortex-pay>
+<input type="hidden" name="partner_id" value="{partner_id}"/>
+<input type="hidden" name="direction" value="{direction}"/>
+<input type="hidden" name="currency" value="{sel_currency}"/>
+{doc_hidden}
+<div class="card bg-base-100 shadow mb-4"><div class="card-body py-4">
+<div class="grid grid-cols-1 md:grid-cols-5 gap-4">
+<label class="form-control"><div class="label py-0"><span class="label-text">{amount_label}</span></div><input name="amount_received" type="number" step="0.01" min="0" data-vortex-pay-amount class="input input-bordered input-sm text-right font-mono" placeholder="0.00"/></label>
+<label class="form-control"><div class="label py-0"><span class="label-text">Currency</span></div><select data-vortex-pay-currency data-reload="{reload_base}" class="select select-bordered select-sm">{ccy_options}</select></label>
+<label class="form-control"><div class="label py-0"><span class="label-text">Payment date</span></div><input name="payment_date" type="date" value="{today}" class="input input-bordered input-sm"/></label>
+<label class="form-control"><div class="label py-0"><span class="label-text">Pay via</span></div><select name="journal_code" class="select select-bordered select-sm"><option value="BNK">Bank</option><option value="CSH">Cash</option></select></label>
+<label class="form-control"><div class="label py-0"><span class="label-text">Reference</span></div><input name="memo" maxlength="120" class="input input-bordered input-sm" placeholder="optional"/></label>
+</div>
+</div></div>
+<div class="card bg-base-100 shadow"><div class="card-body">
+<div class="flex items-center justify-between mb-2">
+<h2 class="text-sm font-semibold uppercase opacity-60">Open items to knock off ({sel_currency})</h2>
+<button type="button" data-vortex-pay-auto class="btn btn-ghost btn-xs">Auto-fill oldest first</button>
+</div>
+<p class="text-xs opacity-60 mb-3">Tick the documents to settle — the amount is spread oldest-first into <em>Applied</em>, which you can override per row for a directed split. Credit notes and advances fund the balance; any excess cash is kept as an advance.</p>
+{table}
+{writeoff_block}
+<div class="divider my-3"></div>
+<div class="grid grid-cols-2 sm:grid-cols-4 gap-2 text-sm">
+<div class="flex justify-between"><span class="opacity-70">Applied</span><span class="font-mono font-semibold" data-pay-allocated>0.00</span></div>
+<div class="flex justify-between"><span class="opacity-70">Write-off</span><span class="font-mono font-semibold" data-pay-writeoff-total>0.00</span></div>
+<div class="flex justify-between"><span class="opacity-70">Advance</span><span class="font-mono font-semibold" data-pay-advance>0.00</span></div>
+<div class="flex justify-between"><span class="opacity-70">Unfunded</span><span class="font-mono font-semibold" data-pay-shortfall>0.00</span></div>
+</div>
+<div class="card-actions justify-end mt-4">
+<a href="{back}" class="btn btn-ghost">Cancel</a>
+<button type="submit" class="btn btn-primary">Register Payment</button>
+</div>
+</div></div>
+</form></div>"#,
+        back = back,
+        dir_phrase = dir_phrase,
+        partner_name = esc(&partner_name),
+        partner_id = partner_id,
+        direction = if inbound { "inbound" } else { "outbound" },
+        sel_currency = esc(&sel_currency),
+        doc_hidden = doc_hidden,
+        amount_label = amount_label,
+        reload_base = esc(&reload_base),
+        ccy_options = ccy_options,
+        today = esc(&today),
+        table = table,
+        writeoff_block = writeoff_block,
+    );
+
+    Html(page_shell(&sidebar, "Register Payment", &content)).into_response()
+}
+
+async fn create_payment(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    vortex_plugin_sdk::axum::extract::Form(form): vortex_plugin_sdk::axum::extract::Form<
+        HashMap<String, String>,
+    >,
+) -> Response {
+    let origin = form.get("doc").and_then(|s| Uuid::parse_str(s).ok());
+    let back = match origin {
+        Some(d) => format!("/accounting/documents/{d}"),
+        None => "/accounting/payments".to_string(),
+    };
+    let Some(partner_id) = form.get("partner_id").and_then(|s| Uuid::parse_str(s).ok()) else {
+        return flash_redirect(&back, FlashKind::Error, "Choose a partner first.");
+    };
+    let inbound = form.get("direction").map(|d| d != "outbound").unwrap_or(true);
+    let journal_code = form
+        .get("journal_code")
+        .map(String::as_str)
+        .filter(|s| *s == "BNK" || *s == "CSH")
+        .unwrap_or("BNK")
+        .to_string();
+    let payment_date = date_or_today(&form, "payment_date");
+    let memo = opt_str(&form, "memo");
+    let company_id = default_company(&db).await;
+
+    // The cash that arrived, in the settlement currency (blank = pure
+    // credit-note / write-off application).
+    let amount_received: Decimal = dec_or_zero(&form, "amount_received");
+    let currency_code = form
+        .get("currency")
+        .map(|s| s.trim().to_uppercase())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "MYR".to_string());
+    let is_fx = currency_code != "MYR";
+
+    // Selected rows and their directed amounts. A row counts as selected if
+    // its checkbox is ticked (`pick_{uuid}`) OR the user typed a positive
+    // amount into its Applied field (`alloc_{uuid}`) — typing an amount is
+    // itself an intent to allocate. A ticked row with no explicit amount means
+    // "settle it in full", passed as an oversized amount that post_settlement
+    // clamps to the open balance; an explicit amount always wins.
+    let mut selected: std::collections::HashMap<Uuid, Decimal> = std::collections::HashMap::new();
+    for k in form.keys() {
+        if let Some(rest) = k.strip_prefix("pick_") {
+            if let Ok(id) = Uuid::parse_str(rest) {
+                selected.entry(id).or_insert(Decimal::MAX);
+            }
+        }
+    }
+    for k in form.keys() {
+        if let Some(rest) = k.strip_prefix("alloc_") {
+            if let Ok(id) = Uuid::parse_str(rest) {
+                if let Some(amt) = form
+                    .get(k)
+                    .and_then(|s| s.trim().parse::<Decimal>().ok())
+                    .filter(|d| *d > Decimal::ZERO)
+                {
+                    selected.insert(id, amt); // explicit amount overrides "full"
+                }
+            }
+        }
+    }
+    let picked_ids: Vec<Uuid> = selected.keys().copied().collect();
+    let allocations: Vec<documents::Allocation> = selected
+        .iter()
+        .map(|(id, amount)| documents::Allocation { doc_id: *id, amount: *amount })
+        .collect();
+
+    if picked_ids.is_empty() && amount_received <= Decimal::ZERO {
+        return flash_redirect(
+            &back,
+            FlashKind::Error,
+            "Enter the amount received, or select at least one document.",
+        );
+    }
+
+    // ── Foreign-currency settlement ─────────────────────────────────
+    // Post one payment in the document currency; register_payment reconciles
+    // it against the picks (oldest-first) and posts any realised FX gain/loss.
+    if is_fx {
+        if amount_received <= Decimal::ZERO {
+            return flash_redirect(
+                &back,
+                FlashKind::Error,
+                &format!("Enter the amount received in {currency_code}."),
+            );
+        }
+        let mut ordered = picked_ids.clone();
+        if !ordered.is_empty() {
+            if let Ok(rows) = vortex_plugin_sdk::sqlx::query_scalar::<_, Uuid>(
+                "SELECT id FROM acc_move WHERE id = ANY($1) ORDER BY move_date, number",
+            )
+            .bind(&ordered)
+            .fetch_all(&db)
+            .await
+            {
+                ordered = rows;
+            }
+        }
+        let pay = NewPayment {
+            partner_id,
+            direction: if inbound {
+                PaymentDirection::Inbound
+            } else {
+                PaymentDirection::Outbound
+            },
+            journal_code: &journal_code,
+            currency_code: Some(&currency_code),
+            amount: amount_received,
+            payment_date,
+            memo,
+            company_id,
+            allocate_to: ordered,
+        };
+        return match documents::register_payment(&db, &state.pool, user.id, &pay).await {
+            Ok(pid) => {
+                for id in &picked_ids {
+                    audit_move(&state, &db_ctx, &db, user.id, &user.username, *id, "payment_registered").await;
+                }
+                audit_move(&state, &db_ctx, &db, user.id, &user.username, pid, "payment_registered").await;
+                let to = if origin.is_some() { back } else { format!("/accounting/moves/{pid}") };
+                flash_redirect(&to, FlashKind::Success, "Payment registered and applied.")
+            }
+            Err(e) => flash_redirect(&back, FlashKind::Error, &format!("Could not register payment: {e}")),
+        };
+    }
+
+    // ── Company-currency settlement ─────────────────────────────────
+    // Directed per-document amounts + optional write-off difference.
+    let writeoff_amount = dec_or_zero(&form, "writeoff_amount");
+    let writeoff_account = form.get("writeoff_account").and_then(|s| Uuid::parse_str(s).ok());
+    if writeoff_amount > Decimal::ZERO && writeoff_account.is_none() {
+        return flash_redirect(
+            &back,
+            FlashKind::Error,
+            "Choose an account for the write-off difference.",
+        );
+    }
+    let write_off = match (writeoff_account, writeoff_amount > Decimal::ZERO) {
+        (Some(account_id), true) => Some(documents::WriteOff { account_id, amount: writeoff_amount }),
+        _ => None,
+    };
+
+    match documents::post_settlement(
+        &db, &state.pool, user.id, partner_id, inbound, &journal_code, payment_date, memo,
+        company_id, amount_received, &allocations, write_off,
+    )
+    .await
+    {
+        Ok(payment_id) => {
+            for id in &picked_ids {
+                audit_move(&state, &db_ctx, &db, user.id, &user.username, *id, "payment_registered").await;
+            }
+            if let Some(pid) = payment_id {
+                audit_move(&state, &db_ctx, &db, user.id, &user.username, pid, "payment_registered").await;
+            }
+            let msg = if picked_ids.is_empty() {
+                "Advance payment recorded."
+            } else if payment_id.is_some() {
+                "Payment registered and applied."
+            } else {
+                "Credits applied."
+            };
+            let to = if origin.is_some() {
+                back
+            } else if let Some(pid) = payment_id {
+                format!("/accounting/moves/{pid}")
+            } else {
+                back
+            };
+            flash_redirect(&to, FlashKind::Success, msg)
+        }
+        Err(e) => flash_redirect(&back, FlashKind::Error, &format!("Could not register payment: {e}")),
     }
 }

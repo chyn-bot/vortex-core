@@ -33,12 +33,14 @@ pub mod doc_email;
 pub mod documents;
 pub mod einvois;
 pub mod handlers;
+pub mod model;
 pub mod handlers_assets;
 pub mod handlers_banking;
 pub mod handlers_closing;
 pub mod handlers_currency;
 pub mod handlers_documents;
 pub mod handlers_einvoice;
+pub mod handlers_payment_terms;
 pub mod handlers_tax;
 pub mod plugin;
 pub mod recurring;
@@ -47,6 +49,7 @@ pub mod service;
 pub mod tax;
 
 pub use plugin::AccountingPlugin;
+pub use model::{AccAccount, AccMove};
 pub use documents::{
     create_invoice, post_invoice, refresh_document_totals, refresh_payment_state,
     register_payment, InvoiceLine, NewInvoice, NewPayment, PaymentDirection,

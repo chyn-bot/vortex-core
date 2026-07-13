@@ -17,6 +17,51 @@ const CONTACT_SEQ: vortex_plugin_sdk::orm::sequence::SequenceSpec =
     vortex_plugin_sdk::orm::sequence::SequenceSpec::new("contacts.code", "CNT")
         .with_padding(6);
 
+/// Built-in contact fields a custom field can be anchored *after* (rendered
+/// inline right below that field). Any other anchor — or none — falls to the
+/// bottom "Custom Fields" section, so nothing is ever silently dropped.
+const CONTACT_ANCHORS: &[&str] = &[
+    "name", "contact_type", "vat_number", "credit_limit", "email", "phone", "mobile", "notes",
+];
+
+/// The custom-field HTML for a contact form: one inline group per anchor plus
+/// the bottom section for everything unplaced. `record_id` is `None` on create.
+struct ContactCustom {
+    name: String,
+    contact_type: String,
+    vat_number: String,
+    credit_limit: String,
+    email: String,
+    phone: String,
+    mobile: String,
+    notes: String,
+    /// Bottom "Custom Fields" card (unanchored + anchors this form can't place).
+    bottom: String,
+}
+
+async fn contact_custom(db: &vortex_plugin_sdk::sqlx::PgPool, record_id: Option<&str>) -> ContactCustom {
+    use vortex_plugin_sdk::framework::custom_fields as cf;
+    let g = |anchor: &'static str| cf::render_anchor_group(db, "contacts", record_id, anchor);
+    let bottom_inner = cf::render_unplaced_section(db, "contacts", record_id, CONTACT_ANCHORS).await;
+    ContactCustom {
+        name: g("name").await,
+        contact_type: g("contact_type").await,
+        vat_number: g("vat_number").await,
+        credit_limit: g("credit_limit").await,
+        email: g("email").await,
+        phone: g("phone").await,
+        mobile: g("mobile").await,
+        notes: g("notes").await,
+        bottom: if bottom_inner.is_empty() {
+            String::new()
+        } else {
+            format!(
+                r#"<div class="card bg-base-100 shadow mt-6"><div class="card-body">{bottom_inner}</div></div>"#
+            )
+        },
+    }
+}
+
 /// Build the contacts route set.
 pub fn contacts_routes() -> Router<Arc<AppState>> {
     Router::new()
@@ -27,6 +72,7 @@ pub fn contacts_routes() -> Router<Arc<AppState>> {
         .route("/contacts/{id}", post(update_contact))
         .route("/contacts/{id}/archive", post(archive_contact))
         .route("/contacts/{id}/unarchive", post(unarchive_contact))
+        .route("/contacts/{id}/duplicate", post(duplicate_contact))
         .route("/contacts/{id}/status/{state}", post(change_contact_status))
 }
 
@@ -39,8 +85,8 @@ fn page_shell(sidebar: &str, title: &str, content: &str) -> String {
 <title>{title} - Vortex</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=4" rel="stylesheet"/>
-<script src="/static/vortex.js?v=4" defer></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script>
 <script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
@@ -238,6 +284,11 @@ async fn new_contact_form(
         }
     }
 
+    // Admin-defined custom fields (Initiative #2). Anchored fields render inline
+    // right after their built-in field; the rest fall to the bottom section. A
+    // field added in Settings ▸ Custom Fields shows here without a code change.
+    let cc = contact_custom(&db, None).await;
+
     let content = format!(
         r#"<a href="/contacts" class="btn btn-ghost btn-sm mb-2">← Back to Contacts</a>
 <h1 class="text-2xl font-bold mb-6">New Contact</h1>
@@ -253,6 +304,7 @@ async fn new_contact_form(
 <label class="label"><span class="label-text">Name *</span></label>
 <input name="name" class="input input-bordered input-sm" required/>
 </div>
+{cf_name}
 <div class="form-control mb-3">
 <label class="label"><span class="label-text">Type</span></label>
 <select name="contact_type" class="select select-bordered select-sm">
@@ -262,6 +314,7 @@ async fn new_contact_form(
 <option value="other">Other</option>
 </select>
 </div>
+{cf_ctype}
 <div class="form-control mb-3">
 <label class="cursor-pointer label justify-start gap-3">
 <input type="checkbox" name="is_company" class="checkbox checkbox-sm"/>
@@ -272,10 +325,12 @@ async fn new_contact_form(
 <label class="label"><span class="label-text">VAT Number</span></label>
 <input name="vat_number" class="input input-bordered input-sm"/>
 </div>
+{cf_vat}
 <div class="form-control mb-3">
 <label class="label"><span class="label-text">Credit Limit</span></label>
 <input name="credit_limit" type="number" step="0.01" class="input input-bordered input-sm"/>
 </div>
+{cf_credit}
 <div class="form-control mb-3">
 <label class="cursor-pointer label justify-start gap-3">
 <input type="checkbox" name="active" class="checkbox checkbox-sm" checked/>
@@ -294,14 +349,17 @@ async fn new_contact_form(
 <label class="label"><span class="label-text">Email</span></label>
 <input name="email" type="email" autocomplete="email" class="input input-bordered input-sm"/>
 </div>
+{cf_email}
 <div class="form-control mb-3">
 <label class="label"><span class="label-text">Phone</span></label>
 <input name="phone" type="tel" inputmode="tel" class="input input-bordered input-sm"/>
 </div>
+{cf_phone}
 <div class="form-control mb-3">
 <label class="label"><span class="label-text">Mobile</span></label>
 <input name="mobile" type="tel" inputmode="tel" class="input input-bordered input-sm"/>
 </div>
+{cf_mobile}
 </div>
 </div>
 
@@ -376,13 +434,23 @@ async function loadStates(countryId) {{
 <label class="label"><span class="label-text">Notes</span></label>
 <textarea name="notes" class="textarea textarea-bordered" rows="3"></textarea>
 </div>
-
+{cf_notes}
+{bottom}
 <div class="mt-6 flex gap-2">
 <button type="submit" class="btn btn-primary btn-sm">Create</button>
 <a href="/contacts" class="btn btn-ghost btn-sm">Cancel</a>
 </div>
 </form>"#,
         country_options = country_options,
+        cf_name = cc.name,
+        cf_ctype = cc.contact_type,
+        cf_vat = cc.vat_number,
+        cf_credit = cc.credit_limit,
+        cf_email = cc.email,
+        cf_phone = cc.phone,
+        cf_mobile = cc.mobile,
+        cf_notes = cc.notes,
+        bottom = cc.bottom,
     );
 
     Html(page_shell(&sidebar, "New Contact", &content)).into_response()
@@ -482,6 +550,17 @@ async fn create_contact(
             vortex_plugin_sdk::axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             format!("Failed to create contact: {e}"),
         ).into_response();
+    }
+
+    // Persist admin-defined custom field values (Initiative #2). Non-fatal: the
+    // contact exists either way, so a custom-value hiccup only gets logged.
+    let custom_pairs: Vec<(String, String)> = form.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    if let Err(e) = vortex_plugin_sdk::framework::custom_fields::save_values(
+        &db, "contacts", contact_id, &custom_pairs,
+    )
+    .await
+    {
+        error!(error = %e, "custom field save failed");
     }
 
     // Audit: log the creation via the WORM ledger.
@@ -619,6 +698,11 @@ async fn edit_contact(
     // Per-record audit trail (reusable core widget over the WORM ledger).
     let history_panel = vortex_plugin_sdk::framework::render_audit_trail(&db, "contact", id).await;
 
+    // On-record activity stream: schedule tasks, assign to a colleague for
+    // review, mark complete — plus messages and attachments. Core primitive,
+    // same slot on every module's record page.
+    let activity_panel = vortex_plugin_sdk::framework::render_chatter_panel("contacts", id);
+
     // Status section: display-only progress bar + role-gated transition
     // buttons, plus a lock banner when the current stage is locked.
     let status_change_base = format!("/contacts/{}/status", id);
@@ -674,13 +758,43 @@ async fn edit_contact(
     let record_panels =
         vortex_plugin_sdk::framework::render_record_panels(&state, &db, "contacts", id).await;
 
+    // "Invite to portal" — the host's external portal lives at /portal; from a
+    // customer record an admin can provision self-service access. Shown only to
+    // admins, only for customers; the label reflects whether a login exists.
+    let portal_button = if user.is_admin() && matches!(contact_type.as_str(), "customer" | "both") {
+        let has_login = vortex_plugin_sdk::sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM users WHERE contact_id = $1 AND is_portal = true",
+        )
+        .bind(id)
+        .fetch_one(&db)
+        .await
+        .map(|n| n > 0)
+        .unwrap_or(false);
+        let label = if has_login { "Portal access" } else { "Invite to portal" };
+        format!(
+            r#"<a href="/settings/portal-users/contact/{id}" class="btn btn-sm btn-outline">{label}</a>"#,
+            id = id, label = label,
+        )
+    } else {
+        String::new()
+    };
+
+    // Admin-defined custom fields (Initiative #2), prefilled from stored values.
+    // Anchored ones render inline after their field; the rest sit at the bottom.
+    let ids = id.to_string();
+    let cc = contact_custom(&db, Some(&ids)).await;
+
     let content = format!(
         r#"<div class="flex items-center justify-between mb-6">
 <div>
 <a href="/contacts" class="btn btn-ghost btn-sm mb-2">← Back to Contacts</a>
 <h1 class="text-2xl font-bold">{name} <span class="text-base-content/40 font-mono text-sm">{code}</span></h1>
 </div>
+<div class="flex items-center gap-2">
+{portal_button}
+{duplicate_button}
 {archive_button}
+</div>
 </div>
 
 {status_bar}
@@ -699,6 +813,7 @@ async fn edit_contact(
 <label class="label"><span class="label-text">Name *</span></label>
 <input name="name" class="input input-bordered input-sm" value="{name_val}" required/>
 </div>
+{cf_name}
 <div class="form-control mb-3">
 <label class="label"><span class="label-text">Type</span></label>
 <select name="contact_type" class="select select-bordered select-sm">
@@ -708,6 +823,7 @@ async fn edit_contact(
 <option value="other" {sel_other}>Other</option>
 </select>
 </div>
+{cf_ctype}
 <div class="form-control mb-3">
 <label class="cursor-pointer label justify-start gap-3">
 <input type="checkbox" name="is_company" class="checkbox checkbox-sm" {is_company_checked}/>
@@ -718,10 +834,12 @@ async fn edit_contact(
 <label class="label"><span class="label-text">VAT Number</span></label>
 <input name="vat_number" class="input input-bordered input-sm" value="{vat}"/>
 </div>
+{cf_vat}
 <div class="form-control mb-3">
 <label class="label"><span class="label-text">Credit Limit</span></label>
 <input name="credit_limit" type="number" step="0.01" class="input input-bordered input-sm" value="{credit}"/>
 </div>
+{cf_credit}
 <div class="form-control mb-3">
 <label class="cursor-pointer label justify-start gap-3">
 <input type="checkbox" name="active" class="checkbox checkbox-sm" {active_checked}/>
@@ -740,14 +858,17 @@ async fn edit_contact(
 <label class="label"><span class="label-text">Email</span></label>
 <input name="email" type="email" autocomplete="email" class="input input-bordered input-sm" value="{email_val}"/>
 </div>
+{cf_email}
 <div class="form-control mb-3">
 <label class="label"><span class="label-text">Phone</span></label>
 <input name="phone" type="tel" inputmode="tel" class="input input-bordered input-sm" value="{phone_val}"/>
 </div>
+{cf_phone}
 <div class="form-control mb-3">
 <label class="label"><span class="label-text">Mobile</span></label>
 <input name="mobile" type="tel" inputmode="tel" class="input input-bordered input-sm" value="{mobile_val}"/>
 </div>
+{cf_mobile}
 </div>
 </div>
 
@@ -823,7 +944,8 @@ async function loadStates(countryId) {{
 <label class="label"><span class="label-text">Notes</span></label>
 <textarea name="notes" class="textarea textarea-bordered" rows="3">{notes_val}</textarea>
 </div>
-
+{cf_notes}
+{bottom}
 <div class="mt-6 flex gap-2">
 <button type="submit" class="btn btn-primary btn-sm">Save</button>
 <a href="/contacts" class="btn btn-ghost btn-sm">Cancel</a>
@@ -831,8 +953,11 @@ async function loadStates(countryId) {{
 </fieldset>
 </form>
 
+{activity_panel}
+
 {history_panel}"#,
         id = id,
+        activity_panel = activity_panel,
         name = esc(&name),
         code = esc(code.as_deref().unwrap_or("")),
         name_val = esc(&name),
@@ -849,6 +974,15 @@ async function loadStates(countryId) {{
         vat = esc(vat_number.as_deref().unwrap_or("")),
         credit = credit_limit.map(|c| format!("{:.2}", c)).unwrap_or_default(),
         notes_val = esc(notes.as_deref().unwrap_or("")),
+        cf_name = cc.name,
+        cf_ctype = cc.contact_type,
+        cf_vat = cc.vat_number,
+        cf_credit = cc.credit_limit,
+        cf_email = cc.email,
+        cf_phone = cc.phone,
+        cf_mobile = cc.mobile,
+        cf_notes = cc.notes,
+        bottom = cc.bottom,
         sel_cust = sel(&contact_type, "customer"),
         sel_supp = sel(&contact_type, "supplier"),
         sel_both = sel(&contact_type, "both"),
@@ -859,7 +993,9 @@ async function loadStates(countryId) {{
         status_bar = status_bar,
         approval_panel = approval_panel,
         form_disabled = form_disabled,
+        duplicate_button = duplicate_button(&format!("/contacts/{id}/duplicate")),
         archive_button = archive_button,
+        portal_button = portal_button,
     );
 
     Html(page_shell(&sidebar, &format!("Edit {}", name), &content)).into_response()
@@ -1089,6 +1225,16 @@ async fn update_contact(
     )
     .await;
 
+    // Persist admin-defined custom field values (Initiative #2) from the same
+    // submission. Non-fatal — the contact update already succeeded.
+    if let Err(e) = vortex_plugin_sdk::framework::custom_fields::save_values(
+        &db, "contacts", id, &pairs,
+    )
+    .await
+    {
+        error!(error = %e, "custom field save failed");
+    }
+
     info!(id = %id, name = %name, "contact updated");
     // Stay on the record — one Save now persists contact + panel
     // fields, and returning here makes that visible.
@@ -1170,4 +1316,80 @@ async fn unarchive_contact(
 
     info!(id = %id, "contact un-archived");
     vortex_plugin_sdk::axum::response::Redirect::to(&format!("/contacts/{id}")).into_response()
+}
+
+/// POST /contacts/:id/duplicate — copy the contact into a fresh, active
+/// draft: new sequence code, name marked "(copy)", lifecycle reset.
+async fn duplicate_contact(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<Uuid>,
+) -> Response {
+    // Draw a fresh contact code — `code` is unique per company, so the
+    // copy can never reuse the source's number.
+    let code = match vortex_plugin_sdk::orm::sequence::next(&state.pool, &CONTACT_SEQ).await {
+        Ok(c) => c,
+        Err(e) => {
+            error!(error = %e, "duplicate sequence draw failed");
+            return (
+                vortex_plugin_sdk::axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to generate contact code",
+            ).into_response();
+        }
+    };
+
+    // Lifecycle columns fall back to their DB defaults: the duplicate
+    // comes out active (even when the source is archived) and back at the
+    // initial `record_state`. `updated_by` is a stale editor stamp — the
+    // copy hasn't been edited yet. `created_by` is stamped by execute().
+    // Tags (`contact_tag_rel`) are copied separately below — the rel table
+    // has a composite PK and no `id` column, so `ChildCopy` doesn't apply.
+    // Cross-plugin record-panel data (e.g. accounting's tax identity)
+    // belongs to its owning plugin and is deliberately NOT copied.
+    let spec = DuplicateSpec::new("contacts")
+        .set("code", json!(code))
+        .copy_suffix("name")
+        .skip("record_state")
+        .skip("active")
+        .skip("updated_by");
+    let new_id = match spec.execute(&db, id, Some(user.id)).await {
+        Ok(new_id) => new_id,
+        Err(e) => {
+            error!(error = %e, "contact duplicate failed");
+            return (
+                vortex_plugin_sdk::axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "Duplicate failed",
+            ).into_response();
+        }
+    };
+
+    // Carry the source's tags over to the copy (best-effort: a tag
+    // failure must not orphan the already-created contact).
+    if let Err(e) = vortex_plugin_sdk::sqlx::query(
+        "INSERT INTO contact_tag_rel (contact_id, tag_id) \
+         SELECT $1, tag_id FROM contact_tag_rel WHERE contact_id = $2",
+    )
+    .bind(new_id)
+    .bind(id)
+    .execute(&db)
+    .await
+    {
+        error!(error = %e, "copying contact tags failed");
+    }
+
+    let audit_entry = vortex_plugin_sdk::security::AuditEntry::new(
+        vortex_plugin_sdk::security::AuditAction::RecordCreated,
+        vortex_plugin_sdk::security::AuditSeverity::Info,
+    )
+    .with_user(vortex_plugin_sdk::common::UserId(user.id))
+    .with_username(&user.username)
+    .with_database(&db_ctx.db_name)
+    .with_resource("contact", new_id.to_string())
+    .with_details(json!({ "duplicated_from": id, "code": code }));
+    let _ = state.audit.log(audit_entry).await;
+
+    info!(id = %new_id, source = %id, code = %code, "contact duplicated");
+    vortex_plugin_sdk::axum::response::Redirect::to(&format!("/contacts/{new_id}")).into_response()
 }

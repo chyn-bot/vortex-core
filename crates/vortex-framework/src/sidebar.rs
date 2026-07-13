@@ -47,6 +47,32 @@ pub fn build_sidebar(
     plugin_registry: &PluginRegistry,
     user_roles: &[String],
 ) -> String {
+    let nav_html =
+        build_sidebar_nav(active_page, installed, is_admin, plugin_registry, user_roles);
+    format!(r##"<aside id="sidebar" class="w-64 bg-base-100 shadow-lg flex flex-col fixed top-0 left-0 z-40 h-full -translate-x-full transition-transform duration-200 lg:translate-x-0 lg:sticky lg:top-0 lg:h-screen lg:self-start overflow-y-auto">
+<div class="p-4 border-b border-base-300"><a href="/home" class="text-xl font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a></div>
+<nav class="flex-1 p-4 overflow-y-auto"><ul class="menu menu-sm gap-1">{}</ul></nav>
+<div class="p-4 border-t border-base-300"><div class="flex items-center gap-3">
+<div class="avatar placeholder"><div class="bg-primary text-primary-content rounded-full w-10"><span>{}</span></div></div>
+<div class="flex-1 min-w-0"><p class="font-medium truncate">{}</p></div>
+<button onclick="(function(){{var h=document.documentElement,c=h.getAttribute('data-theme')==='dark'?'corporate':'dark';h.setAttribute('data-theme',c);localStorage.setItem('theme',c);document.querySelectorAll('.theme-icon-sun,.theme-icon-moon').forEach(function(e){{e.classList.toggle('hidden')}})}})();" class="btn btn-ghost btn-sm btn-square" title="Toggle theme"><svg class="theme-icon-sun w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5" stroke-width="2"/><path stroke-linecap="round" stroke-width="2" d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg><svg class="theme-icon-moon w-5 h-5 hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg></button>
+<form action="/auth/logout" method="POST"><button type="submit" class="btn btn-ghost btn-sm">Logout</button></form>
+</div></div>
+</aside>"##, nav_html, initials, user_name)
+}
+
+/// Render just the inner navigation `<li>` items (core + plugin), without
+/// the surrounding `<aside>` / user-footer chrome. The generic model views
+/// (list / kanban / graph / calendar / pivot) embed this inside their own
+/// `<ul class="menu">` slot so they show the same aggregated menu as every
+/// plugin page instead of the sparse `ir_ui_menu` fallback.
+pub fn build_sidebar_nav(
+    active_page: &str,
+    installed: &HashSet<String>,
+    is_admin: bool,
+    plugin_registry: &PluginRegistry,
+    user_roles: &[String],
+) -> String {
     let mut nav_html = String::new();
 
     // ─── Core items (host-owned) ───────────────────────────────
@@ -62,10 +88,12 @@ pub fn build_sidebar(
     let active = if active_page == "reports" { " active" } else { "" };
     nav_html.push_str(&format!(r##"<li><a href="/reports" class="{}"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 17v-6h13M9 5h13M5 5h.01M5 11h.01M5 17h.01"/></svg>Reports</a></li>"##, active));
 
-    if is_admin {
-        let active = if active_page == "dashboard" { " active" } else { "" };
-        nav_html.push_str(&format!(r##"<li><a href="/dashboard" class="{}"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/></svg>Dashboard</a></li>"##, active));
+    // Dashboards — visible to all; the page shows the user's own boards plus
+    // any shared ones (admins see all).
+    let active = if active_page == "dashboards" { " active" } else { "" };
+    nav_html.push_str(&format!(r##"<li><a href="/dashboards" class="{}"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 5a1 1 0 011-1h4a1 1 0 011 1v6a1 1 0 01-1 1H5a1 1 0 01-1-1V5zM14 5a1 1 0 011-1h4a1 1 0 011 1v2a1 1 0 01-1 1h-4a1 1 0 01-1-1V5zM14 13a1 1 0 011-1h4a1 1 0 011 1v6a1 1 0 01-1 1h-4a1 1 0 01-1-1v-6zM4 17a1 1 0 011-1h4a1 1 0 011 1v2a1 1 0 01-1 1H5a1 1 0 01-1-1v-2z"/></svg>Dashboards</a></li>"##, active));
 
+    if is_admin {
         let active = if active_page == "audit" { " active" } else { "" };
         nav_html.push_str(&format!(r##"<li><a href="/audit" class="{}"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01"/></svg>Audit Log</a></li>"##, active));
 
@@ -140,16 +168,7 @@ pub fn build_sidebar(
         }
     }
 
-    format!(r##"<aside id="sidebar" class="w-64 bg-base-100 shadow-lg flex flex-col fixed top-0 left-0 z-40 h-full -translate-x-full transition-transform duration-200 lg:translate-x-0 lg:sticky lg:top-0 lg:h-screen lg:self-start overflow-y-auto">
-<div class="p-4 border-b border-base-300"><a href="/home" class="text-xl font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a></div>
-<nav class="flex-1 p-4 overflow-y-auto"><ul class="menu menu-sm gap-1">{}</ul></nav>
-<div class="p-4 border-t border-base-300"><div class="flex items-center gap-3">
-<div class="avatar placeholder"><div class="bg-primary text-primary-content rounded-full w-10"><span>{}</span></div></div>
-<div class="flex-1 min-w-0"><p class="font-medium truncate">{}</p></div>
-<button onclick="(function(){{var h=document.documentElement,c=h.getAttribute('data-theme')==='dark'?'corporate':'dark';h.setAttribute('data-theme',c);localStorage.setItem('theme',c);document.querySelectorAll('.theme-icon-sun,.theme-icon-moon').forEach(function(e){{e.classList.toggle('hidden')}})}})();" class="btn btn-ghost btn-sm btn-square" title="Toggle theme"><svg class="theme-icon-sun w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5" stroke-width="2"/><path stroke-linecap="round" stroke-width="2" d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg><svg class="theme-icon-moon w-5 h-5 hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg></button>
-<form action="/auth/logout" method="POST"><button type="submit" class="btn btn-ghost btn-sm">Logout</button></form>
-</div></div>
-</aside>"##, nav_html, initials, user_name)
+    nav_html
 }
 
 /// Turn a technical name like `"field_service"` into a display
@@ -291,6 +310,28 @@ mod tests {
         assert!(html.contains("Leads"));
         assert!(html.contains("Field Service"));
         assert!(html.contains("/crm/leads"));
+    }
+
+    #[test]
+    fn sidebar_nav_is_bare_li_items_embedded_in_full_sidebar() {
+        // The generic model views (list/kanban/graph/calendar/pivot) drop
+        // build_sidebar_nav() into their own <ul class="menu"> slot, so it must
+        // contain the aggregated menu items but none of the <aside>/user chrome.
+        // And build_sidebar() must embed exactly that nav verbatim — proving the
+        // split is behaviour-preserving for existing full-sidebar callers.
+        let mut r = PluginRegistry::new();
+        r.register(Arc::new(Dummy));
+        let installed: HashSet<String> = ["field_service".to_string()].into_iter().collect();
+
+        let nav = build_sidebar_nav("home", &installed, true, &r, &[]);
+        assert!(nav.contains("Leads"), "nav should carry plugin entries");
+        assert!(nav.contains(r#"href="/home""#), "nav should carry core entries");
+        assert!(!nav.contains("<aside"), "nav must not include the aside chrome");
+        assert!(!nav.contains("Logout"), "nav must not include the user footer");
+
+        let full = build_sidebar("home", "Alice", "AL", &installed, true, &r, &[]);
+        assert!(full.contains("<aside"), "full sidebar keeps the aside chrome");
+        assert!(full.contains(&nav), "full sidebar embeds the bare nav verbatim");
     }
 
     #[test]

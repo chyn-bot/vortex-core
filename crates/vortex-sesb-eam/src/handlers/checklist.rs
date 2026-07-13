@@ -142,11 +142,13 @@ async fn edit_tpl(
         id = id, itypes = enum_options(INPUT_TYPES, "pass_fail"));
 
     let header = form_header("/sesb-eam/checklist-templates", "Back to Templates", &format!("Edit {}", name));
+    let activity_panel = vortex_plugin_sdk::framework::render_chatter_panel("eam_checklist_tpl", id);
     let content = format!(
         r#"{form}<div class="max-w-2xl mt-6"><div class="card bg-base-100 shadow"><div class="card-body">
 <h2 class="card-title text-lg mb-2">Items</h2>
 <table class="table table-sm"><thead><tr><th>Name</th><th>Section</th><th>Type</th><th>Flags</th><th></th></tr></thead><tbody>{items}</tbody></table>
-{add}</div></div></div>"#,
+{add}</div></div></div>
+<div class="max-w-2xl mt-6">{activity_panel}</div>"#,
         form = form_page(&format!("/sesb-eam/checklist-templates/{id}"), &header, &body), items = item_rows, add = add_form);
     Html(page_shell(&sidebar, &format!("Template {}", name), &content)).into_response()
 }

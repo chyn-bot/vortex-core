@@ -183,7 +183,9 @@ async fn auth_middleware(
             u.username,
             u.full_name,
             u.active,
-            u.locked
+            u.locked,
+            u.is_portal,
+            u.contact_id
         FROM sessions s
         JOIN users u ON s.user_id = u.id
         WHERE s.token_hash = $1
@@ -211,6 +213,12 @@ async fn auth_middleware(
             if session.locked {
                 warn!("User {} is locked", session.username);
                 return redirect_to_login_with_message("Account locked");
+            }
+            // Hard isolation boundary: an external portal user's session must
+            // never grant access to the internal back-office tree, whatever
+            // roles are attached. Bounce them to their own surface.
+            if session.is_portal {
+                return Redirect::to("/portal").into_response();
             }
 
             // Update last activity (extends session on activity).
@@ -252,6 +260,8 @@ async fn auth_middleware(
                 full_name: session.full_name,
                 session_id: session.session_id,
                 roles,
+                contact_id: session.contact_id,
+                is_portal: session.is_portal,
             };
             request.extensions_mut().insert(auth_user);
 
@@ -299,6 +309,8 @@ struct SessionWithUser {
     full_name: Option<String>,
     active: bool,
     locked: bool,
+    is_portal: bool,
+    contact_id: Option<uuid::Uuid>,
 }
 
 fn redirect_to_login_with_message(_message: &str) -> Response {
@@ -425,6 +437,10 @@ async fn api_auth_middleware(
         full_name: tok.full_name.clone(),
         session_id: tok.token_id, // no session row for tokens; trace by token id
         roles: tok.roles.clone(),
+        // Bearer tokens (mobile / service PAT) are first-party today; portal
+        // logins use the browser session. A portal-scoped token is future work.
+        contact_id: None,
+        is_portal: false,
     };
     request.extensions_mut().insert(auth_user);
     request.extensions_mut().insert(tok); // ResolvedToken — scope checks
@@ -569,6 +585,8 @@ async fn resolve_bearer(
         full_name: tok.full_name.clone(),
         session_id: tok.token_id,
         roles: tok.roles.clone(),
+        contact_id: None,
+        is_portal: false,
     };
     let db_ctx = DatabaseContext {
         db_name,
@@ -631,12 +649,18 @@ async fn mobile_login(
         .map(|u| u.active && !u.locked && verify_password(&body.password, &u.password_hash))
         .unwrap_or(false);
 
+    // Client IP for login audit attribution (best-effort).
+    let (client_ip, _ua) = request_fingerprint(&headers);
+
     if !ok {
         // Audit the failure against the tenant chain (best-effort).
-        let entry = AuditEntry::new(AuditAction::LoginFailure, AuditSeverity::Warning)
+        let mut entry = AuditEntry::new(AuditAction::LoginFailure, AuditSeverity::Warning)
             .with_username(&body.username)
             .with_database(&db_name)
             .with_details(serde_json::json!({"database": db_name, "channel": "mobile"}));
+        if let Some(ip) = &client_ip {
+            entry = entry.with_source_ip(ip.clone());
+        }
         let _ = state.audit.log(entry).await;
         return api_error(
             StatusCode::UNAUTHORIZED,
@@ -655,11 +679,14 @@ async fn mobile_login(
         MfaGate::Ok => {}
         MfaGate::Reject(resp) => {
             if matches!(&resp, MfaReject::InvalidCode) {
-                let entry = AuditEntry::new(AuditAction::LoginFailure, AuditSeverity::Warning)
+                let mut entry = AuditEntry::new(AuditAction::LoginFailure, AuditSeverity::Warning)
                     .with_user(vortex_common::UserId(user.id))
                     .with_username(&user.username)
                     .with_database(&db_name)
                     .with_details(serde_json::json!({"database": db_name, "channel": "mobile", "reason": "mfa"}));
+                if let Some(ip) = &client_ip {
+                    entry = entry.with_source_ip(ip.clone());
+                }
                 let _ = state.audit.log(entry).await;
             }
             return resp.into_response(&user.username);
@@ -847,7 +874,7 @@ async fn issue_mobile_session(
     .await
     .unwrap_or_default();
 
-    let entry = AuditEntry::new(AuditAction::LoginSuccess, AuditSeverity::Info)
+    let mut entry = AuditEntry::new(AuditAction::LoginSuccess, AuditSeverity::Info)
         .with_user(vortex_common::UserId(user_id))
         .with_username(username)
         .with_database(db_name)
@@ -856,6 +883,9 @@ async fn issue_mobile_session(
             "database": db_name, "channel": "mobile",
             "device_id": device_id, "family_id": pair.family_id,
         }));
+    if let Some(ip) = &ip {
+        entry = entry.with_source_ip(ip.clone());
+    }
     let _ = state.audit.log(entry).await;
 
     let now = chrono::Utc::now();
@@ -1216,9 +1246,47 @@ async fn api_create_record(
                 &state.db, &db, &db_ctx.db_name, "record.created",
                 serde_json::json!({"model": model, "id": id, "record": rec}),
             ).await;
+            let _ = vortex_framework::computed_fields::store_values(&db, &model, id).await;
+            let _ = vortex_framework::automation::run_rules(&db, &model, "create", id).await;
             (StatusCode::CREATED, Json(serde_json::json!({"id": id, "record": rec}))).into_response()
         }
         Err(e) => api_error(StatusCode::BAD_REQUEST, "create_failed", &e),
+    }
+}
+
+/// `POST /api/v1/{model}/{id}/duplicate` — copy a record into a fresh row.
+/// Identity columns are regenerated and `created_by` becomes the calling
+/// user; everything else is copied verbatim (unique columns may reject the
+/// copy — the DB constraint decides).
+async fn api_duplicate_record(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(tok): Extension<vortex_framework::api::ResolvedToken>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path((model, id)): Path<(String, uuid::Uuid)>,
+) -> Response {
+    if let Some(resp) = require_write(&tok) {
+        return resp;
+    }
+    match vortex_framework::api::duplicate_record(&db, &model, id, Some(user.id)).await {
+        Ok(new_id) => {
+            api_audit(
+                &state, &db_ctx.db_name, &user,
+                AuditAction::RecordCreated, AuditSeverity::Info, &model, Some(&new_id.to_string()),
+                serde_json::json!({"via": "api", "duplicated_from": id}),
+            ).await;
+            let rec = vortex_framework::api::get_record(&db, &model, new_id).await.ok().flatten();
+            vortex_framework::webhooks::emit(
+                &state.db, &db, &db_ctx.db_name, "record.created",
+                serde_json::json!({"model": model, "id": new_id, "record": rec, "duplicated_from": id}),
+            ).await;
+            (StatusCode::CREATED, Json(serde_json::json!({"id": new_id, "record": rec}))).into_response()
+        }
+        Err(e) if e == "source record not found" => {
+            api_error(StatusCode::NOT_FOUND, "not_found", "No such record.")
+        }
+        Err(e) => api_error(StatusCode::BAD_REQUEST, "duplicate_failed", &e),
     }
 }
 
@@ -1247,6 +1315,8 @@ async fn api_update_record(
                 &state.db, &db, &db_ctx.db_name, "record.updated",
                 serde_json::json!({"model": model, "id": id, "record": rec}),
             ).await;
+            let _ = vortex_framework::computed_fields::store_values(&db, &model, id).await;
+            let _ = vortex_framework::automation::run_rules(&db, &model, "update", id).await;
             Json(serde_json::json!({"id": id, "record": rec})).into_response()
         }
         Ok(false) => api_error(StatusCode::NOT_FOUND, "not_found", "No such record."),
@@ -1332,8 +1402,8 @@ fn module_not_installed_page(module_name: &str) -> String {
     format!(r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style><title>Module Not Installed</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=4" rel="stylesheet"/>
-<script src="/static/vortex.js?v=4" defer></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script>
 <script src="/static/vendor/tailwind.js"></script></head>
 <body class="min-h-screen bg-base-200 flex items-center justify-center">
 <div class="card bg-base-100 shadow-xl max-w-md w-full">
@@ -1894,6 +1964,28 @@ pub async fn run(host: String, port: u16, _workers: Option<usize>) -> Result<()>
     // state so a plugin that was already marked `installed` stays so.
     crate::commands::module_sync::sync_plugins_best_effort(&db, &plugin_registry).await;
 
+    // ─── Boot-time model-registry sync (§2 #3) ────────────────────────
+    // `#[derive(Model)]` → `ir_model` is the single source of truth for the
+    // generic views and REST API, but the sync otherwise only fires on three
+    // triggers (apps-refresh, `db migrate`, install). A struct that changed
+    // without one of those would leave the primary DB's `ir_model_field`
+    // stale until the next trigger. Running the (idempotent, now self-pruning)
+    // sync here closes that window to a single restart. Primary DB only,
+    // mirroring `sync_plugins_best_effort`; tenant DBs self-heal on their own
+    // triggers. Non-fatal — a legacy DB predating migration 122 just warns.
+    {
+        let metas: Vec<&'static vortex_orm::model::ModelMeta> = plugin_registry
+            .plugins_iter()
+            .flat_map(|p| p.models())
+            .collect();
+        if !metas.is_empty() {
+            match vortex_orm::registry_sync::sync_model_registry(&db, &metas).await {
+                Ok(n) => info!(models = n as i64, "model registry synced at startup"),
+                Err(e) => warn!(error = %e, "startup model registry sync failed"),
+            }
+        }
+    }
+
     // ─── Scheduler (Phase 0.7) ────────────────────────────────────────
     // Collect every plugin's scheduled actions, build the scheduler's
     // handler map, and upsert definitions into `scheduled_actions`. The
@@ -1937,6 +2029,15 @@ pub async fn run(host: String, port: u16, _workers: Option<usize>) -> Result<()>
         }
     }
     let reports = Arc::new(vortex_framework::reports::ReportRegistry::new(all_reports));
+
+    // Collect every plugin's printable document types (quotation, invoice, …)
+    // into a single PrintDocRegistry. The /settings/print-templates UI lists
+    // these; plugin print handlers render through print_layout::render_document.
+    let mut all_print_docs = Vec::new();
+    for plugin in plugin_registry.plugins_iter() {
+        all_print_docs.extend(plugin.print_docs());
+    }
+    let print_docs = Arc::new(vortex_framework::print_layout::PrintDocRegistry::new(all_print_docs));
 
     // ─── i18n / Translations (Phase 0.7) ──────────────────────────────
     // Collect plugin-contributed translations, sync to DB, then build
@@ -1991,6 +2092,7 @@ pub async fn run(host: String, port: u16, _workers: Option<usize>) -> Result<()>
         plugin_registry: plugin_registry.clone(),
         scheduler: scheduler.clone(),
         reports: reports.clone(),
+        print_docs: print_docs.clone(),
         i18n,
         files,
     });
@@ -2072,7 +2174,9 @@ fn build_router(state: Arc<AppState>) -> Router {
     // --- Core routes (always available) ---
     let protected_routes = Router::new()
         .route("/home", get(home_page))
-        .route("/dashboard", get(dashboard_page))
+        // /dashboard merged into /home (role-aware landing). Redirect
+        // keeps old bookmarks and stray links working.
+        .route("/dashboard", get(|| async { Redirect::to("/home") }))
         .route("/auth/logout", post(logout).get(logout))
         .route("/partials/recent-activity", get(recent_activity))
         .route("/partials/system-status", get(system_status))
@@ -2127,9 +2231,16 @@ fn build_router(state: Arc<AppState>) -> Router {
         // Generic model views
         .route("/list/{model}", get(generic_list_view))
         .route("/kanban/{model}", get(generic_kanban_view))
+        .route("/kanban/{model}/move", post(kanban_move))
         .route("/graph/{model}", get(generic_graph_view))
         .route("/calendar/{model}", get(generic_calendar_view))
+        .route("/calendar/{model}/data", get(generic_calendar_data))
         .route("/pivot/{model}", get(generic_pivot_view))
+        .route("/pivot/{model}/data", get(generic_pivot_data))
+        .route("/pivot/{model}/values", get(generic_pivot_values))
+        // Saved analytic views (Initiative #4)
+        .route("/views/save", post(saved_view_save))
+        .route("/views/{id}/delete", post(saved_view_delete))
         // Saved filters API
         .route("/api/filters/{model}", get(get_filters))
         .route("/api/filters/{model}", post(save_filter))
@@ -2154,6 +2265,21 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/settings", get(settings_index))
         .route("/audit", get(audit_log_page))
         .route("/notifications", get(notifications_page))
+        .route("/settings/custom-fields", get(custom_fields_list))
+        .route("/settings/custom-fields", post(custom_field_create))
+        .route("/settings/custom-fields/delete", post(custom_field_delete))
+        .route("/settings/custom-fields/reorder", post(custom_field_reorder))
+        .route("/settings/automation-rules", get(automation_rules_list))
+        .route("/settings/automation-rules", post(automation_rule_create))
+        .route("/settings/automation-rules/delete", post(automation_rule_delete))
+        .route("/settings/computed-fields", get(computed_fields_list))
+        .route("/settings/computed-fields", post(computed_field_create))
+        .route("/settings/computed-fields/delete", post(computed_field_delete))
+        .route("/dashboards", get(dashboards_index).post(dashboard_create))
+        .route("/dashboards/{id}", get(dashboard_view))
+        .route("/dashboards/{id}/delete", post(dashboard_delete))
+        .route("/dashboards/{id}/widget", post(dashboard_widget_create))
+        .route("/dashboards/widget/{id}/delete", post(dashboard_widget_delete))
         .route("/settings/activity-types", get(activity_types_list))
         .route("/settings/activity-types", post(activity_type_create))
         .route("/settings/activity-types/{id}", get(activity_type_edit))
@@ -2230,6 +2356,12 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/settings/api-tokens", get(api_tokens_list))
         .route("/settings/api-tokens", post(api_token_create))
         .route("/settings/api-tokens/{id}/revoke", post(api_token_revoke))
+        // Portal user provisioning (admin-gated in-handler)
+        .route("/settings/portal-users", get(portal_users_list))
+        .route("/settings/portal-users/invite", post(portal_user_invite))
+        .route("/settings/portal-users/contact/{id}", get(portal_user_for_contact))
+        .route("/settings/portal-users/{id}/revoke", post(portal_user_revoke))
+        .route("/settings/portal-users/{id}/resend", post(portal_user_resend))
         // Webhooks (outbound event subscriptions, admin)
         .route("/settings/webhooks", get(webhooks_list))
         .route("/settings/webhooks", post(webhook_create))
@@ -2237,6 +2369,17 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/settings/webhooks/{id}", post(webhook_update))
         .route("/settings/webhooks/{id}/delete", post(webhook_delete))
         .route("/settings/webhooks/{id}/test", post(webhook_test))
+        // Print layout designer — document branding + per-document templates
+        .route("/settings/document-layout", get(document_layout_page))
+        .route("/settings/document-layout", post(document_layout_save))
+        .route("/settings/document-layout/logo", post(document_layout_logo))
+        .route("/settings/print-templates", get(print_templates_list))
+        .route("/settings/print-templates/{doc_type}", get(print_template_edit))
+        .route("/settings/print-templates/{doc_type}", post(print_template_save))
+        .route("/settings/print-templates/{doc_type}/preview", post(print_template_preview))
+        .route("/settings/print-templates/{doc_type}/visual", post(print_template_visual_save))
+        .route("/settings/print-templates/{doc_type}/visual/preview", post(print_template_visual_preview))
+        .route("/settings/company-logo", get(serve_company_logo))
         // Approvals (generic, cross-module inbox + decisions)
         .route("/approvals", get(approvals_inbox))
         .route("/approvals/{id}/approve", post(approval_approve))
@@ -2250,6 +2393,8 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/notifications", get(api_notifications))
         .route("/api/countries", get(api_countries))
         .route("/api/states/{country_id}", get(api_states))
+        // Many2One typeahead suggestion feed (signed descriptor)
+        .route("/api/lookup", get(api_lookup))
         ;
 
     // ─── Plugin-contributed routes (Phase 0.3) ────────────────────
@@ -2355,7 +2500,34 @@ fn build_router(state: Arc<AppState>) -> Router {
             "/api/v1/{model}/{id}",
             get(api_get_record).patch(api_update_record).delete(api_delete_record),
         )
+        .route("/api/v1/{model}/{id}/duplicate", post(api_duplicate_record))
         .route_layer(middleware::from_fn_with_state(state.clone(), api_auth_middleware));
+
+    // ─── External portal (/portal/*) ──────────────────────────────
+    // Protected surface: only `is_portal` users, guarded by
+    // `portal_auth_middleware`. Separate from the internal tree, whose
+    // `auth_middleware` bounces portal users away.
+    let portal_protected = Router::new()
+        .route("/portal", get(portal_home))
+        .route("/portal/invoices", get(portal_invoices))
+        .route("/portal/invoices/{id}", get(portal_invoice_detail))
+        .route("/portal/orders", get(portal_orders))
+        .route("/portal/statement", get(portal_statement))
+        .route("/portal/logout", post(portal_logout))
+        .route_layer(middleware::from_fn_with_state(state.clone(), portal_auth_middleware));
+
+    // Public portal login (pre-auth), rate-limited like the staff login.
+    let portal_login_limiter = RateLimiter::new(RateLimitConfig {
+        max_requests: 5,
+        window: std::time::Duration::from_secs(60),
+        per_user: false,
+    });
+    let portal_public = Router::new()
+        .route("/portal/login", get(portal_login_page).post(portal_login_submit))
+        // Invite acceptance (set-password) is pre-auth, like login.
+        .route("/portal/invite/{token}", get(portal_invite_page).post(portal_invite_submit))
+        .layer(middleware::from_fn(vortex_server::middleware::rate_limit::rate_limit_middleware))
+        .layer(Extension(portal_login_limiter));
 
     // Public routes - no authentication required
     Router::new()
@@ -2384,6 +2556,10 @@ fn build_router(state: Arc<AppState>) -> Router {
 
         // Merge protected routes
         .merge(protected_routes)
+
+        // External portal: public login + protected self-service tree
+        .merge(portal_public)
+        .merge(portal_protected)
 
         // Merge the bearer-authenticated REST API
         .merge(api_routes)
@@ -2577,6 +2753,10 @@ async fn login_submit(
     headers: HeaderMap,
     Form(form): Form<LoginForm>,
 ) -> Response {
+    // Client IP (best-effort, first X-Forwarded-For hop) for the login audit —
+    // so successful and failed logins are attributable to a source address.
+    let (client_ip, _ua) = request_fingerprint(&headers);
+
     // Resolve target database
     let db_name = resolve_database(&state, &headers, form.database.as_deref()).await;
 
@@ -2649,7 +2829,7 @@ async fn login_submit(
                 // entry to the tenant's database so each tenant's audit
                 // chain is self-contained. In single-DB mode, db_name
                 // matches the primary and the write goes there anyway.
-                let audit_entry = AuditEntry::new(
+                let mut audit_entry = AuditEntry::new(
                     AuditAction::LoginSuccess,
                     AuditSeverity::Info,
                 )
@@ -2661,6 +2841,9 @@ async fn login_submit(
                     "database": db_name,
                     "session_id": token_hash,
                 }));
+                if let Some(ip) = &client_ip {
+                    audit_entry = audit_entry.with_source_ip(ip.clone());
+                }
                 if let Err(e) = state.audit.log(audit_entry).await {
                     error!("WORM audit write failed for LoginSuccess: {}", e);
                 }
@@ -2688,7 +2871,7 @@ async fn login_submit(
                 .await;
 
                 // Log failed login — WORM ledger.
-                let audit_entry = AuditEntry::new(
+                let mut audit_entry = AuditEntry::new(
                     AuditAction::LoginFailure,
                     AuditSeverity::Warning,
                 )
@@ -2700,6 +2883,9 @@ async fn login_submit(
                     "reason": "invalid_password",
                     "database": db_name,
                 }));
+                if let Some(ip) = &client_ip {
+                    audit_entry = audit_entry.with_source_ip(ip.clone());
+                }
                 if let Err(e) = state.audit.log(audit_entry).await {
                     error!("WORM audit write failed for LoginFailure: {}", e);
                 }
@@ -2709,7 +2895,7 @@ async fn login_submit(
         }
         Ok(None) => {
             // Log failed login attempt for unknown user — WORM ledger.
-            let audit_entry = AuditEntry::new(
+            let mut audit_entry = AuditEntry::new(
                 AuditAction::LoginFailure,
                 AuditSeverity::Warning,
             )
@@ -2720,6 +2906,9 @@ async fn login_submit(
                 "reason": "user_not_found",
                 "database": db_name,
             }));
+            if let Some(ip) = &client_ip {
+                audit_entry = audit_entry.with_source_ip(ip.clone());
+            }
             if let Err(e) = state.audit.log(audit_entry).await {
                 error!("WORM audit write failed for unknown-user LoginFailure: {}", e);
             }
@@ -2731,6 +2920,1277 @@ async fn login_submit(
             error_response("Login failed")
         }
     }
+}
+
+// ============================================================================
+// External customer/vendor portal — /portal/*
+// ============================================================================
+//
+// A self-service surface for **portal users** (`users.is_portal = true`, bound
+// to a `contacts` row via `users.contact_id`). It is a hard-isolated tree:
+//
+//   * `portal_auth_middleware` guards every `/portal/*` page and admits ONLY
+//     portal users; the internal `auth_middleware` conversely rejects them.
+//   * Every query is scoped by the partner id derived from the **session**
+//     (`AuthUser::portal_contact_id`), never a request parameter — so a portal
+//     user can only ever see their own partner's documents, and record views
+//     re-check ownership (`WHERE id = $1 AND partner_id = $2`).
+//
+// MVP surfaces: landing, my invoices (+ detail), my orders, my statement
+// (open items / ageing). PDF download and a vendor view are follow-ups.
+
+fn portal_money(v: f64) -> String {
+    // Group thousands with commas, two decimals. Small, dependency-free.
+    let neg = v < 0.0;
+    let s = format!("{:.2}", v.abs());
+    let (int, frac) = s.split_once('.').unwrap_or((s.as_str(), "00"));
+    let mut grouped = String::new();
+    let bytes = int.as_bytes();
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i) % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(*b as char);
+    }
+    format!("{}{}.{}", if neg { "-" } else { "" }, grouped, frac)
+}
+
+/// The mobile-first portal chrome. Self-contained (vendored daisyUI, like the
+/// rest of the served pages); no internal sidebar or admin surfaces.
+fn portal_shell(title: &str, who: &str, active: &str, body: &str) -> String {
+    use vortex_framework::ui::html_escape;
+    let nav = |href: &str, id: &str, label: &str| -> String {
+        let cls = if id == active { "font-semibold text-base-content" } else { "text-base-content/60" };
+        format!(r#"<a href="{href}" class="{cls} hover:text-base-content whitespace-nowrap">{label}</a>"#)
+    };
+    format!(
+        r#"<!DOCTYPE html><html data-theme="dark"><head>
+<script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script>
+<title>{title} · Portal</title>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vendor/tailwind.js"></script>
+<style>
+body {{ background: oklch(var(--b2)); color: oklch(var(--bc)); }}
+.pbar {{ background: oklch(var(--b1)); border-bottom: 1px solid oklch(var(--b3)); position: sticky; top: 0; z-index: 40; }}
+.pcard {{ background: oklch(var(--b1)); border: 1px solid oklch(var(--b3)); border-radius: .6rem; }}
+table.ptbl {{ width: 100%; border-collapse: collapse; font-size: .9rem; }}
+table.ptbl th, table.ptbl td {{ padding: .5rem .6rem; border-bottom: 1px solid oklch(var(--b3)); text-align: left; }}
+table.ptbl td.num, table.ptbl th.num {{ text-align: right; font-variant-numeric: tabular-nums; }}
+</style></head><body class="min-h-screen">
+<nav class="pbar px-4 py-3 flex items-center justify-between gap-4">
+  <a href="/portal" class="text-lg font-bold"><span style="color:#8BC53F">re</span><span class="text-base-content/60">micle</span> <span class="font-normal text-sm text-base-content/50">Portal</span></a>
+  <div class="flex items-center gap-4 text-sm overflow-x-auto">
+    {home}{invoices}{orders}{statement}
+    <span class="text-base-content/40 hidden sm:inline">|</span>
+    <span class="text-base-content/70 hidden sm:inline">{who}</span>
+    <form method="post" action="/portal/logout" class="inline"><button class="text-error hover:underline">Sign out</button></form>
+  </div>
+</nav>
+<main class="max-w-4xl mx-auto p-4 md:p-6">{body}</main>
+</body></html>"#,
+        title = html_escape(title),
+        who = html_escape(who),
+        home = nav("/portal", "home", "Home"),
+        invoices = nav("/portal/invoices", "invoices", "Invoices"),
+        orders = nav("/portal/orders", "orders", "Orders"),
+        statement = nav("/portal/statement", "statement", "Statement"),
+        body = body,
+    )
+}
+
+#[derive(serde::Deserialize)]
+struct PortalLoginForm {
+    username: String,
+    password: String,
+    database: Option<String>,
+}
+
+/// Standalone portal login page (no shell nav — pre-auth). `err` shows a
+/// validation message when re-rendered after a failed attempt.
+fn portal_login_html(err: Option<&str>) -> String {
+    use vortex_framework::ui::html_escape;
+    let err_html = err
+        .map(|e| format!(r#"<div class="alert alert-error text-sm mb-3">{}</div>"#, html_escape(e)))
+        .unwrap_or_default();
+    format!(
+        r#"<!DOCTYPE html><html data-theme="dark"><head>
+<title>Portal Sign in</title><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
+<script src="/static/vendor/tailwind.js"></script>
+<style>body{{background:#0b0f0a;color:#e5e7eb}}</style></head>
+<body class="min-h-screen flex items-center justify-center p-4">
+<div class="w-full max-w-sm" style="background:#12160f;border:1px solid #263019;border-radius:.75rem;padding:1.5rem">
+  <div class="text-center mb-5">
+    <div class="text-2xl font-bold"><span style="color:#8BC53F">re</span><span style="color:#9ca3af">micle</span></div>
+    <div class="text-sm mt-1" style="color:#9ca3af">Customer &amp; supplier portal</div>
+  </div>
+  {err_html}
+  <form method="post" action="/portal/login" class="flex flex-col gap-3">
+    <label class="text-sm">Username
+      <input name="username" required autofocus autocomplete="username" class="input input-bordered w-full mt-1" style="background:#0b0f0a"/>
+    </label>
+    <label class="text-sm">Password
+      <input name="password" type="password" required autocomplete="current-password" class="input input-bordered w-full mt-1" style="background:#0b0f0a"/>
+    </label>
+    <button class="btn mt-2" style="background:#8BC53F;border-color:#8BC53F;color:#000">Sign in</button>
+  </form>
+</div></body></html>"#,
+        err_html = err_html,
+    )
+}
+
+async fn portal_login_page() -> Response {
+    Html(portal_login_html(None)).into_response()
+}
+
+/// POST /portal/login — authenticates ONLY `is_portal` users. An internal
+/// account that tries here is refused (and vice-versa at `/auth/login`).
+async fn portal_login_submit(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Form(form): Form<PortalLoginForm>,
+) -> Response {
+    let (client_ip, _ua) = request_fingerprint(&headers);
+    let db_name = resolve_database(&state, &headers, form.database.as_deref()).await;
+    let pool = match state.pool_manager.get_pool(&db_name).await {
+        Ok(p) => p,
+        Err(e) => {
+            error!("portal login: pool for '{}' failed: {}", db_name, e);
+            return Html(portal_login_html(Some("Service unavailable. Try again shortly."))).into_response();
+        }
+    };
+    let db = pool.pool().clone();
+
+    let row = sqlx::query(
+        "SELECT id, password_hash, full_name, active, locked, is_portal, contact_id \
+         FROM users WHERE username = $1",
+    )
+    .bind(&form.username)
+    .fetch_optional(&db)
+    .await;
+
+    let audit_fail = |state: &Arc<AppState>, user_id: Option<uuid::Uuid>, reason: &'static str| {
+        let mut e = AuditEntry::new(AuditAction::LoginFailure, AuditSeverity::Warning)
+            .with_username(&form.username)
+            .with_database(&db_name)
+            .with_resource("portal_session", user_id.map(|u| u.to_string()).unwrap_or_else(|| "unknown".into()))
+            .with_error(reason)
+            .with_details(serde_json::json!({"reason": reason, "database": db_name, "surface": "portal"}));
+        if let Some(u) = user_id {
+            e = e.with_user(vortex_common::UserId(u));
+        }
+        if let Some(ip) = &client_ip {
+            e = e.with_source_ip(ip.clone());
+        }
+        let audit = state.audit.clone();
+        async move {
+            if let Err(err) = audit.log(e).await {
+                error!("WORM audit write failed for portal LoginFailure: {}", err);
+            }
+        }
+    };
+
+    let bad_creds = "Invalid username or password.";
+    match row {
+        Ok(Some(r)) => {
+            let uid: uuid::Uuid = r.get("id");
+            let is_portal: bool = r.get("is_portal");
+            let active: bool = r.get("active");
+            let locked: bool = r.get("locked");
+            let hash: String = r.get("password_hash");
+            let full_name: Option<String> = r.try_get("full_name").ok().flatten();
+            let contact_id: Option<uuid::Uuid> = r.try_get("contact_id").ok().flatten();
+
+            // Not a portal account → refuse here without confirming the password,
+            // and don't leak that the username exists as a staff login.
+            if !is_portal {
+                audit_fail(&state, Some(uid), "not_portal_user").await;
+                return Html(portal_login_html(Some(bad_creds))).into_response();
+            }
+            if !active || locked {
+                audit_fail(&state, Some(uid), if locked { "locked" } else { "disabled" }).await;
+                return Html(portal_login_html(Some("This account is not active. Contact your account manager."))).into_response();
+            }
+            if !verify_password(&form.password, &hash) {
+                let _ = sqlx::query("UPDATE users SET failed_login_attempts = failed_login_attempts + 1 WHERE id = $1")
+                    .bind(uid).execute(&db).await;
+                audit_fail(&state, Some(uid), "invalid_password").await;
+                return Html(portal_login_html(Some(bad_creds))).into_response();
+            }
+            if contact_id.is_none() {
+                // A portal user with no partner binding is a provisioning bug;
+                // the CHECK constraint should prevent it, but fail safe.
+                audit_fail(&state, Some(uid), "no_contact_binding").await;
+                return Html(portal_login_html(Some("Your portal account is not fully set up. Contact your account manager."))).into_response();
+            }
+
+            let token = generate_session_token();
+            let token_hash = hash_token(&token);
+            if let Err(e) = sqlx::query(
+                "INSERT INTO sessions (user_id, token_hash, expires_at, ip_address) \
+                 VALUES ($1, $2, NOW() + INTERVAL '30 minutes', NULL)",
+            )
+            .bind(uid)
+            .bind(&token_hash)
+            .execute(&db)
+            .await
+            {
+                error!("portal login: session insert failed: {}", e);
+                return Html(portal_login_html(Some("Sign-in failed. Try again."))).into_response();
+            }
+            let _ = sqlx::query("UPDATE users SET last_login_at = NOW(), failed_login_attempts = 0 WHERE id = $1")
+                .bind(uid).execute(&db).await;
+
+            let mut entry = AuditEntry::new(AuditAction::LoginSuccess, AuditSeverity::Info)
+                .with_user(vortex_common::UserId(uid))
+                .with_username(&form.username)
+                .with_database(&db_name)
+                .with_resource("portal_session", uid.to_string())
+                .with_details(serde_json::json!({"database": db_name, "surface": "portal"}));
+            if let Some(ip) = &client_ip {
+                entry = entry.with_source_ip(ip.clone());
+            }
+            if let Err(e) = state.audit.log(entry).await {
+                error!("WORM audit write failed for portal LoginSuccess: {}", e);
+            }
+            let _ = full_name;
+
+            let mut resp_headers = HeaderMap::new();
+            resp_headers.insert(
+                header::SET_COOKIE,
+                format!("session={}|{}; Path=/; HttpOnly; SameSite=Strict; Max-Age=1800", db_name, token)
+                    .parse()
+                    .unwrap(),
+            );
+            (resp_headers, Redirect::to("/portal")).into_response()
+        }
+        Ok(None) => {
+            audit_fail(&state, None, "user_not_found").await;
+            Html(portal_login_html(Some(bad_creds))).into_response()
+        }
+        Err(e) => {
+            error!("portal login: db error: {}", e);
+            Html(portal_login_html(Some("Sign-in failed. Try again."))).into_response()
+        }
+    }
+}
+
+async fn portal_logout(Db(db): Db, jar: HeaderMap) -> Response {
+    // Best-effort session revocation, then clear the cookie.
+    if let Some(cookie) = jar.get(header::COOKIE).and_then(|c| c.to_str().ok()) {
+        if let Some(raw) = cookie.split(';').find_map(|kv| kv.trim().strip_prefix("session=")) {
+            let token = raw.rsplit('|').next().unwrap_or(raw);
+            let th = hash_token(token);
+            let _ = sqlx::query("UPDATE sessions SET revoked = true, revoked_at = NOW(), revoked_reason = 'portal_logout' WHERE token_hash = $1")
+                .bind(&th).execute(&db).await;
+        }
+    }
+    let mut headers = HeaderMap::new();
+    headers.insert(header::SET_COOKIE, "session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0".parse().unwrap());
+    (headers, Redirect::to("/portal/login")).into_response()
+}
+
+fn portal_redirect_login() -> Response {
+    let mut headers = HeaderMap::new();
+    headers.insert(header::SET_COOKIE, "session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0".parse().unwrap());
+    (headers, Redirect::to("/portal/login")).into_response()
+}
+
+/// Guard for `/portal/*`: admits ONLY authenticated `is_portal` users, injects
+/// their `AuthUser` (with `contact_id`) + tenant `DatabaseContext`. Anything
+/// else is bounced to the portal login.
+async fn portal_auth_middleware(
+    State(state): State<Arc<AppState>>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let cookie = request
+        .headers()
+        .get(header::COOKIE)
+        .and_then(|c| c.to_str().ok())
+        .and_then(|c| c.split(';').find_map(|kv| kv.trim().strip_prefix("session=").map(str::to_string)));
+    let Some(raw) = cookie else { return portal_redirect_login() };
+
+    // cookie is `db_name|token` (or a legacy bare token → default DB).
+    let (db_name, token) = match raw.split_once('|') {
+        Some((d, t)) => (d.to_string(), t.to_string()),
+        None => (state.default_db.clone(), raw.clone()),
+    };
+    if !db_name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return portal_redirect_login();
+    }
+    let pool = match state.pool_manager.get_pool(&db_name).await {
+        Ok(p) => p,
+        Err(_) => return portal_redirect_login(),
+    };
+    let db = pool.pool().clone();
+
+    let token_hash = hash_token(&token);
+    let row = sqlx::query(
+        "SELECT s.id as session_id, s.user_id, s.expires_at, s.last_activity_at, s.revoked, \
+                u.username, u.full_name, u.active, u.locked, u.is_portal, u.contact_id \
+         FROM sessions s JOIN users u ON s.user_id = u.id WHERE s.token_hash = $1",
+    )
+    .bind(&token_hash)
+    .fetch_optional(&db)
+    .await;
+
+    let Ok(Some(r)) = row else { return portal_redirect_login() };
+    let revoked: bool = r.get("revoked");
+    let expires_at: chrono::DateTime<chrono::Utc> = r.get("expires_at");
+    let active: bool = r.get("active");
+    let locked: bool = r.get("locked");
+    let is_portal: bool = r.get("is_portal");
+    let contact_id: Option<uuid::Uuid> = r.try_get("contact_id").ok().flatten();
+    if revoked || expires_at < chrono::Utc::now() || !active || locked || !is_portal || contact_id.is_none() {
+        return portal_redirect_login();
+    }
+
+    let session_id: uuid::Uuid = r.get("session_id");
+    let user_id: uuid::Uuid = r.get("user_id");
+    let last_activity: Option<chrono::DateTime<chrono::Utc>> = r.try_get("last_activity_at").ok().flatten();
+    let refresh_due = last_activity.map_or(true, |t| chrono::Utc::now() - t > chrono::Duration::seconds(60));
+    if refresh_due {
+        let _ = sqlx::query("UPDATE sessions SET last_activity_at = NOW(), expires_at = NOW() + INTERVAL '30 minutes' WHERE id = $1")
+            .bind(session_id).execute(&db).await;
+    }
+
+    let db_installed_modules: HashSet<String> = sqlx::query_scalar(
+        "SELECT technical_name FROM installed_modules WHERE state = 'installed'",
+    )
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .collect();
+
+    let auth_user = AuthUser {
+        id: user_id,
+        username: r.get("username"),
+        full_name: r.try_get("full_name").ok().flatten(),
+        session_id,
+        roles: vec!["Portal User".to_string()],
+        contact_id,
+        is_portal: true,
+    };
+    request.extensions_mut().insert(auth_user);
+    request.extensions_mut().insert(pool.clone());
+    request.extensions_mut().insert(DatabaseContext {
+        db_name,
+        pool,
+        installed_modules: db_installed_modules,
+    });
+    next.run(request).await
+}
+
+/// The signed-in portal user's partner id, or a redirect if somehow absent
+/// (the middleware guarantees it, so this is defence-in-depth).
+fn portal_partner(user: &AuthUser) -> Result<uuid::Uuid, Response> {
+    user.portal_contact_id().ok_or_else(portal_redirect_login)
+}
+
+async fn portal_home(Db(db): Db, Extension(user): Extension<AuthUser>) -> Response {
+    use vortex_framework::ui::html_escape;
+    let partner = match portal_partner(&user) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    let name: String = sqlx::query_scalar("SELECT name FROM contacts WHERE id = $1")
+        .bind(partner).fetch_optional(&db).await.ok().flatten().unwrap_or_else(|| user.username.clone());
+
+    // Outstanding balance + open-invoice count (posted customer invoices/credit notes).
+    let outstanding: f64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(amount_residual),0)::float8 FROM acc_move \
+         WHERE partner_id = $1 AND state = 'posted' \
+           AND move_type IN ('customer_invoice','customer_credit_note') \
+           AND payment_state IN ('not_paid','partial')",
+    ).bind(partner).fetch_one(&db).await.unwrap_or(0.0);
+    let open_invoices: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM acc_move WHERE partner_id = $1 AND state='posted' \
+           AND move_type IN ('customer_invoice','customer_credit_note') \
+           AND payment_state IN ('not_paid','partial')",
+    ).bind(partner).fetch_one(&db).await.unwrap_or(0);
+    let open_orders: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sales_order WHERE customer_id = $1 AND state IN ('confirmed','draft')",
+    ).bind(partner).fetch_one(&db).await.unwrap_or(0);
+
+    let body = format!(
+        r#"<h1 class="text-2xl font-bold mb-1">Welcome, {name}</h1>
+<p class="text-base-content/60 mb-5">Your account at a glance.</p>
+<div class="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-6">
+  <a href="/portal/statement" class="pcard p-4 block hover:border-primary">
+    <div class="text-sm text-base-content/60">Outstanding balance</div>
+    <div class="text-2xl font-bold mt-1" style="color:#8BC53F">{outstanding}</div>
+  </a>
+  <a href="/portal/invoices" class="pcard p-4 block hover:border-primary">
+    <div class="text-sm text-base-content/60">Open invoices</div>
+    <div class="text-2xl font-bold mt-1">{open_invoices}</div>
+  </a>
+  <a href="/portal/orders" class="pcard p-4 block hover:border-primary">
+    <div class="text-sm text-base-content/60">Active orders</div>
+    <div class="text-2xl font-bold mt-1">{open_orders}</div>
+  </a>
+</div>
+<div class="pcard p-4">
+  <div class="font-semibold mb-2">Quick links</div>
+  <ul class="list-disc pl-5 text-sm space-y-1">
+    <li><a href="/portal/invoices" class="link">View and track your invoices</a></li>
+    <li><a href="/portal/statement" class="link">See your statement of account</a></li>
+    <li><a href="/portal/orders" class="link">Review your orders</a></li>
+  </ul>
+</div>"#,
+        name = html_escape(&name),
+        outstanding = portal_money(outstanding),
+        open_invoices = open_invoices,
+        open_orders = open_orders,
+    );
+    Html(portal_shell("Home", &name, "home", &body)).into_response()
+}
+
+async fn portal_partner_name(db: &PgPool, partner: uuid::Uuid, fallback: &str) -> String {
+    sqlx::query_scalar("SELECT name FROM contacts WHERE id = $1")
+        .bind(partner).fetch_optional(db).await.ok().flatten().unwrap_or_else(|| fallback.to_string())
+}
+
+async fn portal_invoices(Db(db): Db, Extension(user): Extension<AuthUser>) -> Response {
+    use vortex_framework::ui::html_escape;
+    let partner = match portal_partner(&user) { Ok(p) => p, Err(r) => return r };
+    let name = portal_partner_name(&db, partner, &user.username).await;
+
+    let rows = sqlx::query(
+        "SELECT id, number, move_type, invoice_date, due_date, \
+                total_amount::float8 AS total, amount_residual::float8 AS residual, payment_state \
+         FROM acc_move \
+         WHERE partner_id = $1 AND state = 'posted' \
+           AND move_type IN ('customer_invoice','customer_credit_note') \
+         ORDER BY COALESCE(invoice_date, move_date) DESC, number DESC LIMIT 500",
+    )
+    .bind(partner)
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default();
+
+    let mut trs = String::new();
+    for r in &rows {
+        let id: uuid::Uuid = r.get("id");
+        let number: Option<String> = r.try_get("number").ok().flatten();
+        let mtype: String = r.get("move_type");
+        let inv_date: Option<chrono::NaiveDate> = r.try_get("invoice_date").ok().flatten();
+        let due: Option<chrono::NaiveDate> = r.try_get("due_date").ok().flatten();
+        let total: f64 = r.try_get("total").unwrap_or(0.0);
+        let residual: f64 = r.try_get("residual").unwrap_or(0.0);
+        let pstate: String = r.get("payment_state");
+        let is_cn = mtype == "customer_credit_note";
+        let badge = match pstate.as_str() {
+            "paid" => r#"<span class="badge badge-success badge-sm">Paid</span>"#,
+            "partial" => r#"<span class="badge badge-warning badge-sm">Partial</span>"#,
+            "reversed" => r#"<span class="badge badge-ghost badge-sm">Reversed</span>"#,
+            _ => r#"<span class="badge badge-error badge-sm">Unpaid</span>"#,
+        };
+        trs.push_str(&format!(
+            r#"<tr>
+<td><a class="link" href="/portal/invoices/{id}">{num}</a>{cn}</td>
+<td>{date}</td><td>{due}</td>
+<td class="num">{total}</td><td class="num">{residual}</td><td>{badge}</td></tr>"#,
+            id = id,
+            num = html_escape(number.as_deref().unwrap_or("—")),
+            cn = if is_cn { r#" <span class="badge badge-outline badge-sm">Credit</span>"# } else { "" },
+            date = inv_date.map(|d| d.to_string()).unwrap_or_default(),
+            due = due.map(|d| d.to_string()).unwrap_or_default(),
+            total = portal_money(total),
+            residual = portal_money(residual),
+            badge = badge,
+        ));
+    }
+    if rows.is_empty() {
+        trs = r#"<tr><td colspan="6" class="text-base-content/50 text-center py-6">No invoices yet.</td></tr>"#.to_string();
+    }
+
+    let body = format!(
+        r#"<h1 class="text-2xl font-bold mb-4">Invoices</h1>
+<div class="pcard overflow-x-auto">
+<table class="ptbl"><thead><tr>
+<th>Number</th><th>Date</th><th>Due</th><th class="num">Total</th><th class="num">Balance</th><th>Status</th>
+</tr></thead><tbody>{trs}</tbody></table></div>"#,
+        trs = trs,
+    );
+    Html(portal_shell("Invoices", &name, "invoices", &body)).into_response()
+}
+
+async fn portal_invoice_detail(
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Path(id): Path<uuid::Uuid>,
+) -> Response {
+    use vortex_framework::ui::html_escape;
+    let partner = match portal_partner(&user) { Ok(p) => p, Err(r) => return r };
+    let name = portal_partner_name(&db, partner, &user.username).await;
+
+    // Ownership re-check: the invoice must belong to THIS partner.
+    let head = sqlx::query(
+        "SELECT number, move_type, invoice_date, due_date, \
+                total_amount::float8 AS total, amount_residual::float8 AS residual, payment_state \
+         FROM acc_move WHERE id = $1 AND partner_id = $2 AND state = 'posted' \
+           AND move_type IN ('customer_invoice','customer_credit_note')",
+    )
+    .bind(id)
+    .bind(partner)
+    .fetch_optional(&db)
+    .await
+    .ok()
+    .flatten();
+    let Some(h) = head else {
+        let body = r#"<div class="pcard p-6 text-center text-base-content/60">Invoice not found. <a class="link" href="/portal/invoices">Back to invoices</a>.</div>"#;
+        return (StatusCode::NOT_FOUND, Html(portal_shell("Not found", &name, "invoices", body))).into_response();
+    };
+    let number: Option<String> = h.try_get("number").ok().flatten();
+    let inv_date: Option<chrono::NaiveDate> = h.try_get("invoice_date").ok().flatten();
+    let due: Option<chrono::NaiveDate> = h.try_get("due_date").ok().flatten();
+    let total: f64 = h.try_get("total").unwrap_or(0.0);
+    let residual: f64 = h.try_get("residual").unwrap_or(0.0);
+    let pstate: String = h.get("payment_state");
+
+    // Lines the customer actually cares about: the revenue/tax charges, not the
+    // receivable or payable control lines (which just mirror the total). `credit
+    // - debit` renders each charge as a positive amount on a customer invoice.
+    let lines = sqlx::query(
+        "SELECT l.name, (l.credit - l.debit)::float8 AS amount \
+         FROM acc_move_line l JOIN acc_account a ON a.id = l.account_id \
+         WHERE l.move_id = $1 \
+           AND a.account_type NOT IN ('asset_receivable','liability_payable') \
+           AND (l.debit <> 0 OR l.credit <> 0) \
+         ORDER BY l.sequence, l.id",
+    )
+    .bind(id)
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default();
+    let mut line_html = String::new();
+    for l in &lines {
+        let lbl: Option<String> = l.try_get("name").ok().flatten();
+        let amt: f64 = l.try_get("amount").unwrap_or(0.0);
+        line_html.push_str(&format!(
+            r#"<tr><td>{}</td><td class="num">{}</td></tr>"#,
+            html_escape(lbl.as_deref().unwrap_or("—")),
+            portal_money(amt),
+        ));
+    }
+    if lines.is_empty() {
+        line_html = r#"<tr><td colspan="2" class="text-base-content/50 py-4 text-center">No line detail.</td></tr>"#.to_string();
+    }
+
+    let body = format!(
+        r#"<div class="mb-4"><a class="link text-sm" href="/portal/invoices">&larr; Invoices</a></div>
+<h1 class="text-2xl font-bold mb-1">Invoice {num}</h1>
+<div class="text-base-content/60 mb-4">Issued {date} · Due {due} · Status: {pstate}</div>
+<div class="pcard overflow-x-auto mb-4">
+<table class="ptbl"><thead><tr><th>Description</th><th class="num">Amount</th></tr></thead>
+<tbody>{lines}</tbody>
+<tfoot>
+<tr><th>Total</th><th class="num">{total}</th></tr>
+<tr><th>Balance due</th><th class="num">{residual}</th></tr>
+</tfoot></table></div>"#,
+        num = html_escape(number.as_deref().unwrap_or("—")),
+        date = inv_date.map(|d| d.to_string()).unwrap_or_else(|| "—".into()),
+        due = due.map(|d| d.to_string()).unwrap_or_else(|| "—".into()),
+        pstate = html_escape(&pstate),
+        lines = line_html,
+        total = portal_money(total),
+        residual = portal_money(residual),
+    );
+    Html(portal_shell(&format!("Invoice {}", number.as_deref().unwrap_or("")), &name, "invoices", &body)).into_response()
+}
+
+async fn portal_orders(Db(db): Db, Extension(user): Extension<AuthUser>) -> Response {
+    use vortex_framework::ui::html_escape;
+    let partner = match portal_partner(&user) { Ok(p) => p, Err(r) => return r };
+    let name = portal_partner_name(&db, partner, &user.username).await;
+
+    let rows = sqlx::query(
+        "SELECT number, order_date, state, total_amount::float8 AS total \
+         FROM sales_order WHERE customer_id = $1 \
+         ORDER BY order_date DESC, number DESC LIMIT 500",
+    )
+    .bind(partner)
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default();
+
+    let mut trs = String::new();
+    for r in &rows {
+        let number: Option<String> = r.try_get("number").ok().flatten();
+        let odate: Option<chrono::NaiveDate> = r.try_get("order_date").ok().flatten();
+        let state: String = r.try_get("state").ok().flatten().unwrap_or_default();
+        let total: f64 = r.try_get("total").unwrap_or(0.0);
+        let badge = match state.as_str() {
+            "delivered" => r#"<span class="badge badge-success badge-sm">Delivered</span>"#,
+            "confirmed" => r#"<span class="badge badge-info badge-sm">Confirmed</span>"#,
+            "cancelled" => r#"<span class="badge badge-ghost badge-sm">Cancelled</span>"#,
+            _ => r#"<span class="badge badge-warning badge-sm">Draft</span>"#,
+        };
+        trs.push_str(&format!(
+            r#"<tr><td>{num}</td><td>{date}</td><td>{badge}</td><td class="num">{total}</td></tr>"#,
+            num = html_escape(number.as_deref().unwrap_or("—")),
+            date = odate.map(|d| d.to_string()).unwrap_or_default(),
+            badge = badge,
+            total = portal_money(total),
+        ));
+    }
+    if rows.is_empty() {
+        trs = r#"<tr><td colspan="4" class="text-base-content/50 text-center py-6">No orders yet.</td></tr>"#.to_string();
+    }
+
+    let body = format!(
+        r#"<h1 class="text-2xl font-bold mb-4">Orders</h1>
+<div class="pcard overflow-x-auto">
+<table class="ptbl"><thead><tr><th>Number</th><th>Date</th><th>Status</th><th class="num">Total</th></tr></thead>
+<tbody>{trs}</tbody></table></div>"#,
+        trs = trs,
+    );
+    Html(portal_shell("Orders", &name, "orders", &body)).into_response()
+}
+
+async fn portal_statement(Db(db): Db, Extension(user): Extension<AuthUser>) -> Response {
+    use vortex_framework::ui::html_escape;
+    let partner = match portal_partner(&user) { Ok(p) => p, Err(r) => return r };
+    let name = portal_partner_name(&db, partner, &user.username).await;
+
+    // Open items with ageing, scoped to this partner's receivables.
+    let rows = sqlx::query(
+        "SELECT number, invoice_date, due_date, amount_residual::float8 AS residual, \
+                GREATEST(0, (CURRENT_DATE - due_date))::int AS days_overdue \
+         FROM acc_move \
+         WHERE partner_id = $1 AND state = 'posted' \
+           AND move_type IN ('customer_invoice','customer_credit_note') \
+           AND payment_state IN ('not_paid','partial') AND amount_residual <> 0 \
+         ORDER BY due_date NULLS LAST, invoice_date",
+    )
+    .bind(partner)
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default();
+
+    let mut buckets = [0f64; 4]; // current, 1-30, 31-60, 60+
+    let mut total = 0f64;
+    let mut trs = String::new();
+    for r in &rows {
+        let number: Option<String> = r.try_get("number").ok().flatten();
+        let inv_date: Option<chrono::NaiveDate> = r.try_get("invoice_date").ok().flatten();
+        let due: Option<chrono::NaiveDate> = r.try_get("due_date").ok().flatten();
+        let residual: f64 = r.try_get("residual").unwrap_or(0.0);
+        let overdue: i32 = r.try_get("days_overdue").unwrap_or(0);
+        total += residual;
+        let bucket = if overdue <= 0 { 0 } else if overdue <= 30 { 1 } else if overdue <= 60 { 2 } else { 3 };
+        buckets[bucket] += residual;
+        trs.push_str(&format!(
+            r#"<tr><td>{num}</td><td>{date}</td><td>{due}</td><td class="num">{days}</td><td class="num">{amt}</td></tr>"#,
+            num = html_escape(number.as_deref().unwrap_or("—")),
+            date = inv_date.map(|d| d.to_string()).unwrap_or_default(),
+            due = due.map(|d| d.to_string()).unwrap_or_default(),
+            days = if overdue > 0 { overdue.to_string() } else { "—".to_string() },
+            amt = portal_money(residual),
+        ));
+    }
+    if rows.is_empty() {
+        trs = r#"<tr><td colspan="5" class="text-base-content/50 text-center py-6">Nothing outstanding — your account is settled.</td></tr>"#.to_string();
+    }
+
+    let body = format!(
+        r#"<h1 class="text-2xl font-bold mb-1">Statement of account</h1>
+<p class="text-base-content/60 mb-4">Open items for <strong>{name}</strong>.</p>
+<div class="grid grid-cols-2 sm:grid-cols-5 gap-3 mb-5">
+  <div class="pcard p-3"><div class="text-xs text-base-content/60">Total due</div><div class="font-bold" style="color:#8BC53F">{total}</div></div>
+  <div class="pcard p-3"><div class="text-xs text-base-content/60">Current</div><div class="font-bold">{b0}</div></div>
+  <div class="pcard p-3"><div class="text-xs text-base-content/60">1–30 days</div><div class="font-bold">{b1}</div></div>
+  <div class="pcard p-3"><div class="text-xs text-base-content/60">31–60 days</div><div class="font-bold">{b2}</div></div>
+  <div class="pcard p-3"><div class="text-xs text-base-content/60">60+ days</div><div class="font-bold text-error">{b3}</div></div>
+</div>
+<div class="pcard overflow-x-auto">
+<table class="ptbl"><thead><tr><th>Invoice</th><th>Date</th><th>Due</th><th class="num">Days overdue</th><th class="num">Balance</th></tr></thead>
+<tbody>{trs}</tbody>
+<tfoot><tr><th colspan="4">Total outstanding</th><th class="num">{total}</th></tr></tfoot></table></div>"#,
+        name = html_escape(&name),
+        total = portal_money(total),
+        b0 = portal_money(buckets[0]),
+        b1 = portal_money(buckets[1]),
+        b2 = portal_money(buckets[2]),
+        b3 = portal_money(buckets[3]),
+        trs = trs,
+    );
+    Html(portal_shell("Statement", &name, "statement", &body)).into_response()
+}
+
+// ── Portal provisioning (Phase 3) — staff-facing invite/revoke + accept ──────
+//
+// Staff invite a partner from `/settings/portal-users`: the portal `users` row
+// is created inactive with a placeholder password, a single-use invite token is
+// issued (only its hash stored), and the invitee sets a password via the emailed
+// `/portal/invite/{token}` link, which activates the account.
+
+/// An unusable password placeholder — never a valid PHC string, so
+/// `verify_password` can never match it even if `active` were somehow true.
+const PORTAL_INVITE_PLACEHOLDER: &str = "!invite-pending";
+
+fn absolute_url(headers: &HeaderMap, path: &str) -> String {
+    let host = headers.get(header::HOST).and_then(|h| h.to_str().ok()).unwrap_or("localhost:3000");
+    let proto = headers
+        .get("x-forwarded-proto")
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| {
+            if host.starts_with("localhost") || host.starts_with("127.") { "http".into() } else { "https".into() }
+        });
+    format!("{proto}://{host}{path}")
+}
+
+fn portal_admin_shell(user: &AuthUser, title: &str, inner: &str) -> Html<String> {
+    use vortex_framework::ui::html_escape;
+    Html(format!(
+        r##"<!DOCTYPE html><html lang="en" data-theme="dark"><head>
+<script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>{title} - Settings</title>
+<link href="/static/vendor/daisyui.min.css" rel="stylesheet">
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script></head>
+<body class="min-h-screen bg-base-200">
+<div class="navbar bg-base-100 shadow-lg"><div class="flex-1"><a href="/settings" class="btn btn-ghost text-xl">remicle</a></div><div class="flex-none"><span class="text-sm">@{user}</span></div></div>
+<div class="container mx-auto p-6 max-w-5xl">{inner}</div></body></html>"##,
+        title = html_escape(title),
+        user = html_escape(&user.username),
+        inner = inner,
+    ))
+}
+
+async fn portal_users_list(
+    State(_state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+) -> Response {
+    use vortex_framework::ui::html_escape;
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Portal Users"))).into_response();
+    }
+
+    // Existing portal users + their partner + invite status.
+    let users = sqlx::query(
+        "SELECT u.id, u.username, u.email, u.active, u.last_login_at, c.name AS contact_name, \
+                EXISTS(SELECT 1 FROM portal_invite i WHERE i.user_id = u.id AND i.consumed_at IS NULL AND i.expires_at > NOW()) AS pending \
+         FROM users u LEFT JOIN contacts c ON c.id = u.contact_id \
+         WHERE u.is_portal = true ORDER BY u.username",
+    )
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default();
+
+    let mut rows = String::new();
+    for u in &users {
+        let id: uuid::Uuid = u.get("id");
+        let uname: String = u.get("username");
+        let email: Option<String> = u.try_get("email").ok().flatten();
+        let active: bool = u.get("active");
+        let pending: bool = u.try_get("pending").unwrap_or(false);
+        let contact: Option<String> = u.try_get("contact_name").ok().flatten();
+        let last: Option<chrono::DateTime<chrono::Utc>> = u.try_get("last_login_at").ok().flatten();
+        let status = if active {
+            r#"<span class="badge badge-success badge-sm">Active</span>"#
+        } else if pending {
+            r#"<span class="badge badge-info badge-sm">Invited</span>"#
+        } else {
+            r#"<span class="badge badge-ghost badge-sm">Disabled</span>"#
+        };
+        let actions = if active {
+            format!(r#"<form method="post" action="/settings/portal-users/{id}/revoke" class="inline" onsubmit="return confirm('Disable this portal login? They will be signed out immediately.')"><button class="btn btn-xs btn-error btn-outline">Disable</button></form>"#, id = id)
+        } else {
+            format!(r#"<form method="post" action="/settings/portal-users/{id}/resend" class="inline"><button class="btn btn-xs btn-outline">Resend invite</button></form>"#, id = id)
+        };
+        rows.push_str(&format!(
+            r##"<tr><td>{contact}</td><td class="text-xs">@{uname}</td><td class="text-xs">{email}</td><td class="text-xs">{last}</td><td>{status}</td><td class="text-right">{actions}</td></tr>"##,
+            contact = html_escape(contact.as_deref().unwrap_or("—")),
+            uname = html_escape(&uname),
+            email = html_escape(email.as_deref().unwrap_or("—")),
+            last = last.map(|d| d.format("%Y-%m-%d %H:%M").to_string()).unwrap_or_else(|| "—".into()),
+            status = status,
+            actions = actions,
+        ));
+    }
+    if users.is_empty() {
+        rows.push_str(r#"<tr><td colspan="6" class="text-center opacity-50 py-8">No portal users yet — invite a customer below.</td></tr>"#);
+    }
+
+    // Eligible contacts: customers without a portal login yet.
+    let contacts = sqlx::query(
+        "SELECT c.id, c.name FROM contacts c \
+         WHERE c.contact_type IN ('customer','both') AND c.active = true \
+           AND NOT EXISTS (SELECT 1 FROM users u WHERE u.contact_id = c.id AND u.is_portal = true) \
+         ORDER BY c.name LIMIT 1000",
+    )
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default();
+    let mut options = String::new();
+    for c in &contacts {
+        let id: uuid::Uuid = c.get("id");
+        let name: String = c.get("name");
+        options.push_str(&format!(r#"<option value="{id}">{name}</option>"#, id = id, name = html_escape(&name)));
+    }
+    let invite_card = if contacts.is_empty() {
+        r#"<div class="alert">Every active customer already has a portal login.</div>"#.to_string()
+    } else {
+        format!(
+            r##"<div class="card bg-base-100 shadow mb-6"><div class="card-body">
+<h2 class="card-title text-lg">Invite a customer</h2>
+<p class="text-base-content/60 text-sm">Creates a self-service login bound to the selected customer and emails them a link to set a password. They only ever see their own documents.</p>
+<form method="post" action="/settings/portal-users/invite" class="grid md:grid-cols-3 gap-3 items-end">
+<label class="form-control"><span class="label-text">Customer</span><select name="contact_id" required class="select select-bordered select-sm">{options}</select></label>
+<label class="form-control"><span class="label-text">Email</span><input name="email" type="email" required placeholder="person@company.com" class="input input-bordered input-sm"/></label>
+<label class="form-control"><span class="label-text">Username (optional)</span><input name="username" placeholder="defaults to email" class="input input-bordered input-sm"/></label>
+<div class="md:col-span-3"><button class="btn btn-primary btn-sm">Send invitation</button></div>
+</form></div></div>"##,
+            options = options,
+        )
+    };
+
+    let inner = format!(
+        r##"<div class="mb-4"><h1 class="text-2xl font-bold">Portal Users</h1>
+<p class="text-base-content/60">External customer self-service logins. Each is bound to one contact and confined to <code>/portal</code>.</p></div>
+{invite_card}
+<div class="card bg-base-100 shadow"><div class="card-body">
+<table class="table table-sm"><thead><tr><th>Customer</th><th>Username</th><th>Email</th><th>Last login</th><th>Status</th><th></th></tr></thead>
+<tbody>{rows}</tbody></table></div></div>"##,
+        invite_card = invite_card,
+        rows = rows,
+    );
+    portal_admin_shell(&user, "Portal Users", &inner).into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct PortalInviteForm {
+    contact_id: uuid::Uuid,
+    email: String,
+    username: Option<String>,
+}
+
+/// Create the invite token row + email it. Shared by invite and resend. Returns
+/// the absolute accept link so the caller can also show it to the admin.
+async fn issue_portal_invite(
+    db: &PgPool,
+    headers: &HeaderMap,
+    user_id: uuid::Uuid,
+    email: &str,
+    inviter: uuid::Uuid,
+) -> Result<String, String> {
+    // Invalidate any outstanding invites for this user first.
+    let _ = sqlx::query("UPDATE portal_invite SET consumed_at = NOW() WHERE user_id = $1 AND consumed_at IS NULL")
+        .bind(user_id).execute(db).await;
+    let token = generate_session_token();
+    let token_hash = hash_token(&token);
+    sqlx::query(
+        "INSERT INTO portal_invite (user_id, token_hash, email, expires_at, created_by) \
+         VALUES ($1, $2, $3, NOW() + INTERVAL '7 days', $4)",
+    )
+    .bind(user_id)
+    .bind(&token_hash)
+    .bind(email)
+    .bind(inviter)
+    .execute(db)
+    .await
+    .map_err(|e| format!("could not create invite: {e}"))?;
+
+    let link = absolute_url(headers, &format!("/portal/invite/{token}"));
+    let msg = vortex_framework::mail::EmailMessage::text(
+        email,
+        "You're invited to the customer portal",
+        format!(
+            "Hello,\n\nYou've been given access to the customer self-service portal, where you can view your invoices, orders and account statement.\n\nSet your password to get started:\n{link}\n\nThis link expires in 7 days.\n"
+        ),
+    )
+    .with_html(format!(
+        r#"<p>Hello,</p><p>You've been given access to the customer self-service portal, where you can view your invoices, orders and account statement.</p><p><a href="{link}" style="display:inline-block;padding:.6rem 1rem;background:#8BC53F;color:#000;border-radius:.4rem;text-decoration:none">Set your password</a></p><p style="color:#666;font-size:.85rem">Or paste this link into your browser: {link}<br>This link expires in 7 days.</p>"#
+    ));
+    // Best-effort: a missing SMTP config must not block provisioning — the admin
+    // can copy the link shown on the result page.
+    let _ = vortex_framework::mail::send_default(db, &msg, "portal_invite").await;
+    Ok(link)
+}
+
+async fn portal_user_invite(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    headers: HeaderMap,
+    Form(form): Form<PortalInviteForm>,
+) -> Response {
+    use vortex_framework::ui::html_escape;
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Portal Users"))).into_response();
+    }
+    let email = form.email.trim().to_string();
+    let username = form.username.as_deref().map(str::trim).filter(|s| !s.is_empty()).unwrap_or(&email).to_string();
+    let back = r#"<a href="/settings/portal-users" class="btn btn-sm mt-4">Back</a>"#;
+    let err = |e: String| portal_admin_shell(&user, "Portal Users", &format!(r#"<div class="alert alert-error">{}</div>{}"#, html_escape(&e), back)).into_response();
+
+    if email.is_empty() || !email.contains('@') {
+        return err("A valid email is required.".into());
+    }
+    // Contact must exist and be a customer.
+    let contact = sqlx::query("SELECT name, company_id, contact_type FROM contacts WHERE id = $1 AND active = true")
+        .bind(form.contact_id).fetch_optional(&db).await.ok().flatten();
+    let Some(contact) = contact else { return err("That customer no longer exists.".into()) };
+    let ctype: String = contact.get("contact_type");
+    if !matches!(ctype.as_str(), "customer" | "both") {
+        return err("Portal logins can only be created for customers.".into());
+    }
+    let contact_name: String = contact.get("name");
+    let company_id: Option<uuid::Uuid> = contact.try_get("company_id").ok().flatten();
+
+    // One portal login per contact.
+    let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE contact_id = $1 AND is_portal = true")
+        .bind(form.contact_id).fetch_one(&db).await.unwrap_or(0);
+    if exists > 0 {
+        return err(format!("{contact_name} already has a portal login."));
+    }
+    // Username must be free.
+    let taken: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE username = $1")
+        .bind(&username).fetch_one(&db).await.unwrap_or(0);
+    if taken > 0 {
+        return err(format!("The username {username:?} is taken — pick another."));
+    }
+
+    let placeholder = hash_password(PORTAL_INVITE_PLACEHOLDER);
+    let new_id: Result<uuid::Uuid, _> = sqlx::query_scalar(
+        "INSERT INTO users (company_id, username, email, password_hash, full_name, active, is_portal, contact_id, password_changed_at) \
+         VALUES ($1, $2, $3, $4, $5, false, true, $6, NOW()) RETURNING id",
+    )
+    .bind(company_id)
+    .bind(&username)
+    .bind(&email)
+    .bind(&placeholder)
+    .bind(&contact_name)
+    .bind(form.contact_id)
+    .fetch_one(&db)
+    .await;
+    let new_id = match new_id {
+        Ok(id) => id,
+        Err(e) => return err(format!("Could not create the login: {e}")),
+    };
+    let _ = sqlx::query("INSERT INTO user_roles (user_id, role_id) VALUES ($1, '00000000-0000-0000-0000-000000000005') ON CONFLICT DO NOTHING")
+        .bind(new_id).execute(&db).await;
+
+    let link = match issue_portal_invite(&db, &headers, new_id, &email, user.id).await {
+        Ok(l) => l,
+        Err(e) => return err(e),
+    };
+
+    // Audit the provisioning (state-changing).
+    api_audit(
+        &state, &db_ctx.db_name, &user,
+        AuditAction::Custom("portal_user_invited".into()), AuditSeverity::Warning,
+        "portal_user", Some(&new_id.to_string()),
+        serde_json::json!({"contact_id": form.contact_id, "email": email, "username": username}),
+    ).await;
+
+    let inner = format!(
+        r##"<div class="mb-4"><h1 class="text-2xl font-bold">Invitation sent</h1></div>
+<div class="alert alert-success mb-4"><span>Portal login created for <strong>{contact}</strong> and an invite emailed to <strong>{email}</strong>.</span></div>
+<div class="card bg-base-100 shadow"><div class="card-body">
+<p class="text-sm text-base-content/60">If email isn't configured, share this one-time link (expires in 7 days):</p>
+<code class="text-xs break-all bg-base-200 p-2 rounded">{link}</code>
+<a href="/settings/portal-users" class="btn btn-primary btn-sm mt-4 w-fit">Done</a>
+</div></div>"##,
+        contact = html_escape(&contact_name),
+        email = html_escape(&email),
+        link = html_escape(&link),
+    );
+    portal_admin_shell(&user, "Portal Users", &inner).into_response()
+}
+
+async fn portal_user_revoke(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<uuid::Uuid>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Portal Users"))).into_response();
+    }
+    // Only ever touch portal accounts.
+    let affected = sqlx::query("UPDATE users SET active = false WHERE id = $1 AND is_portal = true")
+        .bind(id).execute(&db).await.map(|r| r.rows_affected()).unwrap_or(0);
+    if affected > 0 {
+        let _ = sqlx::query("UPDATE sessions SET revoked = true, revoked_at = NOW(), revoked_reason = 'portal_access_revoked' WHERE user_id = $1 AND revoked = false")
+            .bind(id).execute(&db).await;
+        let _ = sqlx::query("UPDATE portal_invite SET consumed_at = NOW() WHERE user_id = $1 AND consumed_at IS NULL")
+            .bind(id).execute(&db).await;
+        api_audit(
+            &state, &db_ctx.db_name, &user,
+            AuditAction::Custom("portal_user_revoked".into()), AuditSeverity::Warning,
+            "portal_user", Some(&id.to_string()), serde_json::json!({}),
+        ).await;
+    }
+    Redirect::to("/settings/portal-users").into_response()
+}
+
+async fn portal_user_resend(
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    headers: HeaderMap,
+    Path(id): Path<uuid::Uuid>,
+) -> Response {
+    use vortex_framework::ui::html_escape;
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Portal Users"))).into_response();
+    }
+    let row = sqlx::query("SELECT email FROM users WHERE id = $1 AND is_portal = true AND active = false")
+        .bind(id).fetch_optional(&db).await.ok().flatten();
+    let Some(row) = row else { return Redirect::to("/settings/portal-users").into_response() };
+    let email: Option<String> = row.try_get("email").ok().flatten();
+    let Some(email) = email else { return Redirect::to("/settings/portal-users").into_response() };
+    let link = match issue_portal_invite(&db, &headers, id, &email, user.id).await {
+        Ok(l) => l,
+        Err(e) => return portal_admin_shell(&user, "Portal Users", &format!(r#"<div class="alert alert-error">{}</div><a href="/settings/portal-users" class="btn btn-sm mt-4">Back</a>"#, html_escape(&e))).into_response(),
+    };
+    let inner = format!(
+        r##"<div class="mb-4"><h1 class="text-2xl font-bold">Invitation re-sent</h1></div>
+<div class="alert alert-success mb-4"><span>A fresh invite was emailed to <strong>{email}</strong>.</span></div>
+<div class="card bg-base-100 shadow"><div class="card-body">
+<p class="text-sm text-base-content/60">One-time link (expires in 7 days):</p>
+<code class="text-xs break-all bg-base-200 p-2 rounded">{link}</code>
+<a href="/settings/portal-users" class="btn btn-primary btn-sm mt-4 w-fit">Done</a></div></div>"##,
+        email = html_escape(&email),
+        link = html_escape(&link),
+    );
+    portal_admin_shell(&user, "Portal Users", &inner).into_response()
+}
+
+/// GET /settings/portal-users/contact/{id} — the portal panel for one contact,
+/// reachable from the "Invite to portal" button on the contact record. Shows an
+/// invite form for a customer with no login yet, or the current login's status
+/// with manage actions.
+async fn portal_user_for_contact(
+    State(_state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Path(id): Path<uuid::Uuid>,
+) -> Response {
+    use vortex_framework::ui::html_escape;
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Portal Users"))).into_response();
+    }
+    let back = r#"<a href="/settings/portal-users" class="btn btn-sm btn-ghost mt-4">All portal users</a>"#;
+    let contact = sqlx::query("SELECT name, contact_type FROM contacts WHERE id = $1")
+        .bind(id).fetch_optional(&db).await.ok().flatten();
+    let Some(contact) = contact else {
+        return portal_admin_shell(&user, "Portal Users", &format!(r#"<div class="alert alert-error">Contact not found.</div>{back}"#)).into_response();
+    };
+    let cname: String = contact.get("name");
+    let ctype: String = contact.get("contact_type");
+    if !matches!(ctype.as_str(), "customer" | "both") {
+        return portal_admin_shell(&user, "Portal Users", &format!(
+            r#"<div class="mb-4"><h1 class="text-2xl font-bold">Portal access</h1></div><div class="alert">Portal logins are only available for customers. <strong>{}</strong> is not a customer.</div>{back}"#,
+            html_escape(&cname),
+        )).into_response();
+    }
+
+    let existing = sqlx::query(
+        "SELECT u.id, u.username, u.email, u.active, u.last_login_at, \
+                EXISTS(SELECT 1 FROM portal_invite i WHERE i.user_id = u.id AND i.consumed_at IS NULL AND i.expires_at > NOW()) AS pending \
+         FROM users u WHERE u.contact_id = $1 AND u.is_portal = true",
+    )
+    .bind(id)
+    .fetch_optional(&db)
+    .await
+    .ok()
+    .flatten();
+
+    let inner = if let Some(u) = existing {
+        let uid: uuid::Uuid = u.get("id");
+        let uname: String = u.get("username");
+        let email: Option<String> = u.try_get("email").ok().flatten();
+        let active: bool = u.get("active");
+        let pending: bool = u.try_get("pending").unwrap_or(false);
+        let last: Option<chrono::DateTime<chrono::Utc>> = u.try_get("last_login_at").ok().flatten();
+        let (status, action) = if active {
+            (
+                r#"<span class="badge badge-success">Active</span>"#.to_string(),
+                format!(r#"<form method="post" action="/settings/portal-users/{uid}/revoke" onsubmit="return confirm('Disable this portal login? They will be signed out immediately.')"><button class="btn btn-sm btn-error btn-outline">Disable access</button></form>"#),
+            )
+        } else if pending {
+            (
+                r#"<span class="badge badge-info">Invited (awaiting sign-up)</span>"#.to_string(),
+                format!(r#"<form method="post" action="/settings/portal-users/{uid}/resend"><button class="btn btn-sm btn-outline">Resend invite</button></form>"#),
+            )
+        } else {
+            (
+                r#"<span class="badge badge-ghost">Disabled</span>"#.to_string(),
+                format!(r#"<form method="post" action="/settings/portal-users/{uid}/resend"><button class="btn btn-sm btn-outline">Re-invite</button></form>"#),
+            )
+        };
+        format!(
+            r##"<div class="mb-4"><h1 class="text-2xl font-bold">Portal access · {cname}</h1></div>
+<div class="card bg-base-100 shadow"><div class="card-body">
+<div class="flex items-center justify-between flex-wrap gap-3">
+  <div>
+    <div>Username: <code>@{uname}</code></div>
+    <div class="text-sm text-base-content/60">Email: {email} · Last login: {last}</div>
+    <div class="mt-2">{status}</div>
+  </div>
+  <div>{action}</div>
+</div></div></div>{back}"##,
+            cname = html_escape(&cname),
+            uname = html_escape(&uname),
+            email = html_escape(email.as_deref().unwrap_or("—")),
+            last = last.map(|d| d.format("%Y-%m-%d %H:%M").to_string()).unwrap_or_else(|| "never".into()),
+            status = status,
+            action = action,
+            back = back,
+        )
+    } else {
+        // No login yet → pre-filled invite form locked to this contact.
+        format!(
+            r##"<div class="mb-4"><h1 class="text-2xl font-bold">Invite {cname} to the portal</h1>
+<p class="text-base-content/60">Creates a self-service login bound to this customer and emails them a link to set a password. They only ever see their own documents.</p></div>
+<div class="card bg-base-100 shadow"><div class="card-body">
+<form method="post" action="/settings/portal-users/invite" class="grid md:grid-cols-2 gap-3 items-end">
+<input type="hidden" name="contact_id" value="{id}"/>
+<label class="form-control"><span class="label-text">Email</span><input name="email" type="email" required placeholder="person@company.com" class="input input-bordered input-sm"/></label>
+<label class="form-control"><span class="label-text">Username (optional)</span><input name="username" placeholder="defaults to email" class="input input-bordered input-sm"/></label>
+<div class="md:col-span-2"><button class="btn btn-primary btn-sm">Send invitation</button></div>
+</form></div></div>{back}"##,
+            cname = html_escape(&cname),
+            id = id,
+            back = back,
+        )
+    };
+    portal_admin_shell(&user, "Portal Users", &inner).into_response()
+}
+
+/// Look up a valid (unconsumed, unexpired) invite by raw token → its user id.
+async fn portal_invite_lookup(db: &PgPool, token: &str) -> Option<uuid::Uuid> {
+    let token_hash = hash_token(token);
+    sqlx::query_scalar(
+        "SELECT user_id FROM portal_invite \
+         WHERE token_hash = $1 AND consumed_at IS NULL AND expires_at > NOW()",
+    )
+    .bind(&token_hash)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
+}
+
+fn portal_invite_page_html(token: &str, err: Option<&str>) -> String {
+    use vortex_framework::ui::html_escape;
+    let err_html = err
+        .map(|e| format!(r#"<div class="alert alert-error text-sm mb-3">{}</div>"#, html_escape(e)))
+        .unwrap_or_default();
+    format!(
+        r#"<!DOCTYPE html><html data-theme="dark"><head>
+<title>Set your password</title><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
+<script src="/static/vendor/tailwind.js"></script>
+<style>body{{background:#0b0f0a;color:#e5e7eb}}</style></head>
+<body class="min-h-screen flex items-center justify-center p-4">
+<div class="w-full max-w-sm" style="background:#12160f;border:1px solid #263019;border-radius:.75rem;padding:1.5rem">
+  <div class="text-center mb-5"><div class="text-2xl font-bold"><span style="color:#8BC53F">re</span><span style="color:#9ca3af">micle</span></div>
+  <div class="text-sm mt-1" style="color:#9ca3af">Set your portal password</div></div>
+  {err_html}
+  <form method="post" action="/portal/invite/{token}" class="flex flex-col gap-3">
+    <label class="text-sm">New password
+      <input name="password" type="password" required minlength="8" autocomplete="new-password" class="input input-bordered w-full mt-1" style="background:#0b0f0a"/>
+    </label>
+    <label class="text-sm">Confirm password
+      <input name="confirm" type="password" required minlength="8" autocomplete="new-password" class="input input-bordered w-full mt-1" style="background:#0b0f0a"/>
+    </label>
+    <button class="btn mt-2" style="background:#8BC53F;border-color:#8BC53F;color:#000">Set password &amp; sign in</button>
+  </form>
+</div></body></html>"#,
+        err_html = err_html,
+        token = html_escape(token),
+    )
+}
+
+/// Resolve the tenant pool for a public (pre-auth) portal request from the Host
+/// header — the invite/login routes have no `DatabaseContext` injected.
+async fn portal_public_pool(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+) -> Result<sqlx::PgPool, Response> {
+    let db_name = resolve_database(state, headers, None).await;
+    state
+        .pool_manager
+        .get_pool(&db_name)
+        .await
+        .map(|p| p.pool().clone())
+        .map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, Html("Service unavailable")).into_response())
+}
+
+async fn portal_invite_page(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(token): Path<String>,
+) -> Response {
+    let db = match portal_public_pool(&state, &headers).await {
+        Ok(d) => d,
+        Err(r) => return r,
+    };
+    if portal_invite_lookup(&db, &token).await.is_none() {
+        let body = r#"<!DOCTYPE html><html data-theme="dark"><head><title>Invite</title><link href="/static/vendor/daisyui.min.css" rel="stylesheet"/><script src="/static/vendor/tailwind.js"></script><style>body{background:#0b0f0a;color:#e5e7eb}</style></head><body class="min-h-screen flex items-center justify-center p-4"><div class="text-center"><h1 class="text-xl font-bold mb-2">Invitation not valid</h1><p class="text-base-content/60">This invite link has expired or already been used. Ask your account manager to resend it.</p></div></body></html>"#;
+        return (StatusCode::NOT_FOUND, Html(body)).into_response();
+    }
+    Html(portal_invite_page_html(&token, None)).into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct PortalInviteAccept {
+    password: String,
+    confirm: String,
+}
+
+async fn portal_invite_submit(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(token): Path<String>,
+    Form(form): Form<PortalInviteAccept>,
+) -> Response {
+    let db = match portal_public_pool(&state, &headers).await {
+        Ok(d) => d,
+        Err(r) => return r,
+    };
+    let Some(user_id) = portal_invite_lookup(&db, &token).await else {
+        return (StatusCode::NOT_FOUND, Html(portal_invite_page_html(&token, Some("This invite is no longer valid.")))).into_response();
+    };
+    if form.password.len() < 8 {
+        return Html(portal_invite_page_html(&token, Some("Password must be at least 8 characters."))).into_response();
+    }
+    if form.password != form.confirm {
+        return Html(portal_invite_page_html(&token, Some("Passwords don't match."))).into_response();
+    }
+    let hash = hash_password(&form.password);
+    // Activate the account and consume the token in one go. Re-check is_portal
+    // defensively so this can only ever activate a portal login.
+    let updated = sqlx::query(
+        "UPDATE users SET password_hash = $1, active = true, must_change_password = false, \
+                password_changed_at = NOW() WHERE id = $2 AND is_portal = true",
+    )
+    .bind(&hash)
+    .bind(user_id)
+    .execute(&db)
+    .await
+    .map(|r| r.rows_affected())
+    .unwrap_or(0);
+    if updated == 0 {
+        return (StatusCode::NOT_FOUND, Html(portal_invite_page_html(&token, Some("This invite is no longer valid.")))).into_response();
+    }
+    let th = hash_token(&token);
+    let _ = sqlx::query("UPDATE portal_invite SET consumed_at = NOW() WHERE token_hash = $1")
+        .bind(&th).execute(&db).await;
+    Redirect::to("/portal/login").into_response()
 }
 
 // NOTE: error_response / forbidden_page moved to vortex_framework::ui
@@ -2763,7 +4223,20 @@ async fn security_headers_middleware(
     next: Next,
 ) -> Response {
     let mut response = next.run(request).await;
+    // Dynamic HTML must never be reused from the browser cache: these pages are
+    // per-tenant, per-session and data-dependent, so a cached copy shows stale
+    // or empty content until a manual refresh (and would leak ERP data left in
+    // the cache). Static assets are cache-busted with ?v= and keep caching.
+    let is_html = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|ct| ct.starts_with("text/html"))
+        .unwrap_or(false);
     let headers = response.headers_mut();
+    if is_html {
+        headers.insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
+    }
     headers.insert("X-Frame-Options", "DENY".parse().unwrap());
     headers.insert("X-Content-Type-Options", "nosniff".parse().unwrap());
     headers.insert("X-XSS-Protection", "1; mode=block".parse().unwrap());
@@ -2958,22 +4431,40 @@ async fn home_page(
         + "modal.showModal=function(){loadAvailableShortcuts();origFn();};"
         + "</script>";
 
-    let html = format!(
-        r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style><title>Home - Remicle</title>
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=4" rel="stylesheet"/>
-<script src="/static/vortex.js?v=4" defer></script>
-<script src="/static/vendor/tailwind.js"></script>
-<script src="/static/vendor/htmx.min.js"></script>
-</head>
-<body class="min-h-screen bg-base-200">
-<div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a><button onclick="(function(){{var h=document.documentElement,c=h.getAttribute('data-theme')==='dark'?'corporate':'dark';h.setAttribute('data-theme',c);localStorage.setItem('theme',c);document.querySelectorAll('.theme-icon-sun,.theme-icon-moon').forEach(function(e){{e.classList.toggle('hidden')}})}})();" class="btn btn-ghost btn-sm btn-square ml-auto"><svg class="theme-icon-sun w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5" stroke-width="2"/><path stroke-linecap="round" stroke-width="2" d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg><svg class="theme-icon-moon w-5 h-5 hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg></button></div>
-<div id="sidebar-overlay" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
-<div class="flex">{sidebar}
-<main class="flex-1 p-4 lg:p-6 min-w-0">
+    // Admin-only system overview — folded in from the retired /dashboard.
+    // Live counts (the old dashboard tiles were hardcoded) plus the same
+    // recent-activity / system-status partials the dashboard used.
+    let admin_overview = if user.is_admin() {
+        let active_users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE active = true")
+            .fetch_one(&db).await.unwrap_or(0);
+        let companies: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM companies")
+            .fetch_one(&db).await.unwrap_or(0);
+        let modules = installed.len();
+        let audit_24h: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_log WHERE timestamp > NOW() - INTERVAL '24 hours'")
+            .fetch_one(&db).await.unwrap_or(0);
+        format!(
+            r#"<div class="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+<div class="stat bg-base-100 rounded-lg shadow"><div class="stat-title">Active Users</div><div class="stat-value text-primary">{au}</div></div>
+<div class="stat bg-base-100 rounded-lg shadow"><div class="stat-title">Companies</div><div class="stat-value text-secondary">{co}</div></div>
+<div class="stat bg-base-100 rounded-lg shadow"><div class="stat-title">Modules</div><div class="stat-value text-accent">{mo}</div></div>
+<div class="stat bg-base-100 rounded-lg shadow"><div class="stat-title">Audit Events</div><div class="stat-value text-info">{ae}</div><div class="stat-desc">Last 24h</div></div>
+</div>
+<div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
+<div class="card bg-base-100 shadow"><div class="card-body"><h2 class="card-title text-lg">Recent Activity</h2><div class="overflow-x-auto" hx-get="/partials/recent-activity" hx-trigger="load" hx-swap="innerHTML"><span class="loading loading-spinner loading-sm"></span></div></div></div>
+<div class="card bg-base-100 shadow"><div class="card-body"><h2 class="card-title text-lg">System Status</h2><div hx-get="/partials/system-status" hx-trigger="load" hx-swap="innerHTML"><span class="loading loading-spinner loading-sm"></span></div></div></div>
+</div>"#,
+            au = active_users, co = companies, mo = modules, ae = audit_24h
+        )
+    } else {
+        String::new()
+    };
+
+    let body = format!(
+        r#"
 <div class="mb-6"><h1 class="text-2xl font-bold">Welcome, {display_name}</h1><p class="text-base-content/60">Here's what's happening today</p></div>
 
+{admin_overview}
 <!-- Announcements (full width) -->
 <div class="card bg-base-100 shadow mb-6">
 <div class="card-body">
@@ -3020,88 +4511,19 @@ async fn home_page(
 
 </div></div>
 {shortcuts_modal}
-</main></div>
-{shortcuts_js}
-</body></html>"#,
-        sidebar = sidebar,
+"#,
         display_name = html_escape(display_name),
+        admin_overview = admin_overview,
         module_links = module_links,
         shortcuts_modal = shortcuts_modal,
-        shortcuts_js = shortcuts_js,
     );
-
-    Html(html)
-}
-
-async fn dashboard_page(
-    State(state): State<Arc<AppState>>,
-    Db(db): Db,
-    Extension(user): Extension<AuthUser>,
-) -> Html<String> {
-    // Get user's role
-    let role_name: Option<String> = sqlx::query_scalar(
-        r#"
-        SELECT r.name FROM roles r
-        JOIN user_roles ur ON r.id = ur.role_id
-        WHERE ur.user_id = $1
-        LIMIT 1
-        "#
-    )
-    .bind(&user.id)
-    .fetch_optional(&db)
-    .await
-    .ok()
-    .flatten();
-
-    let is_system_admin = role_name.as_deref() == Some("System Administrator");
-    let is_admin = is_system_admin || role_name.as_deref() == Some("Administrator");
-
-    // Get the template and inject user info
-    let template = include_str!("../../templates/dashboard_standalone.html");
-
-    // Replace placeholder with actual user info
-    let display_name = user.full_name.as_deref().unwrap_or(&user.username);
-    let initials = get_initials(display_name);
-
-    // Build admin-only sections
-    let admin_nav = if is_system_admin {
-        r#"<li class="menu-title mt-4"><span>Administration</span></li>
-           <li><a href="/users" class="nav-item"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197m9 5.197v-1"/></svg><span class="sidebar-text">Users</span></a></li>
-           <li><a href="/companies" class="nav-item"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5M9 7h1m-1 4h1m4-4h1m-1 4h1m-5 10v-5a1 1 0 011-1h2a1 1 0 011 1v5m-4 0h4"/></svg><span class="sidebar-text">Companies</span></a></li>
-           <li><a href="/roles" class="nav-item"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"/></svg><span class="sidebar-text">Roles</span></a></li>
-           <li><a href="/admin/access" class="nav-item"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/></svg><span class="sidebar-text">Access Control</span></a></li>
-           <li><a href="/settings" class="nav-item"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/></svg><span class="sidebar-text">Settings</span></a></li>"#
-    } else if is_admin {
-        r#"<li class="menu-title mt-4"><span>Administration</span></li>
-           <li><a href="/users" class="nav-item"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197m9 5.197v-1"/></svg><span class="sidebar-text">Users</span></a></li>
-           <li><a href="/companies" class="nav-item"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5M9 7h1m-1 4h1m4-4h1m-1 4h1m-5 10v-5a1 1 0 011-1h2a1 1 0 011 1v5m-4 0h4"/></svg><span class="sidebar-text">Companies</span></a></li>
-           <li><a href="/roles" class="nav-item"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"/></svg><span class="sidebar-text">Roles</span></a></li>
-           <li><a href="/settings" class="nav-item"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/></svg><span class="sidebar-text">Settings</span></a></li>"#
-    } else {
-        ""
-    };
-
-    let system_nav = if is_system_admin {
-        r#"<li class="menu-title mt-4"><span>System</span></li>
-           <li><a href="/audit"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01"/></svg>Audit Log</a></li>
-           <li><a href="/settings"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/></svg>Settings</a></li>"#
-    } else {
-        ""
-    };
-
-    let role_badge = format!(
-        r#"<span class="badge badge-sm {}">{}</span>"#,
-        if is_system_admin { "badge-error" } else if is_admin { "badge-warning" } else { "badge-info" },
-        role_name.as_deref().unwrap_or("User")
+    let html = vortex_framework::render_app_shell_with(
+        "Home - Remicle",
+        &sidebar,
+        &body,
+        "<script src=\"/static/vendor/htmx.min.js\"></script>\n",
+        &format!("\n{}\n", shortcuts_js),
     );
-
-    let html = template
-        .replace("{{user_name}}", display_name)
-        .replace("{{user_initials}}", &initials)
-        .replace("{{username}}", &user.username)
-        .replace("{{admin_nav}}", admin_nav)
-        .replace("{{system_nav}}", system_nav)
-        .replace("{{role_badge}}", &role_badge);
 
     Html(html)
 }
@@ -3697,17 +5119,7 @@ async fn announcements_list(
         ));
     }
 
-    Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style><title>Announcements - Remicle</title>
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=4" rel="stylesheet"/>
-<script src="/static/vortex.js?v=4" defer></script>
-<script src="/static/vendor/tailwind.js"></script></head>
-<body class="min-h-screen bg-base-200">
-<div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a><button onclick="(function(){{var h=document.documentElement,c=h.getAttribute('data-theme')==='dark'?'corporate':'dark';h.setAttribute('data-theme',c);localStorage.setItem('theme',c);document.querySelectorAll('.theme-icon-sun,.theme-icon-moon').forEach(function(e){{e.classList.toggle('hidden')}})}})();" class="btn btn-ghost btn-sm btn-square ml-auto"><svg class="theme-icon-sun w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5" stroke-width="2"/><path stroke-linecap="round" stroke-width="2" d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg><svg class="theme-icon-moon w-5 h-5 hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg></button></div>
-<div id="sidebar-overlay" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
-<div class="flex">{sidebar}
-<main class="flex-1 p-4 lg:p-6 min-w-0">
+    let body = format!(r#"
 <div class="flex justify-between items-center mb-6">
 <div><h1 class="text-2xl font-bold">Announcements</h1><p class="text-base-content/60">Manage company announcements shown on the home screen</p></div>
 <a href="/announcements/new" class="btn btn-primary">+ New Announcement</a>
@@ -3715,7 +5127,8 @@ async fn announcements_list(
 <div class="card bg-base-100 shadow"><div class="overflow-x-auto">
 <table class="table table-sm"><thead><tr><th>Title</th><th>Severity</th><th>Status</th><th>Author</th><th>Created</th><th>Actions</th></tr></thead>
 <tbody>{table_rows}</tbody></table></div></div>
-</main></div></body></html>"#)).into_response()
+"#);
+    Html(vortex_framework::render_app_shell("Announcements - Remicle", &sidebar, &body)).into_response()
 }
 
 async fn announcement_new(
@@ -3733,17 +5146,7 @@ async fn announcement_new(
     let installed = db_ctx.installed_modules.clone();
     let sidebar = build_sidebar("home", display_name, &initials, &installed, user.is_admin(), &state.plugin_registry, &user.roles);
 
-    Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style><title>New Announcement - Remicle</title>
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=4" rel="stylesheet"/>
-<script src="/static/vortex.js?v=4" defer></script>
-<script src="/static/vendor/tailwind.js"></script></head>
-<body class="min-h-screen bg-base-200">
-<div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a><button onclick="(function(){{var h=document.documentElement,c=h.getAttribute('data-theme')==='dark'?'corporate':'dark';h.setAttribute('data-theme',c);localStorage.setItem('theme',c);document.querySelectorAll('.theme-icon-sun,.theme-icon-moon').forEach(function(e){{e.classList.toggle('hidden')}})}})();" class="btn btn-ghost btn-sm btn-square ml-auto"><svg class="theme-icon-sun w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5" stroke-width="2"/><path stroke-linecap="round" stroke-width="2" d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg><svg class="theme-icon-moon w-5 h-5 hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg></button></div>
-<div id="sidebar-overlay" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
-<div class="flex">{sidebar}
-<main class="flex-1 p-4 lg:p-6 min-w-0"><h1 class="text-2xl font-bold mb-6">New Announcement</h1>
+    let body = format!(r#"<h1 class="text-2xl font-bold mb-6">New Announcement</h1>
 <form action="/announcements" method="POST" class="card bg-base-100 shadow p-6 max-w-2xl">
 <div class="form-control mb-4"><label class="label"><span class="label-text">Title *</span></label><input name="title" class="input input-bordered" required/></div>
 <div class="form-control mb-4"><label class="label"><span class="label-text">Body *</span></label><textarea name="body" class="textarea textarea-bordered h-32" required></textarea></div>
@@ -3756,7 +5159,8 @@ async fn announcement_new(
 <div class="form-control"><label class="label"><span class="label-text">Expire At (leave empty for never)</span></label><input name="expire_at" type="datetime-local" class="input input-bordered"/></div>
 </div>
 <div class="flex gap-2 mt-4"><a href="/announcements" class="btn btn-ghost">Cancel</a><button class="btn btn-primary">Create Announcement</button></div>
-</form></main></div></body></html>"#)).into_response()
+</form>"#);
+    Html(vortex_framework::render_app_shell("New Announcement - Remicle", &sidebar, &body)).into_response()
 }
 
 async fn announcement_create(
@@ -3848,17 +5252,7 @@ async fn announcement_edit(
     let installed = db_ctx.installed_modules.clone();
     let sidebar = build_sidebar("home", display_name, &initials, &installed, user.is_admin(), &state.plugin_registry, &user.roles);
 
-    Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style><title>Edit Announcement - Remicle</title>
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=4" rel="stylesheet"/>
-<script src="/static/vortex.js?v=4" defer></script>
-<script src="/static/vendor/tailwind.js"></script></head>
-<body class="min-h-screen bg-base-200">
-<div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a><button onclick="(function(){{var h=document.documentElement,c=h.getAttribute('data-theme')==='dark'?'corporate':'dark';h.setAttribute('data-theme',c);localStorage.setItem('theme',c);document.querySelectorAll('.theme-icon-sun,.theme-icon-moon').forEach(function(e){{e.classList.toggle('hidden')}})}})();" class="btn btn-ghost btn-sm btn-square ml-auto"><svg class="theme-icon-sun w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5" stroke-width="2"/><path stroke-linecap="round" stroke-width="2" d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg><svg class="theme-icon-moon w-5 h-5 hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg></button></div>
-<div id="sidebar-overlay" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
-<div class="flex">{sidebar}
-<main class="flex-1 p-4 lg:p-6 min-w-0"><h1 class="text-2xl font-bold mb-6">Edit Announcement</h1>
+    let page_body = format!(r#"<h1 class="text-2xl font-bold mb-6">Edit Announcement</h1>
 <form action="/announcements/{id}" method="POST" class="card bg-base-100 shadow p-6 max-w-2xl">
 <div class="form-control mb-4"><label class="label"><span class="label-text">Title *</span></label><input name="title" class="input input-bordered" value="{title}" required/></div>
 <div class="form-control mb-4"><label class="label"><span class="label-text">Body *</span></label><textarea name="body" class="textarea textarea-bordered h-32" required>{body}</textarea></div>
@@ -3871,7 +5265,7 @@ async fn announcement_edit(
 <div class="form-control"><label class="label"><span class="label-text">Expire At</span></label><input name="expire_at" type="datetime-local" class="input input-bordered" value="{expire_val}"/></div>
 </div>
 <div class="flex gap-2 mt-4"><a href="/announcements" class="btn btn-ghost">Cancel</a><button class="btn btn-primary">Save Changes</button></div>
-</form></main></div></body></html>"#,
+</form>"#,
         id = id,
         title = html_escape(&title),
         body = html_escape(&body),
@@ -3879,7 +5273,8 @@ async fn announcement_edit(
         pinned_checked = pinned_checked,
         publish_val = publish_val,
         expire_val = expire_val,
-    )).into_response()
+    );
+    Html(vortex_framework::render_app_shell("Edit Announcement - Remicle", &sidebar, &page_body)).into_response()
 }
 
 async fn announcement_update(
@@ -4921,8 +6316,8 @@ async fn access_control_page(
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Access Control - Remicle</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=4" rel="stylesheet"/>
-<script src="/static/vortex.js?v=4" defer></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script>
     <script src="/static/vendor/tailwind.js"></script>
     <script src="/static/vendor/htmx.min.js"></script>
     <script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style>
@@ -5069,9 +6464,9 @@ async fn access_control_page(
                         <span>Main</span>
                     </li>
                     <li>
-                        <a href="/dashboard">
+                        <a href="/home">
                             <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6"></path></svg>
-                            Dashboard
+                            Home
                         </a>
                     </li>
                     <li class="menu-title mt-4">
@@ -5411,8 +6806,8 @@ async fn modules_list_with_filter(
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Apps & Modules - Remicle</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet" type="text/css" />
-<link href="/static/vortex.css?v=4" rel="stylesheet"/>
-<script src="/static/vortex.js?v=4" defer></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script>
     <script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
@@ -5422,13 +6817,13 @@ async fn modules_list_with_filter(
         <!-- Sidebar -->
         <aside id="sidebar-modules" class="w-64 bg-base-100 shadow-lg flex flex-col min-h-screen fixed lg:static top-0 left-0 z-40 h-full -translate-x-full lg:translate-x-0 transition-transform duration-200">
             <div class="p-4 border-b border-base-300">
-                <a href="/dashboard" class="flex justify-center">
+                <a href="/home" class="flex justify-center">
                     <span class="text-xl font-bold"><span class="text-success">re</span><span class="text-base-content/60">micle</span></span>
                 </a>
             </div>
             <nav class="flex-1 overflow-y-auto p-4">
                 <ul class="menu menu-sm gap-1">
-                    <li><a href="/dashboard">Dashboard</a></li>
+                    <li><a href="/home">Home</a></li>
                     <li class="menu-title mt-4"><span>Administration</span></li>
                     <li><a href="/users">Users</a></li>
                     <li><a href="/admin/access">Access Control</a></li>
@@ -5757,8 +7152,8 @@ async fn modules_detail(
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>{name} - Apps & Modules</title>
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet" type="text/css"/>
-<link href="/static/vortex.css?v=4" rel="stylesheet"/>
-<script src="/static/vortex.js?v=4" defer></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script>
 <script src="/static/vendor/tailwind.js"></script></head>
 <body class="min-h-screen bg-base-200"><main class="max-w-4xl mx-auto p-4 lg:p-8">
 <a href="/modules" class="btn btn-ghost btn-sm mb-4 gap-2">← Back to Apps &amp; Modules</a>
@@ -5871,6 +7266,22 @@ async fn modules_refresh(
             message: "Permission denied".to_string(),
             error: Some("Only system administrators can update the apps list".to_string()),
         }).into_response();
+    }
+
+    // Project plugin `#[derive(Model)]` metadata into this tenant's registry
+    // (ir_model / ir_model_field) so refreshing the apps list also refreshes
+    // the generic-view + REST-API metadata. Mirrors the CLI `db migrate` path.
+    {
+        let metas: Vec<&'static vortex_orm::model::ModelMeta> = state
+            .plugin_registry
+            .plugins_iter()
+            .flat_map(|p| p.models())
+            .collect();
+        if !metas.is_empty() {
+            if let Err(e) = vortex_orm::registry_sync::sync_model_registry(&db, &metas).await {
+                error!("model registry sync during apps-list refresh failed: {}", e);
+            }
+        }
     }
 
     match crate::commands::module_sync::sync_plugins_to_installed_modules(&db, &state.plugin_registry).await {
@@ -6230,6 +7641,26 @@ async fn module_upgrade(
 // Dynamic Sidebar Menu Helper
 // ============================================================================
 
+/// Sidebar `<li>` items for the generic model views (list/kanban/graph/
+/// calendar/pivot). These reuse the same aggregated plugin-registry menu as
+/// every plugin page — via [`vortex_framework::build_sidebar_nav`] — instead
+/// of the sparse `ir_ui_menu` fallback in [`build_sidebar_menu`], so the
+/// left-hand menu no longer vanishes when switching into a non-list view.
+fn generic_view_sidebar(
+    state: &AppState,
+    user: &AuthUser,
+    db_ctx: &DatabaseContext,
+    active: &str,
+) -> String {
+    vortex_framework::build_sidebar_nav(
+        active,
+        &db_ctx.installed_modules,
+        user.is_admin(),
+        &state.plugin_registry,
+        &user.roles,
+    )
+}
+
 async fn build_sidebar_menu(db: &PgPool, user_roles: &[String], current_model: &str) -> String {
     // Fetch menu items
     let menus = sqlx::query(
@@ -6320,7 +7751,7 @@ async fn build_sidebar_menu(db: &PgPool, user_roles: &[String], current_model: &
         } else {
             // It's a direct link (like Dashboard)
             let action_url: Option<String> = menu.get("action_url");
-            let href = action_url.unwrap_or_else(|| "/dashboard".to_string());
+            let href = action_url.unwrap_or_else(|| "/home".to_string());
             html.push_str(&format!(r#"<li><a href="{}" class="nav-item">{}<span class="sidebar-text">{}</span></a></li>"#,
                 href, icon_html, name));
         }
@@ -6362,6 +7793,7 @@ async fn generic_list_view(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
     Path(model_name): Path<String>,
     Query(params): Query<GenericListQuery>,
 ) -> Response {
@@ -6591,17 +8023,26 @@ async fn generic_list_view(
                     "many2one" => record.try_get::<String, _>(col_name.as_str()).unwrap_or_else(|_|
                         record.try_get::<Option<String>, _>(col_name.as_str()).ok().flatten().unwrap_or_else(|| "-".to_string())
                     ),
-                    _ => record.try_get::<String, _>(col_name.as_str()).unwrap_or_else(|_|
-                        record.try_get::<Option<String>, _>(col_name.as_str()).ok().flatten().unwrap_or_else(|| "-".to_string())
-                    ),
+                    // Text, and any non-string scalar (numeric/date/bool columns
+                    // otherwise render as "-" because only String was tried).
+                    _ => record.try_get::<String, _>(col_name.as_str())
+                        .or_else(|_| record.try_get::<Option<String>, _>(col_name.as_str()).map(|v| v.unwrap_or_default()))
+                        .or_else(|_| record.try_get::<i32, _>(col_name.as_str()).map(|v| v.to_string()))
+                        .or_else(|_| record.try_get::<i64, _>(col_name.as_str()).map(|v| v.to_string()))
+                        .or_else(|_| record.try_get::<sqlx::types::Decimal, _>(col_name.as_str()).map(|v| v.to_string()))
+                        .or_else(|_| record.try_get::<f64, _>(col_name.as_str()).map(|v| v.to_string()))
+                        .or_else(|_| record.try_get::<chrono::NaiveDate, _>(col_name.as_str()).map(|v| v.to_string()))
+                        .or_else(|_| record.try_get::<chrono::NaiveDateTime, _>(col_name.as_str()).map(|v| v.format("%Y-%m-%d %H:%M").to_string()))
+                        .or_else(|_| record.try_get::<chrono::DateTime<chrono::Utc>, _>(col_name.as_str()).map(|v| v.format("%Y-%m-%d %H:%M").to_string()))
+                        .unwrap_or_else(|_| "-".to_string()),
                 };
                 format!("<td>{}</td>", cell_val)
             })
             .collect();
 
         rows.push_str(&format!(
-            r#"<tr class="hover cursor-pointer" onclick="window.location='/{}/{}'">{}></tr>"#,
-            model_name, id, cells
+            r#"<tr class="hover cursor-pointer" onclick="window.location='{}'">{}></tr>"#,
+            vortex_framework::record_url(&model_name, &id.to_string()), cells
         ));
     }
 
@@ -6700,7 +8141,7 @@ async fn generic_list_view(
     }
 
     // Build dynamic sidebar
-    let sidebar_menu = build_sidebar_menu(&db, &user.roles, &model_name).await;
+    let sidebar_menu = generic_view_sidebar(&state, &user, &db_ctx, &model_name);
 
     // Fetch saved filters for this model
     let saved_filters = sqlx::query(
@@ -6722,8 +8163,8 @@ async fn generic_list_view(
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style><title>{}</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=4" rel="stylesheet"/>
-<script src="/static/vortex.js?v=4" defer></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script>
 <script src="/static/vendor/tailwind.js"></script>
 <style>
 body {{ background: oklch(var(--b2)); color: oklch(var(--bc)); }}
@@ -6784,7 +8225,7 @@ body {{ background: oklch(var(--b2)); color: oklch(var(--bc)); }}
             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 10h18M3 14h18m-9-4v8m-7 0h14a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg>
         </a>
     </div>
-    <a href="/{}/new" class="btn btn-primary btn-sm">+ New</a>
+    <a href="{}" class="btn btn-primary btn-sm">+ New</a>
 </div>
 </div>
 <div class="card mb-4">
@@ -6818,7 +8259,8 @@ body {{ background: oklch(var(--b2)); color: oklch(var(--bc)); }}
         user.username,
         sidebar_menu,
         model_display_name, model_display_name.to_lowercase(),
-        model_name, model_name, model_name, model_name, model_name, model_name,
+        model_name, model_name, model_name, model_name,
+        vortex_framework::new_record_url(&model_name), model_name,
         saved_filters_options, filter_controls, model_name, headers, rows,
         {
             // Build base_url for pagination links, preserving search/filter/group_by/per_page params
@@ -6853,236 +8295,538 @@ body {{ background: oklch(var(--b2)); color: oklch(var(--bc)); }}
 }
 
 // ============================================================================
+// Saved analytic views (Initiative #4)
+// ============================================================================
+// Persist a pivot/graph/kanban/calendar configuration as an owner/shared user
+// record so operators can name and revisit a breakdown. See
+// vortex_framework::saved_views for the registry-checked config model.
+
+/// Pull the `cfg_<key>` fields out of a posted view-save form into a raw config
+/// bag (the module re-validates every key against the registry).
+fn collect_view_config(
+    form: &std::collections::HashMap<String, String>,
+) -> std::collections::BTreeMap<String, String> {
+    form.iter()
+        .filter_map(|(k, v)| k.strip_prefix("cfg_").map(|key| (key.to_string(), v.clone())))
+        .filter(|(_, v)| !v.trim().is_empty())
+        .collect()
+}
+
+/// POST /views/save — validate and persist the current analytic view config,
+/// then redirect back to that view with the saved config applied.
+async fn saved_view_save(
+    State(_state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Form(form): Form<std::collections::HashMap<String, String>>,
+) -> Response {
+    let model = form.get("model").map(String::as_str).unwrap_or("");
+    let view_type = form.get("view_type").map(String::as_str).unwrap_or("");
+    let name = form.get("name").map(String::as_str).unwrap_or("");
+    let is_shared = form.get("is_shared").map(|v| v == "1" || v == "on").unwrap_or(false);
+    let is_default = form.get("is_default").map(|v| v == "1" || v == "on").unwrap_or(false);
+    let fallback = format!("/{}/{}", view_type, model);
+    let redirect = form.get("redirect").map(String::as_str).filter(|s| s.starts_with('/')).unwrap_or(&fallback);
+    let raw = collect_view_config(&form);
+
+    match vortex_framework::saved_views::create(
+        &db, model, view_type, name, &raw, user.id, is_shared, is_default,
+    )
+    .await
+    {
+        Ok(id) => match vortex_framework::saved_views::load(&db, id).await {
+            // Land on the freshly saved view so the user sees it applied.
+            Some(v) => {
+                let qs = v.query_string();
+                let target = if qs.is_empty() { fallback.clone() } else { format!("/{}/{}?{}", view_type, model, qs) };
+                vortex_framework::flash::flash_redirect(
+                    &target,
+                    vortex_framework::flash::FlashKind::Success,
+                    &format!("Saved view “{}”.", v.name),
+                )
+            }
+            None => Redirect::to(redirect).into_response(),
+        },
+        Err(e) => {
+            // Bounce back to the view with the error surfaced as a toast.
+            vortex_framework::flash::flash_redirect(
+                redirect,
+                vortex_framework::flash::FlashKind::Error,
+                &e,
+            )
+        }
+    }
+}
+
+/// POST /views/{id}/delete — remove a saved view the user owns (or any, if admin).
+async fn saved_view_delete(
+    State(_state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Path(id): Path<uuid::Uuid>,
+    Form(form): Form<std::collections::HashMap<String, String>>,
+) -> Response {
+    let redirect = form.get("redirect").map(String::as_str).filter(|s| s.starts_with('/')).unwrap_or("/home").to_string();
+    match vortex_framework::saved_views::load(&db, id).await {
+        Some(v) if v.can_edit(user.id, user.is_admin()) => {
+            let _ = vortex_framework::saved_views::delete(&db, id).await;
+        }
+        _ => return (StatusCode::FORBIDDEN, "Not permitted").into_response(),
+    }
+    Redirect::to(&redirect).into_response()
+}
+
+// ============================================================================
 // Generic Kanban View
 // ============================================================================
+
+#[derive(serde::Deserialize)]
+struct KanbanMove {
+    id: String,
+    field: String,
+    value: String,
+}
+
+/// POST /kanban/{model}/move — drag-to-change-stage. Sets one registered field
+/// on one record, routed through the same guarded path as any edit: the ORM
+/// allow-lists the column (`api::update_record`), the change is written to the
+/// audit ledger, and automation rules + webhooks fire (the platform's
+/// declarative side-effects). Empty value clears the field (unset a many2one).
+async fn kanban_move(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(model): Path<String>,
+    Form(form): Form<KanbanMove>,
+) -> Response {
+    let id = match uuid::Uuid::parse_str(form.id.trim()) {
+        Ok(i) => i,
+        Err(_) => return api_error(StatusCode::BAD_REQUEST, "bad_id", "Invalid record id."),
+    };
+    if !validate_identifier(&form.field) {
+        return api_error(StatusCode::BAD_REQUEST, "bad_field", "Invalid field.");
+    }
+    let val = if form.value.trim().is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::Value::String(form.value.clone())
+    };
+    let body = serde_json::json!({ form.field.clone(): val });
+    match vortex_framework::api::update_record(&db, &model, id, &body).await {
+        Ok(true) => {
+            api_audit(
+                &state, &db_ctx.db_name, &user,
+                AuditAction::RecordUpdated, AuditSeverity::Info, &model, Some(&id.to_string()),
+                serde_json::json!({"via": "kanban", "field": form.field, "value": form.value}),
+            ).await;
+            let rec = vortex_framework::api::get_record(&db, &model, id).await.ok().flatten();
+            vortex_framework::webhooks::emit(
+                &state.db, &db, &db_ctx.db_name, "record.updated",
+                serde_json::json!({"model": model, "id": id, "record": rec}),
+            ).await;
+            let _ = vortex_framework::computed_fields::store_values(&db, &model, id).await;
+            let _ = vortex_framework::automation::run_rules(&db, &model, "update", id).await;
+            Json(serde_json::json!({"ok": true})).into_response()
+        }
+        Ok(false) => api_error(StatusCode::NOT_FOUND, "not_found", "No such record."),
+        Err(e) => api_error(StatusCode::BAD_REQUEST, "update_failed", &e),
+    }
+}
 
 async fn generic_kanban_view(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
     Path(model_name): Path<String>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
-    // Fetch model metadata
+    let fail = |code: StatusCode, msg: &str| (code, Html(msg.to_string())).into_response();
+
     let model_row = match sqlx::query(
-        "SELECT id, display_name, table_name FROM ir_model WHERE name = $1 AND is_active = true"
+        "SELECT id, display_name, table_name, list_url FROM ir_model WHERE name = $1 AND is_active = true",
     )
     .bind(&model_name)
     .fetch_optional(&db)
-    .await {
+    .await
+    {
         Ok(Some(row)) => row,
-        _ => return (StatusCode::NOT_FOUND, Html("Model not found")).into_response(),
+        _ => return fail(StatusCode::NOT_FOUND, "Model not found"),
     };
-
     let model_id: uuid::Uuid = model_row.get("id");
     let model_display_name: String = model_row.get("display_name");
     let table_name: String = model_row.get("table_name");
+    if !validate_identifier(&table_name) {
+        return fail(StatusCode::BAD_REQUEST, "Invalid model");
+    }
+    let list_view_url: String = model_row
+        .try_get::<Option<String>, _>("list_url")
+        .ok()
+        .flatten()
+        .filter(|u| !u.is_empty())
+        .unwrap_or_else(|| format!("/list/{}", model_name));
 
-    // Fetch kanban view configuration
-    let kanban_config = sqlx::query(
-        r#"SELECT k.card_title_field, k.card_subtitle_field, k.group_by_field, k.card_tags_field
-           FROM ir_ui_view v
-           JOIN ir_ui_view_kanban k ON k.view_id = v.id
-           WHERE v.model_id = $1 AND v.view_type = 'kanban' AND v.active = true
-           ORDER BY v.priority LIMIT 1"#
+    // Field registry: type, label, selection options, related model.
+    struct KField {
+        ftype: String,
+        label: String,
+        options: Option<serde_json::Value>,
+        related: Option<String>,
+    }
+    let frows = sqlx::query(
+        "SELECT name, field_type, display_name, selection_options, related_model
+         FROM ir_model_field WHERE model_id = $1 ORDER BY sequence, name",
     )
     .bind(model_id)
-    .fetch_optional(&db)
+    .fetch_all(&db)
     .await
-    .ok()
-    .flatten();
+    .unwrap_or_default();
+    let mut finfo: std::collections::HashMap<String, KField> = std::collections::HashMap::new();
+    let mut order: Vec<String> = Vec::new();
+    for f in &frows {
+        let n: String = f.get("name");
+        order.push(n.clone());
+        finfo.insert(n, KField {
+            ftype: f.get("field_type"),
+            label: f.get("display_name"),
+            options: f.try_get("selection_options").ok(),
+            related: f.try_get("related_model").ok().flatten(),
+        });
+    }
+    let is_field = |n: &str| validate_identifier(n) && finfo.contains_key(n);
+    let is_numeric = |n: &str| finfo.get(n).map(|k| matches!(k.ftype.as_str(), "integer" | "float" | "decimal" | "monetary" | "number")).unwrap_or(false);
+    let is_groupable = |n: &str| finfo.get(n).map(|k| matches!(k.ftype.as_str(), "selection" | "string" | "char" | "many2one" | "boolean")).unwrap_or(false);
+    let label_of = |n: &str| finfo.get(n).map(|k| k.label.clone()).unwrap_or_else(|| n.to_string());
+    // Real table columns — the kanban only ever reads/writes actual columns
+    // (registered fields can be computed/related and would break a raw SELECT).
+    let real_cols: std::collections::HashSet<String> = sqlx::query_scalar::<_, String>(
+        "SELECT column_name FROM information_schema.columns WHERE table_name = $1",
+    )
+    .bind(&table_name)
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .collect();
+    let is_col = |n: &str| real_cols.contains(n);
+    let has_active = real_cols.contains("active");
+    let where_active = if has_active { " WHERE t.active = true" } else { "" };
+    // Title column: the first conventional label column the table actually has.
+    let title_col = ["name", "title", "display_name", "number", "reference", "code", "quote_number"]
+        .iter()
+        .find(|c| is_col(c))
+        .map(|c| c.to_string());
 
-    // Default config if none defined
-    let title_field = kanban_config.as_ref()
-        .and_then(|r| r.try_get::<String, _>("card_title_field").ok())
-        .unwrap_or_else(|| "name".to_string());
-    let subtitle_field: Option<String> = kanban_config.as_ref()
-        .and_then(|r| r.try_get("card_subtitle_field").ok());
-    let group_by_field: Option<String> = kanban_config.as_ref()
-        .and_then(|r| r.try_get("group_by_field").ok());
-    let tags_field: Option<String> = kanban_config.as_ref()
-        .and_then(|r| r.try_get("card_tags_field").ok());
-
-    // Fetch field metadata for grouping field options
-    let group_options: Vec<(String, String)> = if let Some(ref group_field) = group_by_field {
-        let field_meta = sqlx::query(
-            "SELECT selection_options FROM ir_model_field WHERE model_id = $1 AND name = $2"
-        )
-        .bind(model_id)
-        .bind(group_field)
-        .fetch_optional(&db)
-        .await
-        .ok()
-        .flatten();
-
-        if let Some(row) = field_meta {
-            let opts: Option<serde_json::Value> = row.get("selection_options");
-            opts.as_ref()
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|o| {
-                            let val = o.get("value")?.as_str()?;
-                            let label = o.get("label")?.as_str()?;
-                            Some((val.to_string(), label.to_string()))
-                        })
-                        .collect()
-                })
-                .unwrap_or_default()
-        } else {
-            vec![]
-        }
-    } else {
-        vec![]
+    // Selection value -> label lookup for a field.
+    let sel_label = |field: &str, val: &str| -> String {
+        finfo.get(field)
+            .and_then(|k| k.options.as_ref())
+            .and_then(|v| v.as_array())
+            .and_then(|arr| arr.iter().find(|o| o.get("value").and_then(|x| x.as_str()) == Some(val)))
+            .and_then(|o| o.get("label").and_then(|x| x.as_str()))
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| val.to_string())
     };
 
-    // Fetch records
-    if !validate_identifier(&table_name) {
-        return (StatusCode::BAD_REQUEST, Html("Invalid model".to_string())).into_response();
-    }
-    let query = format!("SELECT * FROM {} WHERE active = true ORDER BY name LIMIT 200", table_name);
-    let records = sqlx::query(&query)
-        .fetch_all(&db)
+    // ---- config -----------------------------------------------------------
+    let default_cfg = vortex_framework::saved_views::default_config_for(&db, &model_name, "kanban")
         .await
         .unwrap_or_default();
+    let pick = |k: &str| params.get(k).cloned().or_else(|| default_cfg.get(k).cloned());
 
-    // Group records by the group_by_field
-    let mut columns: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    // Group-by: config → first stage-like field → first groupable field.
+    let group_by = pick("group_by").filter(|g| is_field(g) && is_groupable(g) && is_col(g)).unwrap_or_else(|| {
+        ["stage", "state", "status", "record_state", "kanban_state"]
+            .iter()
+            .find(|c| is_field(c) && is_groupable(c) && is_col(c))
+            .map(|c| c.to_string())
+            .or_else(|| order.iter().find(|n| is_groupable(n) && is_col(n)).cloned())
+            .unwrap_or_default()
+    });
+    let card_fields: Vec<String> = pick("cards")
+        .unwrap_or_default()
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .filter(|s| is_field(s) && is_col(s) && *s != group_by)
+        .map(|s| s.to_string())
+        .collect();
+    let measure = pick("measure").filter(|m| is_field(m) && is_numeric(m) && is_col(m));
+    let agg = pick("agg").filter(|a| ["count", "sum", "avg", "min", "max"].contains(&a.as_str())).unwrap_or_else(|| "sum".to_string());
+    let drag_enabled = pick("drag").as_deref() != Some("0");
 
-    // Initialize columns from group_options
-    for (val, _label) in &group_options {
-        columns.insert(val.clone(), Vec::new());
+    let sidebar_menu = generic_view_sidebar(&state, &user, &db_ctx, &model_name);
+    let mut current_cfg = std::collections::BTreeMap::new();
+    if !group_by.is_empty() { current_cfg.insert("group_by".to_string(), group_by.clone()); }
+    let view_bar = vortex_framework::saved_views::render_view_bar(
+        &db, &model_name, "kanban", &current_cfg, user.id, user.is_admin(),
+    )
+    .await;
+
+    // Field list for the client config controls (groupable dims + numeric).
+    let mut field_arr: Vec<serde_json::Value> = Vec::new();
+    for n in &order {
+        let k = &finfo[n];
+        let numeric = is_numeric(n);
+        if is_groupable(n) || numeric {
+            field_arr.push(serde_json::json!({"name": n, "label": k.label, "numeric": numeric, "groupable": is_groupable(n)}));
+        }
     }
+    let fields_json = serde_json::to_string(&field_arr).unwrap_or_else(|_| "[]".to_string());
+    let config_json = serde_json::json!({
+        "group_by": group_by,
+        "cards": card_fields.join(","),
+        "measure": measure.clone().unwrap_or_default(),
+        "agg": agg,
+        "drag": if drag_enabled { "1" } else { "0" },
+    })
+    .to_string();
 
-    // Build cards and group them
-    for record in &records {
-        let id: uuid::Uuid = record.get("id");
-        let title: String = record.try_get(title_field.as_str()).unwrap_or_default();
-        let subtitle: String = subtitle_field.as_ref()
-            .and_then(|f| record.try_get::<Option<String>, _>(f.as_str()).ok().flatten())
-            .unwrap_or_default();
-        let tag_value: String = tags_field.as_ref()
-            .and_then(|f| record.try_get::<String, _>(f.as_str()).ok())
-            .unwrap_or_default();
-        let group_value: String = group_by_field.as_ref()
-            .and_then(|f| record.try_get::<String, _>(f.as_str()).ok())
-            .unwrap_or_else(|| "other".to_string());
-
-        let tag_badge = match tag_value.as_str() {
-            "approved" => r#"<span class="badge badge-success badge-xs">Approved</span>"#,
-            "draft" => r#"<span class="badge badge-warning badge-xs">Draft</span>"#,
-            _ => "",
-        };
-
-        let card_html = format!(
-            r#"<div class="card bg-base-100 shadow-sm mb-2 cursor-pointer hover:shadow-md transition-shadow" onclick="window.location='/{}/{}'">
-                <div class="card-body p-3">
-                    <h3 class="card-title text-sm">{}</h3>
-                    <p class="text-xs opacity-60">{}</p>
-                    <div class="mt-1">{}</div>
-                </div>
-            </div>"#,
-            model_name, id, title, subtitle, tag_badge
+    // ---- build columns -----------------------------------------------------
+    // A column is (value_key, label). `value_key` is what a drag posts as the
+    // new field value; for a many2one it's the related id, for a selection the
+    // option value, etc.
+    let gtype = finfo.get(&group_by).map(|k| k.ftype.clone()).unwrap_or_default();
+    let mut columns: Vec<(String, String)> = Vec::new();
+    if group_by.is_empty() {
+        // no groupable field — render a single bucket
+        columns.push((String::new(), "All".to_string()));
+    } else if gtype == "boolean" {
+        columns.push(("true".to_string(), "Yes".to_string()));
+        columns.push(("false".to_string(), "No".to_string()));
+    } else if gtype == "many2one" {
+        if let Some(rel) = finfo.get(&group_by).and_then(|k| k.related.clone()) {
+            let rel_table = rel.replace('.', "_");
+            if validate_identifier(&rel_table) {
+                let q = format!(
+                    "SELECT DISTINCT r.id::text AS v, COALESCE(r.name, '(unnamed)') AS l \
+                     FROM {table} t JOIN {rel} r ON t.{gf} = r.id{wa} ORDER BY l",
+                    table = table_name, rel = rel_table, gf = group_by, wa = where_active,
+                );
+                for row in sqlx::query(&q).fetch_all(&db).await.unwrap_or_default() {
+                    columns.push((row.get::<String, _>("v"), row.get::<String, _>("l")));
+                }
+            }
+        }
+    } else if gtype == "selection" {
+        // selection_options come in two shapes: [{value,label}] OR a flat
+        // ["value", ...] array. Only the former was handled, so a flat-array
+        // field produced zero columns → an empty board. Support both, then
+        // append any stored value the options list doesn't cover so no card is
+        // silently dropped (stored states can drift from the declared options).
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        if let Some(arr) = finfo.get(&group_by).and_then(|k| k.options.as_ref()).and_then(|v| v.as_array()) {
+            for o in arr {
+                let vl = match o {
+                    serde_json::Value::String(s) => Some((s.clone(), s.clone())),
+                    serde_json::Value::Object(_) => match (
+                        o.get("value").and_then(|x| x.as_str()),
+                        o.get("label").and_then(|x| x.as_str()),
+                    ) {
+                        (Some(v), Some(l)) => Some((v.to_string(), l.to_string())),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some((v, l)) = vl {
+                    if seen.insert(v.clone()) {
+                        columns.push((v, l));
+                    }
+                }
+            }
+        }
+        let q = format!(
+            "SELECT DISTINCT CAST(t.{gf} AS TEXT) AS v FROM {table} t \
+             WHERE t.{gf} IS NOT NULL{active} ORDER BY v",
+            table = table_name, gf = group_by,
+            active = if has_active { " AND t.active = true" } else { "" },
         );
-
-        columns.entry(group_value).or_insert_with(Vec::new).push(card_html);
+        for row in sqlx::query(&q).fetch_all(&db).await.unwrap_or_default() {
+            let v: String = row.get("v");
+            if seen.insert(v.clone()) {
+                columns.push((v.clone(), v));
+            }
+        }
+    } else {
+        // text / status: distinct present values
+        let q = format!(
+            "SELECT DISTINCT CAST(t.{gf} AS TEXT) AS v FROM {table} t \
+             WHERE t.{gf} IS NOT NULL{active} ORDER BY v",
+            table = table_name, gf = group_by,
+            active = if has_active { " AND t.active = true" } else { "" },
+        );
+        for row in sqlx::query(&q).fetch_all(&db).await.unwrap_or_default() {
+            let v: String = row.get("v");
+            columns.push((v.clone(), v));
+        }
     }
 
-    // Build column HTML
-    let mut columns_html = String::new();
-    for (val, label) in &group_options {
-        let cards = columns.get(val).map(|v| v.join("")).unwrap_or_default();
-        let count = columns.get(val).map(|v| v.len()).unwrap_or(0);
-        columns_html.push_str(&format!(
-            r#"<div class="flex-1 min-w-[280px] max-w-[320px]">
-                <div class="bg-base-200 rounded-lg p-3">
-                    <div class="flex justify-between items-center mb-3">
-                        <h3 class="font-semibold text-sm uppercase tracking-wide">{}</h3>
-                        <span class="badge badge-ghost badge-sm">{}</span>
-                    </div>
-                    <div class="space-y-2 min-h-[100px]">
-                        {}
-                    </div>
-                </div>
-            </div>"#,
-            label, count, cards
+    // ---- fetch records into an explicit, text-safe projection --------------
+    let title_sel = title_col
+        .as_ref()
+        .map(|c| format!("CAST(t.{} AS TEXT)", c))
+        .unwrap_or_else(|| "t.id::text".to_string());
+    let mut selects: Vec<String> = vec![
+        "t.id::text AS __id".to_string(),
+        format!("{} AS __title", title_sel),
+    ];
+    if !group_by.is_empty() {
+        selects.push(format!("CAST(t.{} AS TEXT) AS __grp", group_by));
+    } else {
+        selects.push("'' AS __grp".to_string());
+    }
+    if let Some(m) = &measure {
+        selects.push(format!("CAST(t.{} AS DOUBLE PRECISION) AS __m", m));
+    }
+    for (i, cf) in card_fields.iter().enumerate() {
+        selects.push(format!("CAST(t.{} AS TEXT) AS c{}", cf, i));
+    }
+    let rec_q = format!(
+        "SELECT {} FROM {} t{} ORDER BY 2 LIMIT 500",
+        selects.join(", "), table_name, where_active,
+    );
+    let records = sqlx::query(&rec_q).fetch_all(&db).await.unwrap_or_default();
+
+    // Group cards + accumulate the per-column measure.
+    let mut cards_by_col: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut count_by_col: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    let mut vals_by_col: std::collections::HashMap<String, Vec<f64>> = std::collections::HashMap::new();
+    let mut has_none = false;
+    for r in &records {
+        let id: String = r.try_get("__id").unwrap_or_default();
+        let title: String = r.try_get::<Option<String>, _>("__title").ok().flatten().unwrap_or_else(|| "(untitled)".to_string());
+        let grp: String = r.try_get::<Option<String>, _>("__grp").ok().flatten().unwrap_or_default();
+        let col_key = grp.clone();
+        if col_key.is_empty() { has_none = true; }
+        let mut m_attr = String::new();
+        if measure.is_some() {
+            if let Ok(Some(v)) = r.try_get::<Option<f64>, _>("__m") {
+                vals_by_col.entry(col_key.clone()).or_default().push(v);
+                m_attr = format!(r#" data-m="{}""#, v);
+            }
+        }
+        *count_by_col.entry(col_key.clone()).or_insert(0) += 1;
+
+        // Card body: title + configured field chips.
+        let mut chips = String::new();
+        for (i, cf) in card_fields.iter().enumerate() {
+            let raw: String = r.try_get::<Option<String>, _>(format!("c{}", i).as_str()).ok().flatten().unwrap_or_default();
+            if raw.is_empty() { continue; }
+            let disp = if finfo.get(cf).map(|k| k.ftype == "selection").unwrap_or(false) { sel_label(cf, &raw) } else { raw };
+            chips.push_str(&format!(
+                r#"<div class="kb-chip"><span class="kb-chip-k">{}</span> {}</div>"#,
+                html_escape(&label_of(cf)), html_escape(&disp),
+            ));
+        }
+        let card = format!(
+            r#"<div class="kb-card" draggable="true" data-id="{id}" data-url="{url}"{m}><div class="kb-card-title">{title}</div>{chips}</div>"#,
+            id = html_escape(&id),
+            url = html_escape(&vortex_framework::record_url(&model_name, &id)),
+            title = html_escape(&title), chips = chips, m = m_attr,
+        );
+        cards_by_col.entry(col_key).or_default().push_str(&card);
+    }
+    if has_none {
+        columns.push((String::new(), "(None)".to_string()));
+    }
+
+    let fmt_total = |vals: Option<&Vec<f64>>, count: i64| -> String {
+        if measure.is_none() { return String::new(); }
+        let v = vals.map(|xs| {
+            match agg.as_str() {
+                "count" => count as f64,
+                "avg" => if xs.is_empty() { 0.0 } else { xs.iter().sum::<f64>() / xs.len() as f64 },
+                "min" => xs.iter().cloned().fold(f64::INFINITY, f64::min),
+                "max" => xs.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+                _ => xs.iter().sum(),
+            }
+        }).unwrap_or(0.0);
+        let disp = if v.fract() == 0.0 && v.abs() < 1e15 { format!("{}", v as i64) } else { format!("{:.2}", v) };
+        format!(r#" · <span class="kb-total">{}</span>"#, html_escape(&disp))
+    };
+
+    let mut board = String::new();
+    for (val, label) in &columns {
+        let cards = cards_by_col.get(val).cloned().unwrap_or_default();
+        let count = *count_by_col.get(val).unwrap_or(&0);
+        let total = fmt_total(vals_by_col.get(val), count);
+        board.push_str(&format!(
+            r#"<div class="kb-col"><div class="kb-col-head"><span class="kb-col-title">{label}</span><span class="kb-col-meta">{count}{total}</span></div><div class="kb-col-body" data-value="{val}">{cards}</div></div>"#,
+            label = html_escape(label), count = count, total = total, val = html_escape(val), cards = cards,
         ));
     }
+    if columns.is_empty() {
+        board.push_str(r#"<div class="kb-empty">No groupable field to build a board. Pick a Group-by field.</div>"#);
+    }
 
-    // Build dynamic sidebar
-    let sidebar_menu = build_sidebar_menu(&db, &user.roles, &model_name).await;
+    let html = KANBAN_SHELL
+        .replace("__TITLE__", &html_escape(&model_display_name))
+        .replace("__USER__", &html_escape(&user.username))
+        .replace("__SIDEBAR__", &sidebar_menu)
+        .replace("__LISTURL__", &html_escape(&list_view_url))
+        .replace("__FIELDS__", &html_escape(&fields_json))
+        .replace("__CONFIG__", &html_escape(&config_json))
+        .replace("__GROUP__", &html_escape(&group_by))
+        .replace("__DRAG__", if drag_enabled { "1" } else { "0" })
+        .replace("__BOARD__", &board)
+        .replace("__MODEL__", &html_escape(&model_name))
+        .replace("__NEWURL__", &html_escape(&vortex_framework::new_record_url(&model_name)));
+    Html(html.replace("<!--VIEW_BAR-->", &view_bar)).into_response()
+}
 
-    // Build full page
-    Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style><title>{} - Kanban</title>
+const KANBAN_SHELL: &str = r#"<!DOCTYPE html><html data-theme="dark"><head>
+<script>(function(){var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)})()</script>
+<style>[data-theme="corporate"] .theme-icon-sun{display:none !important}[data-theme="corporate"] .theme-icon-moon{display:inline-block !important}</style>
+<title>__TITLE__ - Kanban</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=4" rel="stylesheet"/>
-<script src="/static/vortex.js?v=4" defer></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<link href="/static/kanban.css?v=1" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script>
 <script src="/static/vendor/tailwind.js"></script>
 <style>
-body {{ background: oklch(var(--b2)); color: oklch(var(--bc)); }}
-.top-navbar {{ background: oklch(var(--b1)); border-bottom: 1px solid oklch(var(--b3)); position: sticky; top: 0; z-index: 50; }}
-.sidebar {{ background: oklch(var(--b1)); border-right: 1px solid oklch(var(--b3)); }}
-.card {{ background: oklch(var(--b1)); border: 1px solid oklch(var(--b3)); }}
-.text-muted {{ color: oklch(var(--bc)/0.6); }}
-.user-badge {{ background: #8BC53F; color: #000; font-weight: 600; }}
-.kanban-col {{ background: oklch(var(--b1)); }}
-@media (max-width: 768px) {{ .sidebar {{ display: none; }} }}
+body { background: oklch(var(--b2)); color: oklch(var(--bc)); }
+.top-navbar { background: oklch(var(--b1)); border-bottom: 1px solid oklch(var(--b3)); position: sticky; top: 0; z-index: 50; }
+.sidebar { background: oklch(var(--b1)); border-right: 1px solid oklch(var(--b3)); }
+.text-muted { color: oklch(var(--bc)/0.6); }
+.user-badge { background: #8BC53F; color: #000; font-weight: 600; }
 </style>
 </head><body class="min-h-screen">
 <nav class="top-navbar px-4 py-3 flex items-center justify-between">
-    <div class="flex items-center gap-2"><button class="btn btn-ghost btn-sm btn-square md:hidden" onclick="var s=document.querySelector('.sidebar');s.classList.toggle('hidden');s.classList.toggle('md:block')"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="text-xl font-bold"><span style="color:#8BC53F">re</span><span class="text-muted">micle</span></a></div>
-    <div class="flex items-center gap-2 md:gap-3">
-        <a href="/home" class="text-base-content text-sm hover:underline hidden md:inline">Home</a>
-        <a href="/settings" class="text-base-content text-sm hover:underline hidden md:inline">Settings</a>
-        <a href="/notifications" class="btn btn-ghost btn-circle btn-sm relative" title="Notifications">
-            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9"/></svg>
-            <span class="absolute top-0 right-0 w-2 h-2 bg-red-500 rounded-full"></span>
-        </a>
-        <button onclick="(function(){{var h=document.documentElement,c=h.getAttribute('data-theme')==='dark'?'corporate':'dark';h.setAttribute('data-theme',c);localStorage.setItem('theme',c);document.querySelectorAll('.theme-icon-sun,.theme-icon-moon').forEach(function(e){{e.classList.toggle('hidden')}})}})();" class="btn btn-ghost btn-circle btn-sm" title="Toggle theme"><svg class="theme-icon-sun w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5" stroke-width="2"/><path stroke-linecap="round" stroke-width="2" d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg><svg class="theme-icon-moon w-5 h-5 hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg></button>
-        <div class="user-badge px-3 py-1 rounded-full text-sm">@{}</div>
-    </div>
+  <div class="flex items-center gap-2">
+    <button class="btn btn-ghost btn-sm btn-square md:hidden" onclick="var s=document.querySelector('.sidebar');s.classList.toggle('hidden');s.classList.toggle('md:block')"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button>
+    <a href="/home" class="text-xl font-bold"><span style="color:#8BC53F">re</span><span class="text-muted">micle</span></a>
+  </div>
+  <div class="flex items-center gap-2 md:gap-3">
+    <a href="/home" class="text-base-content text-sm hover:underline hidden md:inline">Home</a>
+    <a href="/settings" class="text-base-content text-sm hover:underline hidden md:inline">Settings</a>
+    <button onclick="(function(){var h=document.documentElement,c=h.getAttribute('data-theme')==='dark'?'corporate':'dark';h.setAttribute('data-theme',c);localStorage.setItem('theme',c);document.querySelectorAll('.theme-icon-sun,.theme-icon-moon').forEach(function(e){e.classList.toggle('hidden')})})();" class="btn btn-ghost btn-circle btn-sm" title="Toggle theme"><svg class="theme-icon-sun w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5" stroke-width="2"/><path stroke-linecap="round" stroke-width="2" d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg><svg class="theme-icon-moon w-5 h-5 hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg></button>
+    <div class="user-badge px-3 py-1 rounded-full text-sm">@__USER__</div>
+  </div>
 </nav>
 <div class="flex">
-<aside class="sidebar w-64 min-h-screen p-4 hidden md:block">
-<ul class="menu mt-2">
-{}
-</ul>
-</aside>
-<main class="flex-1 p-4 md:p-6">
-<div class="flex flex-col md:flex-row justify-between items-start md:items-center mb-6 gap-4">
-<div><h1 class="text-xl md:text-2xl font-bold">{}</h1><p class="text-muted">Kanban view</p></div>
-<div class="flex gap-2 flex-wrap">
+<aside class="sidebar w-64 min-h-screen p-4 hidden md:block"><ul class="menu mt-2">__SIDEBAR__</ul></aside>
+<main class="flex-1 p-4 md:p-6 min-w-0">
+<div class="flex flex-col md:flex-row justify-between items-start md:items-center mb-4 gap-4">
+  <div><h1 class="text-xl md:text-2xl font-bold">__TITLE__</h1><p class="text-muted">Kanban — drag cards between columns to change stage</p></div>
+  <div class="flex gap-2 flex-wrap">
     <div class="btn-group">
-        <a href="/list/{}" class="btn btn-sm" title="List View">
-            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 10h16M4 14h16M4 18h16"/></svg>
-        </a>
-        <a href="/kanban/{}" class="btn btn-sm btn-active" title="Kanban View">
-            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 17V7m0 10a2 2 0 01-2 2H5a2 2 0 01-2-2V7a2 2 0 012-2h2a2 2 0 012 2m0 10a2 2 0 002 2h2a2 2 0 002-2M9 7a2 2 0 012-2h2a2 2 0 012 2m0 10V7m0 10a2 2 0 002 2h2a2 2 0 002-2V7a2 2 0 00-2-2h-2a2 2 0 00-2 2"/></svg>
-        </a>
-        <a href="/graph/{}" class="btn btn-sm" title="Graph View">
-            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/></svg>
-        </a>
-        <a href="/pivot/{}" class="btn btn-sm" title="Pivot View">
-            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 10h18M3 14h18m-9-4v8m-7 0h14a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg>
-        </a>
+      <a href="__LISTURL__" class="btn btn-sm" title="List View"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 10h16M4 14h16M4 18h16"/></svg></a>
+      <a href="/kanban/__MODEL__" class="btn btn-sm btn-active" title="Kanban View"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 17V7m0 10a2 2 0 01-2 2H5a2 2 0 01-2-2V7a2 2 0 012-2h2a2 2 0 012 2m0 10a2 2 0 002 2h2a2 2 0 002-2M9 7a2 2 0 012-2h2a2 2 0 012 2m0 10V7"/></svg></a>
+      <a href="/graph/__MODEL__" class="btn btn-sm" title="Graph View"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/></svg></a>
+      <a href="/pivot/__MODEL__" class="btn btn-sm" title="Pivot View"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 10h18M3 14h18m-9-4v8m-7 0h14a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg></a>
     </div>
-    <a href="/{}/new" class="btn btn-primary btn-sm" style="background:#8BC53F;border-color:#8BC53F;color:#000">+ New</a>
+    <!--VIEW_BAR-->
+    <a href="__NEWURL__" class="btn btn-sm" style="background:#8BC53F;border-color:#8BC53F;color:#000">+ New</a>
+  </div>
 </div>
-</div>
-<div class="flex gap-4 overflow-x-auto pb-4">
-{}
-</div>
+<div id="kb-config" class="kb-config"></div>
+<div id="kanban-root" class="kb-board" data-model="__MODEL__" data-group="__GROUP__" data-drag="__DRAG__" data-fields="__FIELDS__" data-config="__CONFIG__">__BOARD__</div>
 </main>
 </div>
-</body></html>"#,
-        model_display_name,
-        user.username,
-        sidebar_menu,
-        model_display_name,
-        model_name, model_name, model_name, model_name, model_name,
-        columns_html
-    )).into_response()
-}
+<div id="kb-toast" class="kb-toast"></div>
+<script src="/static/kanban.js?v=1"></script>
+</body></html>"#;
 
 // ============================================================================
 // Generic Graph View
@@ -7092,196 +8836,205 @@ async fn generic_graph_view(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
     Path(model_name): Path<String>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
-    // Fetch model metadata
     let model_row = match sqlx::query(
-        "SELECT id, display_name, table_name FROM ir_model WHERE name = $1 AND is_active = true"
+        "SELECT id, display_name, table_name, list_url FROM ir_model WHERE name = $1 AND is_active = true",
     )
     .bind(&model_name)
     .fetch_optional(&db)
-    .await {
+    .await
+    {
         Ok(Some(row)) => row,
         _ => return (StatusCode::NOT_FOUND, Html("Model not found")).into_response(),
     };
-
     let model_id: uuid::Uuid = model_row.get("id");
     let model_display_name: String = model_row.get("display_name");
     let table_name: String = model_row.get("table_name");
+    if !validate_identifier(&table_name) {
+        return (StatusCode::BAD_REQUEST, Html("Invalid model".to_string())).into_response();
+    }
+    let list_view_url: String = model_row
+        .try_get::<Option<String>, _>("list_url")
+        .ok()
+        .flatten()
+        .filter(|u| !u.is_empty())
+        .unwrap_or_else(|| format!("/list/{}", model_name));
 
-    // Fetch graph view configuration
-    let graph_config = sqlx::query(
-        r#"SELECT g.graph_type, g.measure_field, g.measure_type, g.group_by_field
-           FROM ir_ui_view v
-           JOIN ir_ui_view_graph g ON g.view_id = v.id
-           WHERE v.model_id = $1 AND v.view_type = 'graph' AND v.active = true
-           ORDER BY v.priority LIMIT 1"#
+    // Fields for the pane: groupable dimensions (X-axis / series) + numeric
+    // measures — the same shape the pivot pane uses, so the graph shares its
+    // aggregation engine (/pivot/{model}/data).
+    let fields = sqlx::query(
+        "SELECT name, field_type, display_name FROM ir_model_field WHERE model_id = $1 ORDER BY sequence, name",
     )
     .bind(model_id)
-    .fetch_optional(&db)
+    .fetch_all(&db)
     .await
-    .ok()
-    .flatten();
+    .unwrap_or_default();
+    let mut field_arr: Vec<serde_json::Value> = Vec::new();
+    let mut groupable_names: Vec<String> = Vec::new();
+    for f in &fields {
+        let name: String = f.get("name");
+        let ftype: String = f.get("field_type");
+        let label: String = f.get("display_name");
+        let numeric = matches!(ftype.as_str(), "integer" | "float" | "decimal" | "monetary" | "number");
+        let date = matches!(ftype.as_str(), "date" | "datetime");
+        let groupable = matches!(
+            ftype.as_str(),
+            "selection" | "string" | "char" | "many2one" | "boolean" | "date" | "datetime"
+        );
+        if groupable {
+            groupable_names.push(name.clone());
+        }
+        if groupable || numeric {
+            field_arr.push(serde_json::json!({"name": name, "label": label, "numeric": numeric, "date": date}));
+        }
+    }
+    let fields_json = serde_json::to_string(&field_arr).unwrap_or_else(|_| "[]".to_string());
 
-    let graph_type = graph_config.as_ref()
-        .and_then(|r| r.try_get::<String, _>("graph_type").ok())
-        .unwrap_or_else(|| "bar".to_string());
-    let group_by_field = graph_config.as_ref()
-        .and_then(|r| r.try_get::<String, _>("group_by_field").ok())
-        .unwrap_or_else(|| "contact_type".to_string());
-
-    // Get counts grouped by field
-    let query = format!(
-        "SELECT {}, COUNT(*) as count FROM {} WHERE active = true GROUP BY {} ORDER BY count DESC",
-        group_by_field, table_name, group_by_field
-    );
-    let results = sqlx::query(&query)
-        .fetch_all(&db)
+    // Initial config: query params win, else the shared default saved view.
+    let default_cfg = vortex_framework::saved_views::default_config_for(&db, &model_name, "graph")
         .await
         .unwrap_or_default();
+    let pick = |k: &str| params.get(k).cloned().or_else(|| default_cfg.get(k).cloned());
 
-    // Build chart data
-    let mut labels = Vec::new();
-    let mut data = Vec::new();
-    let colors = ["#22c55e", "#3b82f6", "#f59e0b", "#ef4444", "#8b5cf6", "#ec4899"];
+    // Default the X-axis to a sensible dimension so a chart appears on first
+    // open; the client can change it. (Falls back to the first groupable field.)
+    let group_by_v = pick("group_by").filter(|s| !s.is_empty()).unwrap_or_else(|| {
+        ["state", "record_state", "status", "stage", "contact_type"]
+            .iter()
+            .find(|c| groupable_names.iter().any(|n| n == *c))
+            .map(|c| c.to_string())
+            .or_else(|| groupable_names.first().cloned())
+            .unwrap_or_default()
+    });
+    let series_v = pick("series").unwrap_or_default();
+    let vals_v = pick("vals").unwrap_or_default();
+    let filters_v = pick("filters").unwrap_or_default();
+    let type_v = pick("type")
+        .filter(|t| vortex_framework::saved_views::GRAPH_TYPES.iter().any(|(c, _)| c == t))
+        .unwrap_or_else(|| "bar".to_string());
 
-    for (i, row) in results.iter().enumerate() {
-        let label: String = row.try_get(group_by_field.as_str()).unwrap_or_else(|_| "Other".to_string());
-        let count: i64 = row.get("count");
-        labels.push(format!("\"{}\"", label));
-        data.push(count.to_string());
+    let config_json = serde_json::json!({
+        "group_by": group_by_v,
+        "series": series_v,
+        "vals": vals_v,
+        "filters": filters_v,
+        "type": type_v,
+    })
+    .to_string();
+
+    // Saved-views bar reflects the current config; `type` is always present so
+    // the save form renders even for a bare chart.
+    let mut current_cfg = std::collections::BTreeMap::new();
+    current_cfg.insert("type".to_string(), type_v.clone());
+    for (k, v) in [
+        ("group_by", &group_by_v),
+        ("series", &series_v),
+        ("vals", &vals_v),
+        ("filters", &filters_v),
+    ] {
+        if !v.is_empty() {
+            current_cfg.insert(k.to_string(), v.clone());
+        }
     }
+    let view_bar = vortex_framework::saved_views::render_view_bar(
+        &db, &model_name, "graph", &current_cfg, user.id, user.is_admin(),
+    )
+    .await;
 
-    let labels_json = labels.join(", ");
-    let data_json = data.join(", ");
-    let colors_json = colors.iter().take(data.len()).map(|c| format!("\"{}\"", c)).collect::<Vec<_>>().join(", ");
+    let sidebar_menu = generic_view_sidebar(&state, &user, &db_ctx, &model_name);
 
-    // Build dynamic sidebar
-    let sidebar_menu = build_sidebar_menu(&db, &user.roles, &model_name).await;
+    let html = GRAPH_SHELL
+        .replace("__TITLE__", &html_escape(&model_display_name))
+        .replace("__USER__", &html_escape(&user.username))
+        .replace("__SIDEBAR__", &sidebar_menu)
+        .replace("__LISTURL__", &html_escape(&list_view_url))
+        .replace("__FIELDS__", &html_escape(&fields_json))
+        .replace("__CONFIG__", &html_escape(&config_json))
+        .replace("__MODEL__", &html_escape(&model_name))
+        .replace("__NEWURL__", &html_escape(&vortex_framework::new_record_url(&model_name)));
+    Html(html.replace("<!--VIEW_BAR-->", &view_bar)).into_response()
+}
 
-    Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style><title>{} - Graph</title>
+const GRAPH_SHELL: &str = r#"<!DOCTYPE html><html data-theme="dark"><head>
+<script>(function(){var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)})()</script>
+<style>[data-theme="corporate"] .theme-icon-sun{display:none !important}[data-theme="corporate"] .theme-icon-moon{display:inline-block !important}</style>
+<title>__TITLE__ - Graph</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=4" rel="stylesheet"/>
-<script src="/static/vortex.js?v=4" defer></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<link href="/static/pivot.css?v=25" rel="stylesheet"/>
+<link href="/static/graph.css?v=2" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script>
 <script src="/static/vendor/tailwind.js"></script>
-<script src="/static/vendor/chart.umd.js"></script>
 <style>
-body {{ background: oklch(var(--b2)); color: oklch(var(--bc)); }}
-.top-navbar {{ background: oklch(var(--b1)); border-bottom: 1px solid oklch(var(--b3)); position: sticky; top: 0; z-index: 50; }}
-.sidebar {{ background: oklch(var(--b1)); border-right: 1px solid oklch(var(--b3)); }}
-.card {{ background: oklch(var(--b1)); border: 1px solid oklch(var(--b3)); }}
-.text-muted {{ color: oklch(var(--bc)/0.6); }}
-.user-badge {{ background: #8BC53F; color: #000; font-weight: 600; }}
-@media (max-width: 768px) {{ .sidebar {{ display: none; }} .chart-grid {{ grid-template-columns: 1fr; }} }}
+body { background: oklch(var(--b2)); color: oklch(var(--bc)); }
+.top-navbar { background: oklch(var(--b1)); border-bottom: 1px solid oklch(var(--b3)); position: sticky; top: 0; z-index: 50; }
+.sidebar { background: oklch(var(--b1)); border-right: 1px solid oklch(var(--b3)); }
+.text-muted { color: oklch(var(--bc)/0.6); }
+.user-badge { background: #8BC53F; color: #000; font-weight: 600; }
 </style>
 </head><body class="min-h-screen">
 <nav class="top-navbar px-4 py-3 flex items-center justify-between">
-    <div class="flex items-center gap-2"><button class="btn btn-ghost btn-sm btn-square md:hidden" onclick="var s=document.querySelector('.sidebar');s.classList.toggle('hidden');s.classList.toggle('md:block')"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="text-xl font-bold"><span style="color:#8BC53F">re</span><span class="text-muted">micle</span></a></div>
-    <div class="flex items-center gap-2 md:gap-3">
-        <a href="/home" class="text-base-content text-sm hover:underline hidden md:inline">Home</a>
-        <a href="/settings" class="text-base-content text-sm hover:underline hidden md:inline">Settings</a>
-        <a href="/notifications" class="btn btn-ghost btn-circle btn-sm relative" title="Notifications">
-            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9"/></svg>
-            <span class="absolute top-0 right-0 w-2 h-2 bg-red-500 rounded-full"></span>
-        </a>
-        <button onclick="(function(){{var h=document.documentElement,c=h.getAttribute('data-theme')==='dark'?'corporate':'dark';h.setAttribute('data-theme',c);localStorage.setItem('theme',c);document.querySelectorAll('.theme-icon-sun,.theme-icon-moon').forEach(function(e){{e.classList.toggle('hidden')}})}})();" class="btn btn-ghost btn-circle btn-sm" title="Toggle theme"><svg class="theme-icon-sun w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5" stroke-width="2"/><path stroke-linecap="round" stroke-width="2" d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg><svg class="theme-icon-moon w-5 h-5 hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg></button>
-        <div class="user-badge px-3 py-1 rounded-full text-sm">@{}</div>
-    </div>
+  <div class="flex items-center gap-2">
+    <button class="btn btn-ghost btn-sm btn-square md:hidden" onclick="var s=document.querySelector('.sidebar');s.classList.toggle('hidden');s.classList.toggle('md:block')"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button>
+    <a href="/home" class="text-xl font-bold"><span style="color:#8BC53F">re</span><span class="text-muted">micle</span></a>
+  </div>
+  <div class="flex items-center gap-2 md:gap-3">
+    <a href="/home" class="text-base-content text-sm hover:underline hidden md:inline">Home</a>
+    <a href="/settings" class="text-base-content text-sm hover:underline hidden md:inline">Settings</a>
+    <button onclick="(function(){var h=document.documentElement,c=h.getAttribute('data-theme')==='dark'?'corporate':'dark';h.setAttribute('data-theme',c);localStorage.setItem('theme',c);document.querySelectorAll('.theme-icon-sun,.theme-icon-moon').forEach(function(e){e.classList.toggle('hidden')})})();" class="btn btn-ghost btn-circle btn-sm" title="Toggle theme"><svg class="theme-icon-sun w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5" stroke-width="2"/><path stroke-linecap="round" stroke-width="2" d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg><svg class="theme-icon-moon w-5 h-5 hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg></button>
+    <div class="user-badge px-3 py-1 rounded-full text-sm">@__USER__</div>
+  </div>
 </nav>
 <div class="flex">
-<aside class="sidebar w-64 min-h-screen p-4 hidden md:block">
-<ul class="menu mt-2">
-{}
-</ul>
-</aside>
-<main class="flex-1 p-4 md:p-6">
-<div class="flex flex-col md:flex-row justify-between items-start md:items-center mb-6 gap-4">
-<div><h1 class="text-xl md:text-2xl font-bold">{}</h1><p class="text-muted">Graph view - by {}</p></div>
-<div class="flex gap-2 flex-wrap">
+<aside class="sidebar w-64 min-h-screen p-4 hidden md:block"><ul class="menu mt-2">__SIDEBAR__</ul></aside>
+<main class="flex-1 p-4 md:p-6 min-w-0">
+<div class="flex flex-col md:flex-row justify-between items-start md:items-center mb-4 gap-4">
+  <div><h1 class="text-xl md:text-2xl font-bold">__TITLE__</h1><p class="text-muted">Graph — drag fields into X-axis, Series and Measures</p></div>
+  <div class="flex gap-2 flex-wrap">
     <div class="btn-group">
-        <a href="/list/{}" class="btn btn-sm" title="List View">
-            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 10h16M4 14h16M4 18h16"/></svg>
-        </a>
-        <a href="/kanban/{}" class="btn btn-sm" title="Kanban View">
-            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 17V7m0 10a2 2 0 01-2 2H5a2 2 0 01-2-2V7a2 2 0 012-2h2a2 2 0 012 2m0 10a2 2 0 002 2h2a2 2 0 002-2M9 7a2 2 0 012-2h2a2 2 0 012 2m0 10V7m0 10a2 2 0 002 2h2a2 2 0 002-2V7a2 2 0 00-2-2h-2a2 2 0 00-2 2"/></svg>
-        </a>
-        <a href="/graph/{}" class="btn btn-sm btn-active" title="Graph View">
-            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/></svg>
-        </a>
-        <a href="/pivot/{}" class="btn btn-sm" title="Pivot View">
-            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 10h18M3 14h18m-9-4v8m-7 0h14a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg>
-        </a>
+      <a href="__LISTURL__" class="btn btn-sm" title="List View"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 10h16M4 14h16M4 18h16"/></svg></a>
+      <a href="/kanban/__MODEL__" class="btn btn-sm" title="Kanban View"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 17V7m0 10a2 2 0 01-2 2H5a2 2 0 01-2-2V7a2 2 0 012-2h2a2 2 0 012 2m0 10a2 2 0 002 2h2a2 2 0 002-2M9 7a2 2 0 012-2h2a2 2 0 012 2m0 10V7"/></svg></a>
+      <a href="/graph/__MODEL__" class="btn btn-sm btn-active" title="Graph View"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/></svg></a>
+      <a href="/calendar/__MODEL__" class="btn btn-sm" title="Calendar View"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"/></svg></a>
+      <a href="/pivot/__MODEL__" class="btn btn-sm" title="Pivot View"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 10h18M3 14h18m-9-4v8m-7 0h14a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg></a>
     </div>
-    <a href="/{}/new" class="btn btn-primary btn-sm" style="background:#8BC53F;border-color:#8BC53F;color:#000">+ New</a>
+    <!--VIEW_BAR-->
+    <div class="dropdown dropdown-end">
+      <div tabindex="0" role="button" class="btn btn-sm gap-1" title="Export chart"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v2a2 2 0 002 2h12a2 2 0 002-2v-2M7 10l5 5 5-5M12 15V3"/></svg>Export</div>
+      <ul tabindex="0" class="dropdown-content z-10 menu p-2 shadow bg-base-100 rounded-box w-40 mt-1 border border-base-300">
+        <li><a id="g-export-png">PNG image</a></li>
+        <li><a id="g-export-pdf">PDF document</a></li>
+      </ul>
+    </div>
+    <a href="__NEWURL__" class="btn btn-sm" style="background:#8BC53F;border-color:#8BC53F;color:#000">+ New</a>
+  </div>
 </div>
+<div class="g-wrap">
+  <div class="g-main">
+    <div id="g-types" class="g-types"></div>
+    <div id="g-chart-wrap" class="g-chart-wrap"><canvas id="g-canvas"></canvas></div>
+  </div>
+  <div class="pv-side">
+    <h3>Chart Fields</h3>
+    <div id="g-fields" class="pv-fields"></div>
+    <div class="pv-zones">
+      <div class="pv-zone" id="g-zone-filters" style="grid-column:1/-1"><div class="pv-zone-title">&#9660; Filters</div></div>
+      <div class="pv-zone" id="g-zone-x"><div class="pv-zone-title">&#9636; X-axis</div></div>
+      <div class="pv-zone" id="g-zone-series"><div class="pv-zone-title">&#9638; Series</div></div>
+      <div class="pv-zone" id="g-zone-values" style="grid-column:1/-1"><div class="pv-zone-title">&#931; Measures</div></div>
+    </div>
+  </div>
 </div>
-<div class="grid grid-cols-1 md:grid-cols-2 gap-4 md:gap-6 chart-grid">
-<div class="card">
-<div class="card-body">
-<h2 class="card-title text-sm">By {}</h2>
-<canvas id="barChart"></canvas>
-</div>
-</div>
-<div class="card">
-<div class="card-body">
-<h2 class="card-title text-sm">Distribution</h2>
-<canvas id="pieChart"></canvas>
-</div>
-</div>
-</div>
+<div id="graph-root" data-model="__MODEL__" data-data-url="/pivot/__MODEL__/data" data-fields="__FIELDS__" data-config="__CONFIG__"></div>
+<script src="/static/vendor/chart.umd.js"></script>
+<script src="/static/graph.js?v=2"></script>
 </main>
-</div>
-<script>
-const labels = [{}];
-const data = [{}];
-const colors = [{}];
-
-new Chart(document.getElementById('barChart'), {{
-    type: '{}',
-    data: {{
-        labels: labels,
-        datasets: [{{
-            label: 'Count',
-            data: data,
-            backgroundColor: colors,
-            borderColor: colors,
-            borderWidth: 1
-        }}]
-    }},
-    options: {{
-        responsive: true,
-        plugins: {{ legend: {{ display: false }} }},
-        scales: {{ y: {{ beginAtZero: true }} }}
-    }}
-}});
-
-new Chart(document.getElementById('pieChart'), {{
-    type: 'doughnut',
-    data: {{
-        labels: labels,
-        datasets: [{{
-            data: data,
-            backgroundColor: colors
-        }}]
-    }},
-    options: {{
-        responsive: true,
-        plugins: {{ legend: {{ position: 'bottom' }} }}
-    }}
-}});
-</script>
-</body></html>"#,
-        model_display_name,
-        user.username,
-        sidebar_menu,
-        model_display_name, group_by_field,
-        model_name, model_name, model_name, model_name, model_name,
-        group_by_field,
-        labels_json, data_json, colors_json,
-        graph_type
-    )).into_response()
-}
+</div></body></html>"#;
 
 // ============================================================================
 // Calendar View
@@ -7291,246 +9044,28 @@ async fn generic_calendar_view(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
     Path(model_name): Path<String>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
-    // Fetch model metadata
+    use vortex_framework::ui::html_escape;
+
     let model_row = match sqlx::query(
-        "SELECT id, display_name, table_name FROM ir_model WHERE name = $1 AND is_active = true"
+        "SELECT id, display_name, table_name, list_url FROM ir_model WHERE name = $1 AND is_active = true",
     )
     .bind(&model_name)
     .fetch_optional(&db)
-    .await {
+    .await
+    {
         Ok(Some(row)) => row,
         _ => return (StatusCode::NOT_FOUND, Html("Model not found")).into_response(),
     };
-
     let model_id: uuid::Uuid = model_row.get("id");
     let model_display_name: String = model_row.get("display_name");
     let table_name: String = model_row.get("table_name");
-
-    // Find date field for this model
-    let date_field: String = sqlx::query_scalar(
-        "SELECT field_name FROM ir_model_field WHERE model_id = $1 AND field_type IN ('date', 'datetime') ORDER BY field_name LIMIT 1"
-    )
-    .bind(model_id)
-    .fetch_optional(&db)
-    .await
-    .ok()
-    .flatten()
-    .unwrap_or_else(|| "created_at".to_string());
-
-    // Find name/title field
-    let name_field: String = sqlx::query_scalar(
-        "SELECT field_name FROM ir_model_field WHERE model_id = $1 AND field_name IN ('name', 'title', 'subject') LIMIT 1"
-    )
-    .bind(model_id)
-    .fetch_optional(&db)
-    .await
-    .ok()
-    .flatten()
-    .unwrap_or_else(|| "id".to_string());
-
-    // Parse year/month from query params or use current
-    let now = chrono::Utc::now();
-    let year: i32 = params.get("year").and_then(|y| y.parse().ok()).unwrap_or(now.year());
-    let month: u32 = params.get("month").and_then(|m| m.parse().ok()).unwrap_or(now.month());
-
-    // Calculate first and last day of month
-    let first_day = chrono::NaiveDate::from_ymd_opt(year, month, 1).unwrap();
-    let last_day = if month == 12 {
-        chrono::NaiveDate::from_ymd_opt(year + 1, 1, 1).unwrap().pred_opt().unwrap()
-    } else {
-        chrono::NaiveDate::from_ymd_opt(year, month + 1, 1).unwrap().pred_opt().unwrap()
-    };
-
-    // Fetch records for this month
-    let query = format!(
-        "SELECT id, {}, {}::date as event_date FROM {} WHERE {}::date >= $1 AND {}::date <= $2 ORDER BY {} ASC",
-        name_field, date_field, table_name, date_field, date_field, date_field
-    );
-    let records = sqlx::query(&query)
-        .bind(first_day)
-        .bind(last_day)
-        .fetch_all(&db)
-        .await
-        .unwrap_or_default();
-
-    // Group records by date
-    let mut events_by_date: std::collections::HashMap<chrono::NaiveDate, Vec<(uuid::Uuid, String)>> = std::collections::HashMap::new();
-    for row in &records {
-        let id: uuid::Uuid = row.get("id");
-        let name: String = row.try_get(&name_field as &str).unwrap_or_else(|_| id.to_string());
-        let date: chrono::NaiveDate = row.get("event_date");
-        events_by_date.entry(date).or_default().push((id, name));
+    if !validate_identifier(&table_name) {
+        return (StatusCode::BAD_REQUEST, Html("Invalid model".to_string())).into_response();
     }
-
-    // Build calendar grid
-    let weekday_of_first = first_day.weekday().num_days_from_sunday();
-    let days_in_month = last_day.day();
-
-    let mut calendar_cells = String::new();
-
-    // Empty cells before first day
-    for _ in 0..weekday_of_first {
-        calendar_cells.push_str(r#"<div class="h-24 bg-base-200/50"></div>"#);
-    }
-
-    // Days of month
-    for day in 1..=days_in_month {
-        let date = chrono::NaiveDate::from_ymd_opt(year, month, day).unwrap();
-        let is_today = date == now.date_naive();
-        let today_class = if is_today { "ring-2 ring-primary" } else { "" };
-
-        let mut events_html = String::new();
-        if let Some(events) = events_by_date.get(&date) {
-            for (id, name) in events.iter().take(3) {
-                events_html.push_str(&format!(
-                    r##"<a href="/{}/{}" class="block text-xs bg-primary/20 text-primary rounded px-1 py-0.5 truncate hover:bg-primary/30">{}</a>"##,
-                    model_name, id, name
-                ));
-            }
-            if events.len() > 3 {
-                events_html.push_str(&format!(
-                    r#"<span class="text-xs text-base-content/50">+{} more</span>"#,
-                    events.len() - 3
-                ));
-            }
-        }
-
-        calendar_cells.push_str(&format!(
-            r#"<div class="h-24 bg-base-100 p-1 border border-base-300 {}">
-                <div class="font-semibold text-sm {}">{}</div>
-                <div class="space-y-0.5 mt-1">{}</div>
-            </div>"#,
-            today_class,
-            if is_today { "text-primary" } else { "" },
-            day,
-            events_html
-        ));
-    }
-
-    // Empty cells after last day
-    let total_cells = weekday_of_first + days_in_month;
-    let remaining = (7 - (total_cells % 7)) % 7;
-    for _ in 0..remaining {
-        calendar_cells.push_str(r#"<div class="h-24 bg-base-200/50"></div>"#);
-    }
-
-    // Navigation links
-    let (prev_year, prev_month) = if month == 1 { (year - 1, 12) } else { (year, month - 1) };
-    let (next_year, next_month) = if month == 12 { (year + 1, 1) } else { (year, month + 1) };
-
-    let month_names = ["", "January", "February", "March", "April", "May", "June",
-                       "July", "August", "September", "October", "November", "December"];
-    let month_name = month_names[month as usize];
-
-    // Build dynamic sidebar
-    let sidebar_menu = build_sidebar_menu(&db, &user.roles, &model_name).await;
-
-    Html(format!(r##"<!DOCTYPE html>
-<html data-theme="dark">
-<head>
-    <script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style>
-    <title>{} - Calendar</title>
-    <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=4" rel="stylesheet"/>
-<script src="/static/vortex.js?v=4" defer></script>
-    <script src="/static/vendor/tailwind.js"></script>
-</head>
-<body class="min-h-screen bg-base-200">
-<div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar-inline').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay-inline').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a><button onclick="(function(){{var h=document.documentElement,c=h.getAttribute('data-theme')==='dark'?'corporate':'dark';h.setAttribute('data-theme',c);localStorage.setItem('theme',c);document.querySelectorAll('.theme-icon-sun,.theme-icon-moon').forEach(function(e){{e.classList.toggle('hidden')}})}})();" class="btn btn-ghost btn-sm btn-square ml-auto"><svg class="theme-icon-sun w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5" stroke-width="2"/><path stroke-linecap="round" stroke-width="2" d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg><svg class="theme-icon-moon w-5 h-5 hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg></button></div>
-<div id="sidebar-overlay-inline" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar-inline').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
-<div class="flex">
-    <aside id="sidebar-inline" class="w-64 bg-base-100 shadow-lg min-h-screen p-4 fixed lg:static top-0 left-0 z-40 h-full -translate-x-full lg:translate-x-0 transition-transform duration-200">
-        <div class="text-xl font-bold mb-6"><span class="text-success">re</span><span class="opacity-60">micle</span></div>
-        <ul class="menu">{}</ul>
-    </aside>
-    <main class="flex-1 p-4 lg:p-6 min-w-0">
-        <div class="flex justify-between items-center mb-6">
-            <div>
-                <h1 class="text-2xl font-bold">{}</h1>
-                <p class="opacity-60">Calendar view - by {}</p>
-            </div>
-            <div class="flex gap-2">
-                <div class="btn-group">
-                    <a href="/list/{}" class="btn btn-sm" title="List View">
-                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 10h16M4 14h16M4 18h16"/></svg>
-                    </a>
-                    <a href="/kanban/{}" class="btn btn-sm" title="Kanban View">
-                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 17V7m0 10a2 2 0 01-2 2H5a2 2 0 01-2-2V7a2 2 0 012-2h2a2 2 0 012 2m0 10a2 2 0 002 2h2a2 2 0 002-2M9 7a2 2 0 012-2h2a2 2 0 012 2m0 10V7m0 10a2 2 0 002 2h2a2 2 0 002-2V7a2 2 0 00-2-2h-2a2 2 0 00-2 2"/></svg>
-                    </a>
-                    <a href="/graph/{}" class="btn btn-sm" title="Graph View">
-                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/></svg>
-                    </a>
-                    <a href="/calendar/{}" class="btn btn-sm btn-active" title="Calendar View">
-                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"/></svg>
-                    </a>
-                </div>
-                <a href="/{}/new" class="btn btn-primary btn-sm">+ New</a>
-            </div>
-        </div>
-
-        <div class="card bg-base-100 shadow">
-            <div class="card-body">
-                <div class="flex justify-between items-center mb-4">
-                    <a href="/calendar/{}?year={}&month={}" class="btn btn-ghost btn-sm">← Prev</a>
-                    <h2 class="text-xl font-bold">{} {}</h2>
-                    <a href="/calendar/{}?year={}&month={}" class="btn btn-ghost btn-sm">Next →</a>
-                </div>
-                <div class="grid grid-cols-7 gap-px">
-                    <div class="text-center font-semibold py-2 bg-base-200">Sun</div>
-                    <div class="text-center font-semibold py-2 bg-base-200">Mon</div>
-                    <div class="text-center font-semibold py-2 bg-base-200">Tue</div>
-                    <div class="text-center font-semibold py-2 bg-base-200">Wed</div>
-                    <div class="text-center font-semibold py-2 bg-base-200">Thu</div>
-                    <div class="text-center font-semibold py-2 bg-base-200">Fri</div>
-                    <div class="text-center font-semibold py-2 bg-base-200">Sat</div>
-                    {}
-                </div>
-            </div>
-        </div>
-    </main>
-</div>
-</body>
-</html>"##,
-        model_display_name,
-        sidebar_menu,
-        model_display_name, date_field,
-        model_name, model_name, model_name, model_name, model_name,
-        model_name, prev_year, prev_month,
-        month_name, year,
-        model_name, next_year, next_month,
-        calendar_cells
-    )).into_response()
-}
-
-// ============================================================================
-// Pivot View
-// ============================================================================
-
-async fn generic_pivot_view(
-    State(state): State<Arc<AppState>>,
-    Db(db): Db,
-    Extension(user): Extension<AuthUser>,
-    Path(model_name): Path<String>,
-    Query(params): Query<std::collections::HashMap<String, String>>,
-) -> Response {
-    // Fetch model metadata
-    let model_row = match sqlx::query(
-        "SELECT id, display_name, table_name, list_url FROM ir_model WHERE name = $1 AND is_active = true"
-    )
-    .bind(&model_name)
-    .fetch_optional(&db)
-    .await {
-        Ok(Some(row)) => row,
-        _ => return (StatusCode::NOT_FOUND, Html("Model not found")).into_response(),
-    };
-
-    let model_id: uuid::Uuid = model_row.get("id");
-    let model_display_name: String = model_row.get("display_name");
-    let table_name: String = model_row.get("table_name");
-    // Canonical list URL (plugin-provided when present, generic /list/{model} otherwise)
     let list_view_url: String = model_row
         .try_get::<Option<String>, _>("list_url")
         .ok()
@@ -7538,645 +9073,1194 @@ async fn generic_pivot_view(
         .filter(|u| !u.is_empty())
         .unwrap_or_else(|| format!("/list/{}", model_name));
 
-    // Fetch available fields for pivot configuration
-    let fields = sqlx::query(
-        r#"SELECT name, field_type, display_name, related_model
-           FROM ir_model_field
-           WHERE model_id = $1
-           ORDER BY sequence, name"#
+    // Field registry (type + label).
+    let frows = sqlx::query(
+        "SELECT name, field_type, display_name FROM ir_model_field WHERE model_id = $1 ORDER BY sequence, name",
     )
     .bind(model_id)
     .fetch_all(&db)
     .await
     .unwrap_or_default();
-
-    // Build field info map for many2one lookups and display names
-    let mut field_info: std::collections::HashMap<String, (String, String, Option<String>)> = std::collections::HashMap::new();
-    for field in &fields {
-        let name: String = field.get("name");
-        let field_type: String = field.get("field_type");
-        let display_name: String = field.get("display_name");
-        let related_model: Option<String> = field.try_get("related_model").ok();
-        field_info.insert(name, (field_type, display_name, related_model));
+    let mut ftype: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut flabel: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut order: Vec<String> = Vec::new();
+    for f in &frows {
+        let n: String = f.get("name");
+        order.push(n.clone());
+        ftype.insert(n.clone(), f.get("field_type"));
+        flabel.insert(n, f.get("display_name"));
     }
-
-    // Get selected fields from params - support multiple row/col groups (comma-separated).
-    // Default to empty: the pivot renders with no groups until the user picks one
-    // from the "Add Group" dropdown. Don't assume any specific column exists.
-    let row_groups_str = params.get("rows").map(|s| s.as_str()).unwrap_or("");
-    let col_groups_str = params.get("cols").map(|s| s.as_str()).unwrap_or("");
-    let measure_field = params.get("measure").map(|s| s.as_str()).unwrap_or("id");
-    let measure_type = params.get("agg").map(|s| s.as_str()).unwrap_or("count");
-    let expanded_str = params.get("expanded").map(|s| s.as_str()).unwrap_or("");
-    // `expanded=*` means "expand all" — every non-leaf row is rendered expanded.
-    let expand_all = expanded_str == "*";
-
-    // Parse row and column groups
-    let row_groups: Vec<&str> = row_groups_str.split(',').filter(|s| !s.is_empty()).collect();
-    let col_groups: Vec<&str> = col_groups_str.split(',').filter(|s| !s.is_empty()).collect();
-    let expanded_paths: std::collections::HashSet<String> = if expand_all {
-        std::collections::HashSet::new()
-    } else {
-        expanded_str.split(',').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect()
+    // Real columns — the calendar only ever reads actual columns (registered
+    // fields can be computed/related and would break a raw SELECT).
+    let real_cols: std::collections::HashSet<String> = sqlx::query_scalar::<_, String>(
+        "SELECT column_name FROM information_schema.columns WHERE table_name = $1",
+    )
+    .bind(&table_name)
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .collect();
+    let is_col = |n: &str| real_cols.contains(n);
+    let is_date = |n: &str| ftype.get(n).map(|t| matches!(t.as_str(), "date" | "datetime")).unwrap_or(false);
+    let is_colorable = |n: &str| {
+        ftype.get(n).map(|t| matches!(t.as_str(), "selection" | "many2one" | "boolean" | "string" | "char")).unwrap_or(false)
     };
+    let label_of = |n: &str| flabel.get(n).cloned().unwrap_or_else(|| n.to_string());
 
-    // Build groupable field options for the add-group dropdowns
-    let mut groupable_fields: Vec<(&str, &str)> = Vec::new();
-    for field in &fields {
-        let name: String = field.get("name");
-        let display_name: String = field.get("display_name");
-        let field_type: String = field.get("field_type");
-        if matches!(field_type.as_str(), "selection" | "string" | "char" | "many2one" | "boolean") {
-            // Store references from field_info
-            if let Some((_, dn, _)) = field_info.get(&name) {
-                groupable_fields.push((Box::leak(name.into_boxed_str()), Box::leak(dn.clone().into_boxed_str())));
-            }
+    // ---- config: query params win, else the shared default saved view -------
+    let default_cfg = vortex_framework::saved_views::default_config_for(&db, &model_name, "calendar")
+        .await
+        .unwrap_or_default();
+    let pick = |k: &str| params.get(k).cloned().or_else(|| default_cfg.get(k).cloned());
+
+    let date_field = pick("date_field")
+        .filter(|d| is_date(d) && is_col(d))
+        .or_else(|| order.iter().find(|n| is_date(n) && is_col(n)).cloned())
+        .or_else(|| if is_col("created_at") { Some("created_at".to_string()) } else { None })
+        .unwrap_or_default();
+    let end_field = pick("end_field").filter(|d| is_date(d) && is_col(d) && *d != date_field);
+    let title_field = pick("title_field")
+        .filter(|t| is_col(t))
+        .or_else(|| {
+            ["name", "title", "subject", "display_name", "number", "reference", "code", "quote_number"]
+                .iter()
+                .find(|c| is_col(c))
+                .map(|c| c.to_string())
+        })
+        .unwrap_or_else(|| "id".to_string());
+    let color_field = pick("color_field").filter(|c| is_colorable(c) && is_col(c));
+    let mode = pick("mode")
+        .filter(|m| ["month", "week", "day"].contains(&m.as_str()))
+        .unwrap_or_else(|| "month".to_string());
+
+    // Saved-views toolbar config — captures whatever is currently configured so
+    // "Save view" persists the full calendar layout.
+    let mut current_cfg = std::collections::BTreeMap::new();
+    if !date_field.is_empty() {
+        current_cfg.insert("date_field".to_string(), date_field.clone());
+    }
+    if let Some(e) = &end_field {
+        current_cfg.insert("end_field".to_string(), e.clone());
+    }
+    current_cfg.insert("title_field".to_string(), title_field.clone());
+    if let Some(c) = &color_field {
+        current_cfg.insert("color_field".to_string(), c.clone());
+    }
+    current_cfg.insert("mode".to_string(), mode.clone());
+    let view_bar = vortex_framework::saved_views::render_view_bar(
+        &db, &model_name, "calendar", &current_cfg, user.id, user.is_admin(),
+    )
+    .await;
+
+    // Field list for the client config controls.
+    let mut field_arr: Vec<serde_json::Value> = Vec::new();
+    for n in &order {
+        if !is_col(n) {
+            continue;
         }
+        let t = ftype.get(n).cloned().unwrap_or_default();
+        field_arr.push(serde_json::json!({
+            "name": n,
+            "label": label_of(n),
+            "type": t,
+            "date": is_date(n),
+            "colorable": is_colorable(n),
+        }));
     }
+    let fields_json = serde_json::to_string(&field_arr).unwrap_or_else(|_| "[]".to_string());
+    let config_json = serde_json::json!({
+        "date_field": date_field,
+        "end_field": end_field.clone().unwrap_or_default(),
+        "title_field": title_field,
+        "color_field": color_field.clone().unwrap_or_default(),
+        "mode": mode,
+    })
+    .to_string();
 
-    // Helper to build SQL expression for a field (handles many2one joins)
-    fn build_field_expr(
-        field_name: &str,
-        idx: usize,
-        field_info: &std::collections::HashMap<String, (String, String, Option<String>)>,
-        joins: &mut Vec<String>,
-        selects: &mut Vec<String>,
-        group_bys: &mut Vec<String>,
-    ) {
-        if let Some((field_type, _, related_model)) = field_info.get(field_name) {
-            if field_type == "many2one" {
-                if let Some(rel_model) = related_model {
-                    let rel_table = rel_model.replace(".", "_");
-                    let join_alias = format!("j{}", idx);
-                    joins.push(format!(
-                        "LEFT JOIN {} {} ON t.{} = {}.id",
-                        rel_table, join_alias, field_name, join_alias
-                    ));
-                    selects.push(format!("COALESCE({}.name, '(empty)') as f{}", join_alias, idx));
-                    group_bys.push(format!("{}.name", join_alias));
-                    return;
-                }
-            }
-        }
-        selects.push(format!("COALESCE(CAST(t.{} AS TEXT), '(empty)') as f{}", field_name, idx));
-        group_bys.push(format!("t.{}", field_name));
-    }
+    let sidebar_menu = generic_view_sidebar(&state, &user, &db_ctx, &model_name);
 
-    // Build aggregation function
-    let agg_func = match measure_type {
-        "sum" => format!("COALESCE(SUM(CAST(t.{} AS NUMERIC)), 0)", measure_field),
-        "avg" => format!("COALESCE(AVG(CAST(t.{} AS NUMERIC)), 0)", measure_field),
-        "min" => format!("COALESCE(MIN(CAST(t.{} AS NUMERIC)), 0)", measure_field),
-        "max" => format!("COALESCE(MAX(CAST(t.{} AS NUMERIC)), 0)", measure_field),
-        _ => "COUNT(*)".to_string(),
-    };
-
-    // Data structure for hierarchical pivot
-    // Key: (row_path_tuple, col_path_tuple) -> measure value
-    // row_path_tuple and col_path_tuple are comma-joined strings of group values
-    let mut pivot_data: std::collections::HashMap<(String, String), f64> = std::collections::HashMap::new();
-    let mut all_row_paths: std::collections::BTreeSet<Vec<String>> = std::collections::BTreeSet::new();
-    let mut all_col_paths: std::collections::BTreeSet<Vec<String>> = std::collections::BTreeSet::new();
-
-    // Query all combinations of row and column groups
-    if !row_groups.is_empty() {
-        let mut joins: Vec<String> = Vec::new();
-        let mut selects: Vec<String> = Vec::new();
-        let mut group_bys: Vec<String> = Vec::new();
-
-        // Add row group fields
-        for (i, &field_name) in row_groups.iter().enumerate() {
-            build_field_expr(field_name, i, &field_info, &mut joins, &mut selects, &mut group_bys);
-        }
-
-        // Add column group fields
-        let col_offset = row_groups.len();
-        for (i, &field_name) in col_groups.iter().enumerate() {
-            build_field_expr(field_name, col_offset + i, &field_info, &mut joins, &mut selects, &mut group_bys);
-        }
-
-        selects.push(format!("{} as measure", agg_func));
-
-        let query = format!(
-            "SELECT {} FROM {} t {} WHERE t.active = true GROUP BY {}",
-            selects.join(", "),
-            table_name,
-            joins.join(" "),
-            group_bys.join(", ")
-        );
-
-        if let Ok(results) = sqlx::query(&query).fetch_all(&db).await {
-            for row in results {
-                // Extract row path
-                let mut row_path: Vec<String> = Vec::new();
-                for i in 0..row_groups.len() {
-                    let val: String = row.try_get(&format!("f{}", i) as &str).unwrap_or_default();
-                    row_path.push(val);
-                }
-
-                // Extract col path
-                let mut col_path: Vec<String> = Vec::new();
-                for i in 0..col_groups.len() {
-                    let val: String = row.try_get(&format!("f{}", col_offset + i) as &str).unwrap_or_default();
-                    col_path.push(val);
-                }
-
-                let measure: f64 = row.try_get::<i64, _>("measure")
-                    .map(|v| v as f64)
-                    .or_else(|_| row.try_get::<f64, _>("measure"))
-                    .or_else(|_| row.try_get::<i32, _>("measure").map(|v| v as f64))
-                    .unwrap_or(0.0);
-
-                // Store all partial row paths for subtotals
-                for depth in 1..=row_path.len() {
-                    all_row_paths.insert(row_path[..depth].to_vec());
-                }
-                for depth in 1..=col_path.len() {
-                    all_col_paths.insert(col_path[..depth].to_vec());
-                }
-                if col_path.is_empty() {
-                    all_col_paths.insert(vec![]);
-                }
-
-                let row_key = row_path.join("\x00");
-                let col_key = col_path.join("\x00");
-
-                *pivot_data.entry((row_key, col_key)).or_insert(0.0) += measure;
-            }
-        }
-    }
-
-    // Calculate subtotals for each row path prefix
-    let mut row_subtotals: std::collections::HashMap<String, std::collections::HashMap<String, f64>> = std::collections::HashMap::new();
-    for ((row_key, col_key), val) in &pivot_data {
-        let row_parts: Vec<&str> = row_key.split('\x00').collect();
-        // Add to all prefix subtotals
-        for depth in 0..=row_parts.len() {
-            let prefix = row_parts[..depth].join("\x00");
-            *row_subtotals.entry(prefix).or_insert_with(std::collections::HashMap::new).entry(col_key.clone()).or_insert(0.0) += val;
-        }
-    }
-
-    // Calculate column totals
-    let mut col_totals: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
-    for ((_, col_key), val) in &pivot_data {
-        *col_totals.entry(col_key.clone()).or_insert(0.0) += val;
-    }
-
-    // Grand total
-    let grand_total: f64 = pivot_data.values().sum();
-
-    // Sort column paths
-    let col_paths_sorted: Vec<Vec<String>> = all_col_paths.into_iter().collect();
-
-    // Build the hierarchical pivot table HTML
-    let mut table_html = String::new();
-
-    // Header rows (one per column group level, or just one if no col groups)
-    table_html.push_str("<thead>");
-    if col_groups.is_empty() {
-        table_html.push_str("<tr><th class=\"pivot-header pivot-row-label\"></th><th class=\"pivot-header\">Total</th></tr>");
-    } else {
-        // Build column headers with hierarchy
-        table_html.push_str("<tr><th class=\"pivot-header pivot-row-label\"></th>");
-        for col_path in &col_paths_sorted {
-            if !col_path.is_empty() {
-                let col_label = col_path.last().unwrap_or(&String::new()).clone();
-                table_html.push_str(&format!("<th class=\"pivot-header\">{}</th>", col_label));
-            }
-        }
-        table_html.push_str("<th class=\"pivot-header pivot-total\">Total</th></tr>");
-    }
-    table_html.push_str("</thead>");
-
-    // Data rows with hierarchy
-    table_html.push_str("<tbody>");
-
-    // Collect unique row paths at each depth and sort them
-    let mut row_paths_by_depth: std::collections::BTreeMap<usize, std::collections::BTreeSet<Vec<String>>> = std::collections::BTreeMap::new();
-    for row_path in &all_row_paths {
-        row_paths_by_depth.entry(row_path.len()).or_insert_with(std::collections::BTreeSet::new).insert(row_path.clone());
-    }
-
-    // Recursive function to render row hierarchy
-    fn render_row_hierarchy(
-        table_html: &mut String,
-        current_path: &[String],
-        depth: usize,
-        max_depth: usize,
-        all_row_paths: &std::collections::BTreeSet<Vec<String>>,
-        row_subtotals: &std::collections::HashMap<String, std::collections::HashMap<String, f64>>,
-        col_paths_sorted: &[Vec<String>],
-        expanded_paths: &std::collections::HashSet<String>,
-        expand_all: bool,
-        row_groups: &[&str],
-        model_name: &str,
-        row_groups_str: &str,
-        col_groups_str: &str,
-        measure_field: &str,
-        measure_type: &str,
-    ) {
-        // Find all children at current level
-        let path_key = current_path.join("\x00");
-        let mut children: Vec<Vec<String>> = Vec::new();
-
-        for row_path in all_row_paths {
-            if row_path.len() == depth + 1 && row_path[..depth] == *current_path {
-                children.push(row_path.clone());
-            }
-        }
-        children.sort();
-
-        for child_path in children {
-            let is_leaf = depth + 1 >= max_depth;
-            let child_key = child_path.join("\x00");
-            let is_expanded = expand_all || expanded_paths.contains(&child_key);
-            let has_children = !is_leaf && all_row_paths.iter().any(|p| p.len() > depth + 1 && p[..depth + 1] == child_path[..]);
-
-            // Calculate indent
-            let indent = depth * 20;
-            let label = child_path.last().unwrap_or(&String::new()).clone();
-
-            // Build toggle URL
-            let mut new_expanded = expanded_paths.clone();
-            if is_expanded {
-                new_expanded.remove(&child_key);
-            } else {
-                new_expanded.insert(child_key.clone());
-            }
-            let expanded_param: String = new_expanded.into_iter().collect::<Vec<_>>().join(",");
-
-            // Row styling based on depth
-            let row_class = format!("pivot-row-level{}", depth);
-
-            table_html.push_str(&format!("<tr class=\"{}\">", row_class));
-
-            // Row label cell with expand/collapse
-            table_html.push_str(&format!("<td class=\"pivot-row-header\" style=\"padding-left: {}px;\">", indent + 8));
-
-            if has_children {
-                let toggle_icon = if is_expanded { "▼" } else { "▶" };
-                table_html.push_str(&format!(
-                    "<a href=\"/pivot/{}?rows={}&cols={}&measure={}&agg={}&expanded={}\" class=\"pivot-toggle\">{}</a> ",
-                    model_name, row_groups_str, col_groups_str, measure_field, measure_type, expanded_param, toggle_icon
-                ));
-            } else {
-                table_html.push_str("<span class=\"pivot-toggle-spacer\"></span>");
-            }
-
-            table_html.push_str(&format!("{}</td>", label));
-
-            // Get subtotals for this row
-            let empty_map = std::collections::HashMap::new();
-            let row_data = row_subtotals.get(&child_key).unwrap_or(&empty_map);
-
-            // Data cells
-            if col_paths_sorted.is_empty() || (col_paths_sorted.len() == 1 && col_paths_sorted[0].is_empty()) {
-                let val = row_data.get("").unwrap_or(&0.0);
-                let cell_class = if *val > 0.0 { "pivot-cell pivot-has-value" } else { "pivot-cell" };
-                table_html.push_str(&format!("<td class=\"{}\">{}</td>", cell_class, format_pivot_number(*val, measure_type)));
-            } else {
-                for col_path in col_paths_sorted {
-                    if !col_path.is_empty() {
-                        let col_key = col_path.join("\x00");
-                        let val = row_data.get(&col_key).unwrap_or(&0.0);
-                        let cell_class = if *val > 0.0 { "pivot-cell pivot-has-value" } else { "pivot-cell" };
-                        table_html.push_str(&format!("<td class=\"{}\">{}</td>", cell_class, format_pivot_number(*val, measure_type)));
-                    }
-                }
-                // Row total
-                let row_total: f64 = row_data.values().sum();
-                table_html.push_str(&format!("<td class=\"pivot-cell pivot-total\">{}</td>", format_pivot_number(row_total, measure_type)));
-            }
-
-            table_html.push_str("</tr>");
-
-            // Recursively render children if expanded
-            if is_expanded && has_children {
-                render_row_hierarchy(
-                    table_html,
-                    &child_path,
-                    depth + 1,
-                    max_depth,
-                    all_row_paths,
-                    row_subtotals,
-                    col_paths_sorted,
-                    expanded_paths,
-                    expand_all,
-                    row_groups,
-                    model_name,
-                    row_groups_str,
-                    col_groups_str,
-                    measure_field,
-                    measure_type,
-                );
-            }
-        }
-    }
-
-    // Render the row hierarchy starting from root
-    render_row_hierarchy(
-        &mut table_html,
-        &[],
-        0,
-        row_groups.len(),
-        &all_row_paths,
-        &row_subtotals,
-        &col_paths_sorted,
-        &expanded_paths,
-        expand_all,
-        &row_groups,
-        &model_name,
-        row_groups_str,
-        col_groups_str,
-        measure_field,
-        measure_type,
-    );
-
-    // Footer row with column totals
-    table_html.push_str("<tr class=\"pivot-footer\"><td class=\"pivot-row-header pivot-total\">Total</td>");
-    if col_paths_sorted.is_empty() || (col_paths_sorted.len() == 1 && col_paths_sorted[0].is_empty()) {
-        table_html.push_str(&format!("<td class=\"pivot-cell pivot-grand-total\">{}</td>", format_pivot_number(grand_total, measure_type)));
-    } else {
-        for col_path in &col_paths_sorted {
-            if !col_path.is_empty() {
-                let col_key = col_path.join("\x00");
-                let col_total = col_totals.get(&col_key).unwrap_or(&0.0);
-                table_html.push_str(&format!("<td class=\"pivot-cell pivot-total\">{}</td>", format_pivot_number(*col_total, measure_type)));
-            }
-        }
-        table_html.push_str(&format!("<td class=\"pivot-cell pivot-grand-total\">{}</td>", format_pivot_number(grand_total, measure_type)));
-    }
-    table_html.push_str("</tr>");
-
-    table_html.push_str("</tbody>");
-
-    // Build row/col group tags with remove buttons
-    let mut row_group_tags = String::new();
-    for (i, &group) in row_groups.iter().enumerate() {
-        let display_name = field_info.get(group).map(|(_, dn, _)| dn.as_str()).unwrap_or(group);
-        let remaining: Vec<&str> = row_groups.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, g)| *g).collect();
-        let remaining_str = remaining.join(",");
-        row_group_tags.push_str(&format!(
-            r#"<span class="group-chip"><span>{}</span><a href="/pivot/{}?rows={}&cols={}&measure={}&agg={}" class="group-chip-remove" title="Remove">×</a></span>"#,
-            display_name, model_name, remaining_str, col_groups_str, measure_field, measure_type
-        ));
-    }
-
-    let mut col_group_tags = String::new();
-    for (i, &group) in col_groups.iter().enumerate() {
-        let display_name = field_info.get(group).map(|(_, dn, _)| dn.as_str()).unwrap_or(group);
-        let remaining: Vec<&str> = col_groups.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, g)| *g).collect();
-        let remaining_str = remaining.join(",");
-        col_group_tags.push_str(&format!(
-            r#"<span class="group-chip"><span>{}</span><a href="/pivot/{}?rows={}&cols={}&measure={}&agg={}" class="group-chip-remove" title="Remove">×</a></span>"#,
-            display_name, model_name, row_groups_str, remaining_str, measure_field, measure_type
-        ));
-    }
-
-    // Build add-group dropdown options (excluding already used fields)
-    let used_fields: std::collections::HashSet<&str> = row_groups.iter().chain(col_groups.iter()).cloned().collect();
-    let mut available_field_options = String::new();
-    for (name, display_name) in &groupable_fields {
-        if !used_fields.contains(*name) {
-            available_field_options.push_str(&format!(r#"<option value="{}">{}</option>"#, name, display_name));
-        }
-    }
-
-    // Build measure options
-    let mut measure_options = String::new();
-    measure_options.push_str(&format!(r#"<option value="id"{}>(Count)</option>"#, if measure_field == "id" { " selected" } else { "" }));
-    for field in &fields {
-        let name: String = field.get("name");
-        let display_name: String = field.get("display_name");
-        let field_type: String = field.get("field_type");
-        if matches!(field_type.as_str(), "integer" | "float" | "monetary" | "number") && name != "id" {
-            let selected = if name == measure_field { " selected" } else { "" };
-            measure_options.push_str(&format!(r#"<option value="{}"{}>{}</option>"#, name, selected, display_name));
-        }
-    }
-
-    // Build dynamic sidebar
-    let sidebar_menu = build_sidebar_menu(&db, &user.roles, &model_name).await;
-
-    Html(format!(r##"<!DOCTYPE html>
-<html data-theme="dark">
-<head>
-    <script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style>
-    <title>{} - Pivot</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=4" rel="stylesheet"/>
-<script src="/static/vortex.js?v=4" defer></script>
-    <script src="/static/vendor/tailwind.js"></script>
-    <style>
-        body {{ background: oklch(var(--b2)); color: oklch(var(--bc)); }}
-        .top-navbar {{ background: oklch(var(--b1)); border-bottom: 1px solid oklch(var(--b3)); position: sticky; top: 0; z-index: 50; }}
-        .sidebar {{ background: oklch(var(--b1)); border-right: 1px solid oklch(var(--b3)); }}
-        .card {{ background: oklch(var(--b1)); border: 1px solid oklch(var(--b3)); }}
-        .text-muted {{ color: oklch(var(--bc)/0.6); }}
-        .user-badge {{ background: #8BC53F; color: #000; font-weight: 600; }}
-
-        /* Pivot table — Odoo-inspired: compact, bordered, hoverable */
-        .pivot-table {{ width: auto; min-width: 100%; border-collapse: collapse; font-size: 0.85rem; }}
-        .pivot-table th, .pivot-table td {{ padding: 0.35rem 0.75rem; text-align: right; border: 1px solid oklch(var(--b3)); white-space: nowrap; }}
-        .pivot-table tbody tr:hover td {{ background-color: oklch(var(--b2)/0.5); }}
-        .pivot-header {{ background: oklch(var(--b2)); color: oklch(var(--bc)); font-weight: 500; text-align: center !important; position: relative; }}
-        .pivot-header:hover {{ background: oklch(var(--b3)); }}
-        .pivot-row-label {{ text-align: left !important; min-width: 220px; }}
-        .pivot-row-header {{ background: oklch(var(--b1)); font-weight: 400; text-align: left !important; color: oklch(var(--bc)); cursor: pointer; }}
-        .pivot-row-header:hover {{ background: oklch(var(--b2)); }}
-        .pivot-cell {{ color: oklch(var(--bc)/0.6); font-variant-numeric: tabular-nums; }}
-        .pivot-has-value {{ color: oklch(var(--bc)); }}
-        .pivot-total {{ background: oklch(var(--b2)) !important; font-weight: 600; color: oklch(var(--bc)) !important; }}
-        .pivot-grand-total {{ background: oklch(var(--b3)) !important; color: oklch(var(--bc)) !important; font-weight: 700; }}
-        .pivot-footer td {{ border-top: 2px solid oklch(var(--b3)); }}
-
-        /* Row hierarchy levels — subtle depth indicators */
-        .pivot-row-level0 > td.pivot-row-header {{ font-weight: 600; }}
-        .pivot-row-level1 > td.pivot-row-header {{ font-weight: 500; }}
-        .pivot-row-level2 > td.pivot-row-header {{ font-weight: 400; color: oklch(var(--bc)/0.75); }}
-
-        /* Expand/collapse marker */
-        .pivot-toggle {{ color: oklch(var(--bc)/0.6); text-decoration: none; display: inline-block; width: 14px; }}
-        .pivot-toggle:hover {{ color: #8BC53F; }}
-        .pivot-toggle-spacer {{ display: inline-block; width: 14px; }}
-
-        /* Compact toolbar */
-        .pivot-toolbar {{ display: flex; flex-wrap: wrap; align-items: center; gap: 0.25rem; padding: 0.35rem 0.5rem; background: oklch(var(--b1)); border: 1px solid oklch(var(--b3)); border-radius: 0.5rem; margin-bottom: 1rem; }}
-        .pivot-toolbar-group {{ display: flex; gap: 0.25rem; align-items: center; padding: 0 0.5rem; }}
-        .pivot-toolbar-group + .pivot-toolbar-group {{ border-left: 1px solid oklch(var(--b3)); }}
-        .pivot-toolbar label {{ font-size: 0.75rem; color: oklch(var(--bc)/0.6); margin-right: 0.25rem; }}
-        .pivot-toolbar select {{ background: transparent; border: 1px solid oklch(var(--b3)); border-radius: 0.25rem; padding: 0.2rem 0.4rem; font-size: 0.8rem; color: oklch(var(--bc)); }}
-        .pivot-toolbar-btn {{ display: inline-flex; align-items: center; gap: 0.25rem; background: transparent; border: 1px solid oklch(var(--b3)); border-radius: 0.25rem; padding: 0.3rem 0.5rem; font-size: 0.8rem; color: oklch(var(--bc)); cursor: pointer; text-decoration: none; }}
-        .pivot-toolbar-btn:hover {{ background: oklch(var(--b2)); border-color: #8BC53F; color: #8BC53F; }}
-
-        /* Active group chips + add-group trigger */
-        .pivot-groups-row {{ display: flex; flex-wrap: wrap; gap: 0.75rem; margin-bottom: 0.75rem; font-size: 0.8rem; }}
-        .pivot-groups-axis {{ display: inline-flex; align-items: center; gap: 0.25rem; flex-wrap: wrap; }}
-        .pivot-groups-axis-label {{ color: oklch(var(--bc)/0.6); font-weight: 500; margin-right: 0.25rem; }}
-        .group-chip {{ display: inline-flex; align-items: center; gap: 0.35rem; background: oklch(var(--b1)); border: 1px solid oklch(var(--b3)); border-radius: 999px; padding: 0.15rem 0.6rem; color: oklch(var(--bc)); }}
-        .group-chip-remove {{ color: oklch(var(--bc)/0.5); text-decoration: none; }}
-        .group-chip-remove:hover {{ color: #ff6b6b; }}
-        .add-group-select {{ background: transparent; border: 1px dashed oklch(var(--b3)); border-radius: 999px; padding: 0.15rem 0.5rem; color: oklch(var(--bc)/0.6); font-size: 0.75rem; cursor: pointer; }}
-        .add-group-select:hover {{ border-color: #8BC53F; color: #8BC53F; }}
-
-        @media (max-width: 768px) {{
-            .sidebar {{ display: none; }}
-            .pivot-table {{ font-size: 0.75rem; }}
-            .pivot-table th, .pivot-table td {{ padding: 0.3rem 0.45rem; }}
-            .pivot-row-label {{ min-width: 140px; }}
-        }}
-    </style>
-</head>
-<body class="min-h-screen">
-<nav class="top-navbar px-4 py-3 flex items-center justify-between">
-    <div class="flex items-center gap-2"><button class="btn btn-ghost btn-sm btn-square md:hidden" onclick="var s=document.querySelector('.sidebar');s.classList.toggle('hidden');s.classList.toggle('md:block')"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="text-xl font-bold"><span style="color:#8BC53F">re</span><span class="text-muted">micle</span></a></div>
-    <div class="flex items-center gap-2 md:gap-3">
-        <a href="/home" class="text-base-content text-sm hover:underline hidden md:inline">Home</a>
-        <a href="/settings" class="text-base-content text-sm hover:underline hidden md:inline">Settings</a>
-        <a href="/notifications" class="btn btn-ghost btn-circle btn-sm relative" title="Notifications">
-            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9"/></svg>
-            <span class="absolute top-0 right-0 w-2 h-2 bg-red-500 rounded-full"></span>
-        </a>
-        <button onclick="(function(){{var h=document.documentElement,c=h.getAttribute('data-theme')==='dark'?'corporate':'dark';h.setAttribute('data-theme',c);localStorage.setItem('theme',c);document.querySelectorAll('.theme-icon-sun,.theme-icon-moon').forEach(function(e){{e.classList.toggle('hidden')}})}})();" class="btn btn-ghost btn-circle btn-sm" title="Toggle theme"><svg class="theme-icon-sun w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5" stroke-width="2"/><path stroke-linecap="round" stroke-width="2" d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg><svg class="theme-icon-moon w-5 h-5 hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg></button>
-        <div class="user-badge px-3 py-1 rounded-full text-sm">@{}</div>
-    </div>
-</nav>
-<div class="flex">
-    <aside class="sidebar w-64 min-h-screen p-4 hidden md:block">
-        <ul class="menu mt-2">{}</ul>
-    </aside>
-    <main class="flex-1 p-4 md:p-6">
-        <div class="flex flex-col md:flex-row justify-between items-start md:items-center mb-6 gap-4">
-            <div>
-                <h1 class="text-xl md:text-2xl font-bold">{}</h1>
-                <p class="text-muted">Pivot analysis</p>
-            </div>
-            <div class="flex gap-2 flex-wrap">
-                <div class="btn-group">
-                    <a href="{}" class="btn btn-sm" title="List View">
-                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 10h16M4 14h16M4 18h16"/></svg>
-                    </a>
-                    <a href="/kanban/{}" class="btn btn-sm" title="Kanban View">
-                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 17V7m0 10a2 2 0 01-2 2H5a2 2 0 01-2-2V7a2 2 0 012-2h2a2 2 0 012 2m0 10a2 2 0 002 2h2a2 2 0 002-2M9 7a2 2 0 012-2h2a2 2 0 012 2m0 10V7m0 10a2 2 0 002 2h2a2 2 0 002-2V7a2 2 0 00-2-2h-2a2 2 0 00-2 2"/></svg>
-                    </a>
-                    <a href="/graph/{}" class="btn btn-sm" title="Graph View">
-                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/></svg>
-                    </a>
-                    <a href="/pivot/{}" class="btn btn-sm btn-active" title="Pivot View">
-                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 10h18M3 14h18m-9-4v8m-7 0h14a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg>
-                    </a>
-                </div>
-                <a href="/{}/new" class="btn btn-sm" style="background:#8BC53F;border-color:#8BC53F;color:#000">+ New</a>
-            </div>
-        </div>
-
-        <!-- Compact toolbar: Measure + Aggregation on the left, actions on the right -->
-        <div class="pivot-toolbar">
-            <div class="pivot-toolbar-group">
-                <label>Measure</label>
-                <select onchange="window.location='/pivot/{}?rows={}&cols={}&measure='+this.value+'&agg={}'">
-                    {}
-                </select>
-                <select onchange="window.location='/pivot/{}?rows={}&cols={}&measure={}&agg='+this.value">
-                    <option value="count"{}>Count</option>
-                    <option value="sum"{}>Sum</option>
-                    <option value="avg"{}>Average</option>
-                    <option value="min"{}>Min</option>
-                    <option value="max"{}>Max</option>
-                </select>
-            </div>
-            <div class="pivot-toolbar-group" style="margin-left:auto">
-                <a class="pivot-toolbar-btn" title="Flip axis (swap rows/columns)" href="/pivot/{}?rows={}&cols={}&measure={}&agg={}">
-                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7h12m0 0l-4-4m4 4l-4 4m0 6H4m0 0l4 4m-4-4l4-4"/></svg>
-                    Flip
-                </a>
-                <a class="pivot-toolbar-btn" title="Expand all groups" href="/pivot/{}?rows={}&cols={}&measure={}&agg={}&expanded=*">
-                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 8V4m0 0h4M4 4l5 5m11-5h-4m4 0v4m0-4l-5 5M4 16v4m0 0h4m-4 0l5-5m11 5l-5-5m5 5v-4m0 4h-4"/></svg>
-                    Expand all
-                </a>
-                <a class="pivot-toolbar-btn" title="Collapse all groups" href="/pivot/{}?rows={}&cols={}&measure={}&agg={}">
-                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 9V5m0 0H5m4 0L4 10m11-1h4m0 0V5m0 4l5-5M9 15v4m0 0H5m4 0l-5-5m11 1h4m0 0v4m0-4l5 5"/></svg>
-                    Collapse
-                </a>
-            </div>
-        </div>
-
-        <!-- Active group chips -->
-        <div class="pivot-groups-row">
-            <div class="pivot-groups-axis">
-                <span class="pivot-groups-axis-label">Rows</span>
-                {}
-                <select class="add-group-select" onchange="if(this.value) window.location='/pivot/{}?rows={}'+('{}'?',':'')+this.value+'&cols={}&measure={}&agg={}'">
-                    <option value="">+ add field</option>
-                    {}
-                </select>
-            </div>
-            <div class="pivot-groups-axis">
-                <span class="pivot-groups-axis-label">Columns</span>
-                {}
-                <select class="add-group-select" onchange="if(this.value) window.location='/pivot/{}?rows={}&cols={}'+('{}'?',':'')+this.value+'&measure={}&agg={}'">
-                    <option value="">+ add field</option>
-                    {}
-                </select>
-            </div>
-        </div>
-
-        <!-- Pivot Table -->
-        <div class="card overflow-x-auto">
-            <table class="pivot-table">
-                {}
-            </table>
-        </div>
-    </main>
-</div>
-</body>
-</html>"##,
-        model_display_name,
-        user.username,
-        sidebar_menu,
-        model_display_name,
-        &list_view_url, model_name, model_name, model_name, model_name,
-        // Toolbar — measure dropdown
-        model_name, row_groups_str, col_groups_str, measure_type,
-        measure_options,
-        // Toolbar — aggregation dropdown
-        model_name, row_groups_str, col_groups_str, measure_field,
-        if measure_type == "count" { " selected" } else { "" },
-        if measure_type == "sum" { " selected" } else { "" },
-        if measure_type == "avg" { " selected" } else { "" },
-        if measure_type == "min" { " selected" } else { "" },
-        if measure_type == "max" { " selected" } else { "" },
-        // Toolbar — Flip axis (swaps rows/cols)
-        model_name, col_groups_str, row_groups_str, measure_field, measure_type,
-        // Toolbar — Expand all
-        model_name, row_groups_str, col_groups_str, measure_field, measure_type,
-        // Toolbar — Collapse
-        model_name, row_groups_str, col_groups_str, measure_field, measure_type,
-        // Row groups section
-        row_group_tags,
-        model_name, row_groups_str, row_groups_str, col_groups_str, measure_field, measure_type,
-        available_field_options,
-        // Column groups section
-        col_group_tags,
-        model_name, row_groups_str, col_groups_str, col_groups_str, measure_field, measure_type,
-        available_field_options,
-        // Table
-        table_html
-    )).into_response()
+    let html = CALENDAR_SHELL
+        .replace("__TITLE__", &html_escape(&model_display_name))
+        .replace("__USER__", &html_escape(&user.username))
+        .replace("__SIDEBAR__", &sidebar_menu)
+        .replace("__LISTURL__", &html_escape(&list_view_url))
+        .replace("__FIELDS__", &html_escape(&fields_json))
+        .replace("__CONFIG__", &html_escape(&config_json))
+        .replace("__MODEL__", &html_escape(&model_name))
+        .replace("__NEWURL__", &html_escape(&vortex_framework::new_record_url(&model_name)));
+    Html(html.replace("<!--VIEW_BAR-->", &view_bar)).into_response()
 }
 
-fn format_pivot_number(val: f64, measure_type: &str) -> String {
-    if val == 0.0 {
-        "-".to_string()
-    } else if measure_type == "count" {
-        format!("{:.0}", val)
-    } else if val == val.floor() {
-        format!("{:.0}", val)
-    } else {
-        format!("{:.2}", val)
+/// GET /calendar/{model}/data — events overlapping the `[start,end]` range as
+/// JSON. Every field name is registry-validated and must be a real column
+/// before it is interpolated; the range bounds are bound parameters cast to
+/// `date` in SQL. An event's `[start,end]` span intersects the range when
+/// `start <= range_end AND end >= range_start` (a point event has `end = start`).
+async fn generic_calendar_data(
+    State(_state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(_user): Extension<AuthUser>,
+    Path(model_name): Path<String>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let fail = |msg: &str| Json(serde_json::json!({"ok": false, "error": msg})).into_response();
+
+    struct CF {
+        ftype: String,
+        related: Option<String>,
+        options: Option<serde_json::Value>,
     }
+    // Selection value → human label; boolean 't'/'f' → Yes/No; else verbatim.
+    fn color_label(field: &str, val: &str, finfo: &std::collections::HashMap<String, CF>) -> String {
+        match finfo.get(field) {
+            Some(c) if c.ftype == "boolean" => {
+                if val == "t" || val == "true" { "Yes".to_string() } else { "No".to_string() }
+            }
+            Some(c) if c.ftype == "selection" => c
+                .options
+                .as_ref()
+                .and_then(|v| v.as_array())
+                .and_then(|arr| arr.iter().find(|o| o.get("value").and_then(|x| x.as_str()) == Some(val)))
+                .and_then(|o| o.get("label").and_then(|x| x.as_str()))
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| val.to_string()),
+            _ => val.to_string(),
+        }
+    }
+
+    let model_row = match sqlx::query("SELECT id, table_name FROM ir_model WHERE name = $1 AND is_active = true")
+        .bind(&model_name)
+        .fetch_optional(&db)
+        .await
+    {
+        Ok(Some(r)) => r,
+        _ => return fail("Unknown model"),
+    };
+    let model_id: uuid::Uuid = model_row.get("id");
+    let table_name: String = model_row.get("table_name");
+    if !validate_identifier(&table_name) {
+        return fail("Invalid model");
+    }
+
+    let frows = sqlx::query(
+        "SELECT name, field_type, related_model, selection_options FROM ir_model_field WHERE model_id = $1",
+    )
+    .bind(model_id)
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default();
+    let mut finfo: std::collections::HashMap<String, CF> = std::collections::HashMap::new();
+    for f in &frows {
+        let n: String = f.get("name");
+        finfo.insert(n, CF {
+            ftype: f.get("field_type"),
+            related: f.try_get("related_model").ok().flatten(),
+            options: f.try_get("selection_options").ok(),
+        });
+    }
+    let real_cols: std::collections::HashSet<String> = sqlx::query_scalar::<_, String>(
+        "SELECT column_name FROM information_schema.columns WHERE table_name = $1",
+    )
+    .bind(&table_name)
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .collect();
+    let is_col = |n: &str| validate_identifier(n) && real_cols.contains(n);
+    let is_date = |n: &str| finfo.get(n).map(|c| matches!(c.ftype.as_str(), "date" | "datetime")).unwrap_or(false);
+    let is_datetime = |n: &str| finfo.get(n).map(|c| c.ftype == "datetime").unwrap_or(false);
+
+    // Resolve fields — every one must be a real column.
+    let date_field = match params.get("date_field").filter(|d| is_date(d) && is_col(d)).cloned() {
+        Some(d) => d,
+        None => return fail("No valid date field"),
+    };
+    let end_field = params
+        .get("end_field")
+        .filter(|d| is_date(d) && is_col(d) && d.as_str() != date_field)
+        .cloned();
+    let title_field = params
+        .get("title_field")
+        .filter(|t| is_col(t))
+        .cloned()
+        .unwrap_or_else(|| "id".to_string());
+    let color_field = params.get("color_field").filter(|c| is_col(c)).cloned();
+    let has_active = real_cols.contains("active");
+
+    // Range bounds. The client always sends both as ISO dates; validate the
+    // shape (they are bound, not interpolated, and cast to date in SQL).
+    let start = params.get("start").cloned().unwrap_or_default();
+    let end = params.get("end").cloned().unwrap_or_default();
+    let iso_ok = |s: &str| {
+        s.len() == 10
+            && s.as_bytes().iter().enumerate().all(|(i, b)| {
+                if i == 4 || i == 7 { *b == b'-' } else { b.is_ascii_digit() }
+            })
+    };
+    if !iso_ok(&start) || !iso_ok(&end) {
+        return fail("Invalid range");
+    }
+
+    // Projection expressions. A many2one title/color resolves to the related
+    // record's name via a LEFT JOIN, so the chip shows "Acme Corp" rather than
+    // the raw foreign-key UUID.
+    let mut title_join = String::new();
+    let title_sel = if title_field == "id" {
+        "t.id::text".to_string()
+    } else {
+        match finfo.get(&title_field).map(|c| (c.ftype.clone(), c.related.clone())) {
+            Some((ft, Some(rel))) if ft == "many2one" => {
+                let rel_table = rel.replace('.', "_");
+                if validate_identifier(&rel_table) {
+                    title_join = format!(" LEFT JOIN {rt} titlerel ON t.{tf} = titlerel.id", rt = rel_table, tf = title_field);
+                    "titlerel.name".to_string()
+                } else {
+                    format!("CAST(t.{} AS TEXT)", title_field)
+                }
+            }
+            _ => format!("CAST(t.{} AS TEXT)", title_field),
+        }
+    };
+    let start_date_sel = format!("t.{}::date", date_field);
+    let start_time_sel = if is_datetime(&date_field) {
+        format!("to_char(t.{}, 'HH24:MI')", date_field)
+    } else {
+        "NULL::text".to_string()
+    };
+    let (end_date_sel, end_time_sel) = match &end_field {
+        Some(e) => (
+            format!("t.{}::date", e),
+            if is_datetime(e) { format!("to_char(t.{}, 'HH24:MI')", e) } else { "NULL::text".to_string() },
+        ),
+        None => ("NULL::date".to_string(), "NULL::text".to_string()),
+    };
+
+    // Color group: join the related table for a many2one (group by its name);
+    // otherwise the raw column value as text.
+    let mut color_join = String::new();
+    let color_sel = match &color_field {
+        Some(cf) => match finfo.get(cf).map(|c| (c.ftype.clone(), c.related.clone())) {
+            Some((ft, Some(rel))) if ft == "many2one" => {
+                let rel_table = rel.replace('.', "_");
+                if validate_identifier(&rel_table) {
+                    color_join = format!(" LEFT JOIN {rt} crel ON t.{cf} = crel.id", rt = rel_table, cf = cf);
+                    "crel.name".to_string()
+                } else {
+                    format!("CAST(t.{} AS TEXT)", cf)
+                }
+            }
+            _ => format!("CAST(t.{} AS TEXT)", cf),
+        },
+        None => "NULL::text".to_string(),
+    };
+
+    // Overlap test; with no end field the effective end equals the start.
+    let effective_end = match &end_field {
+        Some(e) => format!("t.{}::date", e),
+        None => start_date_sel.clone(),
+    };
+    let where_active = if has_active { " AND t.active = true" } else { "" };
+    let q = format!(
+        "SELECT t.id::text AS id, {title} AS title, {sd} AS sdate, {st} AS stime, \
+         {ed} AS edate, {et} AS etime, {color} AS grp \
+         FROM {table} t{tjoin}{cjoin} \
+         WHERE {sdcmp} <= $2::date AND {eff} >= $1::date{active} \
+         ORDER BY {sdcmp} ASC LIMIT 2000",
+        title = title_sel,
+        sd = start_date_sel,
+        st = start_time_sel,
+        ed = end_date_sel,
+        et = end_time_sel,
+        color = color_sel,
+        table = table_name,
+        tjoin = title_join,
+        cjoin = color_join,
+        sdcmp = start_date_sel,
+        eff = effective_end,
+        active = where_active,
+    );
+    let rows = match sqlx::query(&q).bind(&start).bind(&end).fetch_all(&db).await {
+        Ok(r) => r,
+        Err(e) => return fail(&format!("query failed: {}", e)),
+    };
+
+    let mut events: Vec<serde_json::Value> = Vec::new();
+    for row in &rows {
+        let id: String = row.get("id");
+        let sdate = match row.try_get::<Option<chrono::NaiveDate>, _>("sdate").ok().flatten() {
+            Some(d) => d,
+            None => continue,
+        };
+        let title: Option<String> = row.try_get::<Option<String>, _>("title").ok().flatten();
+        let stime: Option<String> = row.try_get::<Option<String>, _>("stime").ok().flatten();
+        let edate: Option<chrono::NaiveDate> = row.try_get::<Option<chrono::NaiveDate>, _>("edate").ok().flatten();
+        let etime: Option<String> = row.try_get::<Option<String>, _>("etime").ok().flatten();
+        let grp: Option<String> = row.try_get::<Option<String>, _>("grp").ok().flatten();
+        let grp_label = match (&color_field, &grp) {
+            (Some(cf), Some(g)) => Some(color_label(cf, g, &finfo)),
+            _ => None,
+        };
+        events.push(serde_json::json!({
+            "id": id,
+            "title": title.clone().unwrap_or_else(|| id.clone()),
+            "start": sdate.to_string(),
+            "startTime": stime,
+            "end": edate.map(|d| d.to_string()),
+            "endTime": etime,
+            "group": grp,
+            "groupLabel": grp_label,
+        }));
+    }
+
+    Json(serde_json::json!({
+        "ok": true,
+        "events": events,
+        "color_field": color_field,
+    }))
+    .into_response()
+}
+
+const CALENDAR_SHELL: &str = r#"<!DOCTYPE html><html data-theme="dark"><head>
+<script>(function(){var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)})()</script>
+<style>[data-theme="corporate"] .theme-icon-sun{display:none !important}[data-theme="corporate"] .theme-icon-moon{display:inline-block !important}</style>
+<title>__TITLE__ - Calendar</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<link href="/static/calendar.css?v=1" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script>
+<script src="/static/vendor/tailwind.js"></script>
+<style>
+body { background: oklch(var(--b2)); color: oklch(var(--bc)); }
+.top-navbar { background: oklch(var(--b1)); border-bottom: 1px solid oklch(var(--b3)); position: sticky; top: 0; z-index: 50; }
+.sidebar { background: oklch(var(--b1)); border-right: 1px solid oklch(var(--b3)); }
+.text-muted { color: oklch(var(--bc)/0.6); }
+.user-badge { background: #8BC53F; color: #000; font-weight: 600; }
+</style>
+</head><body class="min-h-screen">
+<nav class="top-navbar px-4 py-3 flex items-center justify-between">
+  <div class="flex items-center gap-2">
+    <button class="btn btn-ghost btn-sm btn-square md:hidden" onclick="var s=document.querySelector('.sidebar');s.classList.toggle('hidden');s.classList.toggle('md:block')"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button>
+    <a href="/home" class="text-xl font-bold"><span style="color:#8BC53F">re</span><span class="text-muted">micle</span></a>
+  </div>
+  <div class="flex items-center gap-2 md:gap-3">
+    <a href="/home" class="text-base-content text-sm hover:underline hidden md:inline">Home</a>
+    <a href="/settings" class="text-base-content text-sm hover:underline hidden md:inline">Settings</a>
+    <button onclick="(function(){var h=document.documentElement,c=h.getAttribute('data-theme')==='dark'?'corporate':'dark';h.setAttribute('data-theme',c);localStorage.setItem('theme',c);document.querySelectorAll('.theme-icon-sun,.theme-icon-moon').forEach(function(e){e.classList.toggle('hidden')})})();" class="btn btn-ghost btn-circle btn-sm" title="Toggle theme"><svg class="theme-icon-sun w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5" stroke-width="2"/><path stroke-linecap="round" stroke-width="2" d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg><svg class="theme-icon-moon w-5 h-5 hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg></button>
+    <div class="user-badge px-3 py-1 rounded-full text-sm">@__USER__</div>
+  </div>
+</nav>
+<div class="flex">
+<aside class="sidebar w-64 min-h-screen p-4 hidden md:block"><ul class="menu mt-2">__SIDEBAR__</ul></aside>
+<main class="flex-1 p-4 md:p-6 min-w-0">
+<div class="flex flex-col md:flex-row justify-between items-start md:items-center mb-4 gap-4">
+  <div><h1 class="text-xl md:text-2xl font-bold">__TITLE__</h1><p class="text-muted">Calendar — click a day to add, drag fields to reconfigure</p></div>
+  <div class="flex gap-2 flex-wrap">
+    <div class="btn-group">
+      <a href="__LISTURL__" class="btn btn-sm" title="List View"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 10h16M4 14h16M4 18h16"/></svg></a>
+      <a href="/kanban/__MODEL__" class="btn btn-sm" title="Kanban View"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 17V7m0 10a2 2 0 01-2 2H5a2 2 0 01-2-2V7a2 2 0 012-2h2a2 2 0 012 2m0 10a2 2 0 002 2h2a2 2 0 002-2M9 7a2 2 0 012-2h2a2 2 0 012 2m0 10V7"/></svg></a>
+      <a href="/graph/__MODEL__" class="btn btn-sm" title="Graph View"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/></svg></a>
+      <a href="/calendar/__MODEL__" class="btn btn-sm btn-active" title="Calendar View"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"/></svg></a>
+      <a href="/pivot/__MODEL__" class="btn btn-sm" title="Pivot View"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 10h18M3 14h18m-9-4v8m-7 0h14a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg></a>
+    </div>
+    <!--VIEW_BAR-->
+    <a href="__NEWURL__" class="btn btn-sm" style="background:#8BC53F;border-color:#8BC53F;color:#000">+ New</a>
+  </div>
+</div>
+<div id="cal-config" class="cal-config"></div>
+<div id="cal-toolbar" class="cal-toolbar"></div>
+<div id="cal-legend" class="cal-legend" style="display:none"></div>
+<div id="cal-body" class="cal-body">
+  <div id="calendar-root" data-model="__MODEL__" data-fields="__FIELDS__" data-config="__CONFIG__"></div>
+</div>
+<script src="/static/calendar.js?v=2"></script>
+</main>
+</div>
+</body></html>"#;
+
+// ============================================================================
+// Generic Pivot View (Excel-style, client-rendered)
+// ============================================================================
+// The page ships a drag-and-drop PivotTable-Fields pane (see /static/pivot.js);
+// aggregation happens server-side in `generic_pivot_data`, which returns a JSON
+// matrix with subtotals/grand-totals computed by SQL ROLLUP.
+
+async fn generic_pivot_view(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(model_name): Path<String>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    use vortex_framework::ui::html_escape;
+
+    let model_row = match sqlx::query(
+        "SELECT id, display_name, table_name, list_url FROM ir_model WHERE name = $1 AND is_active = true",
+    )
+    .bind(&model_name)
+    .fetch_optional(&db)
+    .await
+    {
+        Ok(Some(row)) => row,
+        _ => return (StatusCode::NOT_FOUND, Html("Model not found")).into_response(),
+    };
+    let model_id: uuid::Uuid = model_row.get("id");
+    let model_display_name: String = model_row.get("display_name");
+    let list_view_url: String = model_row
+        .try_get::<Option<String>, _>("list_url")
+        .ok()
+        .flatten()
+        .filter(|u| !u.is_empty())
+        .unwrap_or_else(|| format!("/list/{}", model_name));
+
+    // Fields for the pane: groupable dimensions + numeric measures.
+    let fields = sqlx::query(
+        "SELECT name, field_type, display_name FROM ir_model_field WHERE model_id = $1 ORDER BY sequence, name",
+    )
+    .bind(model_id)
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default();
+    let mut field_arr: Vec<serde_json::Value> = Vec::new();
+    for f in &fields {
+        let name: String = f.get("name");
+        let ftype: String = f.get("field_type");
+        let label: String = f.get("display_name");
+        let numeric = matches!(ftype.as_str(), "integer" | "float" | "decimal" | "monetary" | "number");
+        let date = matches!(ftype.as_str(), "date" | "datetime");
+        let groupable = matches!(
+            ftype.as_str(),
+            "selection" | "string" | "char" | "many2one" | "boolean" | "date" | "datetime"
+        );
+        if groupable || numeric {
+            field_arr.push(serde_json::json!({"name": name, "label": label, "numeric": numeric, "date": date}));
+        }
+    }
+    let fields_json = serde_json::to_string(&field_arr).unwrap_or_else(|_| "[]".to_string());
+
+    // Initial config: query params win, else the shared default saved view.
+    let default_cfg = vortex_framework::saved_views::default_config_for(&db, &model_name, "pivot")
+        .await
+        .unwrap_or_default();
+    let pick = |k: &str| params.get(k).cloned().or_else(|| default_cfg.get(k).cloned());
+    let rows_v = pick("rows").unwrap_or_default();
+    let cols_v = pick("cols").unwrap_or_default();
+    let measure_v = pick("measure").unwrap_or_else(|| "id".to_string());
+    let agg_v = pick("agg").unwrap_or_else(|| "count".to_string());
+    // New (all optional): multiple measures, pinned filters, saved collapse state.
+    let vals_v = pick("vals").unwrap_or_default();
+    let mx_v = pick("mx").unwrap_or_default();
+    let filters_v = pick("filters").unwrap_or_default();
+    let collapsed_v = pick("collapsed").unwrap_or_default();
+    let coldesc_v = pick("coldesc").unwrap_or_default();
+    let config_json = serde_json::json!({
+        "rows": rows_v.split(',').filter(|s| !s.is_empty()).collect::<Vec<_>>(),
+        "cols": cols_v.split(',').filter(|s| !s.is_empty()).collect::<Vec<_>>(),
+        "measure": measure_v,
+        "agg": agg_v,
+        "vals": vals_v,
+        "mx": mx_v,
+        "filters": filters_v,
+        "collapsed": collapsed_v,
+        "coldesc": coldesc_v,
+    })
+    .to_string();
+
+    // Saved-views bar reflects the current config. measure+agg are always present
+    // so the save form renders even for a bare pivot; the client keeps the
+    // remaining cfg_* hidden inputs in step with live drag-drop state.
+    let mut current_cfg = std::collections::BTreeMap::new();
+    current_cfg.insert("measure".to_string(), measure_v.clone());
+    current_cfg.insert("agg".to_string(), agg_v.clone());
+    for (k, v) in [
+        ("rows", &rows_v),
+        ("cols", &cols_v),
+        ("vals", &vals_v),
+        ("mx", &mx_v),
+        ("filters", &filters_v),
+        ("collapsed", &collapsed_v),
+        ("coldesc", &coldesc_v),
+    ] {
+        if !v.is_empty() {
+            current_cfg.insert(k.to_string(), v.clone());
+        }
+    }
+    let view_bar = vortex_framework::saved_views::render_view_bar(
+        &db, &model_name, "pivot", &current_cfg, user.id, user.is_admin(),
+    )
+    .await;
+
+    let sidebar_menu = generic_view_sidebar(&state, &user, &db_ctx, &model_name);
+
+    // Shell built by token replacement (not format!) so the inline navbar JS
+    // keeps its braces without escaping. Dynamic JSON goes into HTML-escaped
+    // double-quoted data-* attributes.
+    let html = PIVOT_SHELL
+        .replace("__TITLE__", &html_escape(&model_display_name))
+        .replace("__USER__", &html_escape(&user.username))
+        .replace("__SIDEBAR__", &sidebar_menu)
+        .replace("__LISTURL__", &html_escape(&list_view_url))
+        .replace("__FIELDS__", &html_escape(&fields_json))
+        .replace("__CONFIG__", &html_escape(&config_json))
+        .replace("__MODEL__", &html_escape(&model_name))
+        .replace("__NEWURL__", &html_escape(&vortex_framework::new_record_url(&model_name)));
+    Html(html.replace("<!--VIEW_BAR-->", &view_bar)).into_response()
+}
+
+const PIVOT_SHELL: &str = r#"<!DOCTYPE html><html data-theme="dark"><head>
+<script>(function(){var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)})()</script>
+<style>[data-theme="corporate"] .theme-icon-sun{display:none !important}[data-theme="corporate"] .theme-icon-moon{display:inline-block !important}</style>
+<title>__TITLE__ - Pivot</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<link href="/static/pivot.css?v=25" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script>
+<script src="/static/vendor/tailwind.js"></script>
+<style>
+body { background: oklch(var(--b2)); color: oklch(var(--bc)); }
+.top-navbar { background: oklch(var(--b1)); border-bottom: 1px solid oklch(var(--b3)); position: sticky; top: 0; z-index: 50; }
+.sidebar { background: oklch(var(--b1)); border-right: 1px solid oklch(var(--b3)); }
+.text-muted { color: oklch(var(--bc)/0.6); }
+.user-badge { background: #8BC53F; color: #000; font-weight: 600; }
+</style>
+</head><body class="min-h-screen">
+<nav class="top-navbar px-4 py-3 flex items-center justify-between">
+  <div class="flex items-center gap-2">
+    <button class="btn btn-ghost btn-sm btn-square md:hidden" onclick="var s=document.querySelector('.sidebar');s.classList.toggle('hidden');s.classList.toggle('md:block')"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button>
+    <a href="/home" class="text-xl font-bold"><span style="color:#8BC53F">re</span><span class="text-muted">micle</span></a>
+  </div>
+  <div class="flex items-center gap-2 md:gap-3">
+    <a href="/home" class="text-base-content text-sm hover:underline hidden md:inline">Home</a>
+    <a href="/settings" class="text-base-content text-sm hover:underline hidden md:inline">Settings</a>
+    <button onclick="(function(){var h=document.documentElement,c=h.getAttribute('data-theme')==='dark'?'corporate':'dark';h.setAttribute('data-theme',c);localStorage.setItem('theme',c);document.querySelectorAll('.theme-icon-sun,.theme-icon-moon').forEach(function(e){e.classList.toggle('hidden')})})();" class="btn btn-ghost btn-circle btn-sm" title="Toggle theme"><svg class="theme-icon-sun w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5" stroke-width="2"/><path stroke-linecap="round" stroke-width="2" d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg><svg class="theme-icon-moon w-5 h-5 hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg></button>
+    <div class="user-badge px-3 py-1 rounded-full text-sm">@__USER__</div>
+  </div>
+</nav>
+<div class="flex">
+<aside class="sidebar w-64 min-h-screen p-4 hidden md:block"><ul class="menu mt-2">__SIDEBAR__</ul></aside>
+<main class="flex-1 p-4 md:p-6 min-w-0">
+<div class="flex flex-col md:flex-row justify-between items-start md:items-center mb-4 gap-4">
+  <div><h1 class="text-xl md:text-2xl font-bold">__TITLE__</h1><p class="text-muted">Pivot table — drag fields into Rows, Columns and Values</p></div>
+  <div class="flex gap-2 flex-wrap">
+    <div class="btn-group">
+      <a href="__LISTURL__" class="btn btn-sm" title="List View"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 10h16M4 14h16M4 18h16"/></svg></a>
+      <a href="/kanban/__MODEL__" class="btn btn-sm" title="Kanban View"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 17V7m0 10a2 2 0 01-2 2H5a2 2 0 01-2-2V7a2 2 0 012-2h2a2 2 0 012 2m0 10a2 2 0 002 2h2a2 2 0 002-2M9 7a2 2 0 012-2h2a2 2 0 012 2m0 10V7"/></svg></a>
+      <a href="/graph/__MODEL__" class="btn btn-sm" title="Graph View"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/></svg></a>
+      <a href="/calendar/__MODEL__" class="btn btn-sm" title="Calendar View"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"/></svg></a>
+      <a href="/pivot/__MODEL__" class="btn btn-sm btn-active" title="Pivot View"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 10h18M3 14h18m-9-4v8m-7 0h14a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg></a>
+    </div>
+    <!--VIEW_BAR-->
+    <button id="pv-export" class="btn btn-sm gap-1" title="Export to Excel (CSV)"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v2a2 2 0 002 2h12a2 2 0 002-2v-2M7 10l5 5 5-5M12 15V3"/></svg>Excel</button>
+    <a href="__NEWURL__" class="btn btn-sm" style="background:#8BC53F;border-color:#8BC53F;color:#000">+ New</a>
+  </div>
+</div>
+<div class="pv-wrap">
+  <div class="pv-main"><div id="pv-table-wrap"><div class="pv-hint">Loading…</div></div></div>
+  <div class="pv-side">
+    <h3>PivotTable Fields</h3>
+    <div id="pv-fields"></div>
+    <div class="pv-zones">
+      <div class="pv-zone" id="pv-zone-filters" style="grid-column:1/-1"><div class="pv-zone-title">&#9660; Filters</div></div>
+      <div class="pv-zone" id="pv-zone-rows"><div class="pv-zone-title">&#9636; Rows</div></div>
+      <div class="pv-zone" id="pv-zone-cols"><div class="pv-zone-title">&#9638; Columns</div></div>
+      <div class="pv-zone" id="pv-zone-values" style="grid-column:1/-1"><div class="pv-zone-title">&#931; Values</div></div>
+    </div>
+  </div>
+</div>
+<div id="pivot-root" data-model="__MODEL__" data-data-url="/pivot/__MODEL__/data" data-fields="__FIELDS__" data-config="__CONFIG__"></div>
+<script src="/static/pivot.js?v=25"></script>
+</main>
+</div></body></html>"#;
+
+/// GET /pivot/{model}/data — aggregated pivot matrix as JSON. Every field name
+/// is allow-listed against the model registry; subtotals and grand totals are
+/// computed by SQL ROLLUP (correct for every aggregate, at every level).
+/// Compile a user-authored arithmetic expression over a model's numeric columns
+/// into a safe SQL fragment for use inside an aggregate. This is the ONLY place a
+/// calculated *field* becomes SQL, so it is deliberately strict:
+///
+/// - grammar is closed: `number | ident | + - * / ( )` and unary +/- only;
+/// - every identifier must be a *registered numeric field* (checked against
+///   `numeric`) AND pass `validate_identifier()` — nothing else reaches SQL, so
+///   no column names, function calls, subqueries, or comments are possible;
+/// - each column is emitted as `CAST(t.<col> AS NUMERIC)` (no interpolation of
+///   user text beyond the vetted identifier);
+/// - division is emitted as `/ NULLIF(rhs, 0)` so a zero divisor yields NULL
+///   instead of erroring the whole pivot query.
+///
+/// Returns the SQL fragment or an error describing the first rejection. The
+/// fragment is fully parenthesised, so operator precedence is preserved
+/// regardless of how the caller nests it.
+fn compile_pivot_expr(
+    expr: &str,
+    numeric: &std::collections::HashSet<String>,
+) -> Result<String, String> {
+    if expr.len() > 500 {
+        return Err("expression too long".into());
+    }
+    #[derive(Clone)]
+    enum Tk {
+        Num(String),
+        Id(String),
+        Op(char),
+    }
+    let chars: Vec<char> = expr.chars().collect();
+    let mut toks: Vec<Tk> = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c.is_whitespace() {
+            i += 1;
+        } else if c.is_ascii_digit() || c == '.' {
+            let start = i;
+            while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '.') {
+                i += 1;
+            }
+            let s: String = chars[start..i].iter().collect();
+            if s.parse::<f64>().is_err() {
+                return Err(format!("invalid number {s:?}"));
+            }
+            toks.push(Tk::Num(s));
+        } else if c.is_ascii_alphabetic() || c == '_' {
+            let start = i;
+            while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+                i += 1;
+            }
+            toks.push(Tk::Id(chars[start..i].iter().collect()));
+        } else if "+-*/()".contains(c) {
+            toks.push(Tk::Op(c));
+            i += 1;
+        } else {
+            return Err(format!("illegal character {c:?}"));
+        }
+    }
+    if toks.is_empty() {
+        return Err("empty expression".into());
+    }
+
+    struct P<'a> {
+        t: &'a [Tk],
+        i: usize,
+        numeric: &'a std::collections::HashSet<String>,
+    }
+    impl<'a> P<'a> {
+        fn peek(&self) -> Option<&Tk> {
+            self.t.get(self.i)
+        }
+        fn is_op(&self, c: char) -> bool {
+            matches!(self.peek(), Some(Tk::Op(x)) if *x == c)
+        }
+        fn expr(&mut self) -> Result<String, String> {
+            let mut l = self.term()?;
+            while self.is_op('+') || self.is_op('-') {
+                let op = if self.is_op('+') { '+' } else { '-' };
+                self.i += 1;
+                let r = self.term()?;
+                l = format!("({} {} {})", l, op, r);
+            }
+            Ok(l)
+        }
+        fn term(&mut self) -> Result<String, String> {
+            let mut l = self.factor()?;
+            while self.is_op('*') || self.is_op('/') {
+                let mul = self.is_op('*');
+                self.i += 1;
+                let r = self.factor()?;
+                l = if mul {
+                    format!("({} * {})", l, r)
+                } else {
+                    format!("({} / NULLIF({}, 0))", l, r)
+                };
+            }
+            Ok(l)
+        }
+        fn factor(&mut self) -> Result<String, String> {
+            match self.peek().cloned() {
+                Some(Tk::Op('(')) => {
+                    self.i += 1;
+                    let v = self.expr()?;
+                    if !self.is_op(')') {
+                        return Err("expected ')'".into());
+                    }
+                    self.i += 1;
+                    Ok(v)
+                }
+                Some(Tk::Op('-')) => {
+                    self.i += 1;
+                    Ok(format!("(- {})", self.factor()?))
+                }
+                Some(Tk::Op('+')) => {
+                    self.i += 1;
+                    self.factor()
+                }
+                Some(Tk::Num(s)) => {
+                    self.i += 1;
+                    Ok(format!("({})", s))
+                }
+                Some(Tk::Id(s)) => {
+                    self.i += 1;
+                    if !validate_identifier(&s) {
+                        return Err(format!("invalid identifier {s:?}"));
+                    }
+                    if !self.numeric.contains(&s) {
+                        return Err(format!("{s:?} is not a numeric field"));
+                    }
+                    Ok(format!("CAST(t.{} AS NUMERIC)", s))
+                }
+                _ => Err("unexpected end of expression".into()),
+            }
+        }
+    }
+
+    let mut p = P { t: &toks, i: 0, numeric };
+    let sql = p.expr()?;
+    if p.i != toks.len() {
+        return Err("unexpected trailing input".into());
+    }
+    Ok(sql)
+}
+
+async fn generic_pivot_data(
+    State(_state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(_user): Extension<AuthUser>,
+    Path(model_name): Path<String>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let fail = |msg: &str| Json(serde_json::json!({"ok": false, "error": msg})).into_response();
+
+    let model_row = match sqlx::query("SELECT id, table_name FROM ir_model WHERE name = $1 AND is_active = true")
+        .bind(&model_name)
+        .fetch_optional(&db)
+        .await
+    {
+        Ok(Some(r)) => r,
+        _ => return fail("Unknown model"),
+    };
+    let model_id: uuid::Uuid = model_row.get("id");
+    let table_name: String = model_row.get("table_name");
+    if !validate_identifier(&table_name) {
+        return fail("Invalid model");
+    }
+
+    let frows = sqlx::query("SELECT name, field_type, display_name, related_model FROM ir_model_field WHERE model_id = $1")
+        .bind(model_id)
+        .fetch_all(&db)
+        .await
+        .unwrap_or_default();
+    let mut finfo: std::collections::HashMap<String, (String, String, Option<String>)> = std::collections::HashMap::new();
+    for f in &frows {
+        let n: String = f.get("name");
+        finfo.insert(n, (f.get("field_type"), f.get("display_name"), f.try_get("related_model").ok().flatten()));
+    }
+    let has_active = finfo.contains_key("active");
+    let is_field = |n: &str| -> bool { validate_identifier(n) && finfo.contains_key(n) };
+
+    use base64::Engine as _;
+
+    const GRANS: &[&str] = &["day", "week", "month", "quarter", "year"];
+    let is_date = |n: &str| -> bool {
+        finfo.get(n).map(|(t, _, _)| matches!(t.as_str(), "date" | "datetime")).unwrap_or(false)
+    };
+    // Row/column tokens are a field name, or — for a date/datetime field — the
+    // field name plus a grouping granularity, `order_date:month`. The granularity
+    // buckets rows by day/week/month/quarter/year instead of by the raw date.
+    let parse_dims = |key: &str| -> Vec<(String, Option<String>)> {
+        params
+            .get(key)
+            .map(|s| s.as_str())
+            .unwrap_or("")
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .filter_map(|tok| {
+                let (f, g) = match tok.split_once(':') {
+                    Some((f, g)) => (f, Some(g)),
+                    None => (tok, None),
+                };
+                if !is_field(f) {
+                    return None;
+                }
+                let g = g.filter(|g| GRANS.contains(g)).map(|g| g.to_string());
+                Some((f.to_string(), g))
+            })
+            .collect()
+    };
+    let rows = parse_dims("rows");
+    let cols = parse_dims("cols");
+
+    let is_numeric = |n: &str| -> bool {
+        finfo
+            .get(n)
+            .map(|(t, _, _)| matches!(t.as_str(), "integer" | "float" | "decimal" | "monetary" | "number"))
+            .unwrap_or(false)
+    };
+    let label_of = |n: &str| -> String {
+        finfo.get(n).map(|(_, d, _)| d.clone()).unwrap_or_else(|| n.to_string())
+    };
+
+    // The text (group-by) expression for a dimension, adding a LEFT JOIN to the
+    // related table for a many2one so grouping/filtering is by human-readable
+    // name rather than opaque id. `jidx` keeps join aliases unique across the
+    // row, column and filter dimensions that share the FROM clause.
+    fn dim_expr(
+        field: &str,
+        finfo: &std::collections::HashMap<String, (String, String, Option<String>)>,
+        joins: &mut Vec<String>,
+        jidx: &mut usize,
+    ) -> String {
+        match finfo.get(field) {
+            Some((ftype, _, Some(rel))) if ftype == "many2one" => {
+                let rel_table = rel.replace('.', "_");
+                if validate_identifier(&rel_table) {
+                    let ja = format!("j{}", *jidx);
+                    *jidx += 1;
+                    joins.push(format!("LEFT JOIN {} {} ON t.{} = {}.id", rel_table, ja, field, ja));
+                    format!("{}.name", ja)
+                } else {
+                    format!("t.{}", field)
+                }
+            }
+            _ => format!("t.{}", field),
+        }
+    }
+
+    // Bucket a date/datetime column to a granularity. The label doubles as the
+    // group key, so every form is lexically sortable in chronological order
+    // (YYYY-MM, YYYY-Www, YYYY-Qn, YYYY) — the client sorts on it directly.
+    fn date_group_expr(col: &str, gran: &str) -> String {
+        match gran {
+            "day" => format!("to_char({col}, 'YYYY-MM-DD')"),
+            "week" => format!("to_char({col}, 'IYYY-\"W\"IW')"),
+            "month" => format!("to_char({col}, 'YYYY-MM')"),
+            "quarter" => format!("to_char({col}, 'YYYY') || '-Q' || to_char({col}, 'Q')"),
+            "year" => format!("to_char({col}, 'YYYY')"),
+            _ => col.to_string(),
+        }
+    }
+
+    let mut joins: Vec<String> = Vec::new();
+    let mut selects: Vec<String> = Vec::new();
+    let mut row_gbs: Vec<String> = Vec::new();
+    let mut col_gbs: Vec<String> = Vec::new();
+    let mut jidx = 0usize;
+
+    // Row/column grouping dimensions: emit the value, its GROUPING() flag, and
+    // record the group-by expression for the ROLLUP. A date dimension with a
+    // granularity is bucketed by `date_group_expr`.
+    let mut build_group = |field: &str, gran: Option<&str>, alias: &str, gbs: &mut Vec<String>, joins: &mut Vec<String>, jidx: &mut usize, selects: &mut Vec<String>| {
+        let base = dim_expr(field, &finfo, joins, jidx);
+        let is_date_field = finfo.get(field).map(|(t, _, _)| matches!(t.as_str(), "date" | "datetime")).unwrap_or(false);
+        let gb = match gran {
+            Some(g) if is_date_field => date_group_expr(&base, g),
+            _ => base,
+        };
+        selects.push(format!("COALESCE(CAST({} AS TEXT), '(empty)') as {}", gb, alias));
+        selects.push(format!("GROUPING({}) as g{}", gb, alias));
+        gbs.push(gb);
+    };
+    for (i, (field, gran)) in rows.iter().enumerate() {
+        build_group(field, gran.as_deref(), &format!("r{}", i), &mut row_gbs, &mut joins, &mut jidx, &mut selects);
+    }
+    for (i, (field, gran)) in cols.iter().enumerate() {
+        build_group(field, gran.as_deref(), &format!("c{}", i), &mut col_gbs, &mut joins, &mut jidx, &mut selects);
+    }
+
+    // Measures (Values). `vals` is a comma list of `agg.field`; falls back to the
+    // legacy single `measure`/`agg` params so old saved views/URLs keep working.
+    // Each measure yields one aggregate column m0, m1, … in the SELECT.
+    struct Measure {
+        agg: String,
+        field: String,             // "id" == count of records
+        expr_sql: Option<String>,  // Some == calculated field (already-compiled SQL inner)
+        label: String,
+    }
+    let numeric_fields: std::collections::HashSet<String> = finfo
+        .iter()
+        .filter(|(_, (t, _, _))| matches!(t.as_str(), "integer" | "float" | "decimal" | "monetary" | "number"))
+        .map(|(k, _)| k.clone())
+        .collect();
+    let mut measures: Vec<Measure> = Vec::new();
+    let push_measure = |measures: &mut Vec<Measure>, agg: &str, field: &str| {
+        let agg = if ["count", "sum", "avg", "min", "max"].contains(&agg) { agg } else { "count" };
+        // Non-count aggregates need a numeric field; otherwise fall back to count.
+        let (agg, field) = if field == "id" || !is_field(field) {
+            ("count", "id")
+        } else if agg != "count" && !is_numeric(field) {
+            ("count", field)
+        } else {
+            (agg, field)
+        };
+        if measures.len() >= 12 {
+            return;
+        }
+        let label = match (agg, field) {
+            ("count", "id") => "Count".to_string(),
+            ("count", f) => format!("Count of {}", label_of(f)),
+            (a, f) => format!("{}{} of {}", a[..1].to_uppercase(), &a[1..], label_of(f)),
+        };
+        measures.push(Measure { agg: agg.to_string(), field: field.to_string(), expr_sql: None, label });
+    };
+    // A calculated field: `agg.=<b64url(expression)>` — the expression is compiled
+    // to a safe SQL fragment over numeric columns, then wrapped in the aggregate.
+    let push_calc_field = |measures: &mut Vec<Measure>, agg: &str, sql: String| {
+        let agg = if ["count", "sum", "avg", "min", "max"].contains(&agg) { agg } else { "sum" };
+        if measures.len() >= 12 {
+            return;
+        }
+        measures.push(Measure { agg: agg.to_string(), field: String::new(), expr_sql: Some(sql), label: "Calc field".to_string() });
+    };
+    if let Some(vals) = params.get("vals").filter(|s| !s.is_empty()) {
+        for tok in vals.split(',').filter(|s| !s.is_empty()) {
+            let (agg, field) = tok.split_once('.').unwrap_or((tok, "id"));
+            if let Some(b64) = field.strip_prefix('=') {
+                let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(b64)
+                    .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(b64))
+                    .ok()
+                    .and_then(|b| String::from_utf8(b).ok());
+                if let Some(src) = decoded {
+                    // Reject silently on a bad expression: the client keeps the chip
+                    // but the pivot just omits that measure rather than 500-ing.
+                    if let Ok(sql) = compile_pivot_expr(&src, &numeric_fields) {
+                        push_calc_field(&mut measures, agg, sql);
+                    }
+                }
+            } else {
+                push_measure(&mut measures, agg, field);
+            }
+        }
+    }
+    if measures.is_empty() {
+        let agg = params.get("agg").map(|s| s.as_str()).unwrap_or("count");
+        let field = params.get("measure").map(|s| s.as_str()).unwrap_or("id");
+        push_measure(&mut measures, agg, field);
+    }
+    for (i, m) in measures.iter().enumerate() {
+        let expr = if let Some(inner) = &m.expr_sql {
+            match m.agg.as_str() {
+                "avg" => format!("AVG({})", inner),
+                "min" => format!("MIN({})", inner),
+                "max" => format!("MAX({})", inner),
+                "count" => format!("COUNT({})", inner),
+                _ => format!("SUM({})", inner),
+            }
+        } else {
+            match m.agg.as_str() {
+                "sum" => format!("SUM(CAST(t.{} AS NUMERIC))", m.field),
+                "avg" => format!("AVG(CAST(t.{} AS NUMERIC))", m.field),
+                "min" => format!("MIN(CAST(t.{} AS NUMERIC))", m.field),
+                "max" => format!("MAX(CAST(t.{} AS NUMERIC))", m.field),
+                _ if m.field == "id" => "COUNT(*)".to_string(),
+                _ => format!("COUNT(t.{})", m.field), // count of non-null values
+            }
+        };
+        selects.push(format!("CAST({} AS DOUBLE PRECISION) as m{}", expr, i));
+    }
+
+    // Pinned filters: `filters` is a comma list of `field.b64value`. The value is
+    // matched against the same text/name expression used for grouping, bound as a
+    // query parameter (never interpolated) — so arbitrary data is safe.
+    let mut wheres: Vec<String> = Vec::new();
+    let mut binds: Vec<String> = Vec::new();
+    if has_active {
+        wheres.push("t.active = true".to_string());
+    }
+    if let Some(filters) = params.get("filters").filter(|s| !s.is_empty()) {
+        for tok in filters.split(',').filter(|s| !s.is_empty()).take(20) {
+            let Some((field, b64)) = tok.split_once('.') else { continue };
+            if !is_field(field) {
+                continue;
+            }
+            let value = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(b64)
+                .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(b64))
+                .ok()
+                .and_then(|b| String::from_utf8(b).ok());
+            let Some(value) = value else { continue };
+            let expr = dim_expr(field, &finfo, &mut joins, &mut jidx);
+            binds.push(value);
+            wheres.push(format!(
+                "COALESCE(CAST({} AS TEXT), '(empty)') = ${}",
+                expr,
+                binds.len()
+            ));
+        }
+    }
+
+    let where_sql = if wheres.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", wheres.join(" AND "))
+    };
+    let group_sql = match (row_gbs.is_empty(), col_gbs.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => format!(" GROUP BY ROLLUP({})", row_gbs.join(", ")),
+        (true, false) => format!(" GROUP BY ROLLUP({})", col_gbs.join(", ")),
+        (false, false) => format!(" GROUP BY ROLLUP({}), ROLLUP({})", row_gbs.join(", "), col_gbs.join(", ")),
+    };
+    let query = format!(
+        "SELECT {} FROM {} t {}{}{}",
+        selects.join(", "),
+        table_name,
+        joins.join(" "),
+        where_sql,
+        group_sql
+    );
+
+    let mut q = sqlx::query(&query);
+    for b in &binds {
+        q = q.bind(b);
+    }
+    let results = match q.fetch_all(&db).await {
+        Ok(r) => r,
+        Err(e) => {
+            error!("pivot data query failed: {e}");
+            return fail("Could not compute pivot for these fields.");
+        }
+    };
+
+    let mut cells: Vec<serde_json::Value> = Vec::new();
+    for row in &results {
+        let mut rpath: Vec<String> = Vec::new();
+        for i in 0..rows.len() {
+            let g: i32 = row.try_get::<i32, _>(format!("gr{}", i).as_str()).unwrap_or(1);
+            if g == 0 {
+                rpath.push(row.try_get::<String, _>(format!("r{}", i).as_str()).unwrap_or_default());
+            } else {
+                break;
+            }
+        }
+        let mut cpath: Vec<String> = Vec::new();
+        for i in 0..cols.len() {
+            let g: i32 = row.try_get::<i32, _>(format!("gc{}", i).as_str()).unwrap_or(1);
+            if g == 0 {
+                cpath.push(row.try_get::<String, _>(format!("c{}", i).as_str()).unwrap_or_default());
+            } else {
+                break;
+            }
+        }
+        let vs: Vec<serde_json::Value> = (0..measures.len())
+            .map(|i| match row.try_get::<Option<f64>, _>(format!("m{}", i).as_str()) {
+                Ok(Some(v)) => serde_json::json!(v),
+                _ => serde_json::Value::Null,
+            })
+            .collect();
+        cells.push(serde_json::json!({"r": rpath, "c": cpath, "vs": vs}));
+    }
+
+    // Field headers; a date dimension shows its granularity, e.g. "Order Date (Month)".
+    let dim_meta = |dims: &[(String, Option<String>)]| -> Vec<serde_json::Value> {
+        dims.iter()
+            .map(|(n, g)| {
+                let label = match g {
+                    Some(g) if is_date(n) => {
+                        let mut ch = g.chars();
+                        let gcap = ch.next().map(|f| f.to_uppercase().collect::<String>() + ch.as_str()).unwrap_or_default();
+                        format!("{} ({})", label_of(n), gcap)
+                    }
+                    _ => label_of(n),
+                };
+                serde_json::json!({"name": n, "label": label})
+            })
+            .collect()
+    };
+    let measure_meta: Vec<serde_json::Value> = measures
+        .iter()
+        .map(|m| serde_json::json!({"agg": m.agg, "field": m.field, "label": m.label}))
+        .collect();
+
+    Json(serde_json::json!({
+        "ok": true,
+        "measures": measure_meta,
+        "rowFields": dim_meta(&rows),
+        "colFields": dim_meta(&cols),
+        "cells": cells,
+    }))
+    .into_response()
+}
+
+/// GET /pivot/{model}/values?field=X — distinct values of a field, for the pivot
+/// Filters zone's value picker. Field name is allow-listed against the registry;
+/// many2one fields resolve to the related record's name.
+async fn generic_pivot_values(
+    State(_state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(_user): Extension<AuthUser>,
+    Path(model_name): Path<String>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let fail = |msg: &str| Json(serde_json::json!({"ok": false, "error": msg})).into_response();
+
+    let model_row = match sqlx::query("SELECT id, table_name FROM ir_model WHERE name = $1 AND is_active = true")
+        .bind(&model_name)
+        .fetch_optional(&db)
+        .await
+    {
+        Ok(Some(r)) => r,
+        _ => return fail("Unknown model"),
+    };
+    let model_id: uuid::Uuid = model_row.get("id");
+    let table_name: String = model_row.get("table_name");
+    if !validate_identifier(&table_name) {
+        return fail("Invalid model");
+    }
+    let field = match params.get("field") {
+        Some(f) if validate_identifier(f) => f.clone(),
+        _ => return fail("Invalid field"),
+    };
+
+    let frow = sqlx::query(
+        "SELECT field_type, related_model FROM ir_model_field WHERE model_id = $1 AND name = $2",
+    )
+    .bind(model_id)
+    .bind(&field)
+    .fetch_optional(&db)
+    .await
+    .ok()
+    .flatten();
+    let Some(frow) = frow else { return fail("Unknown field") };
+    let ftype: String = frow.get("field_type");
+    let related: Option<String> = frow.try_get("related_model").ok().flatten();
+
+    let mut join = String::new();
+    let expr = if ftype == "many2one" {
+        match related.map(|r| r.replace('.', "_")).filter(|t| validate_identifier(t)) {
+            Some(rel_table) => {
+                join = format!(" LEFT JOIN {0} j0 ON t.{1} = j0.id", rel_table, field);
+                "j0.name".to_string()
+            }
+            None => format!("t.{}", field),
+        }
+    } else {
+        format!("t.{}", field)
+    };
+    let has_active = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM ir_model_field WHERE model_id = $1 AND name = 'active'",
+    )
+    .bind(model_id)
+    .fetch_one(&db)
+    .await
+    .map(|n| n > 0)
+    .unwrap_or(false);
+    let where_sql = if has_active { " WHERE t.active = true" } else { "" };
+
+    let query = format!(
+        "SELECT DISTINCT COALESCE(CAST({0} AS TEXT), '(empty)') AS v FROM {1} t{2}{3} ORDER BY v LIMIT 300",
+        expr, table_name, join, where_sql
+    );
+    let rows = match sqlx::query(&query).fetch_all(&db).await {
+        Ok(r) => r,
+        Err(e) => {
+            error!("pivot values query failed: {e}");
+            return fail("Could not read values for this field.");
+        }
+    };
+    let values: Vec<String> = rows.iter().map(|r| r.get::<String, _>("v")).collect();
+    Json(serde_json::json!({"ok": true, "values": values})).into_response()
 }
 
 // ============================================================================
@@ -8547,17 +10631,7 @@ async fn contacts_list(
         ));
     }
 
-    Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style><title>Contacts - Remicle</title>
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=4" rel="stylesheet"/>
-<script src="/static/vortex.js?v=4" defer></script>
-<script src="/static/vendor/tailwind.js"></script></head>
-<body class="min-h-screen bg-base-200">
-<div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a><button onclick="(function(){{var h=document.documentElement,c=h.getAttribute('data-theme')==='dark'?'corporate':'dark';h.setAttribute('data-theme',c);localStorage.setItem('theme',c);document.querySelectorAll('.theme-icon-sun,.theme-icon-moon').forEach(function(e){{e.classList.toggle('hidden')}})}})();" class="btn btn-ghost btn-sm btn-square ml-auto"><svg class="theme-icon-sun w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5" stroke-width="2"/><path stroke-linecap="round" stroke-width="2" d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg><svg class="theme-icon-moon w-5 h-5 hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg></button></div>
-<div id="sidebar-overlay" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
-<div class="flex">{sidebar}
-<main class="flex-1 p-4 lg:p-6 min-w-0">
+    let body = format!(r#"
 <div class="flex justify-between items-center mb-6">
 <div><h1 class="text-2xl font-bold">Contacts</h1><p class="text-base-content/60">Manage customers, suppliers, and stakeholders</p></div>
 <a href="/contacts/new" class="btn btn-primary">+ New Contact</a>
@@ -8568,7 +10642,8 @@ async fn contacts_list(
 <thead><tr><th>Name</th><th>Display Name</th><th>Type</th><th>Email</th><th>Phone</th><th>City</th><th>Status</th></tr></thead>
 <tbody>{rows}</tbody>
 </table></div></div>
-</main></div></body></html>"#)).into_response()
+"#);
+    Html(vortex_framework::render_app_shell("Contacts - Remicle", &sidebar, &body)).into_response()
 }
 
 async fn contacts_new(State(state): State<Arc<AppState>>, Db(db): Db, Extension(_user): Extension<AuthUser>) -> Response {
@@ -8585,8 +10660,8 @@ async fn contacts_new(State(state): State<Arc<AppState>>, Db(db): Db, Extension(
     }
 
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style><title>New Contact</title><meta name="viewport" content="width=device-width, initial-scale=1.0"><link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=4" rel="stylesheet"/>
-<script src="/static/vortex.js?v=4" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script>
 <style>
 .country-dropdown {{ position: relative; }}
 .country-dropdown .dropdown-content {{ max-height: 300px; overflow-y: auto; width: 100%; }}
@@ -8889,8 +10964,8 @@ async fn contacts_edit(
     };
 
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style><title>Edit Contact</title><meta name="viewport" content="width=device-width, initial-scale=1.0"><link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=4" rel="stylesheet"/>
-<script src="/static/vortex.js?v=4" defer></script><script src="/static/vendor/tailwind.js"></script><script src="/static/vendor/htmx.min.js"></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script><script src="/static/vendor/htmx.min.js"></script>
 <style>
 .country-dropdown {{ position: relative; }}
 .country-dropdown .dropdown-content {{ max-height: 300px; overflow-y: auto; width: 100%; }}
@@ -9548,43 +11623,23 @@ async fn chatter_partial(
         // Preview button - inline onclick using data attributes
         let eye_icon = r#"<svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/></svg>"#;
 
-        // Watermark: multiple rows of rotated text covering the entire area
-        let preview_btn = if is_pdf {
-            if is_secure {
-                // Secure PDF: grid watermark overlay on top of iframe, no download
-                format!(
-                    r##"<button class="btn btn-ghost btn-xs opacity-0 group-hover:opacity-100" onclick="var m=document.getElementById('preview-modal'),t=document.getElementById('preview-title'),d=document.getElementById('preview-download'),c=document.getElementById('preview-content');t.textContent=this.dataset.t;d.style.display='none';var wt='{} - CONFIDENTIAL';var rows='';for(var i=0;i<20;i++){{rows+='<div style=\'white-space:nowrap\'>'+Array(10).fill(wt).join(' &nbsp; ')+'</div>';}}c.innerHTML='<div style=\'position:relative;width:100%;height:100%\'><iframe src=\''+this.dataset.u+'#toolbar=0\' style=\'width:100%;height:100%;min-height:70vh;border:none\'></iframe><div style=\'position:absolute;top:0;left:0;right:0;bottom:0;z-index:9999;pointer-events:none;overflow:hidden;display:flex;flex-direction:column;justify-content:space-around;transform:rotate(-20deg);transform-origin:center center;font-size:16px;color:rgba(128,128,128,0.3);font-weight:bold;line-height:3\'>'+rows+'</div></div>';m.showModal();" data-t="{}" data-u="/api/chatter/attachments/{}/download" title="Preview (Secure)">
-                        {}
-                    </button>"##,
-                    user.username, name.replace('"', "&quot;").replace('\'', "&#39;"), att_id, eye_icon
-                )
-            } else {
-                // Normal PDF
-                format!(
-                    r#"<button class="btn btn-ghost btn-xs opacity-0 group-hover:opacity-100" onclick="var m=document.getElementById('preview-modal'),t=document.getElementById('preview-title'),d=document.getElementById('preview-download'),c=document.getElementById('preview-content');t.textContent=this.dataset.t;d.style.display='';d.href=this.dataset.u;c.innerHTML='<iframe src=\''+this.dataset.u+'#toolbar=1\' style=\'width:100%;height:100%;min-height:70vh;border:none\'></iframe>';m.showModal();" data-t="{}" data-u="/api/chatter/attachments/{}/download" title="Preview PDF">
-                        {}
-                    </button>"#,
-                    name.replace('"', "&quot;").replace('\'', "&#39;"), att_id, eye_icon
-                )
-            }
-        } else if is_image {
-            if is_secure {
-                // Secure image: grid watermark overlay, no download
-                format!(
-                    r##"<button class="btn btn-ghost btn-xs opacity-0 group-hover:opacity-100" onclick="var m=document.getElementById('preview-modal'),t=document.getElementById('preview-title'),d=document.getElementById('preview-download'),c=document.getElementById('preview-content');t.textContent=this.dataset.t;d.style.display='none';var wt='{} - CONFIDENTIAL';var rows='';for(var i=0;i<20;i++){{rows+='<div style=\'white-space:nowrap\'>'+Array(10).fill(wt).join(' &nbsp; ')+'</div>';}}c.innerHTML='<div style=\'position:relative;width:100%;height:100%;display:flex;align-items:center;justify-content:center;padding:1rem\'><img src=\''+this.dataset.u+'\' style=\'max-width:100%;max-height:100%;object-fit:contain\'><div style=\'position:absolute;top:0;left:0;right:0;bottom:0;z-index:9999;pointer-events:none;overflow:hidden;display:flex;flex-direction:column;justify-content:space-around;transform:rotate(-20deg);transform-origin:center center;font-size:16px;color:rgba(128,128,128,0.3);font-weight:bold;line-height:3\'>'+rows+'</div></div>';m.showModal();" data-t="{}" data-u="/api/chatter/attachments/{}/download" title="Preview (Secure)">
-                        {}
-                    </button>"##,
-                    user.username, name.replace('"', "&quot;").replace('\'', "&#39;"), att_id, eye_icon
-                )
-            } else {
-                // Normal image
-                format!(
-                    r#"<button class="btn btn-ghost btn-xs opacity-0 group-hover:opacity-100" onclick="var m=document.getElementById('preview-modal'),t=document.getElementById('preview-title'),d=document.getElementById('preview-download'),c=document.getElementById('preview-content');t.textContent=this.dataset.t;d.style.display='';d.href=this.dataset.u;c.innerHTML='<div style=\'width:100%;height:100%;display:flex;align-items:center;justify-content:center;padding:1rem\'><img src=\''+this.dataset.u+'\' style=\'max-width:100%;max-height:100%;object-fit:contain\'></div>';m.showModal();" data-t="{}" data-u="/api/chatter/attachments/{}/download" title="Preview Image">
-                        {}
-                    </button>"#,
-                    name.replace('"', "&quot;").replace('\'', "&#39;"), att_id, eye_icon
-                )
-            }
+        // Preview button. All rendering lives in vortex.js
+        // (vortexOpenPreview) — PDFs render via pdf.js to <canvas> so they
+        // display on iOS Safari (which won't show a PDF in an <iframe>) and so
+        // secure docs keep a per-page watermark with no savable file. Here we
+        // just emit the button carrying the data the JS needs.
+        let preview_btn = if is_pdf || is_image {
+            let kind = if is_pdf { "pdf" } else { "image" };
+            let wm = html_escape(&format!("{} - CONFIDENTIAL", user.username));
+            format!(
+                r#"<button type="button" class="btn btn-ghost btn-xs opacity-0 group-hover:opacity-100" onclick="vortexOpenPreview(this)" data-kind="{kind}" data-secure="{secure}" data-t="{name}" data-u="/api/chatter/attachments/{id}/download" data-wm="{wm}" title="Preview">{icon}</button>"#,
+                kind = kind,
+                secure = if is_secure { "1" } else { "0" },
+                name = html_escape(&name),
+                id = att_id,
+                wm = wm,
+                icon = eye_icon,
+            )
         } else {
             String::new()
         };
@@ -9661,8 +11716,10 @@ async fn chatter_partial(
     // Default due date to tomorrow
     let tomorrow = (chrono::Utc::now() + chrono::Duration::days(1)).format("%Y-%m-%d");
 
+    // Plain inline count — a daisyUI badge box overflows the fixed-height
+    // boxed tab on mobile (clips below the tab). "(N)" never overflows.
     let attachment_badge = if attachment_count > 0 {
-        format!(r#"<span class="badge badge-sm">{}</span>"#, attachment_count)
+        format!(r#"<span class="ml-1 opacity-60">({})</span>"#, attachment_count)
     } else {
         String::new()
     };
@@ -10205,8 +12262,8 @@ async fn notifications_page(
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Notifications - Remicle</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=4" rel="stylesheet"/>
-<script src="/static/vortex.js?v=4" defer></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script>
     <script src="/static/vendor/tailwind.js"></script>
     <style>
         body {{ background: oklch(var(--b2)); color: oklch(var(--bc)); }}
@@ -10323,8 +12380,8 @@ async fn settings_index(
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Settings - Remicle</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=4" rel="stylesheet"/>
-<script src="/static/vortex.js?v=4" defer></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script>
     <script src="/static/vendor/tailwind.js"></script>
     <style>
         body {{ background: oklch(var(--b2)); color: oklch(var(--bc)); }}
@@ -10509,6 +12566,12 @@ async fn settings_index(
                         <p class="text-muted text-sm">Outbound event subscriptions (signed, retried)</p>
                     </div>
                 </a>
+                <a href="/settings/portal-users" class="card transition-all">
+                    <div class="card-body p-4">
+                        <h3 class="card-title text-base md:text-lg">Portal Users</h3>
+                        <p class="text-muted text-sm">Invite customers to the self-service portal</p>
+                    </div>
+                </a>
             </div>
         </div>
 
@@ -10541,6 +12604,52 @@ async fn settings_index(
                     <div class="card-body p-4">
                         <h3 class="card-title text-base md:text-lg">Activity Types</h3>
                         <p class="text-muted text-sm">Activity types for Activity Stream</p>
+                    </div>
+                </a>
+                <a href="/settings/custom-fields" class="card transition-all">
+                    <div class="card-body p-4">
+                        <h3 class="card-title text-base md:text-lg">Custom Fields</h3>
+                        <p class="text-muted text-sm">Add your own fields to any model — no code</p>
+                    </div>
+                </a>
+                <a href="/settings/automation-rules" class="card transition-all">
+                    <div class="card-body p-4">
+                        <h3 class="card-title text-base md:text-lg">Automation Rules</h3>
+                        <p class="text-muted text-sm">React to record changes automatically — no code</p>
+                    </div>
+                </a>
+                <a href="/settings/computed-fields" class="card transition-all">
+                    <div class="card-body p-4">
+                        <h3 class="card-title text-base md:text-lg">Computed Fields</h3>
+                        <p class="text-muted text-sm">Derived fields: formulas &amp; related values — no code</p>
+                    </div>
+                </a>
+                <a href="/dashboards" class="card transition-all">
+                    <div class="card-body p-4">
+                        <h3 class="card-title text-base md:text-lg">Dashboards</h3>
+                        <p class="text-muted text-sm">Build KPI &amp; breakdown boards from any model</p>
+                    </div>
+                </a>
+            </div>
+        </div>
+
+        <!-- Documents Section -->
+        <div class="mb-8">
+            <h2 class="section-title text-lg font-semibold mb-4 flex items-center gap-2">
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+                Documents
+            </h2>
+            <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3 md:gap-4">
+                <a href="/settings/document-layout" class="card transition-all">
+                    <div class="card-body p-4">
+                        <h3 class="card-title text-base md:text-lg">Document Layout</h3>
+                        <p class="text-muted text-sm">Logo, brand colour &amp; footer on printed documents</p>
+                    </div>
+                </a>
+                <a href="/settings/print-templates" class="card transition-all">
+                    <div class="card-body p-4">
+                        <h3 class="card-title text-base md:text-lg">Print Templates</h3>
+                        <p class="text-muted text-sm">Customise the layout of quotations &amp; other documents</p>
                     </div>
                 </a>
             </div>
@@ -10879,21 +12988,7 @@ async fn audit_log_page(
         next = next_link,
     );
 
-    let html = format!(
-        r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style><title>Audit Log - Remicle</title>
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=4" rel="stylesheet"/>
-<script src="/static/vortex.js?v=4" defer></script>
-<script src="/static/vendor/tailwind.js"></script></head>
-<body class="min-h-screen bg-base-200">
-<div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a></div>
-<div id="sidebar-overlay" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
-<div class="flex">{sidebar}
-<main class="flex-1 p-4 lg:p-6 min-w-0">{content}</main></div></body></html>"#,
-        sidebar = sidebar,
-        content = content,
-    );
+    let html = vortex_framework::render_app_shell("Audit Log - Remicle", &sidebar, &content);
     Html(html).into_response()
 }
 
@@ -10905,6 +13000,1112 @@ struct ActivityTypeForm {
     color: Option<String>,
     default_days: Option<i32>,
     sequence: Option<i32>,
+}
+
+// ─── Custom Fields (Initiative #2 admin UI) ──────────────────────────────
+#[derive(serde::Deserialize)]
+struct CustomFieldForm {
+    model: String,
+    name: String,
+    label: String,
+    field_type: String,
+    #[serde(default)]
+    options: Option<String>,
+    #[serde(default)]
+    related_model: Option<String>,
+    #[serde(default)]
+    position_after: Option<String>,
+    #[serde(default)]
+    help: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct CustomFieldDeleteForm {
+    model: String,
+    name: String,
+}
+
+/// Render the Custom Fields settings page, optionally with an error banner.
+async fn render_custom_fields_page(db: &sqlx::PgPool, username: &str, error: Option<&str>) -> String {
+    use vortex_framework::ui::html_escape;
+
+    // Models available to extend (registered in ir_model, now derive-sourced).
+    let models = sqlx::query("SELECT name, display_name FROM ir_model WHERE is_active = true ORDER BY display_name")
+        .fetch_all(db)
+        .await
+        .unwrap_or_default();
+    let mut model_options = String::new();
+    for m in &models {
+        let name: String = m.get("name");
+        let label: String = m.get("display_name");
+        model_options.push_str(&format!(
+            r#"<option value="{}">{} ({})</option>"#,
+            html_escape(&name), html_escape(&label), html_escape(&name)
+        ));
+    }
+
+    // Built-in fields per model, for the "Position" dropdown (anchor a custom
+    // field after one of them). Serialized as JSON for the client to filter by
+    // the selected model. Only non-custom fields are offered as anchors.
+    let field_rows = sqlx::query(
+        "SELECT m.name AS model, f.name AS fname, f.display_name AS flabel \
+         FROM ir_model_field f JOIN ir_model m ON m.id = f.model_id \
+         WHERE f.is_custom = false AND m.is_active = true \
+         ORDER BY m.name, f.sequence, f.name",
+    )
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+    let mut mf: std::collections::BTreeMap<String, Vec<serde_json::Value>> = std::collections::BTreeMap::new();
+    for r in &field_rows {
+        let model: String = r.get("model");
+        let fname: String = r.get("fname");
+        let flabel: String = r.get("flabel");
+        mf.entry(model).or_default().push(serde_json::json!([fname, flabel]));
+    }
+    let model_fields_json = serde_json::to_string(
+        &serde_json::Value::Object(mf.into_iter().map(|(k, v)| (k, serde_json::Value::Array(v))).collect()),
+    )
+    .unwrap_or_else(|_| "{}".to_string());
+
+    // Existing custom fields across all models.
+    let fields = vortex_framework::custom_fields::list_all(db).await;
+    let mut rows_html = String::new();
+    for (model, model_label, f) in &fields {
+        // "Options" column shows selection values, or the link target for a reference.
+        let opts = if f.field_type == "many2one" {
+            match &f.related_model {
+                Some(t) => format!(r#"<span class="opacity-70">→ <code class="text-xs">{}</code></span>"#, html_escape(t)),
+                None => String::from("<span class=\"opacity-40\">—</span>"),
+            }
+        } else if f.selection_options.is_empty() {
+            String::from("<span class=\"opacity-40\">—</span>")
+        } else {
+            html_escape(&f.selection_options.join(", "))
+        };
+        // Reorder controls: swap sequence with the neighbouring custom field.
+        let reorder = format!(
+            r##"<form method="post" action="/settings/custom-fields/reorder" class="inline">
+                    <input type="hidden" name="model" value="{model}"/>
+                    <input type="hidden" name="name" value="{name}"/>
+                    <input type="hidden" name="direction" value="up"/>
+                    <button type="submit" class="btn btn-ghost btn-xs" title="Move up">↑</button>
+                </form>
+                <form method="post" action="/settings/custom-fields/reorder" class="inline">
+                    <input type="hidden" name="model" value="{model}"/>
+                    <input type="hidden" name="name" value="{name}"/>
+                    <input type="hidden" name="direction" value="down"/>
+                    <button type="submit" class="btn btn-ghost btn-xs" title="Move down">↓</button>
+                </form>"##,
+            model = html_escape(model),
+            name = html_escape(&f.name),
+        );
+        // Edit opens the shared modal pre-filled from these data-* attributes.
+        let edit_btn = format!(
+            r#"<button type="button" class="btn btn-ghost btn-xs"
+                data-model="{model}" data-name="{name}" data-label="{label}" data-type="{ftype}"
+                data-options="{opts_raw}" data-related="{related}" data-position="{position}" data-help="{help}"
+                onclick="cfEdit(this)">Edit</button>"#,
+            model = html_escape(model),
+            name = html_escape(&f.name),
+            label = html_escape(&f.label),
+            ftype = html_escape(&f.field_type),
+            opts_raw = html_escape(&f.selection_options.join(", ")),
+            related = html_escape(f.related_model.as_deref().unwrap_or("")),
+            position = html_escape(f.position_after.as_deref().unwrap_or("")),
+            help = html_escape(f.help.as_deref().unwrap_or("")),
+        );
+        rows_html.push_str(&format!(
+            r##"<tr>
+                <td>{model_label} <code class="text-xs opacity-60">{model}</code></td>
+                <td><code class="text-sm">{name}</code></td>
+                <td>{label}</td>
+                <td><span class="badge badge-ghost">{ftype}</span></td>
+                <td class="text-sm">{opts}</td>
+                <td class="text-right whitespace-nowrap">
+                    {reorder}
+                    {edit_btn}
+                    <form method="post" action="/settings/custom-fields/delete" onsubmit="return confirm('Delete custom field {name}? Stored values are kept but hidden.');" class="inline">
+                        <input type="hidden" name="model" value="{model}"/>
+                        <input type="hidden" name="name" value="{name}"/>
+                        <button type="submit" class="btn btn-ghost btn-xs text-error">Delete</button>
+                    </form>
+                </td>
+            </tr>"##,
+            model_label = html_escape(model_label),
+            model = html_escape(model),
+            name = html_escape(&f.name),
+            label = html_escape(&f.label),
+            ftype = html_escape(&f.field_type),
+            opts = opts,
+            reorder = reorder,
+            edit_btn = edit_btn,
+        ));
+    }
+    if rows_html.is_empty() {
+        rows_html.push_str(r#"<tr><td colspan="6" class="text-center opacity-60 py-8">No custom fields yet. Add one to extend any model.</td></tr>"#);
+    }
+
+    let mut type_options = String::new();
+    for (code, label) in vortex_framework::custom_fields::CUSTOM_FIELD_TYPES {
+        type_options.push_str(&format!(r#"<option value="{code}">{label}</option>"#));
+    }
+
+    let error_banner = error
+        .map(|e| format!(r#"<div class="alert alert-error mb-4"><span>{}</span></div>"#, html_escape(e)))
+        .unwrap_or_default();
+
+    format!(
+        r##"<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+    <script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Custom Fields - Settings</title>
+    <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
+    <link href="/static/vortex.css?v=18" rel="stylesheet"/>
+    <script src="/static/vortex.js?v=18" defer></script>
+    <script src="/static/vendor/tailwind.js"></script>
+</head>
+<body class="min-h-screen bg-base-200">
+    <div class="navbar bg-base-100 shadow-lg">
+        <div class="flex-1"><a href="/" class="btn btn-ghost text-xl">remicle</a></div>
+        <div class="flex-none"><span class="text-sm">@{username}</span></div>
+    </div>
+    <div class="container mx-auto p-6">
+        <div class="flex justify-between items-center mb-6">
+            <div>
+                <h1 class="text-2xl font-bold">Custom Fields</h1>
+                <p class="text-base-content/60">Add your own fields to any model. They appear on the record form automatically — no code, no deploy.</p>
+            </div>
+            <button class="btn btn-primary" onclick="cfNew()">+ New Custom Field</button>
+        </div>
+        {error_banner}
+        <div class="card bg-base-100 shadow">
+            <div class="card-body p-0">
+                <table class="table">
+                    <thead><tr><th>Model</th><th>Field</th><th>Label</th><th>Type</th><th>Options</th><th></th></tr></thead>
+                    <tbody>{rows_html}</tbody>
+                </table>
+            </div>
+        </div>
+        <div class="mt-4"><a href="/settings" class="btn btn-ghost btn-sm">← Back to Settings</a></div>
+    </div>
+
+    <dialog id="create-modal" class="modal">
+        <div class="modal-box">
+            <h3 class="font-bold text-lg mb-4" id="cf-modal-title">New Custom Field</h3>
+            <form method="post" action="/settings/custom-fields">
+                <div class="form-control mb-3">
+                    <label class="label"><span class="label-text">Model</span></label>
+                    <select name="model" id="cf-model" class="select select-bordered" required onchange="cfModelChange()">{model_options}</select>
+                    <input type="hidden" id="cf-model-hidden"/>
+                </div>
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <div class="form-control mb-3">
+                        <label class="label"><span class="label-text">Field name</span></label>
+                        <input type="text" name="name" id="cf-name" class="input input-bordered font-mono" value="x_" placeholder="x_priority" required/>
+                        <span class="label-text-alt opacity-60 mt-1" id="cf-name-hint">lowercase, starts with x_</span>
+                    </div>
+                    <div class="form-control mb-3">
+                        <label class="label"><span class="label-text">Label</span></label>
+                        <input type="text" name="label" id="cf-label" class="input input-bordered" placeholder="Priority" required/>
+                    </div>
+                </div>
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <div class="form-control mb-3">
+                        <label class="label"><span class="label-text">Type</span></label>
+                        <select name="field_type" id="cf-type" class="select select-bordered" onchange="cfToggle()">{type_options}</select>
+                    </div>
+                    <div class="form-control mb-3">
+                        <label class="label"><span class="label-text">Position</span></label>
+                        <select name="position_after" id="cf-position" class="select select-bordered"></select>
+                        <span class="label-text-alt opacity-60 mt-1">where it appears on the form</span>
+                    </div>
+                    <div class="form-control mb-3" id="cf-options-wrap">
+                        <label class="label"><span class="label-text">Options</span></label>
+                        <input type="text" name="options" id="cf-options" class="input input-bordered" placeholder="low, medium, high"/>
+                        <span class="label-text-alt opacity-60 mt-1">comma-separated · Selection only</span>
+                    </div>
+                    <div class="form-control mb-3" id="cf-target-wrap" style="display:none">
+                        <label class="label"><span class="label-text">Target model</span></label>
+                        <select name="related_model" id="cf-related" class="select select-bordered">{model_options}</select>
+                        <span class="label-text-alt opacity-60 mt-1">the model this field links to · Reference only</span>
+                    </div>
+                </div>
+                <div class="form-control mb-3">
+                    <label class="label"><span class="label-text">Help text (optional)</span></label>
+                    <input type="text" name="help" id="cf-help" class="input input-bordered" placeholder="Shown under the field"/>
+                </div>
+                <div class="modal-action">
+                    <button type="button" class="btn" onclick="document.getElementById('create-modal').close();">Cancel</button>
+                    <button type="submit" class="btn btn-primary" id="cf-submit">Create</button>
+                </div>
+            </form>
+        </div>
+        <form method="dialog" class="modal-backdrop"><button>close</button></form>
+    </dialog>
+    <script>
+    var CF_MODEL_FIELDS = {model_fields_json};
+    // Show/hide the Options (selection) and Target model (reference) inputs.
+    function cfToggle() {{
+        var t = document.getElementById('cf-type').value;
+        document.getElementById('cf-options-wrap').style.display = (t === 'selection') ? '' : 'none';
+        document.getElementById('cf-target-wrap').style.display  = (t === 'many2one') ? '' : 'none';
+    }}
+    // Repopulate the Position dropdown from the selected model's built-in fields.
+    function cfPositions(model, selected) {{
+        var sel = document.getElementById('cf-position');
+        sel.innerHTML = '<option value="">Bottom (Custom Fields section)</option>';
+        var list = CF_MODEL_FIELDS[model] || [];
+        for (var i = 0; i < list.length; i++) {{
+            var o = document.createElement('option');
+            o.value = list[i][0];
+            o.textContent = 'After: ' + list[i][1];
+            if (list[i][0] === selected) o.selected = true;
+            sel.appendChild(o);
+        }}
+    }}
+    function cfModelChange() {{
+        cfPositions(document.getElementById('cf-model').value, '');
+    }}
+    // Open the modal in create mode: editable name, blank fields.
+    function cfNew() {{
+        document.getElementById('cf-modal-title').textContent = 'New Custom Field';
+        document.getElementById('cf-submit').textContent = 'Create';
+        var model = document.getElementById('cf-model');
+        model.disabled = false;
+        document.getElementById('cf-model-hidden').removeAttribute('name');
+        var name = document.getElementById('cf-name');
+        name.readOnly = false; name.value = 'x_';
+        document.getElementById('cf-name-hint').style.display = '';
+        document.getElementById('cf-label').value = '';
+        document.getElementById('cf-type').value = 'string';
+        document.getElementById('cf-options').value = '';
+        document.getElementById('cf-help').value = '';
+        cfPositions(model.value, '');
+        cfToggle();
+        document.getElementById('create-modal').showModal();
+    }}
+    // Open the modal in edit mode: model + name locked (they key the record).
+    function cfEdit(btn) {{
+        var d = btn.dataset;
+        document.getElementById('cf-modal-title').textContent = 'Edit Custom Field';
+        document.getElementById('cf-submit').textContent = 'Save changes';
+        var model = document.getElementById('cf-model');
+        model.value = d.model; model.disabled = true;
+        var hidden = document.getElementById('cf-model-hidden');
+        hidden.setAttribute('name', 'model'); hidden.value = d.model;
+        var name = document.getElementById('cf-name');
+        name.value = d.name; name.readOnly = true;
+        document.getElementById('cf-name-hint').style.display = 'none';
+        document.getElementById('cf-label').value = d.label;
+        document.getElementById('cf-type').value = d.type;
+        document.getElementById('cf-options').value = d.options || '';
+        document.getElementById('cf-related').value = d.related || '';
+        document.getElementById('cf-help').value = d.help || '';
+        cfPositions(d.model, d.position || '');
+        cfToggle();
+        document.getElementById('create-modal').showModal();
+    }}
+    cfModelChange();
+    </script>
+</body>
+</html>"##
+    )
+}
+
+async fn custom_fields_list(
+    State(_state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+) -> Response {
+    if !user.is_system_admin() && !user.has_role("Administrator") {
+        return Redirect::to("/settings").into_response();
+    }
+    Html(render_custom_fields_page(&db, &user.username, None).await).into_response()
+}
+
+async fn custom_field_create(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Form(form): Form<CustomFieldForm>,
+) -> Response {
+    if !user.is_system_admin() && !user.has_role("Administrator") {
+        return Redirect::to("/settings").into_response();
+    }
+    let options: Vec<String> = form
+        .options
+        .as_deref()
+        .unwrap_or("")
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let help = form.help.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let related_model = form.related_model.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let position_after = form.position_after.as_deref().map(str::trim).filter(|s| !s.is_empty());
+
+    match vortex_framework::custom_fields::add(
+        &db, form.model.trim(), form.name.trim(), form.label.trim(),
+        form.field_type.trim(), &options, related_model, position_after, help,
+    ).await {
+        Ok(()) => {
+            let audit = AuditEntry::new(AuditAction::ConfigChanged, AuditSeverity::Info)
+                .with_user(vortex_common::UserId(user.id))
+                .with_username(&user.username)
+                .with_database(&db_ctx.db_name)
+                .with_resource("custom_field", format!("{}.{}", form.model.trim(), form.name.trim()))
+                .with_details(serde_json::json!({
+                    "action": "add", "type": form.field_type.trim(), "label": form.label.trim(),
+                }));
+            let _ = state.audit.log(audit).await;
+            Redirect::to("/settings/custom-fields").into_response()
+        }
+        Err(e) => Html(render_custom_fields_page(&db, &user.username, Some(&e)).await).into_response(),
+    }
+}
+
+async fn custom_field_delete(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Form(form): Form<CustomFieldDeleteForm>,
+) -> Response {
+    if !user.is_system_admin() && !user.has_role("Administrator") {
+        return Redirect::to("/settings").into_response();
+    }
+    if let Err(e) = vortex_framework::custom_fields::delete(&db, form.model.trim(), form.name.trim()).await {
+        return Html(render_custom_fields_page(&db, &user.username, Some(&e)).await).into_response();
+    }
+    let audit = AuditEntry::new(AuditAction::ConfigChanged, AuditSeverity::Info)
+        .with_user(vortex_common::UserId(user.id))
+        .with_username(&user.username)
+        .with_database(&db_ctx.db_name)
+        .with_resource("custom_field", format!("{}.{}", form.model.trim(), form.name.trim()))
+        .with_details(serde_json::json!({ "action": "delete" }));
+    let _ = state.audit.log(audit).await;
+    Redirect::to("/settings/custom-fields").into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct CustomFieldReorderForm {
+    model: String,
+    name: String,
+    /// "up" moves the field earlier; anything else moves it later.
+    direction: String,
+}
+
+/// POST /settings/custom-fields/reorder — move a custom field up or down within
+/// its model's Custom Fields section (swaps sequence with its neighbour).
+async fn custom_field_reorder(
+    State(_state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Form(form): Form<CustomFieldReorderForm>,
+) -> Response {
+    if !user.is_system_admin() && !user.has_role("Administrator") {
+        return Redirect::to("/settings").into_response();
+    }
+    let _ = vortex_framework::custom_fields::move_field(
+        &db, form.model.trim(), form.name.trim(), form.direction.trim() == "up",
+    )
+    .await;
+    Redirect::to("/settings/custom-fields").into_response()
+}
+
+// ─── Automation Rules (Initiative #3 admin UI) ───────────────────────────
+#[derive(serde::Deserialize)]
+struct AutomationRuleForm {
+    name: String,
+    model: String,
+    trigger: String,
+    #[serde(default)]
+    condition_field: Option<String>,
+    #[serde(default)]
+    condition_op: Option<String>,
+    #[serde(default)]
+    condition_value: Option<String>,
+    action_field: String,
+    #[serde(default)]
+    action_value: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct AutomationRuleDeleteForm {
+    id: uuid::Uuid,
+}
+
+async fn render_automation_rules_page(db: &sqlx::PgPool, username: &str, error: Option<&str>) -> String {
+    use vortex_framework::ui::html_escape;
+
+    let models = sqlx::query("SELECT name, display_name FROM ir_model WHERE is_active = true ORDER BY display_name")
+        .fetch_all(db).await.unwrap_or_default();
+    let mut model_options = String::new();
+    for m in &models {
+        let name: String = m.get("name");
+        let label: String = m.get("display_name");
+        model_options.push_str(&format!(r#"<option value="{}">{} ({})</option>"#,
+            html_escape(&name), html_escape(&label), html_escape(&name)));
+    }
+    // Convenience datalist of all registered field names.
+    let field_rows = sqlx::query("SELECT DISTINCT name FROM ir_model_field WHERE is_custom = false ORDER BY name")
+        .fetch_all(db).await.unwrap_or_default();
+    let mut field_datalist = String::new();
+    for f in &field_rows {
+        let n: String = f.get("name");
+        field_datalist.push_str(&format!(r#"<option value="{}"></option>"#, html_escape(&n)));
+    }
+
+    let mut trigger_options = String::new();
+    for (code, label) in vortex_framework::automation::TRIGGERS {
+        trigger_options.push_str(&format!(r#"<option value="{code}">{label}</option>"#));
+    }
+    let mut op_options = String::from(r#"<option value="">(no condition)</option>"#);
+    for (code, label) in vortex_framework::automation::OPERATORS {
+        op_options.push_str(&format!(r#"<option value="{code}">{label}</option>"#));
+    }
+    let op_label = |code: &str| vortex_framework::automation::OPERATORS.iter()
+        .find(|(c, _)| *c == code).map(|(_, l)| *l).unwrap_or(code).to_string();
+    let trig_label = |code: &str| vortex_framework::automation::TRIGGERS.iter()
+        .find(|(c, _)| *c == code).map(|(_, l)| *l).unwrap_or(code).to_string();
+
+    let rules = vortex_framework::automation::list_all(db).await;
+    let mut rows_html = String::new();
+    for r in &rules {
+        let condition = match (&r.condition_field, &r.condition_op) {
+            (Some(f), Some(op)) => format!("<code>{}</code> {} <code>{}</code>",
+                html_escape(f), html_escape(&op_label(op)), html_escape(r.condition_value.as_deref().unwrap_or(""))),
+            _ => "<span class=\"opacity-40\">always</span>".to_string(),
+        };
+        let action = format!("set <code>{}</code> = <code>{}</code>",
+            html_escape(&r.action_field), html_escape(r.action_value.as_deref().unwrap_or("∅")));
+        rows_html.push_str(&format!(
+            r##"<tr>
+                <td>{name}</td>
+                <td><code class="text-xs">{model}</code> {trig}</td>
+                <td class="text-sm">{condition}</td>
+                <td class="text-sm">{action}</td>
+                <td class="text-right"><form method="post" action="/settings/automation-rules/delete" onsubmit="return confirm('Delete rule {name}?');" class="inline"><input type="hidden" name="id" value="{id}"/><button class="btn btn-ghost btn-xs text-error">Delete</button></form></td>
+            </tr>"##,
+            name = html_escape(&r.name), model = html_escape(&r.model_name),
+            trig = html_escape(&trig_label(&r.trigger_event)),
+            condition = condition, action = action, id = r.id,
+        ));
+    }
+    if rows_html.is_empty() {
+        rows_html.push_str(r#"<tr><td colspan="5" class="text-center opacity-60 py-8">No automation rules yet. Add one to react to record changes automatically.</td></tr>"#);
+    }
+
+    let error_banner = error.map(|e| format!(r#"<div class="alert alert-error mb-4"><span>{}</span></div>"#, html_escape(e))).unwrap_or_default();
+
+    format!(r##"<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+    <script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script>
+    <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Automation Rules - Settings</title>
+    <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
+    <link href="/static/vortex.css?v=18" rel="stylesheet"/>
+    <script src="/static/vendor/tailwind.js"></script>
+</head>
+<body class="min-h-screen bg-base-200">
+    <div class="navbar bg-base-100 shadow-lg"><div class="flex-1"><a href="/" class="btn btn-ghost text-xl">remicle</a></div><div class="flex-none"><span class="text-sm">@{username}</span></div></div>
+    <div class="container mx-auto p-6">
+        <div class="flex justify-between items-center mb-6">
+            <div><h1 class="text-2xl font-bold">Automation Rules</h1>
+            <p class="text-base-content/60">When a record changes and matches a condition, run an action automatically — no code.</p></div>
+            <button class="btn btn-primary" onclick="document.getElementById('create-modal').showModal();">+ New Rule</button>
+        </div>
+        {error_banner}
+        <div class="card bg-base-100 shadow"><div class="card-body p-0">
+            <table class="table"><thead><tr><th>Name</th><th>When</th><th>Condition</th><th>Action</th><th></th></tr></thead>
+            <tbody>{rows_html}</tbody></table>
+        </div></div>
+        <div class="mt-4"><a href="/settings" class="btn btn-ghost btn-sm">← Back to Settings</a></div>
+    </div>
+    <datalist id="field-list">{field_datalist}</datalist>
+    <dialog id="create-modal" class="modal"><div class="modal-box max-w-2xl">
+        <h3 class="font-bold text-lg mb-4">New Automation Rule</h3>
+        <form method="post" action="/settings/automation-rules">
+            <div class="form-control mb-3"><label class="label"><span class="label-text">Rule name</span></label>
+                <input type="text" name="name" class="input input-bordered" placeholder="Flag VIP customers" required/></div>
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div class="form-control mb-3"><label class="label"><span class="label-text">When this model…</span></label>
+                    <select name="model" class="select select-bordered" required>{model_options}</select></div>
+                <div class="form-control mb-3"><label class="label"><span class="label-text">…is</span></label>
+                    <select name="trigger" class="select select-bordered">{trigger_options}</select></div>
+            </div>
+            <div class="divider text-xs opacity-60">CONDITION (optional)</div>
+            <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                <div class="form-control mb-3"><label class="label"><span class="label-text">Field</span></label>
+                    <input type="text" name="condition_field" list="field-list" class="input input-bordered font-mono" placeholder="contact_type"/></div>
+                <div class="form-control mb-3"><label class="label"><span class="label-text">Operator</span></label>
+                    <select name="condition_op" class="select select-bordered">{op_options}</select></div>
+                <div class="form-control mb-3"><label class="label"><span class="label-text">Value</span></label>
+                    <input type="text" name="condition_value" class="input input-bordered" placeholder="customer"/></div>
+            </div>
+            <div class="divider text-xs opacity-60">ACTION</div>
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div class="form-control mb-3"><label class="label"><span class="label-text">Set field</span></label>
+                    <input type="text" name="action_field" list="field-list" class="input input-bordered font-mono" placeholder="city" required/></div>
+                <div class="form-control mb-3"><label class="label"><span class="label-text">To value</span></label>
+                    <input type="text" name="action_value" class="input input-bordered" placeholder="VIP"/></div>
+            </div>
+            <div class="modal-action">
+                <button type="button" class="btn" onclick="document.getElementById('create-modal').close();">Cancel</button>
+                <button type="submit" class="btn btn-primary">Create rule</button>
+            </div>
+        </form>
+    </div><form method="dialog" class="modal-backdrop"><button>close</button></form></dialog>
+</body></html>"##)
+}
+
+async fn automation_rules_list(
+    State(_state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+) -> Response {
+    if !user.is_admin() {
+        return Redirect::to("/settings").into_response();
+    }
+    Html(render_automation_rules_page(&db, &user.username, None).await).into_response()
+}
+
+async fn automation_rule_create(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Form(form): Form<AutomationRuleForm>,
+) -> Response {
+    if !user.is_admin() {
+        return Redirect::to("/settings").into_response();
+    }
+    let cond_field = form.condition_field.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let cond_op = form.condition_op.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let cond_val = form.condition_value.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let action_val = form.action_value.as_deref().map(str::trim).filter(|s| !s.is_empty());
+
+    match vortex_framework::automation::create(
+        &db, form.name.trim(), form.model.trim(), form.trigger.trim(),
+        cond_field, cond_op, cond_val, form.action_field.trim(), action_val, Some(user.id),
+    ).await {
+        Ok(()) => {
+            let audit = AuditEntry::new(AuditAction::ConfigChanged, AuditSeverity::Info)
+                .with_user(vortex_common::UserId(user.id))
+                .with_username(&user.username)
+                .with_database(&db_ctx.db_name)
+                .with_resource("automation_rule", format!("{}:{}", form.model.trim(), form.name.trim()))
+                .with_details(serde_json::json!({"action": "add", "trigger": form.trigger.trim()}));
+            let _ = state.audit.log(audit).await;
+            Redirect::to("/settings/automation-rules").into_response()
+        }
+        Err(e) => Html(render_automation_rules_page(&db, &user.username, Some(&e)).await).into_response(),
+    }
+}
+
+async fn automation_rule_delete(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Form(form): Form<AutomationRuleDeleteForm>,
+) -> Response {
+    if !user.is_admin() {
+        return Redirect::to("/settings").into_response();
+    }
+    if let Err(e) = vortex_framework::automation::delete(&db, form.id).await {
+        return Html(render_automation_rules_page(&db, &user.username, Some(&e)).await).into_response();
+    }
+    let audit = AuditEntry::new(AuditAction::ConfigChanged, AuditSeverity::Info)
+        .with_user(vortex_common::UserId(user.id))
+        .with_username(&user.username)
+        .with_database(&db_ctx.db_name)
+        .with_resource("automation_rule", form.id.to_string())
+        .with_details(serde_json::json!({"action": "delete"}));
+    let _ = state.audit.log(audit).await;
+    Redirect::to("/settings/automation-rules").into_response()
+}
+
+// ─── Computed Fields (Initiative #5 admin UI) ────────────────────────────
+#[derive(serde::Deserialize)]
+struct ComputedFieldForm {
+    model: String,
+    name: String,
+    label: String,
+    kind: String,
+    expr: String,
+    #[serde(default)]
+    help: Option<String>,
+}
+
+async fn render_computed_fields_page(db: &sqlx::PgPool, username: &str, error: Option<&str>) -> String {
+    use vortex_framework::ui::html_escape;
+
+    let models = sqlx::query("SELECT name, display_name FROM ir_model WHERE is_active = true ORDER BY display_name")
+        .fetch_all(db).await.unwrap_or_default();
+    let mut model_options = String::new();
+    for m in &models {
+        let name: String = m.get("name");
+        let label: String = m.get("display_name");
+        model_options.push_str(&format!(r#"<option value="{}">{} ({})</option>"#,
+            html_escape(&name), html_escape(&label), html_escape(&name)));
+    }
+    let mut kind_options = String::new();
+    for (code, label) in vortex_framework::computed_fields::COMPUTE_KINDS {
+        kind_options.push_str(&format!(r#"<option value="{code}">{label}</option>"#));
+    }
+
+    let fields = vortex_framework::computed_fields::list_all(db).await;
+    let mut rows_html = String::new();
+    for (model, model_label, f) in &fields {
+        let kind_badge = if f.kind == "related" { "related" } else { "formula" };
+        rows_html.push_str(&format!(
+            r##"<tr>
+                <td>{model_label} <code class="text-xs opacity-60">{model}</code></td>
+                <td><code class="text-sm">{name}</code></td>
+                <td>{label}</td>
+                <td><span class="badge badge-ghost">{kind}</span></td>
+                <td><code class="text-sm">{expr}</code></td>
+                <td class="text-right">
+                    <form method="post" action="/settings/computed-fields/delete" onsubmit="return confirm('Delete computed field {name}?');" class="inline">
+                        <input type="hidden" name="model" value="{model}"/>
+                        <input type="hidden" name="name" value="{name}"/>
+                        <button class="btn btn-ghost btn-xs text-error">Delete</button>
+                    </form>
+                </td>
+            </tr>"##,
+            model_label = html_escape(model_label), model = html_escape(model),
+            name = html_escape(&f.name), label = html_escape(&f.label),
+            kind = kind_badge, expr = html_escape(&f.expr),
+        ));
+    }
+    if rows_html.is_empty() {
+        rows_html.push_str(r#"<tr><td colspan="6" class="text-center opacity-60 py-8">No computed fields yet. Add one to derive a value automatically.</td></tr>"#);
+    }
+
+    let error_banner = error.map(|e| format!(r#"<div class="alert alert-error mb-4"><span>{}</span></div>"#, html_escape(e))).unwrap_or_default();
+
+    format!(r##"<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+    <script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script>
+    <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Computed Fields - Settings</title>
+    <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
+    <link href="/static/vortex.css?v=18" rel="stylesheet"/>
+    <script src="/static/vendor/tailwind.js"></script>
+</head>
+<body class="min-h-screen bg-base-200">
+    <div class="navbar bg-base-100 shadow-lg"><div class="flex-1"><a href="/" class="btn btn-ghost text-xl">remicle</a></div><div class="flex-none"><span class="text-sm">@{username}</span></div></div>
+    <div class="container mx-auto p-6">
+        <div class="flex justify-between items-center mb-6">
+            <div><h1 class="text-2xl font-bold">Computed Fields</h1>
+            <p class="text-base-content/60">Derive a read-only value from a formula over this record's number fields, or pull one across a link. Recomputed on every save — no code.</p></div>
+            <button class="btn btn-primary" onclick="document.getElementById('create-modal').showModal();">+ New Computed Field</button>
+        </div>
+        {error_banner}
+        <div class="card bg-base-100 shadow"><div class="card-body p-0">
+            <table class="table"><thead><tr><th>Model</th><th>Field</th><th>Label</th><th>Kind</th><th>Definition</th><th></th></tr></thead>
+            <tbody>{rows_html}</tbody></table>
+        </div></div>
+        <div class="mt-4"><a href="/settings" class="btn btn-ghost btn-sm">← Back to Settings</a></div>
+    </div>
+    <dialog id="create-modal" class="modal"><div class="modal-box max-w-2xl">
+        <h3 class="font-bold text-lg mb-4">New Computed Field</h3>
+        <form method="post" action="/settings/computed-fields">
+            <div class="form-control mb-3"><label class="label"><span class="label-text">Model</span></label>
+                <select name="model" class="select select-bordered" required>{model_options}</select></div>
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div class="form-control mb-3"><label class="label"><span class="label-text">Field name</span></label>
+                    <input type="text" name="name" class="input input-bordered font-mono" value="x_" placeholder="x_line_total" required/>
+                    <span class="label-text-alt opacity-60 mt-1">lowercase, starts with x_</span></div>
+                <div class="form-control mb-3"><label class="label"><span class="label-text">Label</span></label>
+                    <input type="text" name="label" class="input input-bordered" placeholder="Line Total" required/></div>
+            </div>
+            <div class="form-control mb-3"><label class="label"><span class="label-text">Kind</span></label>
+                <select name="kind" class="select select-bordered">{kind_options}</select></div>
+            <div class="form-control mb-3"><label class="label"><span class="label-text">Definition</span></label>
+                <input type="text" name="expr" class="input input-bordered font-mono" placeholder="qty * unit_price   —or—   partner_id.email" required/>
+                <span class="label-text-alt opacity-60 mt-1">Formula: arithmetic on number fields (+ - * / and parentheses). Related: link_field.target_field</span></div>
+            <div class="form-control mb-3"><label class="label"><span class="label-text">Help text (optional)</span></label>
+                <input type="text" name="help" class="input input-bordered" placeholder="Shown under the field"/></div>
+            <div class="modal-action">
+                <button type="button" class="btn" onclick="document.getElementById('create-modal').close();">Cancel</button>
+                <button type="submit" class="btn btn-primary">Create</button>
+            </div>
+        </form>
+    </div><form method="dialog" class="modal-backdrop"><button>close</button></form></dialog>
+</body></html>"##)
+}
+
+async fn computed_fields_list(
+    State(_state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+) -> Response {
+    if !user.is_system_admin() && !user.has_role("Administrator") {
+        return Redirect::to("/settings").into_response();
+    }
+    Html(render_computed_fields_page(&db, &user.username, None).await).into_response()
+}
+
+async fn computed_field_create(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Form(form): Form<ComputedFieldForm>,
+) -> Response {
+    if !user.is_system_admin() && !user.has_role("Administrator") {
+        return Redirect::to("/settings").into_response();
+    }
+    let help = form.help.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    match vortex_framework::computed_fields::add(
+        &db, form.model.trim(), form.name.trim(), form.label.trim(),
+        form.kind.trim(), form.expr.trim(), help,
+    ).await {
+        Ok(()) => {
+            let audit = AuditEntry::new(AuditAction::ConfigChanged, AuditSeverity::Info)
+                .with_user(vortex_common::UserId(user.id))
+                .with_username(&user.username)
+                .with_database(&db_ctx.db_name)
+                .with_resource("computed_field", format!("{}.{}", form.model.trim(), form.name.trim()))
+                .with_details(serde_json::json!({"action": "add", "kind": form.kind.trim(), "expr": form.expr.trim()}));
+            let _ = state.audit.log(audit).await;
+            Redirect::to("/settings/computed-fields").into_response()
+        }
+        Err(e) => Html(render_computed_fields_page(&db, &user.username, Some(&e)).await).into_response(),
+    }
+}
+
+async fn computed_field_delete(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Form(form): Form<CustomFieldDeleteForm>,
+) -> Response {
+    if !user.is_system_admin() && !user.has_role("Administrator") {
+        return Redirect::to("/settings").into_response();
+    }
+    if let Err(e) = vortex_framework::computed_fields::delete(&db, form.model.trim(), form.name.trim()).await {
+        return Html(render_computed_fields_page(&db, &user.username, Some(&e)).await).into_response();
+    }
+    let audit = AuditEntry::new(AuditAction::ConfigChanged, AuditSeverity::Info)
+        .with_user(vortex_common::UserId(user.id))
+        .with_username(&user.username)
+        .with_database(&db_ctx.db_name)
+        .with_resource("computed_field", format!("{}.{}", form.model.trim(), form.name.trim()))
+        .with_details(serde_json::json!({"action": "delete"}));
+    let _ = state.audit.log(audit).await;
+    Redirect::to("/settings/computed-fields").into_response()
+}
+
+// ─── Dashboards (Initiative #4) ──────────────────────────────────────────
+#[derive(serde::Deserialize)]
+struct DashboardForm {
+    name: String,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    shared: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct WidgetForm {
+    title: String,
+    widget_type: String,
+    model: String,
+    #[serde(default)]
+    measure_field: Option<String>,
+    aggregate: String,
+    #[serde(default)]
+    group_field: Option<String>,
+    #[serde(default)]
+    filter_field: Option<String>,
+    #[serde(default)]
+    filter_op: Option<String>,
+    #[serde(default)]
+    filter_value: Option<String>,
+    #[serde(default)]
+    col_span: Option<i32>,
+}
+
+/// The shared page chrome for the dashboards views — the full app shell with
+/// the host sidebar, so Dashboards feels like a first-class section (matching
+/// Reports).
+fn dashboard_full_page(sidebar: &str, title: &str, body: &str) -> String {
+    let title = format!("{} - Remicle", vortex_framework::ui::html_escape(title));
+    vortex_framework::render_app_shell(&title, sidebar, body)
+}
+
+async fn dashboards_index(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+) -> Response {
+    use vortex_framework::ui::html_escape;
+    let boards = vortex_framework::dashboards::list_visible(&db, user.id, user.is_admin()).await;
+    let mut cards = String::new();
+    for b in &boards {
+        let shared = if b.is_shared { r#"<span class="badge badge-sm badge-ghost">shared</span>"# } else { "" };
+        cards.push_str(&format!(
+            r##"<a href="/dashboards/{id}" class="card bg-base-100 shadow transition-all hover:shadow-md">
+                <div class="card-body p-5"><div class="flex items-center gap-2"><h3 class="card-title text-lg">{name}</h3>{shared}</div>
+                <p class="text-base-content/60 text-sm">{desc}</p></div></a>"##,
+            id = b.id, name = html_escape(&b.name), shared = shared,
+            desc = html_escape(b.description.as_deref().unwrap_or("")),
+        ));
+    }
+    if cards.is_empty() {
+        cards.push_str(r#"<div class="col-span-full text-center opacity-60 py-12">No dashboards yet. Create one to get started.</div>"#);
+    }
+
+    let body = format!(r##"
+        <div class="flex justify-between items-center mb-6">
+            <div><h1 class="text-2xl font-bold">Dashboards</h1>
+            <p class="text-base-content/60">Assemble KPI and breakdown widgets over any model — no code.</p></div>
+            <button class="btn btn-primary" onclick="document.getElementById('new-dash').showModal();">+ New Dashboard</button>
+        </div>
+        <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">{cards}</div>
+        <dialog id="new-dash" class="modal"><div class="modal-box">
+            <h3 class="font-bold text-lg mb-4">New Dashboard</h3>
+            <form method="post" action="/dashboards">
+                <div class="form-control mb-3"><label class="label"><span class="label-text">Name</span></label>
+                    <input type="text" name="name" class="input input-bordered" placeholder="Sales Overview" required/></div>
+                <div class="form-control mb-3"><label class="label"><span class="label-text">Description (optional)</span></label>
+                    <input type="text" name="description" class="input input-bordered"/></div>
+                <div class="form-control mb-3"><label class="label cursor-pointer justify-start gap-3">
+                    <input type="checkbox" name="shared" class="checkbox checkbox-primary"/>
+                    <span class="label-text">Share with everyone (otherwise only you see it)</span></label></div>
+                <div class="modal-action">
+                    <button type="button" class="btn" onclick="document.getElementById('new-dash').close();">Cancel</button>
+                    <button type="submit" class="btn btn-primary">Create</button>
+                </div>
+            </form>
+        </div><form method="dialog" class="modal-backdrop"><button>close</button></form></dialog>
+    "##, cards = cards);
+    let display_name = user.full_name.as_deref().unwrap_or(&user.username);
+    let initials = get_initials(display_name);
+    let installed = db_ctx.installed_modules.clone();
+    let sidebar = build_sidebar("dashboards", display_name, &initials, &installed, user.is_admin(), &state.plugin_registry, &user.roles);
+    Html(dashboard_full_page(&sidebar, "Dashboards", &body)).into_response()
+}
+
+async fn dashboard_create(
+    State(_state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Form(form): Form<DashboardForm>,
+) -> Response {
+    let shared = matches!(form.shared.as_deref(), Some("on") | Some("true"));
+    match vortex_framework::dashboards::create(
+        &db, form.name.trim(), form.description.as_deref(), user.id, shared,
+    ).await {
+        Ok(id) => Redirect::to(&format!("/dashboards/{id}")).into_response(),
+        Err(_) => Redirect::to("/dashboards").into_response(),
+    }
+}
+
+async fn dashboard_view(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<uuid::Uuid>,
+) -> Response {
+    use vortex_framework::ui::html_escape;
+    let Some(board) = vortex_framework::dashboards::load(&db, id).await else {
+        return Redirect::to("/dashboards").into_response();
+    };
+    let is_admin = user.is_admin();
+    if !board.can_view(user.id, is_admin) {
+        return Redirect::to("/dashboards").into_response();
+    }
+    let can_edit = board.can_edit(user.id, is_admin);
+
+    // Widgets grid.
+    let widgets = vortex_framework::dashboards::widgets_for(&db, id).await;
+    let mut grid = String::new();
+    for w in &widgets {
+        grid.push_str(&vortex_framework::dashboards::render_widget(&db, w, can_edit).await);
+    }
+    if grid.is_empty() {
+        grid.push_str(r#"<div class="col-span-full text-center opacity-60 py-12">No widgets yet.</div>"#);
+    }
+
+    // Edit controls (add widget + delete dashboard) only for editors.
+    let (add_btn, edit_modal, delete_dash) = if can_edit {
+        let models = sqlx::query("SELECT name, display_name FROM ir_model WHERE is_active = true ORDER BY display_name")
+            .fetch_all(&db).await.unwrap_or_default();
+        let mut model_options = String::new();
+        for m in &models {
+            let name: String = m.get("name");
+            let label: String = m.get("display_name");
+            model_options.push_str(&format!(r#"<option value="{}">{} ({})</option>"#,
+                html_escape(&name), html_escape(&label), html_escape(&name)));
+        }
+        let field_rows = sqlx::query("SELECT DISTINCT name FROM ir_model_field WHERE is_custom = false ORDER BY name")
+            .fetch_all(&db).await.unwrap_or_default();
+        let mut field_datalist = String::new();
+        for f in &field_rows {
+            let n: String = f.get("name");
+            field_datalist.push_str(&format!(r#"<option value="{}"></option>"#, html_escape(&n)));
+        }
+        let mut agg_options = String::new();
+        for (code, label) in vortex_framework::dashboards::AGGREGATES {
+            agg_options.push_str(&format!(r#"<option value="{code}">{label}</option>"#));
+        }
+        let mut type_options = String::new();
+        for (code, label) in vortex_framework::dashboards::WIDGET_TYPES {
+            type_options.push_str(&format!(r#"<option value="{code}">{label}</option>"#));
+        }
+        let mut op_options = String::from(r#"<option value="">(no filter)</option>"#);
+        for (code, label) in vortex_framework::dashboards::FILTER_OPS {
+            op_options.push_str(&format!(r#"<option value="{code}">{label}</option>"#));
+        }
+        let add = r#"<button class="btn btn-primary btn-sm" onclick="document.getElementById('add-widget').showModal();">+ Add Widget</button>"#.to_string();
+        let modal = format!(r##"<datalist id="field-list">{field_datalist}</datalist>
+        <dialog id="add-widget" class="modal"><div class="modal-box max-w-2xl">
+            <h3 class="font-bold text-lg mb-4">Add Widget</h3>
+            <form method="post" action="/dashboards/{id}/widget">
+                <div class="form-control mb-3"><label class="label"><span class="label-text">Title</span></label>
+                    <input type="text" name="title" class="input input-bordered" placeholder="Total revenue" required/></div>
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <div class="form-control mb-3"><label class="label"><span class="label-text">Type</span></label>
+                        <select name="widget_type" class="select select-bordered">{type_options}</select></div>
+                    <div class="form-control mb-3"><label class="label"><span class="label-text">Model</span></label>
+                        <select name="model" class="select select-bordered" required>{model_options}</select></div>
+                </div>
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <div class="form-control mb-3"><label class="label"><span class="label-text">Measure</span></label>
+                        <select name="aggregate" class="select select-bordered">{agg_options}</select></div>
+                    <div class="form-control mb-3"><label class="label"><span class="label-text">Number field</span></label>
+                        <input type="text" name="measure_field" list="field-list" class="input input-bordered font-mono" placeholder="(blank for Count)"/></div>
+                </div>
+                <div class="form-control mb-3"><label class="label"><span class="label-text">Break down by (Bars only)</span></label>
+                    <input type="text" name="group_field" list="field-list" class="input input-bordered font-mono" placeholder="contact_type"/></div>
+                <div class="divider text-xs opacity-60">FILTER (optional)</div>
+                <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                    <div class="form-control mb-3"><label class="label"><span class="label-text">Field</span></label>
+                        <input type="text" name="filter_field" list="field-list" class="input input-bordered font-mono"/></div>
+                    <div class="form-control mb-3"><label class="label"><span class="label-text">Operator</span></label>
+                        <select name="filter_op" class="select select-bordered">{op_options}</select></div>
+                    <div class="form-control mb-3"><label class="label"><span class="label-text">Value</span></label>
+                        <input type="text" name="filter_value" class="input input-bordered"/></div>
+                </div>
+                <div class="form-control mb-3"><label class="label"><span class="label-text">Width</span></label>
+                    <select name="col_span" class="select select-bordered">
+                        <option value="1">Small (1 column)</option><option value="2">Medium (2 columns)</option><option value="3">Full width</option>
+                    </select></div>
+                <div class="modal-action">
+                    <button type="button" class="btn" onclick="document.getElementById('add-widget').close();">Cancel</button>
+                    <button type="submit" class="btn btn-primary">Add</button>
+                </div>
+            </form>
+        </div><form method="dialog" class="modal-backdrop"><button>close</button></form></dialog>"##);
+        let del = format!(r#"<form method="post" action="/dashboards/{id}/delete" onsubmit="return confirm('Delete this dashboard and all its widgets?');" class="inline">
+            <button class="btn btn-ghost btn-sm text-error">Delete dashboard</button></form>"#);
+        (add, modal, del)
+    } else {
+        (String::new(), String::new(), String::new())
+    };
+
+    let body = format!(r##"
+        <div class="flex flex-wrap justify-between items-center gap-2 mb-6">
+            <div><a href="/dashboards" class="text-sm opacity-60 hover:underline">← All dashboards</a>
+            <h1 class="text-2xl font-bold">{name}</h1>
+            <p class="text-base-content/60">{desc}</p></div>
+            <div class="flex gap-2">{add_btn}{delete_dash}</div>
+        </div>
+        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">{grid}</div>
+        {edit_modal}
+    "##,
+        name = html_escape(&board.name),
+        desc = html_escape(board.description.as_deref().unwrap_or("")),
+        add_btn = add_btn, delete_dash = delete_dash, grid = grid, edit_modal = edit_modal);
+    let display_name = user.full_name.as_deref().unwrap_or(&user.username);
+    let initials = get_initials(display_name);
+    let installed = db_ctx.installed_modules.clone();
+    let sidebar = build_sidebar("dashboards", display_name, &initials, &installed, user.is_admin(), &state.plugin_registry, &user.roles);
+    Html(dashboard_full_page(&sidebar, &board.name, &body)).into_response()
+}
+
+async fn dashboard_delete(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<uuid::Uuid>,
+) -> Response {
+    let Some(board) = vortex_framework::dashboards::load(&db, id).await else {
+        return Redirect::to("/dashboards").into_response();
+    };
+    if !board.can_edit(user.id, user.is_admin()) {
+        return Redirect::to("/dashboards").into_response();
+    }
+    let _ = vortex_framework::dashboards::delete(&db, id).await;
+    let audit = AuditEntry::new(AuditAction::ConfigChanged, AuditSeverity::Info)
+        .with_user(vortex_common::UserId(user.id))
+        .with_username(&user.username)
+        .with_database(&db_ctx.db_name)
+        .with_resource("dashboard", id.to_string())
+        .with_details(serde_json::json!({"action": "delete"}));
+    let _ = state.audit.log(audit).await;
+    Redirect::to("/dashboards").into_response()
+}
+
+async fn dashboard_widget_create(
+    State(_state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Path(id): Path<uuid::Uuid>,
+    Form(form): Form<WidgetForm>,
+) -> Response {
+    let dest = format!("/dashboards/{id}");
+    let Some(board) = vortex_framework::dashboards::load(&db, id).await else {
+        return Redirect::to("/dashboards").into_response();
+    };
+    if !board.can_edit(user.id, user.is_admin()) {
+        return Redirect::to(&dest).into_response();
+    }
+    let _ = vortex_framework::dashboards::add_widget(
+        &db, id, form.title.trim(), form.widget_type.trim(), form.model.trim(),
+        form.measure_field.as_deref(), form.aggregate.trim(),
+        form.group_field.as_deref(), form.filter_field.as_deref(),
+        form.filter_op.as_deref(), form.filter_value.as_deref(),
+        form.col_span.unwrap_or(1),
+    ).await;
+    Redirect::to(&dest).into_response()
+}
+
+async fn dashboard_widget_delete(
+    State(_state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Path(id): Path<uuid::Uuid>,
+) -> Response {
+    // Resolve the widget's dashboard and check edit rights before deleting.
+    let dash_id: Option<uuid::Uuid> = sqlx::query_scalar(
+        "SELECT dashboard_id FROM dashboard_widget WHERE id = $1")
+        .bind(id).fetch_optional(&db).await.ok().flatten();
+    let Some(dash_id) = dash_id else {
+        return Redirect::to("/dashboards").into_response();
+    };
+    let dest = format!("/dashboards/{dash_id}");
+    if let Some(board) = vortex_framework::dashboards::load(&db, dash_id).await {
+        if board.can_edit(user.id, user.is_admin()) {
+            let _ = vortex_framework::dashboards::delete_widget(&db, id).await;
+        }
+    }
+    Redirect::to(&dest).into_response()
 }
 
 async fn activity_types_list(
@@ -10949,8 +14150,8 @@ async fn activity_types_list(
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Activity Types - Settings</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=4" rel="stylesheet"/>
-<script src="/static/vortex.js?v=4" defer></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script>
     <script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
@@ -11112,8 +14313,8 @@ async fn activity_type_edit(
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{} - Activity Type</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=4" rel="stylesheet"/>
-<script src="/static/vortex.js?v=4" defer></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script>
     <script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
@@ -11246,8 +14447,8 @@ fn settings_write_error(back: &str, msg: &str) -> Response {
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Error</title>
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=4" rel="stylesheet"/>
-<script src="/static/vortex.js?v=4" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script>
 </head><body class="min-h-screen bg-base-200"><div class="container mx-auto p-6 max-w-xl">
 <div class="alert alert-error mb-4"><span>{}</span></div>
 <a href="{}" class="btn btn-ghost btn-sm">← Back</a>
@@ -11265,8 +14466,8 @@ fn settings_write_ok(back: &str, msg: &str) -> Response {
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Done</title>
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=4" rel="stylesheet"/>
-<script src="/static/vortex.js?v=4" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script>
 </head><body class="min-h-screen bg-base-200"><div class="container mx-auto p-6 max-w-xl">
 <div class="alert alert-success mb-4"><span>{}</span></div>
 <a href="{}" class="btn btn-ghost btn-sm">← Back</a>
@@ -11336,8 +14537,8 @@ async fn countries_list(
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Countries - Settings</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=4" rel="stylesheet"/>
-<script src="/static/vortex.js?v=4" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg">
@@ -11490,8 +14691,8 @@ async fn country_edit(
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{name} - Country</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=4" rel="stylesheet"/>
-<script src="/static/vortex.js?v=4" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg">
@@ -11669,8 +14870,8 @@ async fn states_list(
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>States - Settings</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=4" rel="stylesheet"/>
-<script src="/static/vortex.js?v=4" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg">
@@ -11816,8 +15017,8 @@ async fn state_edit(
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{name} - State</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=4" rel="stylesheet"/>
-<script src="/static/vortex.js?v=4" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg">
@@ -12015,8 +15216,8 @@ async fn stages_list(
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Stages - Settings</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=4" rel="stylesheet"/>
-<script src="/static/vortex.js?v=4" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg">
@@ -12175,8 +15376,8 @@ async fn stage_edit(
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{label} - Stage</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=4" rel="stylesheet"/>
-<script src="/static/vortex.js?v=4" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg">
@@ -12427,8 +15628,8 @@ async fn stage_buttons_list(
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Stage Buttons - Settings</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=4" rel="stylesheet"/>
-<script src="/static/vortex.js?v=4" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg">
@@ -12596,8 +15797,8 @@ async fn stage_button_edit(
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{label} - Stage Button</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=4" rel="stylesheet"/>
-<script src="/static/vortex.js?v=4" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg">
@@ -12848,8 +16049,8 @@ async fn approval_rules_list(Db(db): Db, Extension(user): Extension<AuthUser>) -
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Approval Rules - Settings</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=4" rel="stylesheet"/>
-<script src="/static/vortex.js?v=4" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg">
@@ -13047,21 +16248,7 @@ async fn approvals_inbox(
         rows = rows,
     );
 
-    let html = format!(
-        r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><title>Approvals - Remicle</title>
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=4" rel="stylesheet"/>
-<script src="/static/vortex.js?v=4" defer></script>
-<script src="/static/vendor/tailwind.js"></script></head>
-<body class="min-h-screen bg-base-200">
-<div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a></div>
-<div id="sidebar-overlay" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
-<div class="flex">{sidebar}
-<main class="flex-1 p-4 lg:p-6 min-w-0">{content}</main></div></body></html>"#,
-        sidebar = sidebar,
-        content = content,
-    );
+    let html = vortex_framework::render_app_shell("Approvals - Remicle", &sidebar, &content);
     Html(html).into_response()
 }
 
@@ -13231,8 +16418,8 @@ async fn email_servers_list(Db(db): Db, Extension(user): Extension<AuthUser>) ->
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Email / SMTP - Settings</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=4" rel="stylesheet"/>
-<script src="/static/vortex.js?v=4" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg">
@@ -13437,8 +16624,8 @@ async fn email_server_edit(
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{name} - Mail Server</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=4" rel="stylesheet"/>
-<script src="/static/vortex.js?v=4" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg">
@@ -13703,8 +16890,8 @@ async fn jobs_list(
 <script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Jobs - Settings</title>
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=4" rel="stylesheet"/>
-<script src="/static/vortex.js?v=4" defer></script><script src="/static/vendor/tailwind.js"></script></head>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script></head>
 <body class="min-h-screen bg-base-200">
 <div class="navbar bg-base-100 shadow-lg"><div class="flex-1"><a href="/" class="btn btn-ghost text-xl">remicle</a></div><div class="flex-none"><span class="text-sm">@{user}</span></div></div>
 <div class="container mx-auto p-6 max-w-5xl">
@@ -13749,8 +16936,8 @@ fn api_tokens_page_shell(user: &AuthUser, inner: &str) -> Html<String> {
 <script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>API Tokens - Settings</title>
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=4" rel="stylesheet"/>
-<script src="/static/vortex.js?v=4" defer></script><script src="/static/vendor/tailwind.js"></script></head>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script></head>
 <body class="min-h-screen bg-base-200">
 <div class="navbar bg-base-100 shadow-lg"><div class="flex-1"><a href="/" class="btn btn-ghost text-xl">remicle</a></div><div class="flex-none"><span class="text-sm">@{user}</span></div></div>
 <div class="container mx-auto p-6 max-w-5xl">{inner}</div></body></html>"##,
@@ -13929,13 +17116,581 @@ fn webhooks_page_shell(user: &AuthUser, title: &str, inner: &str) -> Html<String
 <script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>{title} - Settings</title>
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=4" rel="stylesheet"/>
-<script src="/static/vortex.js?v=4" defer></script><script src="/static/vendor/tailwind.js"></script></head>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script></head>
 <body class="min-h-screen bg-base-200">
 <div class="navbar bg-base-100 shadow-lg"><div class="flex-1"><a href="/" class="btn btn-ghost text-xl">remicle</a></div><div class="flex-none"><span class="text-sm">@{user}</span></div></div>
 <div class="container mx-auto p-6 max-w-4xl">{inner}</div></body></html>"##,
         title = html_escape(title), user = html_escape(&user.username), inner = inner,
     ))
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Print layout designer — document branding (DocLayout) + per-document QWeb
+// templates, on top of vortex_framework::print_layout. Admin-only.
+// ═══════════════════════════════════════════════════════════════════════════
+
+const LOGO_KEY_PL: &str = "company/logo";
+
+/// Serve the uploaded company logo (used by the layout settings + preview).
+async fn serve_company_logo(
+    State(state): State<Arc<AppState>>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+) -> Response {
+    match state.files.get(&db_ctx.db_name, LOGO_KEY_PL).await {
+        Ok(Some(data)) => {
+            let ct = if data.starts_with(&[0xFF, 0xD8, 0xFF]) { "image/jpeg" } else { "image/png" };
+            ([(header::CONTENT_TYPE, ct), (header::CACHE_CONTROL, "no-cache")], data).into_response()
+        }
+        _ => (StatusCode::NOT_FOUND, "no logo").into_response(),
+    }
+}
+
+async fn document_layout_page(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Document Layout"))).into_response();
+    }
+    let l = vortex_framework::print_layout::DocLayout::load(&db).await;
+    let has_logo = matches!(state.files.get(&db_ctx.db_name, LOGO_KEY_PL).await, Ok(Some(_)));
+    let logo_block = if has_logo {
+        r#"<img src="/settings/company-logo" alt="logo" style="max-height:70px;max-width:240px" class="bg-white p-2 rounded border"/>"#.to_string()
+    } else {
+        r#"<span class="text-sm opacity-60">No logo uploaded yet.</span>"#.to_string()
+    };
+    let sel = |v: &str| if l.paper_size == v { "selected" } else { "" };
+    let inner = format!(
+        r##"<div class="mb-4"><a href="/settings/print-templates" class="link text-sm">→ Print templates</a>
+<h1 class="text-2xl font-bold">Document Layout</h1>
+<p class="text-base-content/60">Branding shared by every printed document (quotations, invoices…). Set the logo, colour, font and footer once; every document picks them up.</p></div>
+
+<div class="card bg-base-100 shadow mb-6"><div class="card-body">
+<h2 class="card-title text-lg">Logo</h2>
+<div class="flex items-center gap-4 flex-wrap">{logo_block}
+<form method="post" action="/settings/document-layout/logo" enctype="multipart/form-data" class="flex items-center gap-2">
+<input type="file" name="logo" accept="image/png,image/jpeg" required class="file-input file-input-bordered file-input-sm"/>
+<button class="btn btn-primary btn-sm">Upload</button></form></div>
+<p class="text-xs opacity-50 mt-2">PNG or JPEG, under 512 KB.</p></div></div>
+
+<form method="post" action="/settings/document-layout" class="card bg-base-100 shadow"><div class="card-body grid md:grid-cols-2 gap-4">
+<label class="form-control"><span class="label-text">Brand colour</span>
+<input type="color" name="brand_color" value="{brand}" class="input input-bordered h-12 w-24 p-1"/></label>
+<label class="form-control"><span class="label-text">Paper size</span>
+<select name="paper_size" class="select select-bordered"><option {a4}>A4</option><option {lt}>Letter</option></select></label>
+<label class="form-control md:col-span-2"><span class="label-text">Font family (CSS)</span>
+<input name="font_family" value="{font}" class="input input-bordered"/></label>
+<label class="form-control md:col-span-2"><span class="label-text">Footer (HTML) — shown at the bottom of every document</span>
+<textarea name="footer_html" rows="2" class="textarea textarea-bordered">{footer}</textarea></label>
+<div class="md:col-span-2"><button class="btn btn-primary">Save branding</button></div>
+</div></form>"##,
+        logo_block = logo_block,
+        brand = html_escape(&l.brand_color),
+        a4 = sel("A4"),
+        lt = sel("Letter"),
+        font = html_escape(&l.font_family),
+        footer = html_escape(&l.footer_html),
+    );
+    webhooks_page_shell(&user, "Document Layout", &inner).into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct DocLayoutForm {
+    brand_color: String,
+    font_family: String,
+    footer_html: String,
+    paper_size: String,
+}
+
+async fn document_layout_save(
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Form(f): Form<DocLayoutForm>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Document Layout"))).into_response();
+    }
+    let l = vortex_framework::print_layout::DocLayout {
+        brand_color: f.brand_color,
+        font_family: f.font_family,
+        footer_html: f.footer_html,
+        paper_size: f.paper_size,
+    };
+    let _ = l.save(&db, Some(user.id)).await;
+    Redirect::to("/settings/document-layout").into_response()
+}
+
+async fn document_layout_logo(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    mut multipart: Multipart,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Document Layout"))).into_response();
+    }
+    let mut data: Option<Vec<u8>> = None;
+    while let Ok(Some(field)) = multipart.next_field().await {
+        if field.name() == Some("logo") {
+            if let Ok(bytes) = field.bytes().await {
+                data = Some(bytes.to_vec());
+            }
+        }
+    }
+    let Some(data) = data.filter(|d| !d.is_empty()) else {
+        return Redirect::to("/settings/document-layout").into_response();
+    };
+    if data.len() > 512 * 1024 {
+        return Redirect::to("/settings/document-layout").into_response();
+    }
+    let ct = if data.starts_with(&[0x89, b'P', b'N', b'G']) {
+        "image/png"
+    } else if data.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        "image/jpeg"
+    } else {
+        return Redirect::to("/settings/document-layout").into_response();
+    };
+    let _ = state.files.put(&db_ctx.db_name, LOGO_KEY_PL, &data, Some(ct)).await;
+    Redirect::to("/settings/document-layout").into_response()
+}
+
+async fn print_templates_list(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Print Templates"))).into_response();
+    }
+    let mut rows = String::new();
+    for d in state.print_docs.all() {
+        let custom = vortex_framework::print_layout::get_template(&db, &d.doc_type).await.is_some();
+        let badge = if custom {
+            r#"<span class="badge badge-success badge-sm">Customised</span>"#
+        } else {
+            r#"<span class="badge badge-ghost badge-sm">Default</span>"#
+        };
+        rows.push_str(&format!(
+            r#"<tr><td><a href="/settings/print-templates/{dt}" class="link link-primary font-medium">{label}</a><div class="text-xs opacity-50">{dt}</div></td><td>{badge}</td><td class="text-right"><a href="/settings/print-templates/{dt}" class="btn btn-ghost btn-xs">Edit</a></td></tr>"#,
+            dt = html_escape(&d.doc_type),
+            label = html_escape(&d.label),
+            badge = badge,
+        ));
+    }
+    if state.print_docs.is_empty() {
+        rows.push_str(r#"<tr><td colspan="3" class="text-center opacity-50 py-8">No printable documents are registered by the installed modules.</td></tr>"#);
+    }
+    let inner = format!(
+        r##"<div class="mb-4"><a href="/settings/document-layout" class="link text-sm">→ Document layout (logo &amp; branding)</a>
+<h1 class="text-2xl font-bold">Print Templates</h1>
+<p class="text-base-content/60">Change how each printable document looks — no coding needed. Open one to use the <b>Visual editor</b> (toggle sections, pick columns, rename labels, live preview), or switch to the <b>HTML</b> tab for full control. Branding (logo, colour, footer) comes from the Document Layout page.</p></div>
+<div class="card bg-base-100 shadow"><div class="card-body">
+<table class="table"><thead><tr><th>Document</th><th>Status</th><th></th></tr></thead><tbody>{rows}</tbody></table></div></div>"##,
+        rows = rows,
+    );
+    webhooks_page_shell(&user, "Print Templates", &inner).into_response()
+}
+
+async fn print_template_edit(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Path(doc_type): Path<String>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Print Templates"))).into_response();
+    }
+    let Some(d) = state.print_docs.get(&doc_type) else {
+        return (StatusCode::NOT_FOUND, "Unknown document type").into_response();
+    };
+    let custom = vortex_framework::print_layout::get_template(&db, &doc_type).await;
+    let is_custom = custom.is_some();
+    let body = custom.unwrap_or_else(|| d.default_template.clone());
+    let mut vars = String::new();
+    for (k, v) in &d.variables {
+        vars.push_str(&format!(
+            r#"<tr><td class="font-mono text-xs align-top">{}</td><td class="text-xs">{}</td></tr>"#,
+            html_escape(k),
+            html_escape(v),
+        ));
+    }
+    let status = if is_custom {
+        r#"<span class="badge badge-success badge-sm align-middle">Customised</span>"#
+    } else {
+        r#"<span class="badge badge-ghost badge-sm align-middle">Using default</span>"#
+    };
+    let dt_esc = html_escape(&doc_type);
+
+    // The advanced (raw-HTML) editor panel — always available.
+    let html_panel = format!(
+        r##"<form method="post" action="/settings/print-templates/{dt}/preview" target="_blank" id="tpl-form">
+<div class="grid lg:grid-cols-3 gap-4">
+<div class="lg:col-span-2 card bg-base-100 shadow"><div class="card-body">
+<textarea name="body" id="tpl-body" rows="26" class="textarea textarea-bordered font-mono text-xs w-full" spellcheck="false">{body}</textarea>
+<div class="flex gap-2 mt-3 flex-wrap">
+<button formaction="/settings/print-templates/{dt}" formtarget="_self" class="btn btn-primary btn-sm" name="action" value="save">Save</button>
+<button class="btn btn-outline btn-sm">Preview ↗</button>
+<button type="button" class="btn btn-ghost btn-sm" onclick="document.getElementById('tpl-body').value=document.getElementById('tpl-default').textContent">Load default</button>
+<button formaction="/settings/print-templates/{dt}" formtarget="_self" class="btn btn-ghost btn-sm text-error" name="action" value="reset" onclick="return confirm('Discard the custom template and use the built-in default?')">Reset to default</button>
+</div></div></div>
+<div class="card bg-base-100 shadow"><div class="card-body">
+<h2 class="card-title text-sm">Available variables</h2>
+<table class="table table-xs"><tbody>{vars}</tbody></table>
+<p class="text-xs opacity-60 mt-2">Preview renders with sample data; the real print uses the record's data and your uploaded logo.</p>
+</div></div>
+</div></form>
+<template id="tpl-default">{default}</template>"##,
+        dt = dt_esc,
+        body = html_escape(&body),
+        vars = vars,
+        default = html_escape(&d.default_template),
+    );
+
+    // The no-code Visual panel — only when the document exposes a config.
+    let (tabs, panels, lead) = if let Some(base) = &d.default_config {
+        // Which config populates the form: the saved visual state if any,
+        // else the built-in starting config. If a custom body exists but has
+        // no saved config, it was hand-edited in HTML — warn before overwrite.
+        let saved_cfg =
+            vortex_framework::print_layout::get_layout_config(&db, &doc_type).await;
+        let hand_edited = is_custom && saved_cfg.is_none();
+        let form_cfg = saved_cfg.unwrap_or_else(|| base.clone());
+        let warn = if hand_edited {
+            r#"<div class="alert alert-warning py-2 text-sm mb-3">This template was edited in the HTML tab. Saving from the Visual editor will replace those hand-made changes.</div>"#
+        } else {
+            ""
+        };
+        let form = render_visual_form(&form_cfg);
+        let visual_panel = format!(
+            r##"<div id="panel-visual">
+{warn}
+<form method="post" action="/settings/print-templates/{dt}/visual" id="vis-form">
+<div class="grid lg:grid-cols-2 gap-4">
+<div class="card bg-base-100 shadow"><div class="card-body max-h-[74vh] overflow-y-auto">
+{form}
+<div class="flex gap-2 mt-4 flex-wrap sticky bottom-0 bg-base-100 pt-3">
+<button class="btn btn-primary btn-sm">Save</button>
+<button formaction="/settings/print-templates/{dt}" formtarget="_self" class="btn btn-ghost btn-sm text-error" name="action" value="reset" onclick="return confirm('Discard customisations and use the built-in default?')">Reset to default</button>
+</div>
+</div></div>
+<div class="card bg-base-100 shadow"><div class="card-body">
+<div class="text-xs opacity-60 mb-2">Live preview — sample data</div>
+<iframe id="vis-preview" title="Live preview" sandbox="allow-same-origin" class="w-full rounded border border-base-300 bg-white" style="height:74vh"></iframe>
+</div></div>
+</div></form>
+</div>"##,
+            warn = warn,
+            dt = dt_esc,
+            form = form,
+        );
+        let tabbar = r##"<div role="tablist" class="tabs tabs-boxed mb-4 w-fit">
+<button type="button" id="tabbtn-visual" class="tab tab-active" data-panel="panel-visual">Visual editor</button>
+<button type="button" id="tabbtn-html" class="tab" data-panel="panel-html">HTML (advanced)</button>
+</div>"##
+            .to_string();
+        (
+            tabbar,
+            format!("{visual}<div id=\"panel-html\" style=\"display:none\">{html}</div>", visual = visual_panel, html = html_panel),
+            "Toggle sections and edit labels on the left; the preview updates as you go. Switch to <b>HTML</b> for full control.",
+        )
+    } else {
+        (
+            String::new(),
+            format!("<div id=\"panel-html\">{}</div>", html_panel),
+            "Edit the HTML below and hit Preview to see it with sample data. Save to make it live; Reset restores the built-in default.",
+        )
+    };
+
+    // Combined tab-switch + live-preview script (CSP: script-src 'self'
+    // 'unsafe-inline'). No inline handlers on the tab buttons.
+    let script = PRINT_EDITOR_JS.replace("__DT__", &doc_type.replace('"', ""));
+
+    let inner = format!(
+        r##"<div class="mb-4"><a href="/settings/print-templates" class="link text-sm">← Print templates</a>
+<h1 class="text-2xl font-bold">{label} template {status}</h1>
+<p class="text-base-content/60">{lead}</p></div>
+{tabs}
+{panels}
+<script>{script}</script>"##,
+        label = html_escape(&d.label),
+        status = status,
+        lead = lead,
+        tabs = tabs,
+        panels = panels,
+        script = script,
+    );
+    webhooks_page_shell(&user, &d.label, &inner).into_response()
+}
+
+/// Client script for the print-template editor: tab switching and the Visual
+/// editor's debounced live preview (posts the form, drops the returned HTML
+/// into the preview iframe). `__DT__` is replaced with the document type.
+const PRINT_EDITOR_JS: &str = r#"
+(function(){
+  var btns = document.querySelectorAll('[data-panel]');
+  btns.forEach(function(b){
+    b.addEventListener('click', function(){
+      var target = b.getAttribute('data-panel');
+      document.querySelectorAll('#panel-visual,#panel-html').forEach(function(p){
+        p.style.display = (p.id === target) ? '' : 'none';
+      });
+      btns.forEach(function(x){ x.classList.toggle('tab-active', x === b); });
+    });
+  });
+  var form = document.getElementById('vis-form');
+  var frame = document.getElementById('vis-preview');
+  if(form && frame){
+    var url = '/settings/print-templates/__DT__/visual/preview';
+    var t;
+    function refresh(){
+      var data = new URLSearchParams(new FormData(form));
+      fetch(url, {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:data.toString()})
+        .then(function(r){ return r.text(); })
+        .then(function(html){ frame.srcdoc = html; })
+        .catch(function(){});
+    }
+    form.addEventListener('input', function(){ clearTimeout(t); t=setTimeout(refresh, 250); });
+    form.addEventListener('change', function(){ clearTimeout(t); t=setTimeout(refresh, 250); });
+    refresh();
+  }
+})();
+"#;
+
+#[derive(serde::Deserialize)]
+struct PrintTplForm {
+    body: Option<String>,
+    action: Option<String>,
+}
+
+async fn print_template_save(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Path(doc_type): Path<String>,
+    Form(f): Form<PrintTplForm>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Print Templates"))).into_response();
+    }
+    if state.print_docs.get(&doc_type).is_none() {
+        return (StatusCode::NOT_FOUND, "Unknown document type").into_response();
+    }
+    let body = f.body.unwrap_or_default();
+    if f.action.as_deref() == Some("reset") || body.trim().is_empty() {
+        let _ = vortex_framework::print_layout::clear_template(&db, &doc_type).await;
+    } else {
+        let _ = vortex_framework::print_layout::save_template(&db, &doc_type, &body, Some(user.id)).await;
+    }
+    Redirect::to(&format!("/settings/print-templates/{}", doc_type)).into_response()
+}
+
+async fn print_template_preview(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(doc_type): Path<String>,
+    Form(f): Form<PrintTplForm>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Print Templates"))).into_response();
+    }
+    let Some(d) = state.print_docs.get(&doc_type) else {
+        return (StatusCode::NOT_FOUND, "Unknown document type").into_response();
+    };
+    let layout = vortex_framework::print_layout::DocLayout::load(&db).await;
+    let body = f.body.unwrap_or_default();
+    let body = if body.trim().is_empty() { d.default_template.clone() } else { body };
+    let mut globals = d.sample_globals.clone();
+    if matches!(state.files.get(&db_ctx.db_name, LOGO_KEY_PL).await, Ok(Some(_))) {
+        globals.insert("company.logo".into(), "/settings/company-logo".into());
+    }
+    let title = format!("{} (preview)", d.label);
+    let html = vortex_framework::print_layout::render_body(&layout, &title, &body, &globals, &d.sample_lines);
+    Html(html).into_response()
+}
+
+/// Render the no-code Visual editor form from a [`LayoutConfig`]. Every control
+/// carries the field name that [`layout_config_from_form`] reads back.
+fn render_visual_form(cfg: &vortex_framework::print_layout::LayoutConfig) -> String {
+    let cbx = |name: &str, label: &str, checked: bool| -> String {
+        format!(
+            r#"<label class="label cursor-pointer justify-start gap-3 py-1"><input type="checkbox" name="{n}" class="checkbox checkbox-sm" {c}/><span class="label-text">{l}</span></label>"#,
+            n = name,
+            c = if checked { "checked" } else { "" },
+            l = html_escape(label),
+        )
+    };
+    let txt = |name: &str, label: &str, value: &str| -> String {
+        format!(
+            r#"<label class="form-control w-full"><span class="label-text text-xs opacity-70">{l}</span><input type="text" name="{n}" value="{v}" class="input input-bordered input-sm w-full" maxlength="80"/></label>"#,
+            n = name,
+            l = html_escape(label),
+            v = html_escape(value),
+        )
+    };
+    let section = |title: &str, body: &str| -> String {
+        format!(
+            r#"<div class="mb-4"><div class="text-xs font-semibold uppercase tracking-wide opacity-50 mb-1 border-b border-base-300 pb-1">{t}</div>{b}</div>"#,
+            t = html_escape(title),
+            b = body,
+        )
+    };
+
+    // Header
+    let header = format!(
+        "{title}{logo}{addr}{reg}<div class=\"mt-2 grid grid-cols-1 gap-1\">{num}{date}{val}</div>{vallbl}",
+        title = txt("title", "Document title", &cfg.title),
+        logo = cbx("show_logo", "Show company logo", cfg.show_logo),
+        addr = cbx("show_company_address", "Show company address", cfg.show_company_address),
+        reg = cbx("show_company_reg", "Show company registration no.", cfg.show_company_reg),
+        num = cbx("show_number", "Show document number", cfg.show_number),
+        date = cbx("show_date", "Show date", cfg.show_date),
+        val = cbx("show_validity", "Show validity / due date", cfg.show_validity),
+        vallbl = txt("validity_label", "Validity row label", &cfg.validity_label),
+    );
+
+    // Customer
+    let customer = format!(
+        "{show}{label}",
+        show = cbx("show_customer", "Show bill-to / customer block", cfg.show_customer),
+        label = txt("customer_label", "Bill-to label", &cfg.customer_label),
+    );
+
+    // Columns
+    let mut cols = String::from(r#"<div class="text-xs opacity-60 mb-2">Tick a column to show it; edit its heading.</div>"#);
+    for c in &cfg.columns {
+        cols.push_str(&format!(
+            r#"<div class="flex items-center gap-2 mb-1">{show}<input type="text" name="col_label_{key}" value="{label}" class="input input-bordered input-xs flex-1" maxlength="40"/><span class="badge badge-ghost badge-xs font-mono">{key}</span></div>"#,
+            show = cbx(&format!("col_show_{}", c.key), "", c.show),
+            key = html_escape(&c.key),
+            label = html_escape(&c.label),
+        ));
+    }
+
+    // Totals
+    let totals = format!(
+        "{sub}{subl}{tax}{taxl}{totl}",
+        sub = cbx("show_subtotal", "Show subtotal row", cfg.show_subtotal),
+        subl = txt("subtotal_label", "Subtotal label", &cfg.subtotal_label),
+        tax = cbx("show_tax", "Show tax row", cfg.show_tax),
+        taxl = txt("tax_label", "Tax label", &cfg.tax_label),
+        totl = txt("total_label", "Total label", &cfg.total_label),
+    );
+
+    // Notes & signatures
+    let notes = format!(
+        "{n}{nl}{s}{sl}{sr}",
+        n = cbx("show_notes", "Show notes block", cfg.show_notes),
+        nl = txt("notes_label", "Notes heading", &cfg.notes_label),
+        s = cbx("show_signatures", "Show signature strip", cfg.show_signatures),
+        sl = txt("sign_left", "Left signature label", &cfg.sign_left),
+        sr = txt("sign_right", "Right signature label", &cfg.sign_right),
+    );
+
+    format!(
+        "{}{}{}{}{}",
+        section("Header", &header),
+        section("Bill-to", &customer),
+        section("Line columns", &cols),
+        section("Totals", &totals),
+        section("Notes &amp; signatures", &notes),
+    )
+}
+
+/// Build a [`LayoutConfig`] from the submitted Visual-editor form. Column keys
+/// and order come from `base` (plugin-defined); the form only overrides the
+/// `show` flag and the label of each. Absent checkbox names mean unchecked.
+fn layout_config_from_form(
+    base: &vortex_framework::print_layout::LayoutConfig,
+    f: &std::collections::HashMap<String, String>,
+) -> vortex_framework::print_layout::LayoutConfig {
+    let has = |k: &str| f.contains_key(k);
+    let txt = |k: &str, d: &str| {
+        f.get(k)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| d.to_string())
+    };
+    let mut cfg = base.clone();
+    cfg.title = txt("title", &base.title);
+    cfg.show_logo = has("show_logo");
+    cfg.show_company_address = has("show_company_address");
+    cfg.show_company_reg = has("show_company_reg");
+    cfg.show_customer = has("show_customer");
+    cfg.customer_label = txt("customer_label", &base.customer_label);
+    cfg.show_number = has("show_number");
+    cfg.show_date = has("show_date");
+    cfg.show_validity = has("show_validity");
+    cfg.validity_label = txt("validity_label", &base.validity_label);
+    cfg.show_subtotal = has("show_subtotal");
+    cfg.show_tax = has("show_tax");
+    cfg.subtotal_label = txt("subtotal_label", &base.subtotal_label);
+    cfg.tax_label = txt("tax_label", &base.tax_label);
+    cfg.total_label = txt("total_label", &base.total_label);
+    cfg.show_notes = has("show_notes");
+    cfg.notes_label = txt("notes_label", &base.notes_label);
+    cfg.show_signatures = has("show_signatures");
+    cfg.sign_left = txt("sign_left", &base.sign_left);
+    cfg.sign_right = txt("sign_right", &base.sign_right);
+    for (i, col) in base.columns.iter().enumerate() {
+        cfg.columns[i].show = has(&format!("col_show_{}", col.key));
+        cfg.columns[i].label = txt(&format!("col_label_{}", col.key), &col.label);
+    }
+    cfg
+}
+
+async fn print_template_visual_save(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Path(doc_type): Path<String>,
+    Form(f): Form<std::collections::HashMap<String, String>>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Print Templates"))).into_response();
+    }
+    let Some(d) = state.print_docs.get(&doc_type) else {
+        return (StatusCode::NOT_FOUND, "Unknown document type").into_response();
+    };
+    let Some(base) = &d.default_config else {
+        return (StatusCode::BAD_REQUEST, "This document has no visual editor").into_response();
+    };
+    let cfg = layout_config_from_form(base, &f);
+    let _ = vortex_framework::print_layout::save_layout(&db, &doc_type, &cfg, Some(user.id)).await;
+    Redirect::to(&format!("/settings/print-templates/{}", doc_type)).into_response()
+}
+
+async fn print_template_visual_preview(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(doc_type): Path<String>,
+    Form(f): Form<std::collections::HashMap<String, String>>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Print Templates"))).into_response();
+    }
+    let Some(d) = state.print_docs.get(&doc_type) else {
+        return (StatusCode::NOT_FOUND, "Unknown document type").into_response();
+    };
+    let Some(base) = &d.default_config else {
+        return (StatusCode::BAD_REQUEST, "This document has no visual editor").into_response();
+    };
+    let cfg = layout_config_from_form(base, &f);
+    let body = vortex_framework::print_layout::build_template(&cfg);
+    let layout = vortex_framework::print_layout::DocLayout::load(&db).await;
+    let mut globals = d.sample_globals.clone();
+    if matches!(state.files.get(&db_ctx.db_name, LOGO_KEY_PL).await, Ok(Some(_))) {
+        globals.insert("company.logo".into(), "/settings/company-logo".into());
+    }
+    let title = format!("{} (preview)", d.label);
+    let html = vortex_framework::print_layout::render_body(&layout, &title, &body, &globals, &d.sample_lines);
+    Html(html).into_response()
 }
 
 /// Comma/space/newline separated event types -> Vec, empty -> [] (all events).
@@ -14212,8 +17967,8 @@ async fn sequences_list(
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Sequences - Settings</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=4" rel="stylesheet"/>
-<script src="/static/vortex.js?v=4" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script>
     <script src="/static/vendor/htmx.min.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
@@ -14417,8 +18172,8 @@ async fn sequence_edit(
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{} - Sequence</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=4" rel="stylesheet"/>
-<script src="/static/vortex.js?v=4" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg">
@@ -14609,8 +18364,8 @@ async fn cron_list(
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Scheduled Jobs - Settings</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=4" rel="stylesheet"/>
-<script src="/static/vortex.js?v=4" defer></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script>
     <script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
@@ -14831,8 +18586,8 @@ async fn cron_edit(
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{} - Scheduled Job</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=4" rel="stylesheet"/>
-<script src="/static/vortex.js?v=4" defer></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script>
     <script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
@@ -15407,8 +19162,8 @@ async fn reports_list(Db(db): Db, Extension(user): Extension<AuthUser>) -> Respo
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Reports - Settings</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=4" rel="stylesheet"/>
-<script src="/static/vortex.js?v=4" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg"><div class="flex-1"><a href="/" class="btn btn-ghost text-xl">remicle</a></div><div class="flex-none"><span class="text-sm">@{user}</span></div></div>
@@ -15601,8 +19356,8 @@ async fn report_edit(Db(db): Db, Extension(user): Extension<AuthUser>, Path(id):
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{name} - Report</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=4" rel="stylesheet"/>
-<script src="/static/vortex.js?v=4" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg"><div class="flex-1"><a href="/" class="btn btn-ghost text-xl">remicle</a></div><div class="flex-none"><span class="text-sm">@{user}</span></div></div>
@@ -15811,16 +19566,7 @@ async fn reports_hub(
         <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">{cards}</div>"##,
         author_btn = author_btn, cards = cards,
     );
-    let html = format!(
-        r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><title>Reports - Remicle</title>
-<meta name="viewport" content="width=device-width, initial-scale=1.0"><link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=4" rel="stylesheet"/>
-<script src="/static/vortex.js?v=4" defer></script><script src="/static/vendor/tailwind.js"></script></head>
-<body class="min-h-screen bg-base-200"><div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a></div>
-<div id="sidebar-overlay" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
-<div class="flex">{sidebar}<main class="flex-1 p-4 lg:p-6 min-w-0">{content}</main></div></body></html>"#,
-        sidebar = sidebar, content = content,
-    );
+    let html = vortex_framework::render_app_shell("Reports - Remicle", &sidebar, &content);
     Html(html).into_response()
 }
 
@@ -16013,13 +19759,12 @@ async fn report_runs_page(
         <tbody>{trs}</tbody></table></div></div>"##,
         days = vortex_framework::report_jobs::retention_days(), who_th = who_th, trs = trs,
     );
-    let html = format!(
-        r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><title>Generated Reports - Remicle</title>{refresh}
-<meta name="viewport" content="width=device-width, initial-scale=1.0"><link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=4" rel="stylesheet"/>
-<script src="/static/vortex.js?v=4" defer></script><script src="/static/vendor/tailwind.js"></script></head>
-<body class="min-h-screen bg-base-200"><div class="flex">{sidebar}<main class="flex-1 p-4 lg:p-6 min-w-0">{content}</main></div></body></html>"#,
-        refresh = refresh, sidebar = sidebar, content = content,
+    let html = vortex_framework::render_app_shell_with(
+        "Generated Reports - Remicle",
+        &sidebar,
+        &content,
+        &refresh,
+        "",
     );
     Html(html).into_response()
 }
@@ -16158,8 +19903,10 @@ async fn dynamic_form_new(
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
     Path(model_name): Path<String>,
+    Query(prefill): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
-    render_dynamic_form(&db, &user, &model_name, None).await
+    let _ = &state;
+    render_dynamic_form(&db, &user, &model_name, None, &prefill).await
 }
 
 async fn dynamic_form_edit(
@@ -16168,7 +19915,8 @@ async fn dynamic_form_edit(
     Extension(user): Extension<AuthUser>,
     Path((model_name, record_id)): Path<(String, uuid::Uuid)>,
 ) -> Response {
-    render_dynamic_form(&db, &user, &model_name, Some(record_id)).await
+    let _ = &state;
+    render_dynamic_form(&db, &user, &model_name, Some(record_id), &std::collections::HashMap::new()).await
 }
 
 async fn render_dynamic_form(
@@ -16176,6 +19924,10 @@ async fn render_dynamic_form(
     user: &AuthUser,
     model_name: &str,
     record_id: Option<uuid::Uuid>,
+    // Query-param seed values for a brand-new record (e.g. the calendar's
+    // "click a day to create" pre-fills the date field). Only keys that match a
+    // registered, editable field are applied.
+    prefill: &std::collections::HashMap<String, String>,
 ) -> Response {
     // Fetch model metadata
     let model_row = match sqlx::query(
@@ -16196,17 +19948,39 @@ async fn render_dynamic_form(
         return (StatusCode::BAD_REQUEST, Html("Invalid model")).into_response();
     }
 
-    // Fetch field definitions
-    let fields = sqlx::query(
-        "SELECT name, display_name, field_type, selection_options, related_model, widget
+    // Fetch field definitions. NB: do not SELECT `widget` — that column is
+    // absent on some drifted tenant DBs, and its value was read but never used,
+    // so dropping it makes the generic form robust to that drift.
+    //
+    // Fail loud, don't blank: a query error (or an empty registry) used to fall
+    // through `unwrap_or_default()` to zero rows, rendering a silently-empty
+    // form that drops every field on save. Both cases are now surfaced as an
+    // error page instead of a plausible-looking blank form (§2 #2).
+    let fields = match sqlx::query(
+        "SELECT name, display_name, field_type, selection_options, related_model
          FROM ir_model_field
          WHERE model_id = $1 AND name NOT IN ('id', 'created_at', 'updated_at', 'active')
          ORDER BY sequence, display_name"
     )
     .bind(model_id)
     .fetch_all(db)
-    .await
-    .unwrap_or_default();
+    .await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!(model = model_name, error = %e, "generic form: field-definition query failed");
+            return error_response(&format!(
+                "Could not load the field layout for '{}'. The model registry may be out of sync — try Update Apps List, or contact an administrator.",
+                model_name
+            ));
+        }
+    };
+    if fields.is_empty() {
+        tracing::error!(model = model_name, "generic form: no registered fields (registry drift)");
+        return error_response(&format!(
+            "No editable fields are registered for '{}'. The model registry is out of sync with the database schema.",
+            model_name
+        ));
+    }
 
     // Fetch existing record if editing
     let record_data: std::collections::HashMap<String, String> = if let Some(rid) = record_id {
@@ -16220,6 +19994,17 @@ async fn render_dynamic_form(
                     .or_else(|_| row.try_get::<i32, _>(col_name).map(|v| v.to_string()))
                     .or_else(|_| row.try_get::<i64, _>(col_name).map(|v| v.to_string()))
                     .or_else(|_| row.try_get::<bool, _>(col_name).map(|v| v.to_string()))
+                    // Date/datetime columns must be extracted explicitly, else
+                    // they fall through to `unwrap_or_default()` and the edit
+                    // form shows a blank date (e.g. a calendar event's date).
+                    .or_else(|_| row.try_get::<chrono::NaiveDate, _>(col_name).map(|v| v.to_string()))
+                    .or_else(|_| row.try_get::<chrono::NaiveDateTime, _>(col_name).map(|v| v.format("%Y-%m-%dT%H:%M").to_string()))
+                    .or_else(|_| row.try_get::<chrono::DateTime<chrono::Utc>, _>(col_name).map(|v| v.format("%Y-%m-%dT%H:%M").to_string()))
+                    // Numeric columns: NUMERIC/DECIMAL decode as Decimal, double
+                    // precision as f64. Without these arms a monetary/decimal
+                    // field renders blank and is silently dropped on save.
+                    .or_else(|_| row.try_get::<sqlx::types::Decimal, _>(col_name).map(|v| v.to_string()))
+                    .or_else(|_| row.try_get::<f64, _>(col_name).map(|v| v.to_string()))
                     .or_else(|_| row.try_get::<uuid::Uuid, _>(col_name).map(|v| v.to_string()))
                     .unwrap_or_default();
                 data.insert(col_name.to_string(), value);
@@ -16229,7 +20014,14 @@ async fn render_dynamic_form(
             std::collections::HashMap::new()
         }
     } else {
-        std::collections::HashMap::new()
+        // New record: seed only from query params that name a registered field.
+        let known: std::collections::HashSet<String> =
+            fields.iter().map(|f| f.get::<String, _>("name")).collect();
+        prefill
+            .iter()
+            .filter(|(k, _)| known.contains(k.as_str()))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
     };
 
     // Build form fields HTML
@@ -16240,7 +20032,6 @@ async fn render_dynamic_form(
         let field_type: String = field.get("field_type");
         let selection_options: Option<serde_json::Value> = field.get("selection_options");
         let relation_model: Option<String> = field.get("related_model");
-        let widget: Option<String> = field.get("widget");
 
         let current_value = record_data.get(&field_name).cloned().unwrap_or_default();
         let required_attr = "";  // Can add required logic later based on field metadata
@@ -16392,8 +20183,8 @@ async fn render_dynamic_form(
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{}</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=4" rel="stylesheet"/>
-<script src="/static/vortex.js?v=4" defer></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script>
     <script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
@@ -16586,6 +20377,32 @@ async fn api_states(State(state): State<Arc<AppState>>, Db(db): Db, Path(country
     axum::Json(data).into_response()
 }
 
+/// Query for the many2one typeahead: an opaque signed descriptor `src` plus
+/// the partial text `q`. See [`vortex_framework::form::LookupSource`].
+#[derive(serde::Deserialize)]
+struct LookupParams {
+    src: String,
+    #[serde(default)]
+    q: String,
+}
+
+/// `GET /api/lookup?src=<signed>&q=<text>` — suggestion feed for reference
+/// fields. `src` is a server-signed [`LookupSource`]; an unverifiable token is
+/// refused (empty result), so a session user can never search an arbitrary
+/// table. Session-authenticated and tenant-scoped like any other UI endpoint.
+async fn api_lookup(Db(db): Db, Query(params): Query<LookupParams>) -> Response {
+    let Some(src) = vortex_framework::form::LookupSource::decode(&params.src) else {
+        return axum::Json(serde_json::json!({ "results": [] })).into_response();
+    };
+    let results: Vec<serde_json::Value> = src
+        .search(&db, &params.q)
+        .await
+        .into_iter()
+        .map(|(id, label)| serde_json::json!({ "id": id, "label": label }))
+        .collect();
+    axum::Json(serde_json::json!({ "results": results })).into_response()
+}
+
 #[cfg(test)]
 mod tenant_host_tests {
     use super::*;
@@ -16644,5 +20461,77 @@ mod tenant_host_tests {
         // match every database once %h is escaped.
         assert!(host_filtered_databases("^%h$", ".*.vortex.com", &all).is_empty());
         assert!(host_filtered_databases("^%h$", "gaia|remicle.vortex.com", &all).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod pivot_expr_tests {
+    use super::compile_pivot_expr;
+    use std::collections::HashSet;
+
+    fn nums() -> HashSet<String> {
+        ["quantity", "unit_price", "discount", "amount_total"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn compiles_arithmetic_over_numeric_columns() {
+        let n = nums();
+        let sql = compile_pivot_expr("quantity * unit_price", &n).unwrap();
+        assert_eq!(sql, "(CAST(t.quantity AS NUMERIC) * CAST(t.unit_price AS NUMERIC))");
+    }
+
+    #[test]
+    fn precedence_is_parenthesised() {
+        let n = nums();
+        let sql = compile_pivot_expr("quantity + unit_price * discount", &n).unwrap();
+        // multiplication binds tighter than addition
+        assert_eq!(
+            sql,
+            "(CAST(t.quantity AS NUMERIC) + (CAST(t.unit_price AS NUMERIC) * CAST(t.discount AS NUMERIC)))"
+        );
+    }
+
+    #[test]
+    fn division_guards_against_zero() {
+        let n = nums();
+        let sql = compile_pivot_expr("amount_total / quantity", &n).unwrap();
+        assert_eq!(sql, "(CAST(t.amount_total AS NUMERIC) / NULLIF(CAST(t.quantity AS NUMERIC), 0))");
+    }
+
+    #[test]
+    fn parens_and_unary_minus() {
+        let n = nums();
+        let sql = compile_pivot_expr("-(quantity - 1)", &n).unwrap();
+        assert_eq!(sql, "(- (CAST(t.quantity AS NUMERIC) - (1)))");
+    }
+
+    #[test]
+    fn rejects_unknown_field() {
+        let n = nums();
+        assert!(compile_pivot_expr("quantity * evil", &n).is_err());
+    }
+
+    #[test]
+    fn rejects_non_numeric_or_injection_attempts() {
+        let n = nums();
+        // SQL injection / statement breaking
+        assert!(compile_pivot_expr("1; DROP TABLE sales_order", &n).is_err());
+        assert!(compile_pivot_expr("quantity) FROM users --", &n).is_err());
+        // function calls are not in the grammar
+        assert!(compile_pivot_expr("pg_sleep(5)", &n).is_err());
+        assert!(compile_pivot_expr("count(quantity)", &n).is_err());
+        // subquery / string literal characters are illegal tokens
+        assert!(compile_pivot_expr("'x'", &n).is_err());
+        assert!(compile_pivot_expr("quantity + (SELECT 1)", &n).is_err());
+        // dotted / qualified identifiers rejected by validate_identifier + grammar
+        assert!(compile_pivot_expr("t.password", &n).is_err());
+        // unbalanced parens
+        assert!(compile_pivot_expr("(quantity + unit_price", &n).is_err());
+        // empty / trailing operator
+        assert!(compile_pivot_expr("", &n).is_err());
+        assert!(compile_pivot_expr("quantity +", &n).is_err());
     }
 }

@@ -1,0 +1,27 @@
+/* Configurable graph view. Reuses the pivot pane classes (pv-side, pv-zone,
+   pv-chip, pv-field) from pivot.css; this file adds only the chart canvas and
+   the chart-type picker. Theme-aware via the daisyUI oklch custom properties. */
+
+.g-wrap { display: flex; gap: 1rem; align-items: flex-start; }
+.g-main { flex: 1; min-width: 0; }
+@media (max-width: 1024px) { .g-wrap { flex-direction: column; } .g-main { width: 100%; } }
+
+/* Chart canvas card */
+.g-chart-wrap {
+  position: relative;
+  background: oklch(var(--b1)); border: 1px solid oklch(var(--b3));
+  border-radius: 0.5rem; padding: 1rem;
+  height: 460px;
+}
+#g-canvas { max-width: 100%; }
+.g-hint { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-size: .85rem; opacity: .55; text-align: center; padding: 2rem; }
+
+/* Chart-type picker */
+.g-types { display: flex; flex-wrap: wrap; gap: .3rem; margin-bottom: .75rem; }
+.g-type {
+  font-size: .75rem; padding: .3rem .6rem; cursor: pointer;
+  background: oklch(var(--b1)); border: 1px solid oklch(var(--b3));
+  border-radius: .375rem; color: oklch(var(--bc)/.8);
+}
+.g-type:hover { border-color: #8BC53F; color: oklch(var(--bc)); }
+.g-type-on { background: #8BC53F; border-color: #8BC53F; color: #000; font-weight: 600; }

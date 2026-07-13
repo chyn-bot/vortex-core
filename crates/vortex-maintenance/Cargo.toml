@@ -13,4 +13,9 @@ description = "Maintenance / CMMS plugin — generic assets, work orders and pre
 
 [dependencies]
 vortex-plugin-sdk = { workspace = true }
+# Direct deps required by `#[derive(Model)]` (macro emits absolute vortex_orm:: / vortex_common:: paths).
+vortex-orm = { workspace = true }
+vortex-common = { workspace = true }
+uuid = { workspace = true }
+serde = { workspace = true }
 vortex-inventory = { workspace = true }

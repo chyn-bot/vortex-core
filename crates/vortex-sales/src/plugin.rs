@@ -12,6 +12,14 @@ const MIG_001_SALES: &str = include_str!("../migrations/001_sales/postgres.sql")
 const MIG_002_REGISTRY: &str = include_str!("../migrations/002_sales_registry/postgres.sql");
 const MIG_003_DELIVERY: &str = include_str!("../migrations/003_delivery_docs/postgres.sql");
 const MIG_004_QUOTATIONS: &str = include_str!("../migrations/004_quotations/postgres.sql");
+const MIG_005_DESC_TEXT: &str = include_str!("../migrations/005_line_description_text/postgres.sql");
+const MIG_006_QUOTE_FIELDS: &str = include_str!("../migrations/006_quote_fields/postgres.sql");
+const MIG_007_DISPLAY_TYPE: &str = include_str!("../migrations/007_line_display_type/postgres.sql");
+const MIG_008_QUOTE_DISCOUNT: &str = include_str!("../migrations/008_quote_discount/postgres.sql");
+const MIG_009_LINE_UOM: &str = include_str!("../migrations/009_line_uom/postgres.sql");
+const MIG_010_NOTE_TEMPLATES: &str = include_str!("../migrations/010_note_templates/postgres.sql");
+const MIG_011_PAYMENT_TERM: &str = include_str!("../migrations/011_payment_term/postgres.sql");
+const MIG_012_LIST_URL: &str = include_str!("../migrations/012_list_url/postgres.sql");
 
 pub struct SalesPlugin;
 
@@ -31,6 +39,13 @@ impl Default for SalesPlugin {
 impl Plugin for SalesPlugin {
     fn technical_name(&self) -> &'static str {
         "sales"
+    }
+
+    /// Sales models projected into the metadata registry from their
+    /// `#[derive(Model)]` structs — supersedes migration `002_sales_registry`.
+    fn models(&self) -> Vec<&'static vortex_orm::model::ModelMeta> {
+        use vortex_orm::model::Model;
+        vec![crate::model::SalesOrder::meta()]
     }
 
     fn display_name(&self) -> &'static str {
@@ -69,6 +84,11 @@ impl Plugin for SalesPlugin {
         handlers::sales_routes()
     }
 
+    /// The quotation is user-customisable in Settings ▸ Print Templates.
+    fn print_docs(&self) -> Vec<PrintDocType> {
+        vec![handlers::quotation_print_doc()]
+    }
+
     fn menu_entries(&self) -> Vec<MenuEntry> {
         vec![
             MenuEntry::new("sales.quotes", "Quotations", "/sales/quotes", MenuGroup::Operations)
@@ -77,6 +97,19 @@ impl Plugin for SalesPlugin {
             MenuEntry::new("sales.orders", "Sales Orders", "/sales", MenuGroup::Operations)
                 .with_icon("cart")
                 .with_priority(38),
+            // Configuration — collapsible parent, Odoo-style.
+            MenuEntry::new("sales.config", "Configuration", "#", MenuGroup::Operations)
+                .with_icon("cog")
+                .with_priority(95),
+            MenuEntry::new(
+                "sales.note_templates",
+                "Terms Templates",
+                "/sales/note-templates",
+                MenuGroup::Operations,
+            )
+            .with_icon("file-text")
+            .with_priority(96)
+            .under("sales.config"),
         ]
     }
 
@@ -107,6 +140,56 @@ impl Plugin for SalesPlugin {
                 up_sql: MIG_004_QUOTATIONS,
                 down_sql: None,
                 requires_core_migration: Some("122_model_registry"),
+            },
+            PluginMigration {
+                name: "005_line_description_text",
+                up_sql: MIG_005_DESC_TEXT,
+                down_sql: None,
+                requires_core_migration: None,
+            },
+            PluginMigration {
+                name: "006_quote_fields",
+                up_sql: MIG_006_QUOTE_FIELDS,
+                down_sql: None,
+                requires_core_migration: None,
+            },
+            PluginMigration {
+                name: "007_line_display_type",
+                up_sql: MIG_007_DISPLAY_TYPE,
+                down_sql: None,
+                requires_core_migration: None,
+            },
+            PluginMigration {
+                name: "008_quote_discount",
+                up_sql: MIG_008_QUOTE_DISCOUNT,
+                down_sql: None,
+                requires_core_migration: None,
+            },
+            PluginMigration {
+                name: "009_line_uom",
+                up_sql: MIG_009_LINE_UOM,
+                down_sql: None,
+                requires_core_migration: Some("119_commerce_primitives"),
+            },
+            PluginMigration {
+                name: "010_note_templates",
+                up_sql: MIG_010_NOTE_TEMPLATES,
+                down_sql: None,
+                requires_core_migration: None,
+            },
+            // References the accounting-owned `payment_term` table (accounting
+            // migration 016); accounting registers before sales.
+            PluginMigration {
+                name: "011_payment_term",
+                up_sql: MIG_011_PAYMENT_TERM,
+                down_sql: None,
+                requires_core_migration: None,
+            },
+            PluginMigration {
+                name: "012_list_url",
+                up_sql: MIG_012_LIST_URL,
+                down_sql: None,
+                requires_core_migration: Some("123_model_list_url"),
             },
         ]
     }

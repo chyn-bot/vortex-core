@@ -109,6 +109,7 @@ it probably already exists, audited and tested.
 | List framework | Declarative list views: pagination (clamped), filters, group-by, aggregates — one definition, full UI | `vortex_framework::list` |
 | Form engine | Declare a form once (`FormConfig`/`FormField`) → rendering, widget inference by field kind (text/number/date/checkbox/select/many2one), server-side validation with error round-trip, and type-safe INSERT/UPDATE. Handlers shrink to authorize → save → audit | `vortex_framework::form` |
 | Record UX | Field-change tracking (`Tracker`), Odoo-style status bar, rendered audit trail, chatter (messages + secure attachments) on any record | `vortex_framework` + `vortex-chatter` |
+| Record duplication | Odoo-style Duplicate on any record: declarative copy spec (skip → DB default, set → override, ` (copy)` suffix, child line tables cloned with counters reset) in one transaction, plus the standard header button and `POST /api/v1/{model}/{id}/duplicate` | `DuplicateSpec`/`ChildCopy`/`duplicate_button` (SDK prelude) |
 
 ### Process
 | Primitive | What it gives you | Entry point |

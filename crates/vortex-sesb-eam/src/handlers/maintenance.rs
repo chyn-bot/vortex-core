@@ -28,6 +28,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/sesb-eam/maintenance/{id}", get(edit_wo))
         .route("/sesb-eam/maintenance/{id}", post(update_wo))
         .route("/sesb-eam/maintenance/{id}/action/{action}", post(wo_action))
+        .route("/sesb-eam/maintenance/{id}/duplicate", post(duplicate_wo))
         .route("/sesb-eam/maintenance/{id}/parts/add", post(add_part_line))
         .route("/sesb-eam/maintenance/{id}/parts/{line_id}/delete", post(del_part_line))
 }
@@ -252,18 +253,21 @@ async fn edit_wo(
 
     let actions = state_actions(&wstate, id);
     let history = vortex_plugin_sdk::framework::render_audit_trail(&db, "eam_maintenance", id).await;
+    let activity_panel = vortex_plugin_sdk::framework::render_chatter_panel("eam_maintenance", id);
     let header = format!(
         r#"<div class="flex items-center justify-between mb-3"><div>
 <a href="/sesb-eam/maintenance" class="btn btn-ghost btn-sm mb-2">← Back to Work Orders</a>
-<h1 class="text-2xl font-bold">{num} {badge}</h1><div class="text-sm opacity-60">{eq}</div></div></div>"#,
-        num = esc(&number), badge = state_badge(&wstate), eq = esc(equipment_name.as_deref().unwrap_or("")));
+<h1 class="text-2xl font-bold">{num} {badge}</h1><div class="text-sm opacity-60">{eq}</div></div>{dup}</div>"#,
+        num = esc(&number), badge = state_badge(&wstate), eq = esc(equipment_name.as_deref().unwrap_or("")),
+        dup = duplicate_button(&format!("/sesb-eam/maintenance/{id}/duplicate")));
     let content = format!(
         r#"<div class="max-w-5xl">{header}{stats}{actions}
 <form method="POST" action="/sesb-eam/maintenance/{id}"><div class="card bg-base-100 shadow"><div class="card-body">{base}
 <div class="mt-3"><button class="btn btn-primary btn-sm">Save</button></div></div></div></form>
 {checklist}{parts}
+<div class="mt-6">{activity_panel}</div>
 <div class="mt-6">{history}</div></div>"#,
-        header = header, stats = stats, actions = actions, id = id, base = base, checklist = checklist_card, parts = part_card, history = history);
+        header = header, stats = stats, actions = actions, id = id, base = base, checklist = checklist_card, parts = part_card, history = history, activity_panel = activity_panel);
     Html(page_shell(&sidebar, &format!("WO {}", number), &content)).into_response()
 }
 
@@ -428,6 +432,64 @@ async fn wo_action(
             Redirect::to(&format!("/sesb-eam/maintenance/{id}")).into_response()
         }
         Err(msg) => (StatusCode::CONFLICT, format!("{msg}: cannot {action} from {cur}")).into_response(),
+    }
+}
+
+/// POST /sesb-eam/maintenance/{id}/duplicate — copy a work order into a
+/// fresh draft: new MNT number, lifecycle + execution actuals reset, part
+/// lines cloned as the parts plan, checklist lines cloned with their
+/// recorded values cleared. The assignee is kept deliberately — "copy this
+/// job" in the field means re-running the same job with the same crew.
+async fn duplicate_wo(
+    State(state): State<Arc<AppState>>, Db(db): Db,
+    Extension(user): Extension<AuthUser>, Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<Uuid>,
+) -> Response {
+    let number = match vortex_plugin_sdk::orm::sequence::next(&state.pool, &MNT_SEQ).await {
+        Ok(n) => n,
+        Err(_) => return bad("Failed to generate number"),
+    };
+    let spec = DuplicateSpec::new("eam_maintenance")
+        .set("name", json!(number))
+        .copy_suffix("description")
+        // lifecycle → DB defaults: state 'draft', request_date CURRENT_DATE
+        .skip("state").skip("request_date")
+        // execution actuals
+        .skip("start_date").skip("end_date").skip("actual_duration_hours")
+        .skip("accepted_by").skip("acceptance_date")
+        .skip("rejected_by").skip("rejection_date").skip("rejection_reason").skip("rejection_count")
+        .skip("verified_by").skip("verification_date").skip("verification_notes").skip("verification_rating")
+        .skip("needs_rework").skip("rework_notes").skip("rework_count")
+        .skip("findings").skip("actions_taken").skip("recommendations")
+        .skip("signature").skip("signed_by_name").skip("signature_date")
+        // costs recomputed below from the cloned part lines
+        .skip("labor_cost").skip("materials_cost").skip("total_cost")
+        // provenance the copy must not inherit
+        .skip("plan_id").skip("repair_for_defect_id").skip("parent_maintenance_id").skip("is_consolidated")
+        .skip("escalation_level").skip("last_escalated_on").skip("updated_by")
+        // boundary-reassignment history (§3.12) stays with the source
+        .skip("reassignment_reason").skip("reassigned_by_id").skip("reassigned_date").skip("reassignment_count")
+        .child(ChildCopy::new("eam_maintenance_part_line", "maintenance_id"))
+        .child(ChildCopy::new("eam_checklist_line", "maintenance_id")
+            .skip("value_pass_fail").skip("value_yes_no").skip("value_measurement")
+            .skip("value_text").skip("value_selection").skip("value_rating")
+            .skip("note").skip("photo"));
+    match spec.execute(&db, id, Some(user.id)).await {
+        Ok(new_id) => {
+            recompute_costs(&db, new_id).await;
+            let entry = vortex_plugin_sdk::security::AuditEntry::new(
+                vortex_plugin_sdk::security::AuditAction::RecordCreated, vortex_plugin_sdk::security::AuditSeverity::Info,
+            ).with_user(vortex_plugin_sdk::common::UserId(user.id)).with_username(&user.username)
+             .with_database(&db_ctx.db_name).with_resource("eam_maintenance", new_id.to_string()).with_resource_name(&number)
+             .with_details(json!({"duplicated_from": id, "number": number}));
+            let _ = state.audit.log(entry).await;
+            info!(number=%number, "work order duplicated");
+            Redirect::to(&format!("/sesb-eam/maintenance/{new_id}")).into_response()
+        }
+        Err(e) => {
+            error!(error=%e, "wo duplicate");
+            (StatusCode::INTERNAL_SERVER_ERROR, "Duplicate failed").into_response()
+        }
     }
 }
 

@@ -859,7 +859,8 @@ pub(crate) async fn upsert_profile_fields(
         "UPDATE acc_partner_tax_profile SET \
             tin = $2, id_type = $3, id_value = $4, sst_registration = $5, \
             msic_code = $6, einvoice_email = $7, einvoice_optout = $8, \
-            receivable_account_id = $9, payable_account_id = $10 \
+            receivable_account_id = $9, payable_account_id = $10, \
+            payment_term_id = $11 \
          WHERE contact_id = $1 RETURNING id",
     )
     .bind(contact_id)
@@ -872,6 +873,7 @@ pub(crate) async fn upsert_profile_fields(
     .bind(optout)
     .bind(uuid("receivable_account_id"))
     .bind(uuid("payable_account_id"))
+    .bind(uuid("payment_term_id"))
     .fetch_one(db)
     .await
     .map_err(|e| e.to_string())?;

@@ -71,6 +71,42 @@ pub fn available() -> bool {
     cfg!(feature = "pdf-chromium")
 }
 
+/// Snap packages Chromium behind a wrapper (`/snap/bin/chromium`) that runs it
+/// in a private mount namespace. A process manager like chromiumoxide passes a
+/// host `--user-data-dir` the snap can't see, so the browser dies on launch
+/// (the classic "PDF rendering failed — check VORTEX_CHROMIUM"). Detect that
+/// wrapper and substitute the snap's *inner* binary, which runs unconfined and
+/// shares the host filesystem. Non-snap paths pass through unchanged.
+#[cfg(feature = "pdf-chromium")]
+fn resolve_chromium(path: &str) -> String {
+    let p = path.trim();
+    let is_snap_wrapper = p.starts_with("/snap/bin/")
+        || std::fs::read_link(p)
+            .map(|t| t.to_string_lossy().contains("/snap/"))
+            .unwrap_or(false);
+    if is_snap_wrapper {
+        // The stable `current` symlink first, else the newest versioned revision.
+        let current = "/snap/chromium/current/usr/lib/chromium-browser/chrome";
+        if std::path::Path::new(current).exists() {
+            return current.to_string();
+        }
+        if let Ok(entries) = std::fs::read_dir("/snap/chromium") {
+            let mut inner: Vec<String> = entries
+                .filter_map(|e| e.ok())
+                .filter_map(|e| {
+                    let cand = e.path().join("usr/lib/chromium-browser/chrome");
+                    cand.exists().then(|| cand.to_string_lossy().into_owned())
+                })
+                .collect();
+            inner.sort();
+            if let Some(newest) = inner.pop() {
+                return newest;
+            }
+        }
+    }
+    p.to_string()
+}
+
 #[cfg(feature = "pdf-chromium")]
 pub async fn html_to_pdf(html: &str, opts: &PdfOptions) -> Result<Vec<u8>, PdfError> {
     use chromiumoxide::browser::{Browser, BrowserConfig};
@@ -84,10 +120,18 @@ pub async fn html_to_pdf(html: &str, opts: &PdfOptions) -> Result<Vec<u8>, PdfEr
         .arg("--no-sandbox")
         .arg("--disable-dev-shm-usage")
         .arg("--disable-gpu");
-    if let Ok(path) = std::env::var("VORTEX_CHROMIUM") {
-        if !path.trim().is_empty() {
-            builder = builder.chrome_executable(path);
+    // Resolve the Chromium binary: an explicit VORTEX_CHROMIUM (snap-corrected),
+    // else pre-empt chromiumoxide's autodetect when only the snap wrapper exists.
+    let configured = std::env::var("VORTEX_CHROMIUM").ok().filter(|s| !s.trim().is_empty());
+    let resolved = match configured {
+        Some(p) => Some(resolve_chromium(&p)),
+        None => {
+            let snap = resolve_chromium("/snap/bin/chromium");
+            (snap != "/snap/bin/chromium" && std::path::Path::new(&snap).exists()).then_some(snap)
         }
+    };
+    if let Some(exe) = resolved {
+        builder = builder.chrome_executable(exe);
     }
     let config = builder.build().map_err(PdfError::Launch)?;
 

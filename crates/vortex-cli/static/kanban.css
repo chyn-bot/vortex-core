@@ -1,0 +1,42 @@
+/* Configurable kanban board. Theme-aware via daisyUI oklch custom properties. */
+
+/* Config bar */
+.kb-config { display: flex; flex-wrap: wrap; gap: .75rem 1.25rem; align-items: center; margin-bottom: 1rem; padding: .6rem .75rem; background: oklch(var(--b1)); border: 1px solid oklch(var(--b3)); border-radius: .5rem; }
+.kb-ctl { display: flex; align-items: center; gap: .4rem; font-size: .78rem; }
+.kb-ctl-k { opacity: .6; text-transform: uppercase; letter-spacing: .03em; font-size: .68rem; font-weight: 600; }
+.kb-config select { font-size: .8rem; background: oklch(var(--b2)); border: 1px solid oklch(var(--b3)); border-radius: .3rem; padding: .2rem .4rem; }
+.kb-config input[type=checkbox] { cursor: pointer; width: 1rem; height: 1rem; }
+.kb-tot { display: inline-flex; gap: .3rem; }
+
+/* Card-fields dropdown */
+.kb-dd { position: relative; }
+.kb-dd-menu { display: none; position: absolute; z-index: 20; top: 100%; left: 0; margin-top: .25rem; min-width: 180px; max-height: 300px; overflow-y: auto; background: oklch(var(--b1)); border: 1px solid oklch(var(--b3)); border-radius: .4rem; padding: .35rem; box-shadow: 0 6px 20px rgba(0,0,0,.25); }
+.kb-dd-open .kb-dd-menu { display: block; }
+.kb-dd-item { display: flex; align-items: center; gap: .45rem; padding: .3rem .4rem; border-radius: .3rem; font-size: .8rem; cursor: pointer; }
+.kb-dd-item:hover { background: oklch(var(--b2)); }
+
+/* Board */
+.kb-board { display: flex; gap: 1rem; overflow-x: auto; padding-bottom: 1rem; align-items: flex-start; }
+.kb-col { flex: 0 0 300px; max-width: 300px; background: oklch(var(--b2)/.5); border: 1px solid oklch(var(--b3)); border-radius: .5rem; display: flex; flex-direction: column; max-height: calc(100vh - 220px); }
+.kb-col-head { display: flex; justify-content: space-between; align-items: center; padding: .6rem .75rem; border-bottom: 1px solid oklch(var(--b3)); position: sticky; top: 0; }
+.kb-col-title { font-weight: 600; font-size: .82rem; text-transform: uppercase; letter-spacing: .02em; }
+.kb-col-meta { font-size: .72rem; opacity: .7; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.kb-total { color: #8BC53F; font-weight: 600; }
+.kb-col-body { padding: .6rem; overflow-y: auto; flex: 1; min-height: 80px; display: flex; flex-direction: column; gap: .5rem; transition: background .12s; }
+.kb-col-body.kb-over { background: color-mix(in oklab, #8BC53F 12%, transparent); outline: 2px dashed #8BC53F; outline-offset: -4px; border-radius: .375rem; }
+
+/* Card */
+.kb-card { background: oklch(var(--b1)); border: 1px solid oklch(var(--b3)); border-radius: .4rem; padding: .55rem .65rem; cursor: pointer; box-shadow: 0 1px 2px rgba(0,0,0,.08); transition: box-shadow .12s, transform .06s; }
+.kb-card:hover { box-shadow: 0 3px 10px rgba(0,0,0,.18); border-color: #8BC53F; }
+.kb-card[draggable=true] { cursor: grab; }
+.kb-card.kb-dragging { opacity: .45; }
+.kb-card-title { font-weight: 600; font-size: .85rem; line-height: 1.25; }
+.kb-chip { font-size: .72rem; opacity: .85; margin-top: .25rem; }
+.kb-chip-k { opacity: .5; text-transform: uppercase; letter-spacing: .02em; font-size: .62rem; margin-right: .25rem; }
+
+.kb-empty { opacity: .55; font-size: .85rem; padding: 2rem; }
+
+/* Toast */
+.kb-toast { position: fixed; bottom: 1.25rem; left: 50%; transform: translateX(-50%) translateY(2rem); opacity: 0; pointer-events: none; background: oklch(var(--b1)); border: 1px solid oklch(var(--b3)); color: oklch(var(--bc)); padding: .5rem .9rem; border-radius: .4rem; font-size: .82rem; box-shadow: 0 6px 20px rgba(0,0,0,.3); transition: opacity .2s, transform .2s; z-index: 60; }
+.kb-toast-show { opacity: 1; transform: translateX(-50%) translateY(0); }
+.kb-toast-err { border-color: oklch(var(--er)); color: oklch(var(--er)); }

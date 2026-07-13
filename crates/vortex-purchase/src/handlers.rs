@@ -33,6 +33,7 @@ pub fn purchase_routes() -> Router<Arc<AppState>> {
         .route("/purchase/orders/{id}/confirm", post(confirm_order))
         .route("/purchase/orders/{id}/send", post(mark_sent))
         .route("/purchase/orders/{id}/revise", post(revise_rfq))
+        .route("/purchase/orders/{id}/duplicate", post(duplicate_order))
         .route("/purchase/orders/{id}/print-rfq", get(print_rfq))
         .route("/purchase/orders/{id}/cancel", post(cancel_order))
         .route("/purchase/orders/{id}/receive", get(receive_form))
@@ -51,8 +52,8 @@ fn page_shell(sidebar: &str, title: &str, content: &str) -> String {
 <title>{title} - Vortex</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=4" rel="stylesheet"/>
-<script src="/static/vortex.js?v=4" defer></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script>
 <script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
@@ -761,6 +762,12 @@ async fn edit_order(
             )),
         }
     }
+    // Duplicate — available in every state: any document, however far
+    // along, can seed a fresh editable RFQ.
+    actions.push_str(&format!(
+        r#"<span class="inline ml-2">{}</span>"#,
+        duplicate_button(&format!("/purchase/orders/{id}/duplicate")),
+    ));
 
     // ── Revision chain ──
     let revisions_card = if let Some(root) = root_rfq_id {
@@ -816,6 +823,9 @@ async fn edit_order(
         String::new()
     };
 
+    // Activity stream: schedule/assign/complete tasks, messages, attachments.
+    let activity_panel = vortex_plugin_sdk::framework::render_chatter_panel("purchase_order", id);
+
     let content = format!(
         r#"<div class="flex items-center justify-between mb-4">
 <div>
@@ -848,7 +858,8 @@ async fn edit_order(
 </div>
 </div></div>
 
-{revisions_card}"#,
+{revisions_card}
+<div class="mt-6">{activity_panel}</div>"#,
         back_url = if is_rfq_stage { "/purchase/rfqs" } else { "/purchase" },
         back_label = if is_rfq_stage { "RFQs" } else { "Purchase Orders" },
         number = esc(&identity),
@@ -1236,6 +1247,68 @@ async fn revise_rfq(
 
     audit_po(&state, &db_ctx, &db, user.id, &user.username, new_id, "revised").await;
     info!(rfq = %rfq_number, revision = next_rev, "RFQ revised");
+    vortex_plugin_sdk::axum::response::Redirect::to(&format!("/purchase/orders/{new_id}")).into_response()
+}
+
+/// POST /purchase/orders/{id}/duplicate — copy any document, whatever its
+/// state, into a fresh editable RFQ that starts its own revision family:
+/// new RFQ number, revision 1, no PO number, nothing received or billed.
+/// (Contrast with revise, which stays inside the source's RFQ family.)
+async fn duplicate_order(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<Uuid>,
+) -> Response {
+    // Every purchase document is born as an RFQ: the copy draws a fresh
+    // RFQ number now; its PO number is only minted at confirmation.
+    let rfq_number = match vortex_plugin_sdk::orm::sequence::next(&state.pool, &RFQ_SEQ).await {
+        Ok(n) => n,
+        Err(e) => {
+            error!(error = %e, "RFQ sequence generation failed");
+            return (vortex_plugin_sdk::axum::http::StatusCode::INTERNAL_SERVER_ERROR, "Failed to generate RFQ number").into_response();
+        }
+    };
+
+    let new_id = Uuid::now_v7();
+    let spec = DuplicateSpec::new("purchase_order")
+        .with_id(new_id)
+        .set("rfq_number", json!(rfq_number))
+        .set("root_rfq_id", json!(new_id)) // the copy roots its own RFQ family
+        .skip("revision") // default 1
+        .skip("number") // PO number arrives at confirmation
+        .skip("state") // default 'rfq'
+        .skip("order_date") // default CURRENT_DATE — today
+        .skip("respond_by") // the source's reply-by date is stale here
+        .skip("updated_by") // nobody has touched the copy yet
+        .skip("vendor_bill_move_id") // never inherit the source's vendor bill
+        .skip("untaxed_amount") // recomputed from the copied lines below
+        .skip("tax_amount")
+        .skip("total_amount")
+        .child(
+            ChildCopy::new("purchase_order_line", "order_id")
+                .set("qty_received", json!(0)), // nothing received yet
+        );
+    if let Err(e) = spec.execute(&db, id, Some(user.id)).await {
+        error!(error = %e, "PO duplicate failed");
+        return (vortex_plugin_sdk::axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("Duplicate failed: {e}")).into_response();
+    }
+    recompute_totals(&db, new_id).await;
+
+    let entry = vortex_plugin_sdk::security::AuditEntry::new(
+        vortex_plugin_sdk::security::AuditAction::RecordCreated,
+        vortex_plugin_sdk::security::AuditSeverity::Info,
+    )
+    .with_user(vortex_plugin_sdk::common::UserId(user.id))
+    .with_username(&user.username)
+    .with_database(&db_ctx.db_name)
+    .with_resource("purchase_order", new_id.to_string())
+    .with_resource_name(&rfq_number)
+    .with_details(json!({ "duplicated_from": id, "rfq_number": rfq_number }));
+    let _ = state.audit.log(entry).await;
+
+    info!(number = %rfq_number, "purchase order duplicated");
     vortex_plugin_sdk::axum::response::Redirect::to(&format!("/purchase/orders/{new_id}")).into_response()
 }
 

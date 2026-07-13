@@ -1,0 +1,736 @@
+//! Per-tenant custom fields (Initiative #2).
+//!
+//! A custom field is a row in `ir_model_field` with `is_custom = true` on a
+//! model that already exists in the registry (which, since Initiative #1, is
+//! derived from `#[derive(Model)]`). Its values live in the central
+//! `ir_custom_value` overflow store — one JSONB blob per record — so a tenant
+//! admin can add a field to any model at runtime with **no runtime DDL** on the
+//! model's own table.
+//!
+//! The generic form framework calls [`render_for_form`] and [`save_values`]
+//! automatically, so a custom field appears on, and persists from, every
+//! `FormConfig`-driven form with no per-page code.
+//!
+//! Scope of this first cut: `is_visible` gates rendering; group-based field
+//! ACL and value-change audit ride on top later. The derive registry sync only
+//! upserts code-declared fields and never deletes, so custom rows are safe
+//! beside them.
+
+use std::collections::BTreeMap;
+
+use sqlx::{PgPool, Row};
+use uuid::Uuid;
+
+use crate::ui::html_escape;
+
+/// Field types an admin may choose for a custom field — a safe subset of the
+/// `ir_model_field` vocabulary (no relational types in this first cut).
+pub const CUSTOM_FIELD_TYPES: &[(&str, &str)] = &[
+    ("string", "Text (single line)"),
+    ("text", "Text (multi-line)"),
+    ("number", "Number"),
+    ("monetary", "Monetary"),
+    ("boolean", "Checkbox"),
+    ("date", "Date"),
+    ("datetime", "Date & time"),
+    ("selection", "Selection"),
+    // Stored as the registry's canonical relational type so it satisfies the
+    // ir_model_field type CHECK and reads back like a real FK column.
+    ("many2one", "Reference (link to a record)"),
+];
+
+/// A custom field definition.
+#[derive(Debug, Clone)]
+pub struct CustomField {
+    pub name: String,
+    pub label: String,
+    pub field_type: String,
+    pub selection_options: Vec<String>,
+    /// Target model name for a `reference` field (the model whose records this
+    /// links to). `None` for every other type.
+    pub related_model: Option<String>,
+    /// Built-in field this custom field renders immediately after on the form.
+    /// `None`/empty → the bottom "Custom Fields" section.
+    pub position_after: Option<String>,
+    pub help: Option<String>,
+    pub sequence: i32,
+    pub is_visible: bool,
+}
+
+/// Is `t` an admin-choosable custom field type?
+pub fn is_valid_type(t: &str) -> bool {
+    CUSTOM_FIELD_TYPES.iter().any(|(k, _)| *k == t)
+}
+
+/// Validate a custom field name: must be `x_`-prefixed and a safe identifier.
+/// The `x_` convention keeps custom names from ever colliding with a
+/// code-declared column.
+pub fn valid_name(name: &str) -> bool {
+    name.len() >= 3
+        && name.len() <= 63
+        && name.starts_with("x_")
+        && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+        && name.bytes().next().is_some_and(|b| b == b'x')
+}
+
+/// Custom fields defined on `model`, ordered for display. Resilient: returns
+/// empty on any error (e.g. a database that predates migration 137), so it is
+/// safe to call from the hot form path unconditionally.
+pub async fn list_for_model(db: &PgPool, model: &str) -> Vec<CustomField> {
+    let rows = sqlx::query(
+        r#"
+        SELECT f.name, f.display_name, f.field_type, f.selection_options,
+               f.related_model, f.position_after, f.help, f.sequence, f.is_visible
+        FROM ir_model_field f
+        JOIN ir_model m ON m.id = f.model_id
+        WHERE m.name = $1 AND f.is_custom = true AND COALESCE(f.is_computed, false) = false
+        ORDER BY f.sequence, f.name
+        "#,
+    )
+    .bind(model)
+    .fetch_all(db)
+    .await;
+
+    let Ok(rows) = rows else { return Vec::new() };
+    rows.into_iter().map(row_to_field).collect()
+}
+
+/// Every custom field across all models, with the owning model's registry
+/// name and label — for the admin listing.
+pub async fn list_all(db: &PgPool) -> Vec<(String, String, CustomField)> {
+    let rows = sqlx::query(
+        r#"
+        SELECT m.name AS model, m.display_name AS model_label,
+               f.name, f.display_name, f.field_type, f.selection_options,
+               f.related_model, f.position_after, f.help, f.sequence, f.is_visible
+        FROM ir_model_field f
+        JOIN ir_model m ON m.id = f.model_id
+        WHERE f.is_custom = true AND COALESCE(f.is_computed, false) = false
+        ORDER BY m.display_name, f.sequence, f.name
+        "#,
+    )
+    .fetch_all(db)
+    .await;
+
+    let Ok(rows) = rows else { return Vec::new() };
+    rows.into_iter()
+        .map(|r| {
+            let model: String = r.get("model");
+            let model_label: String = r.get("model_label");
+            (model, model_label, row_to_field(r))
+        })
+        .collect()
+}
+
+fn row_to_field(r: sqlx::postgres::PgRow) -> CustomField {
+    let options: Option<serde_json::Value> = r.try_get("selection_options").ok().flatten();
+    let selection_options = match options {
+        Some(serde_json::Value::Array(a)) => a
+            .into_iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
+        _ => Vec::new(),
+    };
+    CustomField {
+        name: r.get("name"),
+        label: r.get("display_name"),
+        field_type: r.get("field_type"),
+        selection_options,
+        related_model: r.try_get("related_model").ok().flatten(),
+        position_after: r.try_get("position_after").ok().flatten(),
+        help: r.try_get("help").ok().flatten(),
+        sequence: r.get("sequence"),
+        is_visible: r.get("is_visible"),
+    }
+}
+
+/// Add (or update) a custom field on `model`. Validates the name and type, then
+/// upserts an `ir_model_field` row with `is_custom = true`. Errors on a bad
+/// name/type or an unknown model.
+pub async fn add(
+    db: &PgPool,
+    model: &str,
+    name: &str,
+    label: &str,
+    field_type: &str,
+    selection_options: &[String],
+    related_model: Option<&str>,
+    position_after: Option<&str>,
+    help: Option<&str>,
+) -> Result<(), String> {
+    if !valid_name(name) {
+        return Err("Field name must be lowercase, start with \"x_\", and contain only letters, digits and underscores.".into());
+    }
+    if !is_valid_type(field_type) {
+        return Err(format!("Unknown field type {field_type:?}."));
+    }
+    let label = if label.trim().is_empty() { name } else { label.trim() };
+
+    let model_id: Option<Uuid> = sqlx::query_scalar("SELECT id FROM ir_model WHERE name = $1")
+        .bind(model)
+        .fetch_optional(db)
+        .await
+        .map_err(|e| format!("lookup failed: {e}"))?;
+    let Some(model_id) = model_id else {
+        return Err(format!("Unknown model {model:?}."));
+    };
+
+    let options_json: Option<serde_json::Value> = if field_type == "selection" {
+        if selection_options.is_empty() {
+            return Err("A selection field needs at least one option.".into());
+        }
+        Some(serde_json::Value::Array(
+            selection_options
+                .iter()
+                .map(|s| serde_json::Value::String(s.clone()))
+                .collect(),
+        ))
+    } else {
+        None
+    };
+
+    // A reference field links to another registered model — validate the target.
+    let related_model: Option<String> = if field_type == "many2one" {
+        let target = related_model.map(str::trim).filter(|s| !s.is_empty());
+        let Some(target) = target else {
+            return Err("A reference field needs a target model to link to.".into());
+        };
+        let exists: bool = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM ir_model WHERE name = $1 AND is_active = true",
+        )
+        .bind(target)
+        .fetch_one(db)
+        .await
+        .map(|n| n > 0)
+        .unwrap_or(false);
+        if !exists {
+            return Err(format!("Unknown target model {target:?}."));
+        }
+        Some(target.to_string())
+    } else {
+        None
+    };
+
+    // Placement anchor: a built-in (non-custom) field of this model to render
+    // after. An unknown anchor falls back to the bottom section rather than
+    // erroring, so a renamed/removed target can't wedge the field.
+    let position_after: Option<String> = match position_after.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(anchor) => {
+            let ok: bool = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM ir_model_field WHERE model_id = $1 AND name = $2 AND is_custom = false",
+            )
+            .bind(model_id)
+            .bind(anchor)
+            .fetch_one(db)
+            .await
+            .map(|n| n > 0)
+            .unwrap_or(false);
+            if ok { Some(anchor.to_string()) } else { None }
+        }
+        None => None,
+    };
+
+    // Custom fields sort after the code-declared ones.
+    let next_seq: i32 =
+        sqlx::query_scalar("SELECT COALESCE(MAX(sequence), 0) + 10 FROM ir_model_field WHERE model_id = $1")
+            .bind(model_id)
+            .fetch_one(db)
+            .await
+            .map_err(|e| format!("sequence failed: {e}"))?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO ir_model_field
+            (model_id, name, display_name, field_type, selection_options, related_model, position_after, help, sequence, is_custom, is_visible)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, true, true)
+        ON CONFLICT (model_id, name) DO UPDATE
+            SET display_name      = EXCLUDED.display_name,
+                field_type        = EXCLUDED.field_type,
+                selection_options = EXCLUDED.selection_options,
+                related_model     = EXCLUDED.related_model,
+                position_after    = EXCLUDED.position_after,
+                help              = EXCLUDED.help
+        "#,
+    )
+    .bind(model_id)
+    .bind(name)
+    .bind(label)
+    .bind(field_type)
+    .bind(options_json)
+    .bind(&related_model)
+    .bind(&position_after)
+    .bind(help)
+    .bind(next_seq)
+    .execute(db)
+    .await
+    .map_err(|e| format!("save failed: {e}"))?;
+
+    Ok(())
+}
+
+/// Delete a custom field. Only ever removes `is_custom` rows, so a code-declared
+/// field can never be dropped through this path.
+pub async fn delete(db: &PgPool, model: &str, name: &str) -> Result<(), String> {
+    sqlx::query(
+        r#"
+        DELETE FROM ir_model_field f
+        USING ir_model m
+        WHERE f.model_id = m.id AND m.name = $1 AND f.name = $2 AND f.is_custom = true
+        "#,
+    )
+    .bind(model)
+    .bind(name)
+    .execute(db)
+    .await
+    .map_err(|e| format!("delete failed: {e}"))?;
+    Ok(())
+}
+
+/// Load a record's custom values as a string map (JSONB blob flattened).
+pub async fn load_values(db: &PgPool, model: &str, record_id: Uuid) -> BTreeMap<String, String> {
+    let data: Option<serde_json::Value> =
+        sqlx::query_scalar("SELECT data FROM ir_custom_value WHERE model_name = $1 AND record_id = $2")
+            .bind(model)
+            .bind(record_id)
+            .fetch_optional(db)
+            .await
+            .ok()
+            .flatten();
+
+    let mut out = BTreeMap::new();
+    if let Some(serde_json::Value::Object(map)) = data {
+        for (k, v) in map {
+            let s = match v {
+                serde_json::Value::String(s) => s,
+                serde_json::Value::Null => continue,
+                other => other.to_string(),
+            };
+            out.insert(k, s);
+        }
+    }
+    out
+}
+
+/// Persist submitted custom values for a record. Extracts the keys that match
+/// this model's custom fields from the raw form `pairs`, then upserts the JSONB
+/// blob. No-op when the model has no custom fields (so it is cheap and safe on
+/// the universal save path). Unchecked booleans (which browsers omit) are
+/// stored as `false`.
+pub async fn save_values(
+    db: &PgPool,
+    model: &str,
+    record_id: Uuid,
+    pairs: &[(String, String)],
+) -> Result<(), String> {
+    let fields = list_for_model(db, model).await;
+    if fields.is_empty() {
+        return Ok(());
+    }
+
+    let mut obj = serde_json::Map::new();
+    for f in &fields {
+        // Last value wins (mirrors the core form normalizer).
+        let raw = pairs.iter().rev().find(|(k, _)| k == &f.name).map(|(_, v)| v.trim());
+        let value = match f.field_type.as_str() {
+            "boolean" => Some(if matches!(raw, Some("on") | Some("true")) { "true" } else { "false" }.to_string()),
+            _ => raw.map(str::to_string),
+        };
+        if let Some(v) = value {
+            obj.insert(f.name.clone(), serde_json::Value::String(v));
+        }
+    }
+
+    let data = serde_json::Value::Object(obj);
+    sqlx::query(
+        r#"
+        INSERT INTO ir_custom_value (model_name, record_id, data, updated_at)
+        VALUES ($1, $2, $3, NOW())
+        ON CONFLICT (model_name, record_id) DO UPDATE
+            SET data = EXCLUDED.data, updated_at = NOW()
+        "#,
+    )
+    .bind(model)
+    .bind(record_id)
+    .bind(data)
+    .execute(db)
+    .await
+    .map_err(|e| format!("custom value save failed: {e}"))?;
+    Ok(())
+}
+
+/// Render one custom field as a labelled `<label class="form-control">` block,
+/// prefilled with `value`. Async because reference fields query their options.
+async fn render_one_control(db: &PgPool, f: &CustomField, value: &str) -> String {
+    let help = f
+        .help
+        .as_deref()
+        .filter(|h| !h.is_empty())
+        .map(|h| format!(r#"<span class="label-text-alt opacity-60">{}</span>"#, html_escape(h)))
+        .unwrap_or_default();
+    let span = if f.field_type == "text" { " md:col-span-2" } else { "" };
+    // Reference fields need a DB round-trip to list the target records, so they
+    // can't use the sync `widget()`.
+    let widget_html = if f.field_type == "many2one" {
+        reference_widget(db, f, value).await
+    } else {
+        widget(f, value)
+    };
+    format!(
+        r#"<label class="form-control mb-3{span}"><div class="label"><span class="label-text">{label}</span>{help}</div>{widget}</label>"#,
+        span = span,
+        label = html_escape(&f.label),
+        help = help,
+        widget = widget_html,
+    )
+}
+
+/// Render the given custom `fields` as a "Custom Fields" section (header + 2-col
+/// grid), prefilled from the record's stored values. Empty string when the list
+/// is empty, so callers can append it unconditionally.
+async fn render_section(
+    db: &PgPool,
+    model: &str,
+    record_id: Option<&str>,
+    fields: &[CustomField],
+) -> String {
+    if fields.is_empty() {
+        return String::new();
+    }
+    let values = record_values(db, model, record_id).await;
+    let mut body = String::from(
+        r#"<h2 class="text-sm font-semibold uppercase opacity-60 mt-4 mb-2">Custom Fields</h2>"#,
+    );
+    body.push_str(r#"<div class="grid grid-cols-1 md:grid-cols-2 gap-x-8">"#);
+    for f in fields {
+        let value = values.get(&f.name).map(String::as_str).unwrap_or("");
+        body.push_str(&render_one_control(db, f, value).await);
+    }
+    body.push_str("</div>");
+    body
+}
+
+/// Render the visible **unanchored** custom fields for `model` as a "Custom
+/// Fields" section. Anchored fields (those with a `position_after`) are placed
+/// inline by [`render_anchor_group`] instead — this is the right call for a form
+/// that interleaves *every* anchor (e.g. the generic form engine). Empty string
+/// when there are none.
+pub async fn render_for_form(db: &PgPool, model: &str, record_id: Option<&str>) -> String {
+    let fields: Vec<CustomField> = list_for_model(db, model)
+        .await
+        .into_iter()
+        .filter(|f| f.is_visible && f.position_after.as_deref().unwrap_or("").is_empty())
+        .collect();
+    render_section(db, model, record_id, &fields).await
+}
+
+/// Render the bottom "Custom Fields" section for a hand-written form that placed
+/// only *some* anchors inline: it collects the unanchored fields **plus** any
+/// field anchored to a built-in the caller did not place (via `placed`), so an
+/// anchor the template lacks a slot for still shows up rather than vanishing.
+pub async fn render_unplaced_section(
+    db: &PgPool,
+    model: &str,
+    record_id: Option<&str>,
+    placed: &[&str],
+) -> String {
+    let placed: std::collections::HashSet<&str> = placed.iter().copied().collect();
+    let fields: Vec<CustomField> = list_for_model(db, model)
+        .await
+        .into_iter()
+        .filter(|f| {
+            f.is_visible
+                && match f.position_after.as_deref() {
+                    None | Some("") => true,
+                    Some(anchor) => !placed.contains(anchor),
+                }
+        })
+        .collect();
+    render_section(db, model, record_id, &fields).await
+}
+
+/// Render the visible custom fields anchored **after** the built-in field
+/// `anchor` (their `position_after`), as bare form-control blocks meant to slot
+/// straight into a form right below that field. Empty when none are anchored
+/// there, so a template can inject it unconditionally after any field.
+pub async fn render_anchor_group(
+    db: &PgPool,
+    model: &str,
+    record_id: Option<&str>,
+    anchor: &str,
+) -> String {
+    let fields: Vec<CustomField> = list_for_model(db, model)
+        .await
+        .into_iter()
+        .filter(|f| f.is_visible && f.position_after.as_deref() == Some(anchor))
+        .collect();
+    if fields.is_empty() {
+        return String::new();
+    }
+    let values = record_values(db, model, record_id).await;
+    let mut out = String::new();
+    for f in &fields {
+        let value = values.get(&f.name).map(String::as_str).unwrap_or("");
+        out.push_str(&render_one_control(db, f, value).await);
+    }
+    out
+}
+
+/// A record's stored custom values, or empty in create mode / on a bad id.
+async fn record_values(db: &PgPool, model: &str, record_id: Option<&str>) -> BTreeMap<String, String> {
+    match record_id.and_then(|id| Uuid::parse_str(id).ok()) {
+        Some(id) => load_values(db, model, id).await,
+        None => BTreeMap::new(),
+    }
+}
+
+/// The input widget for a custom field, matching the core form styling.
+fn widget(f: &CustomField, value: &str) -> String {
+    let name = html_escape(&f.name);
+    let val = html_escape(value);
+    match f.field_type.as_str() {
+        "text" => format!(
+            r#"<textarea name="{name}" class="textarea textarea-bordered w-full" rows="3">{val}</textarea>"#
+        ),
+        "number" | "monetary" => format!(
+            r#"<input type="number" step="any" name="{name}" value="{val}" class="input input-bordered w-full"/>"#
+        ),
+        "boolean" => {
+            let checked = if value == "true" || value == "t" { " checked" } else { "" };
+            format!(r#"<input type="checkbox" name="{name}" class="toggle toggle-primary"{checked}/>"#)
+        }
+        "date" => format!(
+            r#"<input type="date" name="{name}" value="{val}" class="input input-bordered w-full"/>"#
+        ),
+        "datetime" => {
+            let local = value.get(..16).unwrap_or(value).replace(' ', "T");
+            format!(
+                r#"<input type="datetime-local" name="{name}" value="{}" class="input input-bordered w-full"/>"#,
+                html_escape(&local)
+            )
+        }
+        "selection" => {
+            let mut out = format!(r#"<select name="{name}" class="select select-bordered w-full"><option value=""></option>"#);
+            for opt in &f.selection_options {
+                let selected = if opt == value { " selected" } else { "" };
+                out.push_str(&format!(
+                    r#"<option value="{o}"{selected}>{o}</option>"#,
+                    o = html_escape(opt)
+                ));
+            }
+            out.push_str("</select>");
+            out
+        }
+        // "string" and any unexpected type → single-line text.
+        _ => format!(
+            r#"<input type="text" name="{name}" value="{val}" maxlength="255" class="input input-bordered w-full"/>"#
+        ),
+    }
+}
+
+/// A `<select>` of the target model's records for a `reference` field. The stored
+/// value is the target record's UUID; the current one is pre-selected. Falls
+/// back to a plain text input if the target model or its `name` column can't be
+/// resolved, so the form still renders.
+async fn reference_widget(db: &PgPool, f: &CustomField, value: &str) -> String {
+    let name = html_escape(&f.name);
+    let val = html_escape(value);
+    let text_fallback = || {
+        format!(
+            r#"<input type="text" name="{name}" value="{val}" maxlength="255" class="input input-bordered w-full"/>"#
+        )
+    };
+    let Some(target) = f.related_model.as_deref() else {
+        return text_fallback();
+    };
+    // Resolve the target model's table from the registry and guard the identifier.
+    let table: Option<String> =
+        sqlx::query_scalar("SELECT table_name FROM ir_model WHERE name = $1 AND is_active = true")
+            .bind(target)
+            .fetch_optional(db)
+            .await
+            .ok()
+            .flatten();
+    let Some(table) = table.filter(|t| ident(t)) else {
+        return text_fallback();
+    };
+
+    // Bounded option list, ordered by display name. A model without a `name`
+    // column errors → text fallback (still safe, still editable).
+    let sql = format!("SELECT id::text AS id, name FROM {table} ORDER BY name LIMIT 1000");
+    let Ok(rows) = sqlx::query(&sql).fetch_all(db).await else {
+        return text_fallback();
+    };
+
+    let mut out = format!(r#"<select name="{name}" class="select select-bordered w-full"><option value=""></option>"#);
+    for r in &rows {
+        let id: String = r.try_get("id").unwrap_or_default();
+        let label: String = r.try_get::<Option<String>, _>("name").ok().flatten().unwrap_or_default();
+        let selected = if id == value { " selected" } else { "" };
+        out.push_str(&format!(
+            r#"<option value="{id}"{selected}>{label}</option>"#,
+            id = html_escape(&id),
+            selected = selected,
+            label = html_escape(&label),
+        ));
+    }
+    out.push_str("</select>");
+    out
+}
+
+/// A safe SQL-identifier token (table/column name).
+fn ident(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 63 && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Move a custom field up or down within its model's field ordering by swapping
+/// its `sequence` with the adjacent custom field in that direction. `up` moves
+/// it earlier (smaller sequence); otherwise later. No-op at the ends.
+pub async fn move_field(db: &PgPool, model: &str, name: &str, up: bool) -> Result<(), String> {
+    let model_id: Option<Uuid> = sqlx::query_scalar("SELECT id FROM ir_model WHERE name = $1")
+        .bind(model)
+        .fetch_optional(db)
+        .await
+        .map_err(|e| format!("lookup failed: {e}"))?;
+    let Some(model_id) = model_id else {
+        return Err(format!("Unknown model {model:?}."));
+    };
+
+    let cur: Option<i32> = sqlx::query_scalar(
+        "SELECT sequence FROM ir_model_field WHERE model_id = $1 AND name = $2 AND is_custom = true",
+    )
+    .bind(model_id)
+    .bind(name)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| format!("lookup failed: {e}"))?;
+    let Some(cur) = cur else { return Ok(()) };
+
+    // The nearest custom field on the chosen side (ties broken by name for a
+    // stable order that matches list_for_model).
+    let neighbour = if up {
+        sqlx::query(
+            "SELECT name, sequence FROM ir_model_field \
+             WHERE model_id = $1 AND is_custom = true AND (sequence < $2 OR (sequence = $2 AND name < $3)) \
+             ORDER BY sequence DESC, name DESC LIMIT 1",
+        )
+    } else {
+        sqlx::query(
+            "SELECT name, sequence FROM ir_model_field \
+             WHERE model_id = $1 AND is_custom = true AND (sequence > $2 OR (sequence = $2 AND name > $3)) \
+             ORDER BY sequence ASC, name ASC LIMIT 1",
+        )
+    }
+    .bind(model_id)
+    .bind(cur)
+    .bind(name)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| format!("lookup failed: {e}"))?;
+
+    let Some(nb) = neighbour else { return Ok(()) }; // already at the end
+    let nb_name: String = nb.get("name");
+    let nb_seq: i32 = nb.get("sequence");
+
+    // Swap sequences. When they're equal (both freshly inserted), nudge one so
+    // the order actually changes.
+    let (a, b) = if cur == nb_seq {
+        if up { (cur - 1, nb_seq) } else { (cur + 1, nb_seq) }
+    } else {
+        (nb_seq, cur)
+    };
+    let mut tx = db.begin().await.map_err(|e| format!("reorder failed: {e}"))?;
+    sqlx::query("UPDATE ir_model_field SET sequence = $3 WHERE model_id = $1 AND name = $2")
+        .bind(model_id).bind(name).bind(a)
+        .execute(&mut *tx).await.map_err(|e| format!("reorder failed: {e}"))?;
+    sqlx::query("UPDATE ir_model_field SET sequence = $3 WHERE model_id = $1 AND name = $2")
+        .bind(model_id).bind(&nb_name).bind(b)
+        .execute(&mut *tx).await.map_err(|e| format!("reorder failed: {e}"))?;
+    tx.commit().await.map_err(|e| format!("reorder failed: {e}"))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn name_validation() {
+        assert!(valid_name("x_priority"));
+        assert!(valid_name("x_2nd_ref"));
+        assert!(!valid_name("priority"), "must be x_-prefixed");
+        assert!(!valid_name("x_"), "needs a body");
+        assert!(!valid_name("x_Bad"), "no uppercase");
+        assert!(!valid_name("x_a; drop"), "no punctuation");
+    }
+
+    #[test]
+    fn type_validation() {
+        assert!(is_valid_type("selection"));
+        assert!(is_valid_type("monetary"));
+        assert!(is_valid_type("many2one"), "reference/link type is offered (registry vocabulary)");
+        assert!(!is_valid_type("reference"), "the UI label is Reference but the code is many2one");
+        assert!(!is_valid_type("nonsense"));
+    }
+
+    /// Full loop against a real database. Runs only when `VORTEX_TEST_DB`
+    /// points at a provisioned throwaway DB (migrated, so `contacts` is
+    /// registered and migration 137 is applied); otherwise it skips.
+    #[tokio::test]
+    async fn end_to_end_against_db() {
+        let Ok(url) = std::env::var("VORTEX_TEST_DB") else {
+            eprintln!("skip end_to_end_against_db: VORTEX_TEST_DB unset");
+            return;
+        };
+        let db = PgPool::connect(&url).await.expect("connect");
+
+        // Add a custom selection field to the (derive-registered) contacts model.
+        add(&db, "contacts", "x_priority", "Priority", "selection",
+            &["low".into(), "high".into()], None, None, Some("Ops priority"))
+            .await
+            .expect("add");
+
+        // It renders on the model's form (create mode).
+        let html = render_for_form(&db, "contacts", None).await;
+        assert!(html.contains("Custom Fields"), "section header");
+        assert!(html.contains(r#"name="x_priority""#), "field input present");
+        assert!(html.contains("Priority"), "label present");
+
+        // Save + load round-trip for a record.
+        let rec = Uuid::new_v4();
+        save_values(&db, "contacts", rec, &[("x_priority".into(), "high".into())])
+            .await
+            .expect("save");
+        let vals = load_values(&db, "contacts", rec).await;
+        assert_eq!(vals.get("x_priority").map(String::as_str), Some("high"));
+
+        // Edit-mode render pre-selects the stored value.
+        let edit_html = render_for_form(&db, "contacts", Some(&rec.to_string())).await;
+        assert!(
+            edit_html.contains(r#"<option value="high" selected>"#),
+            "stored value pre-selected on edit"
+        );
+
+        // A custom field is listed for admin.
+        assert!(list_all(&db).await.iter().any(|(m, _, f)| m == "contacts" && f.name == "x_priority"));
+
+        // Cleanup so the test is idempotent.
+        delete(&db, "contacts", "x_priority").await.expect("delete");
+        sqlx::query("DELETE FROM ir_custom_value WHERE model_name = 'contacts' AND record_id = $1")
+            .bind(rec).execute(&db).await.ok();
+        assert!(render_for_form(&db, "contacts", None).await.is_empty(), "no custom fields after delete");
+    }
+
+    #[test]
+    fn widgets_render_by_type() {
+        let f = |t: &str| CustomField {
+            name: "x_f".into(), label: "F".into(), field_type: t.into(),
+            selection_options: vec!["a".into(), "b".into()], related_model: None,
+            position_after: None, help: None, sequence: 10, is_visible: true,
+        };
+        assert!(widget(&f("text"), "").contains("<textarea"));
+        assert!(widget(&f("number"), "3").contains(r#"type="number""#));
+        assert!(widget(&f("boolean"), "true").contains(" checked"));
+        assert!(widget(&f("selection"), "b").contains(r#"<option value="b" selected>"#));
+        assert!(widget(&f("string"), "<x>").contains("&lt;x&gt;"), "escapes value");
+    }
+}

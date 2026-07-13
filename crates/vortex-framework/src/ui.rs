@@ -36,6 +36,38 @@ pub fn html_escape(s: &str) -> String {
         .replace('\'', "&#x27;")
 }
 
+/// Canonical URL of a record's generic form page.
+///
+/// The generic view layer has exactly one record route — `/form/{model}/{id}`
+/// (registered as `dynamic_form`). Historically list rows, kanban cards, and
+/// several "+ New" buttons hand-wrote `/{model}/{id}`, which does not exist, so
+/// every generic drill-in 404'd (§2 #1). This is the single definition of the
+/// record-link shape: every list, kanban, calendar, and cross-plugin link must
+/// build record URLs through here (and [`new_record_url`]) so a route change
+/// can never again silently desynchronise from the links that target it.
+///
+/// The `model` and `id` are URL path segments, not HTML — callers that embed
+/// the result in markup still [`html_escape`] it as usual.
+///
+/// ```
+/// use vortex_framework::ui::record_url;
+/// assert_eq!(record_url("sales_order", "42"), "/form/sales_order/42");
+/// ```
+pub fn record_url(model: &str, id: &str) -> String {
+    format!("/form/{}/{}", model, id)
+}
+
+/// Canonical URL of the generic "new record" form for a model. See
+/// [`record_url`] for why links must not hand-write this path.
+///
+/// ```
+/// use vortex_framework::ui::new_record_url;
+/// assert_eq!(new_record_url("sales_order"), "/form/sales_order/new");
+/// ```
+pub fn new_record_url(model: &str) -> String {
+    format!("/form/{}/new", model)
+}
+
 /// Return the first letter of the first two whitespace-separated words
 /// of a name, uppercased. Used for avatar placeholders.
 ///
@@ -200,8 +232,8 @@ pub fn forbidden_page(action: &str) -> String {
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Access Denied - Vortex</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-    <link href="/static/vortex.css?v=4" rel="stylesheet">
-    <script src="/static/vortex.js?v=4" defer></script>
+    <link href="/static/vortex.css?v=18" rel="stylesheet">
+    <script src="/static/vortex.js?v=18" defer></script>
     <script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200 flex items-center justify-center">
@@ -216,7 +248,7 @@ pub fn forbidden_page(action: &str) -> String {
                 This action requires Administrator or System Administrator privileges.
             </p>
             <div class="card-actions justify-center mt-6">
-                <a href="/dashboard" class="btn btn-primary">Return to Dashboard</a>
+                <a href="/home" class="btn btn-primary">Return to Home</a>
             </div>
         </div>
     </div>

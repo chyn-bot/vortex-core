@@ -22,6 +22,7 @@ use anyhow::{bail, Context, Result};
 
 const TPL_CARGO: &str = include_str!("../../templates/scaffold/Cargo.toml.tmpl");
 const TPL_LIB: &str = include_str!("../../templates/scaffold/lib.rs.tmpl");
+const TPL_MODEL: &str = include_str!("../../templates/scaffold/model.rs.tmpl");
 const TPL_PLUGIN: &str = include_str!("../../templates/scaffold/plugin.rs.tmpl");
 const TPL_HANDLERS: &str = include_str!("../../templates/scaffold/handlers.rs.tmpl");
 const TPL_MIGRATION: &str = include_str!("../../templates/scaffold/migration.sql.tmpl");
@@ -120,6 +121,7 @@ pub fn run(name: &str, display: Option<String>) -> Result<()> {
     fs::create_dir_all(format!("{crate_dir}/migrations/001_init"))?;
     fs::write(format!("{crate_dir}/Cargo.toml"), n.fill(TPL_CARGO))?;
     fs::write(format!("{crate_dir}/src/lib.rs"), n.fill(TPL_LIB))?;
+    fs::write(format!("{crate_dir}/src/model.rs"), n.fill(TPL_MODEL))?;
     fs::write(format!("{crate_dir}/src/plugin.rs"), n.fill(TPL_PLUGIN))?;
     fs::write(format!("{crate_dir}/src/handlers.rs"), n.fill(TPL_HANDLERS))?;
     fs::write(

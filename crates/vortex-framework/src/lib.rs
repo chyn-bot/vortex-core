@@ -35,9 +35,16 @@
 pub mod api;
 pub mod approval;
 pub mod audit_trail;
+pub mod automation;
+pub mod chatter;
 pub mod auth;
+pub mod computed_fields;
+pub mod custom_fields;
+pub mod dashboards;
+pub mod duplicate;
 pub mod files;
 pub mod form;
+pub mod generate;
 pub mod i18n;
 pub mod jobs;
 pub mod list;
@@ -46,13 +53,16 @@ pub mod menu;
 pub mod mobile_auth;
 pub mod pdf;
 pub mod plugin;
+pub mod print_layout;
 pub mod flash;
 pub mod qr;
 pub mod record_panel;
 pub mod registry;
+pub mod saved_views;
 pub mod report_jobs;
 pub mod reports;
 pub mod scheduler;
+pub mod shell;
 pub mod sidebar;
 pub mod state;
 pub mod status;
@@ -65,7 +75,10 @@ pub use api::{ResolvedToken, TokenRow};
 pub use webhooks::WebhookEndpoint;
 pub use approval::{ApprovalRequest, ApprovalStep, DecisionOutcome, NewRequest};
 pub use audit_trail::render_audit_trail;
+pub use chatter::render_chatter_panel;
+pub use print_layout::{DocLayout, LayoutColumn, LayoutConfig, PrintDocRegistry, PrintDocType};
 pub use auth::{AuthUser, Db};
+pub use duplicate::{duplicate_button, ChildCopy, DuplicateSpec};
 pub use jobs::{enqueue, JobContext, JobRegistry, JobWorker, NewJob};
 pub use mail::{EmailMessage, MailAttachment, MailError, MailSecurity, MailServer};
 pub use status::{Stage, StageAction, StageActions, StageColor, StatusBar};
@@ -96,9 +109,10 @@ pub use record_panel::{
     HOST_FORM_ID,
 };
 pub use scheduler::{Schedule, ScheduledAction, ScheduledActionDef, Scheduler};
-pub use sidebar::build_sidebar;
+pub use shell::{render_app_shell, render_app_shell_with};
+pub use sidebar::{build_sidebar, build_sidebar_nav};
 pub use state::{AppState, DatabaseContext};
 pub use ui::{
     build_pagination_html, error_response, format_number, format_time_ago, forbidden_page,
-    get_initials, html_escape,
+    get_initials, html_escape, new_record_url, record_url,
 };

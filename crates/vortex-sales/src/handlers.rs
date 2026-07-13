@@ -34,11 +34,14 @@ pub fn sales_routes() -> Router<Arc<AppState>> {
         .route("/sales/orders/create", post(create_order))
         .route("/sales/orders/{id}", get(edit_order))
         .route("/sales/orders/{id}", post(update_order))
+        .route("/sales/orders/{id}/edit", get(edit_quote_form))
+        .route("/sales/orders/{id}/save", post(save_quote))
         .route("/sales/orders/{id}/lines", post(add_line))
         .route("/sales/orders/{id}/lines/{line_id}/delete", post(delete_line))
         .route("/sales/orders/{id}/confirm", post(confirm_order))
         .route("/sales/orders/{id}/send", post(mark_sent))
         .route("/sales/orders/{id}/revise", post(revise_quote))
+        .route("/sales/orders/{id}/duplicate", post(duplicate_order))
         .route("/sales/orders/{id}/lost", post(mark_lost))
         .route("/sales/orders/{id}/print-quote", get(print_quote))
         .route("/sales/orders/{id}/cancel", post(cancel_order))
@@ -48,6 +51,12 @@ pub fn sales_routes() -> Router<Arc<AppState>> {
         .route("/sales/orders/{id}/confirm-services", post(process_service_confirmation))
         .route("/sales/deliveries/{id}/print", get(print_delivery))
         .route("/sales/orders/{id}/create-invoice", post(create_customer_invoice))
+        // Notes / Terms template library (Sales ▸ Configuration)
+        .route("/sales/note-templates", get(list_note_templates))
+        .route("/sales/note-templates/new", get(new_note_template_form))
+        .route("/sales/note-templates/create", post(create_note_template))
+        .route("/sales/note-templates/{id}", get(edit_note_template))
+        .route("/sales/note-templates/{id}", post(update_note_template))
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -61,8 +70,8 @@ fn page_shell(sidebar: &str, title: &str, content: &str) -> String {
 <title>{title} - Vortex</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=4" rel="stylesheet"/>
-<script src="/static/vortex.js?v=4" defer></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script>
 <script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
@@ -135,6 +144,27 @@ fn state_badge(state: &str) -> &'static str {
     }
 }
 
+/// A display-only status bar for the order pipeline
+/// (Quotation → Sent → Confirmed → Delivered). Terminal states
+/// (cancelled / lost / expired / superseded) are appended only when the
+/// record is actually in one, so the happy path stays uncluttered.
+fn order_statusbar(state: &str) -> String {
+    use vortex_plugin_sdk::framework::{StageColor, StatusBar};
+    let mut bar = StatusBar::new("sales_order", "state")
+        .stage("quotation", "Quotation", StageColor::Neutral)
+        .stage("sent", "Sent", StageColor::Info)
+        .stage("confirmed", "Confirmed", StageColor::Primary)
+        .stage("delivered", "Delivered", StageColor::Success);
+    bar = match state {
+        "cancelled" => bar.stage("cancelled", "Cancelled", StageColor::Error),
+        "lost" => bar.stage("lost", "Lost", StageColor::Error),
+        "expired" => bar.stage("expired", "Expired", StageColor::Warning),
+        "superseded" => bar.stage("superseded", "Superseded", StageColor::Neutral),
+        _ => bar,
+    };
+    bar.render(state, "")
+}
+
 /// The document's display identity: SO number once confirmed, the
 /// quotation number (with revision suffix past rev 1) before that.
 fn doc_identity(number: Option<&str>, quote_number: Option<&str>, revision: i32) -> String {
@@ -173,72 +203,57 @@ async fn customer_options(db: &vortex_plugin_sdk::sqlx::PgPool, selected: Option
     out
 }
 
-/// `<option>` list of sellable products — services included; the
-/// product type decides fulfilment later (stockable → stock move,
-/// consumable → delivery without stock, service → confirmation).
-/// Each option carries a `data-fill` JSON payload so picking a
-/// product autofills the line with the master's sales description,
-/// list price, sales tax and LHDN classification.
-async fn product_options(db: &vortex_plugin_sdk::sqlx::PgPool) -> String {
-    let esc = vortex_plugin_sdk::framework::html_escape;
+
+/// JSON map of customer context (address + credit limit), keyed for the
+/// editor's client so picking a customer can surface where they are and how
+/// much credit they have — without a round-trip.
+async fn customers_json(db: &vortex_plugin_sdk::sqlx::PgPool) -> String {
     let rows = vortex_plugin_sdk::sqlx::query(
-        "SELECT id, code, name, product_type, \
-                COALESCE(NULLIF(sales_description, ''), name) AS side_desc, \
-                CASE WHEN list_price > 0 THEN list_price ELSE cost END AS side_price, \
-                sales_tax_id, classification_code \
-         FROM stock_product \
-         WHERE active ORDER BY code",
+        "SELECT c.id, c.street, c.street2, c.city, c.country, c.credit_limit, \
+                tp.payment_term_id \
+         FROM contacts c \
+         LEFT JOIN LATERAL ( \
+             SELECT payment_term_id FROM acc_partner_tax_profile \
+             WHERE contact_id = c.id ORDER BY company_id NULLS LAST LIMIT 1 \
+         ) tp ON TRUE \
+         WHERE c.active AND c.contact_type IN ('customer','both')",
     )
     .fetch_all(db)
     .await
     .unwrap_or_default();
-    let mut out = String::from(r#"<option value="">-- Product --</option>"#);
-    for r in &rows {
-        let id: Uuid = r.get("id");
-        let code: String = r.get("code");
-        let name: String = r.get("name");
-        let desc: String = r.get("side_desc");
-        let price: Decimal = r.try_get("side_price").unwrap_or(Decimal::ZERO);
-        let mut fill = json!({
-            "description": desc,
-            "unit_price": price.round_dp(2).to_string(),
-        });
-        if let Ok(Some(t)) = r.try_get::<Option<Uuid>, _>("sales_tax_id") {
-            fill["tax_id"] = json!(t.to_string());
-        }
-        if let Ok(Some(c)) = r.try_get::<Option<String>, _>("classification_code") {
-            fill["classification_code"] = json!(c);
-        }
-        let ptype: String = r.get("product_type");
-        let suffix = if ptype == "service" { " [service]" } else { "" };
-        out.push_str(&format!(
-            r#"<option value="{id}" data-fill="{fill}">{code} · {name}{suffix}</option>"#,
-            id = id,
-            fill = esc(&fill.to_string()),
-            code = esc(&code),
-            name = esc(&name),
-            suffix = suffix
-        ));
-    }
-    out
+    let arr: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|r| {
+            let id: Uuid = r.get("id");
+            let parts: Vec<String> = ["street", "street2", "city", "country"]
+                .iter()
+                .filter_map(|c| r.try_get::<Option<String>, _>(*c).ok().flatten())
+                .filter(|s| !s.trim().is_empty())
+                .collect();
+            let credit: Option<Decimal> = r.try_get("credit_limit").ok().flatten();
+            json!({
+                "id": id.to_string(),
+                "address": parts.join(", "),
+                "credit_limit": credit.filter(|c| *c > Decimal::ZERO).map(|c| c.round_dp(2).to_string()),
+                "payment_term_id": r.try_get::<Option<Uuid>, _>("payment_term_id").ok().flatten().map(|u| u.to_string()),
+            })
+        })
+        .collect();
+    serde_json::to_string(&arr).unwrap_or_else(|_| "[]".into())
 }
 
-/// `<option>` list of active sale-side taxes.
-async fn sale_tax_options(db: &vortex_plugin_sdk::sqlx::PgPool) -> String {
-    let esc = vortex_plugin_sdk::framework::html_escape;
-    let rows = vortex_plugin_sdk::sqlx::query(
-        "SELECT id, name FROM taxes WHERE active AND type_tax_use IN ('sale', 'none') ORDER BY name",
+/// The company's base currency id, used to preselect the currency on a new
+/// quote instead of forcing the user to pick every time.
+async fn company_currency_id(db: &vortex_plugin_sdk::sqlx::PgPool) -> Option<Uuid> {
+    vortex_plugin_sdk::sqlx::query(
+        "SELECT c.currency_id FROM companies c \
+         WHERE c.currency_id IS NOT NULL ORDER BY c.created_at LIMIT 1",
     )
-    .fetch_all(db)
+    .fetch_optional(db)
     .await
-    .unwrap_or_default();
-    let mut out = String::from(r#"<option value="">— no tax —</option>"#);
-    for r in &rows {
-        let id: Uuid = r.get("id");
-        let name: String = r.get("name");
-        out.push_str(&format!(r#"<option value="{id}">{name}</option>"#, id = id, name = esc(&name)));
-    }
-    out
+    .ok()
+    .flatten()
+    .and_then(|r| r.try_get::<Option<Uuid>, _>("currency_id").ok().flatten())
 }
 
 /// `<option>` list of internal ship-from locations.
@@ -291,18 +306,75 @@ async fn currency_options(db: &vortex_plugin_sdk::sqlx::PgPool, selected: Option
 
 /// Recompute and persist an order's untaxed/tax/total from its lines,
 /// using the same tax engine the customer invoice will post with.
+/// The uniform factor a whole-quote discount applies to every line's net.
+/// `subtotal` (sum of per-line-discounted nets) is only consulted for a fixed
+/// amount. Returns 1 (no-op) for no/unknown discount. Clamped to [0, 1] so a
+/// discount can never make a line negative.
+fn global_factor(discount_type: Option<&str>, value: Decimal, subtotal: Decimal) -> Decimal {
+    let hundred = Decimal::from(100);
+    match discount_type {
+        Some("percent") => (hundred - value.clamp(Decimal::ZERO, hundred)) / hundred,
+        Some("fixed") if subtotal > Decimal::ZERO => {
+            (subtotal - value.clamp(Decimal::ZERO, subtotal)) / subtotal
+        }
+        _ => Decimal::ONE,
+    }
+}
+
+/// Read an order's whole-quote discount (type, value).
+async fn order_global_discount(
+    db: &vortex_plugin_sdk::sqlx::PgPool,
+    order_id: Uuid,
+) -> (Option<String>, Decimal) {
+    vortex_plugin_sdk::sqlx::query(
+        "SELECT global_discount_type, global_discount_value FROM sales_order WHERE id = $1",
+    )
+    .bind(order_id)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
+    .map(|r| {
+        (
+            r.try_get::<Option<String>, _>("global_discount_type").ok().flatten(),
+            r.try_get::<Decimal, _>("global_discount_value").unwrap_or(Decimal::ZERO),
+        )
+    })
+    .unwrap_or((None, Decimal::ZERO))
+}
+
 async fn recompute_totals(db: &vortex_plugin_sdk::sqlx::PgPool, order_id: Uuid) {
     let rows = vortex_plugin_sdk::sqlx::query(
-        "SELECT quantity, unit_price, tax_id FROM sales_order_line WHERE order_id = $1",
+        "SELECT quantity, unit_price, discount_percent, tax_id FROM sales_order_line \
+         WHERE order_id = $1 AND display_type IS NULL",
     )
     .bind(order_id)
     .fetch_all(db)
     .await
     .unwrap_or_default();
-    let lines: Vec<(Decimal, Decimal, Option<Uuid>)> = rows
+    // Fold the per-line discount into an effective unit price so the tax
+    // engine (and the stored totals) see the net the customer actually pays.
+    let hundred = Decimal::from(100);
+    let mut eff_lines: Vec<(Decimal, Decimal, Option<Uuid>)> = rows
         .iter()
-        .map(|r| (r.get("quantity"), r.get("unit_price"), r.try_get("tax_id").ok().flatten()))
+        .map(|r| {
+            let qty: Decimal = r.get("quantity");
+            let price: Decimal = r.get("unit_price");
+            let disc: Decimal = r.try_get("discount_percent").unwrap_or(Decimal::ZERO);
+            let eff = (price * (hundred - disc) / hundred).round_dp(6);
+            (qty, eff, r.try_get("tax_id").ok().flatten())
+        })
         .collect();
+    // Apply the whole-quote discount as a single uniform factor across lines.
+    let (gd_type, gd_value) = order_global_discount(db, order_id).await;
+    let subtotal: Decimal = eff_lines.iter().map(|(q, p, _)| q * p).sum();
+    let factor = global_factor(gd_type.as_deref(), gd_value, subtotal);
+    if factor != Decimal::ONE {
+        for l in eff_lines.iter_mut() {
+            l.1 = (l.1 * factor).round_dp(6);
+        }
+    }
+    let lines = eff_lines;
     let Ok((untaxed, tax, total)) =
         vortex_accounting::documents::compute_document_totals(db, &lines).await
     else {
@@ -448,6 +520,885 @@ async fn list_quotes(
     Html(page_shell(&sidebar, "Quotations", &list_html)).into_response()
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Inline quote editor (Xero-style single-screen grid)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// JSON array of active products for the editor's line grid: the client
+/// builds the product dropdown from this and autofills description / price /
+/// tax / classification when a product is picked.
+async fn products_json(db: &vortex_plugin_sdk::sqlx::PgPool) -> String {
+    let rows = vortex_plugin_sdk::sqlx::query(
+        "SELECT p.id, p.code, p.name, \
+                COALESCE(NULLIF(p.sales_description, ''), p.name) AS side_desc, \
+                CASE WHEN p.list_price > 0 THEN p.list_price ELSE p.cost END AS side_price, \
+                p.sales_tax_id, p.classification_code, u.code AS uom, p.uom_id \
+         FROM stock_product p LEFT JOIN uoms u ON u.id = p.uom_id \
+         WHERE p.active ORDER BY p.code",
+    )
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+    let arr: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|r| {
+            let id: Uuid = r.get("id");
+            let price: Decimal = r.try_get("side_price").unwrap_or(Decimal::ZERO);
+            json!({
+                "id": id.to_string(),
+                "code": r.get::<String, _>("code"),
+                "name": r.get::<String, _>("name"),
+                "description": r.get::<String, _>("side_desc"),
+                "unit_price": price.round_dp(2).to_string(),
+                "tax_id": r.try_get::<Option<Uuid>, _>("sales_tax_id").ok().flatten().map(|t| t.to_string()),
+                "classification_code": r.try_get::<Option<String>, _>("classification_code").ok().flatten(),
+                "uom": r.try_get::<Option<String>, _>("uom").ok().flatten(),
+                "uom_id": r.try_get::<Option<Uuid>, _>("uom_id").ok().flatten().map(|u| u.to_string()),
+            })
+        })
+        .collect();
+    serde_json::to_string(&arr).unwrap_or_else(|_| "[]".into())
+}
+
+/// JSON array of every active unit of measure for the per-line unit selector.
+async fn uoms_json(db: &vortex_plugin_sdk::sqlx::PgPool) -> String {
+    let rows = vortex_plugin_sdk::sqlx::query(
+        "SELECT id, code, name FROM uoms WHERE active ORDER BY name",
+    )
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+    let arr: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|r| {
+            let id: Uuid = r.get("id");
+            json!({
+                "id": id.to_string(),
+                "code": r.get::<String, _>("code"),
+                "name": r.get::<String, _>("name"),
+            })
+        })
+        .collect();
+    serde_json::to_string(&arr).unwrap_or_else(|_| "[]".into())
+}
+
+/// JSON array of sale-side taxes with the parameters the client needs to
+/// estimate tax live (authoritative totals are recomputed server-side).
+async fn taxes_json(db: &vortex_plugin_sdk::sqlx::PgPool) -> String {
+    let rows = vortex_plugin_sdk::sqlx::query(
+        "SELECT id, name, amount_type, amount, price_include \
+         FROM taxes WHERE active AND type_tax_use IN ('sale', 'none') ORDER BY name",
+    )
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+    let arr: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|r| {
+            let id: Uuid = r.get("id");
+            let amount: Decimal = r.try_get("amount").unwrap_or(Decimal::ZERO);
+            json!({
+                "id": id.to_string(),
+                "name": r.get::<String, _>("name"),
+                "amount_type": r.get::<String, _>("amount_type"),
+                "amount": amount.to_string(),
+                "price_include": r.try_get::<bool, _>("price_include").unwrap_or(false),
+            })
+        })
+        .collect();
+    serde_json::to_string(&arr).unwrap_or_else(|_| "[]".into())
+}
+
+/// One line as submitted by the editor (all strings — parsed server-side so a
+/// blank field degrades to a product default rather than a 422).
+#[derive(serde::Deserialize)]
+struct QuoteLinePayload {
+    /// `"section"` or `"note"` for display-only rows; absent/empty = product line.
+    display_type: Option<String>,
+    product_id: Option<String>,
+    description: Option<String>,
+    quantity: Option<String>,
+    unit_price: Option<String>,
+    discount_percent: Option<String>,
+    tax_id: Option<String>,
+    uom_id: Option<String>,
+    classification_code: Option<String>,
+}
+
+/// The whole quote as submitted by the editor's Save button (JSON body).
+#[derive(serde::Deserialize)]
+struct QuotePayload {
+    customer_id: Option<String>,
+    order_date: Option<String>,
+    expected_date: Option<String>,
+    validity_date: Option<String>,
+    currency_id: Option<String>,
+    source_location_id: Option<String>,
+    payment_term_id: Option<String>,
+    title: Option<String>,
+    summary: Option<String>,
+    note: Option<String>,
+    /// Whole-quote discount: `"percent"` or `"fixed"` (absent/other = none).
+    global_discount_type: Option<String>,
+    global_discount_value: Option<String>,
+    #[serde(default)]
+    lines: Vec<QuoteLinePayload>,
+}
+
+/// Parse the submitted whole-quote discount into a validated (type, value)
+/// pair. An unknown type or a zero value collapses to "no discount".
+fn parse_global_discount(payload: &QuotePayload) -> (Option<String>, Decimal) {
+    let value = d_opt(&payload.global_discount_value)
+        .unwrap_or(Decimal::ZERO)
+        .max(Decimal::ZERO);
+    let ty = s_opt(&payload.global_discount_type)
+        .filter(|t| t == "percent" || t == "fixed")
+        .filter(|_| value > Decimal::ZERO);
+    match ty {
+        Some(t) => (Some(t), value),
+        None => (None, Decimal::ZERO),
+    }
+}
+
+fn s_opt(v: &Option<String>) -> Option<String> {
+    v.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty()).map(|s| s.to_string())
+}
+fn u_opt(v: &Option<String>) -> Option<Uuid> {
+    v.as_deref().and_then(|s| Uuid::parse_str(s.trim()).ok())
+}
+fn d_opt(v: &Option<String>) -> Option<Decimal> {
+    v.as_deref().and_then(|s| s.trim().parse::<Decimal>().ok())
+}
+/// Sanitize an optional rich-text field to the safe allow-list, collapsing an
+/// empty result to `None`.
+fn rich_opt(v: &Option<String>) -> Option<String> {
+    let cleaned = crate::richtext::sanitize_rich(v.as_deref().unwrap_or_default());
+    if cleaned.trim().is_empty() {
+        None
+    } else {
+        Some(cleaned)
+    }
+}
+
+/// Insert the submitted lines for a quote, filling blanks from the product
+/// master (same defaults the client autofills) and sequencing them 10, 20, …
+async fn insert_quote_lines(
+    db: &vortex_plugin_sdk::sqlx::PgPool,
+    order_id: Uuid,
+    company_id: Option<Uuid>,
+    lines: &[QuoteLinePayload],
+) {
+    let hundred = Decimal::from(100);
+    let mut seq = 10i32;
+    for l in lines {
+        // Section / note rows: text-only, no product / qty / tax.
+        if let Some(dt) = s_opt(&l.display_type).filter(|d| d == "section" || d == "note") {
+            let text = s_opt(&l.description).unwrap_or_default();
+            if text.is_empty() {
+                continue; // drop empty display rows
+            }
+            let _ = vortex_plugin_sdk::sqlx::query(
+                "INSERT INTO sales_order_line \
+                 (id, order_id, sequence, product_id, description, quantity, unit_price, \
+                  discount_percent, tax_id, classification_code, company_id, display_type) \
+                 VALUES ($1,$2,$3,NULL,$4,0,0,0,NULL,NULL,$5,$6)",
+            )
+            .bind(Uuid::now_v7())
+            .bind(order_id)
+            .bind(seq)
+            .bind(&text)
+            .bind(company_id)
+            .bind(&dt)
+            .execute(db)
+            .await;
+            seq += 10;
+            continue;
+        }
+        let Some(product_id) = u_opt(&l.product_id) else { continue };
+        let quantity = d_opt(&l.quantity).unwrap_or(Decimal::ONE);
+        if quantity <= Decimal::ZERO {
+            continue;
+        }
+        let product = vortex_plugin_sdk::sqlx::query(
+            "SELECT COALESCE(NULLIF(sales_description, ''), name) AS side_desc, \
+                    CASE WHEN list_price > 0 THEN list_price ELSE cost END AS side_price, \
+                    sales_tax_id, classification_code, uom_id \
+             FROM stock_product WHERE id = $1",
+        )
+        .bind(product_id)
+        .fetch_optional(db)
+        .await
+        .ok()
+        .flatten();
+        let Some(product) = product else { continue };
+        // Descriptions may carry inline rich formatting — sanitize to the
+        // allow-list before storing (it is later rendered raw).
+        let description = crate::richtext::sanitize_rich(
+            &s_opt(&l.description).unwrap_or_else(|| product.get("side_desc")),
+        );
+        let unit_price = d_opt(&l.unit_price).unwrap_or_else(|| product.try_get("side_price").unwrap_or(Decimal::ZERO));
+        let discount = d_opt(&l.discount_percent)
+            .unwrap_or(Decimal::ZERO)
+            .clamp(Decimal::ZERO, hundred);
+        let tax_id = u_opt(&l.tax_id)
+            .or_else(|| product.try_get::<Option<Uuid>, _>("sales_tax_id").ok().flatten());
+        // Chosen unit, or the product's own unit as the fallback.
+        let uom_id = u_opt(&l.uom_id)
+            .or_else(|| product.try_get::<Option<Uuid>, _>("uom_id").ok().flatten());
+        let classification = s_opt(&l.classification_code)
+            .or_else(|| product.try_get::<Option<String>, _>("classification_code").ok().flatten());
+        let _ = vortex_plugin_sdk::sqlx::query(
+            "INSERT INTO sales_order_line \
+             (id, order_id, sequence, product_id, description, quantity, unit_price, \
+              discount_percent, tax_id, uom_id, classification_code, company_id) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)",
+        )
+        .bind(Uuid::now_v7())
+        .bind(order_id)
+        .bind(seq)
+        .bind(product_id)
+        .bind(&description)
+        .bind(quantity)
+        .bind(unit_price)
+        .bind(discount)
+        .bind(tax_id)
+        .bind(uom_id)
+        .bind(classification)
+        .bind(company_id)
+        .execute(db)
+        .await;
+        seq += 10;
+    }
+}
+
+/// Render the single-screen quote editor (header fields + reactive line grid
+/// + live totals). Used for both create and draft-edit; `action_url` is the
+/// JSON save endpoint, `lines_json` seeds existing rows (`"[]"` for new).
+#[allow(clippy::too_many_arguments)]
+fn render_quote_editor(
+    heading: &str,
+    action_url: &str,
+    cancel_url: &str,
+    customers_sel: &str,
+    locations_sel: &str,
+    currencies_sel: &str,
+    payment_terms_sel: &str,
+    order_date: &str,
+    expected_date: &str,
+    validity_date: &str,
+    title: &str,
+    summary: &str,
+    note: &str,
+    products_json: &str,
+    taxes_json: &str,
+    lines_json: &str,
+    customers_json: &str,
+    uoms_json: &str,
+    templates_json: &str,
+    gd_type: &str,
+    gd_value: &str,
+) -> String {
+    let esc = vortex_plugin_sdk::framework::html_escape;
+    let gd_sel = |v: &str| if gd_type == v { " selected" } else { "" };
+    let script = QUOTE_EDITOR_JS.replace("__ACTION__", &action_url.replace('"', ""));
+    format!(
+        r##"<div class="max-w-6xl">
+{rt_head}
+<a href="{cancel_url}" class="btn btn-ghost btn-sm mb-3">← Cancel</a>
+<h1 class="text-2xl font-bold mb-3">{heading}</h1>
+
+{rt_toolbar}
+
+<div class="card bg-base-100 shadow mb-4"><div class="card-body">
+<div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+<div class="form-control md:col-span-1"><label class="label py-1"><span class="label-text text-xs">Customer *</span></label>
+<select id="f-customer" class="select select-bordered select-sm" required>{customers}</select>
+<div id="cust-ctx" class="hidden text-xs text-base-content/60 mt-1 leading-snug"></div></div>
+<div class="form-control"><label class="label py-1"><span class="label-text text-xs">Quote Date</span></label>
+<input id="f-order-date" type="date" value="{order_date}" class="input input-bordered input-sm"/></div>
+<div class="form-control"><label class="label py-1"><span class="label-text text-xs">Valid Until</span></label>
+<input id="f-validity" type="date" value="{validity_date}" class="input input-bordered input-sm"/></div>
+<div class="form-control"><label class="label py-1"><span class="label-text text-xs">Expected Date</span></label>
+<input id="f-expected" type="date" value="{expected_date}" class="input input-bordered input-sm"/></div>
+<div class="form-control"><label class="label py-1"><span class="label-text text-xs">Currency</span></label>
+<select id="f-currency" class="select select-bordered select-sm">{currencies}</select></div>
+<div class="form-control"><label class="label py-1"><span class="label-text text-xs">Ship-From</span></label>
+<select id="f-location" class="select select-bordered select-sm">{locations}</select></div>
+<div class="form-control"><label class="label py-1"><span class="label-text text-xs">Payment Terms</span></label>
+<select id="f-payment-term" class="select select-bordered select-sm">{payment_terms}</select></div>
+</div>
+<div class="form-control mt-3"><label class="label py-1"><span class="label-text text-xs">Title</span></label>
+<div id="f-title" contenteditable="true" data-ph="e.g. Supply &amp; installation of…" class="rt-field input input-bordered input-sm h-auto py-1">{title}</div></div>
+<div class="form-control mt-2"><label class="label py-1"><span class="label-text text-xs">Summary / intro</span></label>
+<div id="f-summary" contenteditable="true" data-ph="A short intro shown under the title" class="rt-field textarea textarea-bordered textarea-sm leading-snug">{summary}</div></div>
+</div></div>
+
+<div class="card bg-base-100 shadow mb-4"><div class="card-body">
+<h2 class="card-title text-lg mb-2">Lines</h2>
+<div class="hidden sm:flex items-center gap-2 pb-1 mb-1 border-b border-base-300 text-xs font-semibold uppercase tracking-wide text-base-content/50">
+<span class="w-5"></span>
+<span class="w-44">Product</span>
+<span class="flex-1">Description</span>
+<span class="w-16 text-right">Qty</span>
+<span class="w-20">Unit</span>
+<span class="w-24 text-right">Unit Price</span>
+<span class="w-16 text-right">Disc %</span>
+<span class="w-28">Tax</span>
+<span class="w-24 text-right">Amount</span>
+<span class="w-6"></span>
+</div>
+<div id="lines-body"></div>
+<div class="flex gap-2 mt-3 flex-wrap">
+<button type="button" id="add-line" class="btn btn-outline btn-sm">+ Add a line</button>
+<button type="button" id="add-section" class="btn btn-ghost btn-sm">+ Add a section</button>
+<button type="button" id="add-note" class="btn btn-ghost btn-sm">+ Add a note</button>
+</div>
+<div class="flex justify-end mt-4">
+<table class="text-sm">
+<tr><td class="text-base-content/60 pr-6">Subtotal</td><td class="text-right font-mono"><span id="sum-sub">0.00</span> <span class="sum-cur"></span></td></tr>
+<tr id="disc-row"><td class="text-base-content/60 pr-6 py-1">
+<div class="flex items-center gap-1">
+<span>Discount</span>
+<select id="f-gdtype" class="select select-bordered select-xs">
+<option value=""{gd_none}>None</option>
+<option value="percent"{gd_pct}>% off</option>
+<option value="fixed"{gd_fix}>Amount</option>
+</select>
+<input id="f-gdval" type="number" step="0.01" min="0" value="{gd_value}" class="input input-bordered input-xs w-20 text-right {gd_hide}" placeholder="0"/>
+</div></td><td class="text-right font-mono text-error">- <span id="sum-disc">0.00</span> <span class="sum-cur"></span></td></tr>
+<tr><td class="text-base-content/60 pr-6">Tax</td><td class="text-right font-mono"><span id="sum-tax">0.00</span> <span class="sum-cur"></span></td></tr>
+<tr><td class="font-semibold pr-6">Total</td><td class="text-right font-mono font-semibold"><span id="sum-tot">0.00</span> <span class="sum-cur"></span></td></tr>
+</table>
+</div>
+</div></div>
+
+<div class="card bg-base-100 shadow mb-4"><div class="card-body">
+<div class="flex items-center justify-between mb-1 flex-wrap gap-2">
+<label class="label-text text-xs">Note / terms (printed under the lines)</label>
+<div class="flex items-center gap-1">
+<span class="text-xs text-base-content/50">Apply template:</span>
+<select id="f-note-template" class="select select-bordered select-xs"></select>
+</div>
+</div>
+<div class="form-control">
+<div id="f-note" contenteditable="true" data-ph="Payment terms, delivery notes, disclaimers…" class="rt-field textarea textarea-bordered textarea-sm leading-snug">{note}</div></div>
+</div></div>
+
+<div class="flex gap-2 items-center">
+<button type="button" id="save-quote" class="btn btn-primary">Save Quotation</button>
+<button type="button" id="save-preview" class="btn btn-outline">Save &amp; Preview</button>
+<a href="{cancel_url}" class="btn btn-ghost">Cancel</a>
+<span id="save-err" class="text-error text-sm"></span>
+</div>
+
+<script type="application/json" id="prod-data">{products}</script>
+<script type="application/json" id="tax-data">{taxes}</script>
+<script type="application/json" id="line-data">{lines}</script>
+<script type="application/json" id="cust-data">{cust}</script>
+<script type="application/json" id="uom-data">{uoms}</script>
+<script type="application/json" id="tpl-data">{templates}</script>
+<script>{rt_js}</script>
+<script>{script}</script>
+</div>"##,
+        cancel_url = esc(cancel_url),
+        heading = esc(heading),
+        customers = customers_sel,
+        currencies = currencies_sel,
+        locations = locations_sel,
+        payment_terms = payment_terms_sel,
+        order_date = esc(order_date),
+        expected_date = esc(expected_date),
+        validity_date = esc(validity_date),
+        title = crate::richtext::sanitize_rich(title),
+        summary = crate::richtext::sanitize_rich(summary),
+        note = crate::richtext::sanitize_rich(note),
+        products = products_json,
+        taxes = taxes_json,
+        lines = lines_json,
+        cust = customers_json,
+        uoms = uoms_json,
+        templates = templates_json,
+        gd_none = gd_sel(""),
+        gd_pct = gd_sel("percent"),
+        gd_fix = gd_sel("fixed"),
+        gd_value = esc(gd_value),
+        gd_hide = if gd_type.is_empty() { "hidden" } else { "" },
+        rt_head = RICH_TEXT_HEAD,
+        rt_toolbar = RICH_TOOLBAR_HTML,
+        rt_js = RICH_TEXT_JS,
+        script = script,
+    )
+}
+
+/// Shared `<style>` for the WYSIWYG rich-text fields — used by both the quote
+/// editor and the note-template editor so contenteditable fields + inserted
+/// tables render identically everywhere.
+const RICH_TEXT_HEAD: &str = r#"<style>
+.rt-field{ min-height:1.9rem; }
+.rt-field:empty:before{ content:attr(data-ph); color:#9ca3af; pointer-events:none; }
+.rt-field:focus{ outline:2px solid hsl(var(--p)/.4); outline-offset:1px; }
+.rt-field table{ border-collapse:collapse; width:100%; }
+.rt-field td, .rt-field th{ border:1px solid #ccc; padding:4px 6px; min-width:2rem; }
+</style>"#;
+
+/// The shared rich-text toolbar markup (formatting + table builder). Reused by
+/// every page that hosts `.rt-field` contenteditable fields.
+const RICH_TOOLBAR_HTML: &str = r##"<div id="rt-toolbar" class="sticky top-0 z-20 flex flex-wrap items-center gap-1 bg-base-100 border border-base-300 rounded px-2 py-1 mb-3 shadow-sm">
+<button type="button" data-cmd="bold" class="btn btn-ghost btn-xs font-bold w-8" title="Bold">B</button>
+<button type="button" data-cmd="italic" class="btn btn-ghost btn-xs italic w-8" title="Italic">I</button>
+<button type="button" data-cmd="underline" class="btn btn-ghost btn-xs underline w-8" title="Underline">U</button>
+<span class="mx-1 text-base-content/20">|</span>
+<select id="rt-size" class="select select-bordered select-xs" title="Font size">
+<option value="">Size</option><option value="2">Small</option><option value="3">Normal</option><option value="5">Large</option><option value="6">Huge</option>
+</select>
+<label class="flex items-center gap-1 text-xs cursor-pointer" title="Text colour">
+<span>Colour</span>
+<input type="color" id="rt-color" value="#111827" class="w-7 h-6 p-0 border border-base-300 rounded bg-base-100"/>
+</label>
+<button type="button" id="rt-clear" class="btn btn-ghost btn-xs" title="Clear formatting">Clear</button>
+<span class="mx-1 text-base-content/20">|</span>
+<button type="button" data-tbl="insert" class="btn btn-ghost btn-xs" title="Insert a table">⊞ Table</button>
+<button type="button" data-tbl="row+" class="btn btn-ghost btn-xs" title="Add row">+Row</button>
+<button type="button" data-tbl="col+" class="btn btn-ghost btn-xs" title="Add column">+Col</button>
+<button type="button" data-tbl="row-" class="btn btn-ghost btn-xs" title="Delete row">−Row</button>
+<button type="button" data-tbl="col-" class="btn btn-ghost btn-xs" title="Delete column">−Col</button>
+<span class="text-xs text-base-content/40 ml-auto hidden sm:inline">Select text, then format</span>
+</div>"##;
+
+/// Self-contained toolbar client: wires `#rt-toolbar` to `document.execCommand`
+/// (bold/italic/underline/size/colour/clear) and DOM table operations, acting
+/// on whichever `.rt-field` holds the caret. Include once per page that renders
+/// [`RICH_TOOLBAR_HTML`]. Formatting is sanitized server-side on save.
+const RICH_TEXT_JS: &str = r#"
+(function(){
+  var tb=document.getElementById('rt-toolbar'); if(!tb) return;
+  var savedRange=null;
+  document.addEventListener('selectionchange', function(){
+    var s=window.getSelection(); if(!s.rangeCount) return;
+    var r=s.getRangeAt(0), n=r.commonAncestorContainer, el=n.nodeType===1?n:n.parentNode;
+    if(el && el.closest && el.closest('.rt-field')) savedRange=r.cloneRange();
+  });
+  function restore(){ if(savedRange){ var s=window.getSelection(); s.removeAllRanges(); s.addRange(savedRange); } }
+  function cmd(c, v){
+    try{ document.execCommand('styleWithCSS', false, true); }catch(_){}
+    document.execCommand(c, false, v===undefined?null:v);
+  }
+  tb.querySelectorAll('button[data-cmd]').forEach(function(b){
+    b.addEventListener('mousedown', function(e){ e.preventDefault(); cmd(b.dataset.cmd); });
+  });
+  var sz=document.getElementById('rt-size');
+  if(sz) sz.addEventListener('change', function(){ if(sz.value){ restore(); cmd('fontSize', sz.value); sz.selectedIndex=0; } });
+  var col=document.getElementById('rt-color');
+  if(col) col.addEventListener('input', function(){ restore(); cmd('foreColor', col.value); });
+  var clr=document.getElementById('rt-clear');
+  if(clr) clr.addEventListener('mousedown', function(e){ e.preventDefault(); cmd('removeFormat'); });
+
+  // ---- table builder ----
+  var CELL='border:1px solid #ccc;padding:4px 6px';
+  function newCell(){ var td=document.createElement('td'); td.setAttribute('style', CELL); td.innerHTML='<br>'; return td; }
+  function curCell(){ if(!savedRange) return null; var n=savedRange.commonAncestorContainer; var e=n.nodeType===1?n:n.parentNode; return e&&e.closest?e.closest('td,th'):null; }
+  function insertTable(){
+    restore();
+    var c='<td style="'+CELL+'"><br></td>';
+    var html='<table style="border-collapse:collapse;width:100%"><tbody><tr>'+c+c+'</tr><tr>'+c+c+'</tr></tbody></table><p><br></p>';
+    document.execCommand('insertHTML', false, html);
+  }
+  function rowAdd(){ var c=curCell(); if(!c) return; var tr=c.closest('tr'); var nr=document.createElement('tr'); for(var i=0;i<tr.children.length;i++) nr.appendChild(newCell()); tr.parentNode.insertBefore(nr, tr.nextSibling); }
+  function colAdd(){ var c=curCell(); if(!c) return; var idx=Array.prototype.indexOf.call(c.parentNode.children,c); c.closest('table').querySelectorAll('tr').forEach(function(tr){ var ref=tr.children[idx]; var cell=newCell(); if(ref) tr.insertBefore(cell, ref.nextSibling); else tr.appendChild(cell); }); }
+  function rowDel(){ var c=curCell(); if(!c) return; var tbl=c.closest('table'); if(tbl.querySelectorAll('tr').length>1) c.closest('tr').remove(); }
+  function colDel(){ var c=curCell(); if(!c) return; var idx=Array.prototype.indexOf.call(c.parentNode.children,c); var rows=c.closest('table').querySelectorAll('tr'); if(rows[0].children.length<=1) return; rows.forEach(function(tr){ if(tr.children[idx]) tr.children[idx].remove(); }); }
+  var TBL={ 'insert':insertTable, 'row+':rowAdd, 'col+':colAdd, 'row-':rowDel, 'col-':colDel };
+  tb.querySelectorAll('button[data-tbl]').forEach(function(b){
+    b.addEventListener('mousedown', function(e){ e.preventDefault(); var f=TBL[b.dataset.tbl]; if(f) f(); });
+  });
+})();
+"#;
+
+/// Reactive line-grid client for the quote editor. Builds product/tax
+/// dropdowns from the embedded JSON, autofills on product select, keeps line
+/// amounts and the subtotal/tax/total live, and POSTs the whole quote as JSON.
+/// `__ACTION__` is replaced with the save endpoint.
+const QUOTE_EDITOR_JS: &str = r#"
+(function(){
+  var PRODUCTS = JSON.parse(document.getElementById('prod-data').textContent || '[]');
+  var TAXES    = JSON.parse(document.getElementById('tax-data').textContent || '[]');
+  var LINES    = JSON.parse(document.getElementById('line-data').textContent || '[]');
+  var CUSTS    = JSON.parse((document.getElementById('cust-data')||{}).textContent || '[]');
+  var UOMS     = JSON.parse((document.getElementById('uom-data')||{}).textContent || '[]');
+  var TEMPLATES= JSON.parse((document.getElementById('tpl-data')||{}).textContent || '[]');
+  var ACTION   = '__ACTION__';
+  var body = document.getElementById('lines-body');
+  var prodById = {}; PRODUCTS.forEach(function(p){ prodById[p.id]=p; });
+  var taxById  = {}; TAXES.forEach(function(t){ taxById[t.id]=t; });
+  var custById = {}; CUSTS.forEach(function(c){ custById[c.id]=c; });
+
+  function esc(x){ return String(x==null?'':x).replace(/[&<>"]/g,function(c){
+    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]; }); }
+  function num(v){ var n=parseFloat(v); return isFinite(n)?n:0; }
+  function prodLabel(p){ return p?(p.code+' · '+p.name):''; }
+  // Rich-text field accessors (contenteditable divs vs plain inputs).
+  function rtGet(el){ if(!el) return ''; return el.isContentEditable ? el.innerHTML : el.value; }
+  function rtSet(el, html){ if(!el) return; if(el.isContentEditable) el.innerHTML = html||''; else el.value = html||''; }
+  function rtSetText(el, txt){ if(!el) return; if(el.isContentEditable) el.textContent = txt||''; else el.value = txt||''; }
+
+  function taxOptions(sel){
+    var s='<option value="">— no tax —</option>';
+    TAXES.forEach(function(t){
+      s+='<option value="'+t.id+'"'+(t.id===sel?' selected':'')+'>'+esc(t.name)+'</option>';
+    });
+    return s;
+  }
+  function uomOptions(sel){
+    var s='<option value="">—</option>';
+    UOMS.forEach(function(u){
+      s+='<option value="'+u.id+'"'+(u.id===sel?' selected':'')+'>'+esc(u.code)+'</option>';
+    });
+    return s;
+  }
+  function currencyCode(){
+    var sel=document.getElementById('f-currency');
+    if(!sel || sel.selectedIndex<0) return '';
+    var t=sel.options[sel.selectedIndex].text||'';
+    return (t.split('—')[0].trim().split(/\s+/)[0])||'';
+  }
+
+  // ---- drag-to-reorder (pointer events → works with touch AND mouse) ----
+  var dragRow=null, dragPid=null;
+  function attachDrag(row){
+    var h=row.querySelector('.l-drag');
+    if(!h) return;
+    h.addEventListener('pointerdown', function(e){
+      e.preventDefault();
+      dragRow=row; dragPid=e.pointerId;
+      row.classList.add('opacity-40','ring','ring-primary/40');
+      try{ h.setPointerCapture(e.pointerId); }catch(_){}
+    });
+    h.addEventListener('pointermove', function(e){
+      if(!dragRow) return;
+      e.preventDefault();
+      var el=document.elementFromPoint(e.clientX, e.clientY);
+      var tgt=el && el.closest ? el.closest('.qline') : null;
+      if(!tgt || tgt===dragRow || tgt.parentNode!==body) return;
+      var rect=tgt.getBoundingClientRect();
+      var before=(e.clientY - rect.top) < rect.height/2;
+      body.insertBefore(dragRow, before?tgt:tgt.nextSibling);
+    });
+    function end(){
+      if(dragRow){ dragRow.classList.remove('opacity-40','ring','ring-primary/40'); }
+      try{ if(dragPid!=null) h.releasePointerCapture(dragPid); }catch(_){}
+      dragRow=null; dragPid=null; recalc();
+    }
+    h.addEventListener('pointerup', end);
+    h.addEventListener('pointercancel', end);
+  }
+
+  // ---- product typeahead (client-side; the full product list is embedded) ----
+  // Replaces the old giant <select> so a user with thousands of products can
+  // just type "cable" and pick, keyboard-only.
+  function filterProducts(q){
+    q=(q||'').trim().toLowerCase();
+    var out=[];
+    for(var i=0;i<PRODUCTS.length && out.length<60;i++){
+      var p=PRODUCTS[i];
+      if(!q || (p.code+' '+p.name).toLowerCase().indexOf(q)>=0) out.push(p);
+    }
+    return out;
+  }
+  function selectProduct(row, id){
+    var p=prodById[id]; if(!p) return;
+    row.querySelector('.l-prod').value=id;
+    row.querySelector('.l-prod-search').value=prodLabel(p);
+    // Only overwrite fields the user hasn't already typed into.
+    var desc=row.querySelector('.l-desc'); if(!rtGet(desc).trim()) rtSetText(desc, p.description||'');
+    var price=row.querySelector('.l-price'); if(!price.value) price.value=p.unit_price||'';
+    if(p.tax_id) row.querySelector('.l-tax').value=p.tax_id;
+    row.dataset.cls=p.classification_code||'';
+    // Default the unit to the product's, unless the user already picked one.
+    var uom=row.querySelector('.l-uom'); if(uom && !uom.value && p.uom_id) uom.value=p.uom_id;
+    closeProdMenu(row);
+    recalc();
+    // Xero-style: filling the last row spawns a fresh one so entry keeps flowing.
+    if(row===body.lastElementChild){ var nr=addRow({}); var ns=nr.querySelector('.l-prod-search'); if(ns) ns.focus(); }
+    else { var q=row.querySelector('.l-qty'); if(q) q.focus(); }
+  }
+  function closeProdMenu(row){
+    var m=row.querySelector('.l-prod-menu'); if(m){ m.classList.add('hidden'); m.innerHTML=''; }
+  }
+  function renderProdMenu(row){
+    var m=row.querySelector('.l-prod-menu');
+    var q=row.querySelector('.l-prod-search').value;
+    var list=filterProducts(q);
+    if(!list.length){ m.innerHTML='<div class="px-2 py-1 text-base-content/50">No match</div>'; m.classList.remove('hidden'); return; }
+    m.innerHTML=list.map(function(p,i){
+      return '<div class="l-opt px-2 py-1 cursor-pointer hover:bg-base-200'+(i===0?' bg-base-200':'')+'" data-id="'+esc(p.id)+'">'+esc(prodLabel(p))+'</div>';
+    }).join('');
+    m.classList.remove('hidden');
+  }
+  function moveHighlight(m, dir){
+    var opts=m.querySelectorAll('.l-opt'); if(!opts.length) return;
+    var cur=-1; for(var i=0;i<opts.length;i++){ if(opts[i].classList.contains('bg-base-200')){ cur=i; break; } }
+    if(cur>=0) opts[cur].classList.remove('bg-base-200');
+    var nx=(cur+dir+opts.length)%opts.length;
+    opts[nx].classList.add('bg-base-200');
+    opts[nx].scrollIntoView({block:'nearest'});
+  }
+  function attachProdCombo(row){
+    var inp=row.querySelector('.l-prod-search');
+    var menu=row.querySelector('.l-prod-menu');
+    inp.addEventListener('focus', function(){ renderProdMenu(row); });
+    inp.addEventListener('input', function(){ row.querySelector('.l-prod').value=''; renderProdMenu(row); });
+    inp.addEventListener('blur', function(){ setTimeout(function(){ closeProdMenu(row); }, 150); });
+    inp.addEventListener('keydown', function(e){
+      if(e.key==='ArrowDown'){ e.preventDefault(); if(menu.classList.contains('hidden')) renderProdMenu(row); else moveHighlight(menu,1); }
+      else if(e.key==='ArrowUp'){ e.preventDefault(); moveHighlight(menu,-1); }
+      else if(e.key==='Enter'){ var h=menu.querySelector('.l-opt.bg-base-200'); if(h){ e.preventDefault(); selectProduct(row, h.dataset.id); } }
+      else if(e.key==='Escape'){ closeProdMenu(row); }
+    });
+    menu.addEventListener('mousedown', function(e){
+      var opt=e.target.closest?e.target.closest('.l-opt'):null;
+      if(opt){ e.preventDefault(); selectProduct(row, opt.dataset.id); }
+    });
+  }
+
+  // On phones each line is a bordered card (clear separation); on >=sm it
+  // collapses back to a single flat table-style row.
+  var ROW='qline flex flex-wrap items-center gap-2 border border-base-300 rounded-lg p-3 mb-3 sm:border-0 sm:border-b sm:border-base-200 sm:rounded-none sm:p-0 sm:py-2 sm:mb-0';
+  function addRow(d){
+    d=d||{};
+    var kind=(d.display_type==='section'||d.display_type==='note')?d.display_type:'line';
+    var row=document.createElement('div');
+    row.className=ROW+(kind==='section'?' bg-base-200/50':'');
+    row.dataset.kind=kind;
+    var drag='<span class="l-drag select-none text-lg leading-none text-base-content/40 w-5 text-center shrink-0" title="Drag to reorder" style="cursor:grab;touch-action:none">⠿</span>';
+    var del='<button type="button" class="btn btn-ghost btn-xs text-error l-del ml-auto sm:ml-0 sm:w-6" title="Remove">✕</button>';
+    if(kind==='line'){
+      row.innerHTML= drag+
+        '<div class="l-prod-wrap relative w-full sm:w-44">'+
+          '<input type="text" autocomplete="off" class="input input-bordered input-xs w-full l-prod-search" placeholder="Search product…"/>'+
+          '<input type="hidden" class="l-prod"/>'+
+          '<div class="l-prod-menu hidden absolute z-30 mt-1 w-64 max-h-60 overflow-auto bg-base-100 border border-base-300 rounded shadow text-xs"></div>'+
+        '</div>'+
+        '<div contenteditable="true" data-ph="Description" class="l-desc rt-field textarea textarea-bordered textarea-xs w-full sm:flex-1 sm:w-auto leading-snug"></div>'+
+        '<input type="number" step="0.0001" min="0" class="input input-bordered input-xs w-16 text-right l-qty" placeholder="Qty"/>'+
+        '<select class="select select-bordered select-xs w-20 l-uom" title="Unit of measure">'+uomOptions(d.uom_id)+'</select>'+
+        '<input type="number" step="0.0001" min="0" class="input input-bordered input-xs w-24 text-right l-price" placeholder="Price"/>'+
+        '<input type="number" step="0.01" min="0" max="100" class="input input-bordered input-xs w-16 text-right l-disc" placeholder="Disc%"/>'+
+        '<select class="select select-bordered select-xs w-28 l-tax">'+taxOptions(d.tax_id)+'</select>'+
+        '<span class="font-mono text-right w-24 l-amt">0.00</span>'+del;
+      body.appendChild(row);
+      rtSet(row.querySelector('.l-desc'), d.description!=null?d.description:'');
+      row.querySelector('.l-qty').value  = d.quantity!=null?d.quantity:'1';
+      row.querySelector('.l-price').value= d.unit_price!=null?d.unit_price:'';
+      row.querySelector('.l-disc').value = d.discount_percent!=null?d.discount_percent:'0';
+      row.dataset.cls = d.classification_code||'';
+      // Seed a pre-selected product (edit mode) into the typeahead.
+      if(d.product_id && prodById[d.product_id]){
+        var sp=prodById[d.product_id];
+        row.querySelector('.l-prod').value=d.product_id;
+        row.querySelector('.l-prod-search').value=prodLabel(sp);
+        // Fall back to the product's own unit when the line stored none.
+        var uu=row.querySelector('.l-uom'); if(!uu.value && sp.uom_id) uu.value=sp.uom_id;
+      }
+      attachProdCombo(row);
+    } else {
+      var field = kind==='section'
+        ? '<input type="text" class="input input-bordered input-xs flex-1 font-semibold l-text" placeholder="Section name (e.g. Phase 1 — Materials)"/>'
+        : '<textarea rows="1" class="textarea textarea-bordered textarea-xs flex-1 italic leading-snug l-text" placeholder="Note shown to the customer"></textarea>';
+      row.innerHTML= drag+field+del;
+      body.appendChild(row);
+      row.querySelector('.l-text').value = d.description!=null?d.description:'';
+    }
+    row.querySelectorAll('input,textarea,select').forEach(function(el){
+      el.addEventListener('input', recalc); el.addEventListener('change', recalc);
+    });
+    row.querySelector('.l-del').addEventListener('click', function(){ row.remove(); recalc(); });
+    attachDrag(row);
+    recalc();
+    return row;
+  }
+
+  // Whole-quote discount factor (mirrors the server): a single uniform scale
+  // applied to every line's net. `netSum` is only needed for a fixed amount.
+  function globalFactor(netSum){
+    var gt=document.getElementById('f-gdtype'); if(!gt) return 1;
+    var t=gt.value, v=num((document.getElementById('f-gdval')||{}).value);
+    if(t==='percent') return Math.max(0,(100-Math.min(v,100))/100);
+    if(t==='fixed' && netSum>0) return Math.max(0,(netSum-Math.min(v,netSum))/netSum);
+    return 1;
+  }
+  function recalc(){
+    var rows=[], netSum=0;
+    body.querySelectorAll('.qline').forEach(function(tr){
+      if(tr.dataset.kind!=='line') return; // sections / notes carry no money
+      var qty=num(tr.querySelector('.l-qty').value);
+      var price=num(tr.querySelector('.l-price').value);
+      var disc=num(tr.querySelector('.l-disc').value);
+      var net=qty*price*(1-disc/100);
+      tr.querySelector('.l-amt').textContent=net.toFixed(2);
+      rows.push({net:net, t:taxById[tr.querySelector('.l-tax').value]});
+      netSum+=net;
+    });
+    var factor=globalFactor(netSum);
+    var subPre=0, base=0, taxT=0;
+    rows.forEach(function(r){
+      var t=r.t, a=t?num(t.amount):0, dnet=r.net*factor;
+      if(t && t.amount_type==='fixed'){ subPre+=r.net; base+=dnet; taxT+=a; }
+      else if(t && t.price_include){ subPre+=r.net/(1+a/100); base+=dnet/(1+a/100); taxT+=dnet-dnet/(1+a/100); }
+      else { subPre+=r.net; base+=dnet; taxT+=(t?dnet*a/100:0); }
+    });
+    var disc=subPre-base; if(disc<0) disc=0;
+    var cur=currencyCode();
+    document.getElementById('sum-sub').textContent=subPre.toFixed(2);
+    document.getElementById('sum-disc').textContent=disc.toFixed(2);
+    document.getElementById('disc-row').style.display = disc>0 ? '' : 'none';
+    document.getElementById('sum-tax').textContent=taxT.toFixed(2);
+    document.getElementById('sum-tot').textContent=(base+taxT).toFixed(2);
+    document.querySelectorAll('.sum-cur').forEach(function(e){ e.textContent=cur; });
+  }
+  // Discount controls: toggle the amount field + recompute.
+  (function(){
+    var gt=document.getElementById('f-gdtype'), gv=document.getElementById('f-gdval');
+    if(!gt||!gv) return;
+    function sync(){ if(gt.value){ gv.classList.remove('hidden'); } else { gv.classList.add('hidden'); } recalc(); }
+    gt.addEventListener('change', sync); gv.addEventListener('input', recalc);
+  })();
+
+  document.getElementById('add-line').addEventListener('click', function(){ var r=addRow({}); r.querySelector('.l-prod-search').focus(); });
+  document.getElementById('add-section').addEventListener('click', function(){ addRow({display_type:'section'}); });
+  document.getElementById('add-note').addEventListener('click', function(){ addRow({display_type:'note'}); });
+  var curSel=document.getElementById('f-currency'); if(curSel) curSel.addEventListener('change', recalc);
+  if(LINES.length){ LINES.forEach(addRow); } else { addRow({}); }
+
+  // ---- customer context (address + credit limit shown on pick) ----
+  var custSel=document.getElementById('f-customer');
+  var custCtx=document.getElementById('cust-ctx');
+  var ptSel=document.getElementById('f-payment-term');
+  function showCust(){
+    if(!custSel||!custCtx) return;
+    var c=custById[custSel.value];
+    if(!c || (!c.address && !c.credit_limit)){ custCtx.classList.add('hidden'); custCtx.innerHTML=''; return; }
+    var bits=[];
+    if(c.address) bits.push('📍 '+esc(c.address));
+    if(c.credit_limit) bits.push('💳 Credit limit '+esc(c.credit_limit));
+    custCtx.innerHTML=bits.join('<br>');
+    custCtx.classList.remove('hidden');
+  }
+  // On picking a customer, default the payment terms to their master default.
+  // Only on an explicit change — so editing an existing quote keeps its own
+  // saved term (which is pre-selected server-side) until the customer changes.
+  function applyCustDefaults(){
+    var c=custById[custSel.value];
+    if(c && ptSel && c.payment_term_id){ ptSel.value=c.payment_term_id; }
+  }
+  if(custSel){
+    custSel.addEventListener('change', function(){ showCust(); applyCustDefaults(); });
+    showCust();
+  }
+
+  // ---- Notes/Terms template picker (copy-on-insert; never mutates template) ----
+  (function(){
+    var sel=document.getElementById('f-note-template'), note=document.getElementById('f-note');
+    if(!sel||!note) return;
+    var tplById={};
+    var opts='<option value="">— choose —</option>';
+    TEMPLATES.forEach(function(t){ tplById[t.id]=t; opts+='<option value="'+esc(t.id)+'">'+esc(t.name)+'</option>'; });
+    sel.innerHTML=opts;
+    if(!TEMPLATES.length){ sel.disabled=true; sel.title='No templates yet — create them under Sales ▸ Configuration ▸ Terms Templates'; }
+    sel.addEventListener('change', function(){
+      var t=tplById[sel.value]; sel.selectedIndex=0;
+      if(!t) return;
+      var cur=note.innerHTML.replace(/<br\s*\/?>|\s|&nbsp;/gi,'');
+      if(cur && !window.confirm('Replace the current Notes / Terms with the "'+t.name+'" template?')) return;
+      note.innerHTML=t.body||'';
+    });
+  })();
+
+  function val(id){ var e=document.getElementById(id); return e?e.value:''; }
+  function rval(id){ var e=document.getElementById(id); return e ? (e.isContentEditable ? e.innerHTML : e.value) : ''; }
+
+  // The rich-text toolbar itself is wired by the shared RICH_TEXT_JS component.
+  // Title is single-line: swallow Enter so it can't become multi-paragraph.
+  (function(){ var t=document.getElementById('f-title'); if(t) t.addEventListener('keydown', function(e){ if(e.key==='Enter') e.preventDefault(); }); })();
+
+  var btn=document.getElementById('save-quote');
+  var pbtn=document.getElementById('save-preview');
+  function reset(){ btn.disabled=false; btn.textContent='Save Quotation'; if(pbtn){ pbtn.disabled=false; pbtn.textContent='Save & Preview'; } }
+  function doSave(preview){
+    var err=document.getElementById('save-err'); err.textContent='';
+    var lines=[], productLines=0, zeroPrice=0;
+    body.querySelectorAll('.qline').forEach(function(tr){
+      if(tr.dataset.kind==='section' || tr.dataset.kind==='note'){
+        var text=tr.querySelector('.l-text').value;
+        if(!text) return;
+        lines.push({ display_type: tr.dataset.kind, description: text });
+        return;
+      }
+      var pid=tr.querySelector('.l-prod').value;
+      if(!pid) return;
+      productLines++;
+      if(num(tr.querySelector('.l-price').value)<=0) zeroPrice++;
+      lines.push({
+        product_id: pid,
+        description: rtGet(tr.querySelector('.l-desc')),
+        quantity: tr.querySelector('.l-qty').value,
+        unit_price: tr.querySelector('.l-price').value,
+        discount_percent: tr.querySelector('.l-disc').value,
+        tax_id: tr.querySelector('.l-tax').value||null,
+        uom_id: tr.querySelector('.l-uom').value||null,
+        classification_code: tr.dataset.cls||null
+      });
+    });
+    // Client-side guards — catch the common "sent an empty/zero quote" mistakes.
+    if(!val('f-customer')){ err.textContent='Choose a customer first.'; return; }
+    if(productLines===0){ err.textContent='Add at least one product line before saving.'; return; }
+    if(zeroPrice>0 && !window.confirm(zeroPrice+' line'+(zeroPrice>1?'s have':' has')+' no price. Save anyway?')) return;
+    var payload={
+      customer_id: val('f-customer')||null,
+      order_date: val('f-order-date')||null,
+      expected_date: val('f-expected')||null,
+      validity_date: val('f-validity')||null,
+      currency_id: val('f-currency')||null,
+      source_location_id: val('f-location')||null,
+      payment_term_id: val('f-payment-term')||null,
+      title: rval('f-title')||null,
+      summary: rval('f-summary')||null,
+      note: rval('f-note')||null,
+      global_discount_type: val('f-gdtype')||null,
+      global_discount_value: val('f-gdval')||null,
+      lines: lines
+    };
+    btn.disabled=true; btn.textContent='Saving…'; if(pbtn){ pbtn.disabled=true; }
+    DIRTY=false; // saving — don't warn on the resulting navigation
+    fetch(ACTION,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)})
+      .then(function(r){ return r.json().then(function(j){ return {ok:r.ok,j:j}; }); })
+      .then(function(res){
+        if(res.ok && res.j && res.j.redirect){
+          // Preview: land on the branded printable quote; else the record.
+          window.location = preview ? (res.j.redirect + '/print-quote') : res.j.redirect;
+          return;
+        }
+        DIRTY=true;
+        err.textContent=(res.j && res.j.error)||'Save failed.'; reset();
+      })
+      .catch(function(){ DIRTY=true; err.textContent='Network error.'; reset(); });
+  }
+  btn.addEventListener('click', function(){ doSave(false); });
+  if(pbtn){ pbtn.addEventListener('click', function(){ doSave(true); }); }
+  // Ctrl/Cmd+Enter saves from anywhere in the editor.
+  document.addEventListener('keydown', function(e){
+    if((e.ctrlKey||e.metaKey) && e.key==='Enter'){ e.preventDefault(); doSave(false); }
+  });
+
+  // ---- unsaved-changes guard ----
+  var DIRTY=false;
+  document.addEventListener('input', function(){ DIRTY=true; }, true);
+  document.addEventListener('change', function(){ DIRTY=true; }, true);
+  window.addEventListener('beforeunload', function(e){
+    if(DIRTY){ e.preventDefault(); e.returnValue=''; return ''; }
+  });
+})();
+"#;
+
 async fn new_order_form(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
@@ -457,62 +1408,58 @@ async fn new_order_form(
     let sidebar = render_sidebar(&state, &user, &db_ctx);
     let customers = customer_options(&db, None).await;
     let locations = location_options(&db, None).await;
-    let currencies = currency_options(&db, None).await;
+    // Preselect the company's base currency so it isn't left blank.
+    let base_currency = company_currency_id(&db).await;
+    let currencies = currency_options(&db, base_currency).await;
+    let payment_terms =
+        vortex_accounting::handlers_payment_terms::payment_term_options(&db, None).await;
+    let products = products_json(&db).await;
+    let taxes = taxes_json(&db).await;
+    let cust_ctx = customers_json(&db).await;
+    let uoms = uoms_json(&db).await;
+    let templates = note_templates_json(&db).await;
 
-    let content = format!(
-        r#"<div class="max-w-2xl">
-<a href="/sales/quotes" class="btn btn-ghost btn-sm mb-4">← Back to Quotations</a>
-<h1 class="text-2xl font-bold mb-6">New Quotation</h1>
-<p class="text-base-content/60 text-sm mb-4">Every sale starts as a quotation — it gets its SO number when confirmed.</p>
-<form method="POST" action="/sales/orders/create">
-<div class="card bg-base-100 shadow"><div class="card-body">
-<div class="form-control mb-3">
-<label class="label"><span class="label-text">Customer *</span></label>
-<select name="customer_id" class="select select-bordered select-sm" required>{customers}</select>
-<label class="label"><span class="label-text-alt text-base-content/50">Customers are contacts of type Customer or Both.</span></label>
-</div>
-<div class="grid grid-cols-2 gap-3">
-<div class="form-control mb-3">
-<label class="label"><span class="label-text">Order Date</span></label>
-<input name="order_date" type="date" class="input input-bordered input-sm"/>
-</div>
-<div class="form-control mb-3">
-<label class="label"><span class="label-text">Expected Date</span></label>
-<input name="expected_date" type="date" class="input input-bordered input-sm"/>
-</div>
-</div>
-<div class="form-control mb-3">
-<label class="label"><span class="label-text">Valid Until</span></label>
-<input name="validity_date" type="date" class="input input-bordered input-sm"/>
-<label class="label"><span class="label-text-alt text-base-content/50">Blank = 30 days from today. Sent quotations expire past this date.</span></label>
-</div>
-<div class="grid grid-cols-2 gap-3">
-<div class="form-control mb-3">
-<label class="label"><span class="label-text">Ship-From Location</span></label>
-<select name="source_location_id" class="select select-bordered select-sm">{locations}</select>
-</div>
-<div class="form-control mb-3">
-<label class="label"><span class="label-text">Currency</span></label>
-<select name="currency_id" class="select select-bordered select-sm">{currencies}</select>
-</div>
-</div>
-<div class="form-control mb-4">
-<label class="label"><span class="label-text">Note</span></label>
-<textarea name="note" class="textarea textarea-bordered" rows="2"></textarea>
-</div>
-<div class="flex gap-2">
-<button type="submit" class="btn btn-primary btn-sm">Create</button>
-<a href="/sales" class="btn btn-ghost btn-sm">Cancel</a>
-</div>
-</div></div>
-</form>
-</div>"#,
-        customers = customers,
-        locations = locations,
-        currencies = currencies,
+    // Sensible date defaults: quote dated today, valid for 30 days — so the
+    // expiry sweep has something to act on and the user rarely has to touch them.
+    let today = vortex_plugin_sdk::chrono::Local::now().date_naive();
+    let order_date = today.format("%Y-%m-%d").to_string();
+    let validity_date = (today + vortex_plugin_sdk::chrono::Duration::days(30))
+        .format("%Y-%m-%d")
+        .to_string();
+
+    let content = render_quote_editor(
+        "New Quotation",
+        "/sales/orders/create",
+        "/sales/quotes",
+        &customers,
+        &locations,
+        &currencies,
+        &payment_terms,
+        &order_date,
+        "",
+        &validity_date,
+        "",
+        "",
+        "",
+        &products,
+        &taxes,
+        "[]",
+        &cust_ctx,
+        &uoms,
+        &templates,
+        "",
+        "",
     );
 
-    Html(page_shell(&sidebar, "New Sales Order", &content)).into_response()
+    Html(page_shell(&sidebar, "New Quotation", &content)).into_response()
+}
+
+/// JSON `{redirect}` on success, `(status, {error})` otherwise.
+fn json_redirect(url: String) -> Response {
+    vortex_plugin_sdk::axum::Json(json!({ "redirect": url })).into_response()
+}
+fn json_err(code: vortex_plugin_sdk::axum::http::StatusCode, msg: &str) -> Response {
+    (code, vortex_plugin_sdk::axum::Json(json!({ "error": msg }))).into_response()
 }
 
 async fn create_order(
@@ -520,10 +1467,11 @@ async fn create_order(
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
     Extension(db_ctx): Extension<DatabaseContext>,
-    vortex_plugin_sdk::axum::extract::Form(form): vortex_plugin_sdk::axum::extract::Form<HashMap<String, String>>,
+    vortex_plugin_sdk::axum::Json(payload): vortex_plugin_sdk::axum::Json<QuotePayload>,
 ) -> Response {
-    let Some(customer_id) = opt_uuid(&form, "customer_id") else {
-        return (vortex_plugin_sdk::axum::http::StatusCode::BAD_REQUEST, "Customer is required").into_response();
+    use vortex_plugin_sdk::axum::http::StatusCode;
+    let Some(customer_id) = u_opt(&payload.customer_id) else {
+        return json_err(StatusCode::BAD_REQUEST, "Customer is required");
     };
 
     // Every sale starts life as a quotation: QT number now, SO number
@@ -532,32 +1480,33 @@ async fn create_order(
         Ok(n) => n,
         Err(e) => {
             error!(error = %e, "QT sequence generation failed");
-            return (vortex_plugin_sdk::axum::http::StatusCode::INTERNAL_SERVER_ERROR, "Failed to generate quotation number").into_response();
+            return json_err(StatusCode::INTERNAL_SERVER_ERROR, "Failed to generate quotation number");
         }
     };
     let company_id = default_company(&db).await;
 
     let order_date: Option<vortex_plugin_sdk::chrono::NaiveDate> =
-        form.get("order_date").filter(|s| !s.is_empty()).and_then(|s| s.parse().ok());
+        s_opt(&payload.order_date).and_then(|s| s.parse().ok());
     let expected_date: Option<vortex_plugin_sdk::chrono::NaiveDate> =
-        form.get("expected_date").filter(|s| !s.is_empty()).and_then(|s| s.parse().ok());
+        s_opt(&payload.expected_date).and_then(|s| s.parse().ok());
     // Default validity: 30 days from today.
-    let validity_date: vortex_plugin_sdk::chrono::NaiveDate = form
-        .get("validity_date")
-        .filter(|v| !v.is_empty())
+    let validity_date: vortex_plugin_sdk::chrono::NaiveDate = s_opt(&payload.validity_date)
         .and_then(|v| v.parse().ok())
         .unwrap_or_else(|| {
             vortex_plugin_sdk::chrono::Utc::now().date_naive()
                 + vortex_plugin_sdk::chrono::Duration::days(30)
         });
 
+    let (gd_type, gd_value) = parse_global_discount(&payload);
+
     let order_id = Uuid::now_v7();
     // order_date column defaults to CURRENT_DATE; pass COALESCE via Option.
     let res = vortex_plugin_sdk::sqlx::query(
         "INSERT INTO sales_order \
          (id, quote_number, revision, root_quote_id, validity_date, customer_id, order_date, \
-          expected_date, currency_id, source_location_id, note, company_id, created_by) \
-         VALUES ($1,$2,1,$1,$3,$4,COALESCE($5, CURRENT_DATE),$6,$7,$8,$9,$10,$11)",
+          expected_date, currency_id, source_location_id, note, title, summary, \
+          global_discount_type, global_discount_value, company_id, created_by, payment_term_id) \
+         VALUES ($1,$2,1,$1,$3,$4,COALESCE($5, CURRENT_DATE),$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)",
     )
     .bind(order_id)
     .bind(&quote_number)
@@ -565,18 +1514,26 @@ async fn create_order(
     .bind(customer_id)
     .bind(order_date)
     .bind(expected_date)
-    .bind(opt_uuid(&form, "currency_id"))
-    .bind(opt_uuid(&form, "source_location_id"))
-    .bind(form.get("note").filter(|s| !s.is_empty()))
+    .bind(u_opt(&payload.currency_id))
+    .bind(u_opt(&payload.source_location_id))
+    .bind(rich_opt(&payload.note))
+    .bind(rich_opt(&payload.title))
+    .bind(rich_opt(&payload.summary))
+    .bind(&gd_type)
+    .bind(gd_value)
     .bind(company_id)
     .bind(user.id)
+    .bind(u_opt(&payload.payment_term_id))
     .execute(&db)
     .await;
 
     if let Err(e) = res {
         error!(error = %e, "quotation insert failed");
-        return (vortex_plugin_sdk::axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create quotation: {e}")).into_response();
+        return json_err(StatusCode::INTERNAL_SERVER_ERROR, "Failed to create quotation");
     }
+
+    insert_quote_lines(&db, order_id, company_id, &payload.lines).await;
+    recompute_totals(&db, order_id).await;
 
     let audit_entry = vortex_plugin_sdk::security::AuditEntry::new(
         vortex_plugin_sdk::security::AuditAction::RecordCreated,
@@ -591,7 +1548,197 @@ async fn create_order(
     let _ = state.audit.log(audit_entry).await;
 
     info!(number = %quote_number, "quotation created");
-    vortex_plugin_sdk::axum::response::Redirect::to(&format!("/sales/orders/{order_id}")).into_response()
+    json_redirect(format!("/sales/orders/{order_id}"))
+}
+
+/// GET the inline editor pre-populated for an existing **draft** quotation.
+/// Non-draft quotations are read-only, so this redirects to the record view.
+async fn edit_quote_form(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<Uuid>,
+) -> Response {
+    let sidebar = render_sidebar(&state, &user, &db_ctx);
+    let row = vortex_plugin_sdk::sqlx::query(
+        "SELECT state, customer_id, order_date::text AS order_date, \
+                expected_date::text AS expected_date, validity_date::text AS validity_date, \
+                currency_id, source_location_id, payment_term_id, title, summary, note, \
+                global_discount_type, \
+                CASE WHEN global_discount_value > 0 THEN global_discount_value::text ELSE '' END AS global_discount_value \
+         FROM sales_order WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&db)
+    .await
+    .ok()
+    .flatten();
+    let Some(row) = row else {
+        return (vortex_plugin_sdk::axum::http::StatusCode::NOT_FOUND, "Quotation not found").into_response();
+    };
+    let po_state: String = row.get("state");
+    if po_state != "quotation" {
+        return vortex_plugin_sdk::axum::response::Redirect::to(&format!("/sales/orders/{id}")).into_response();
+    }
+    let customer_id: Option<Uuid> = row.try_get("customer_id").ok();
+    let currency_id: Option<Uuid> = row.try_get("currency_id").ok().flatten();
+    let source_location_id: Option<Uuid> = row.try_get("source_location_id").ok().flatten();
+    let payment_term_id: Option<Uuid> = row.try_get("payment_term_id").ok().flatten();
+
+    let customers = customer_options(&db, customer_id).await;
+    let locations = location_options(&db, source_location_id).await;
+    let currencies = currency_options(&db, currency_id).await;
+    let payment_terms =
+        vortex_accounting::handlers_payment_terms::payment_term_options(&db, payment_term_id).await;
+    let products = products_json(&db).await;
+    let taxes = taxes_json(&db).await;
+    let cust_ctx = customers_json(&db).await;
+    let uoms = uoms_json(&db).await;
+    let templates = note_templates_json(&db).await;
+
+    // Existing lines → JSON rows for the grid to seed.
+    let line_rows = vortex_plugin_sdk::sqlx::query(
+        "SELECT product_id, description, quantity, unit_price, discount_percent, \
+                tax_id, classification_code, display_type, uom_id \
+         FROM sales_order_line WHERE order_id = $1 ORDER BY sequence, created_at",
+    )
+    .bind(id)
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default();
+    let lines_arr: Vec<serde_json::Value> = line_rows
+        .iter()
+        .map(|r| {
+            let display_type: Option<String> = r.try_get("display_type").ok().flatten();
+            if let Some(dt) = display_type {
+                // Section / note row — only the kind + its text matter.
+                return json!({
+                    "display_type": dt,
+                    "description": r.try_get::<Option<String>, _>("description").ok().flatten(),
+                });
+            }
+            let pid: Option<Uuid> = r.try_get("product_id").ok().flatten();
+            let qty: Decimal = r.try_get("quantity").unwrap_or(Decimal::ONE);
+            let price: Decimal = r.try_get("unit_price").unwrap_or(Decimal::ZERO);
+            let disc: Decimal = r.try_get("discount_percent").unwrap_or(Decimal::ZERO);
+            json!({
+                "product_id": pid.map(|p| p.to_string()),
+                "description": r.try_get::<Option<String>, _>("description").ok().flatten(),
+                "quantity": qty.normalize().to_string(),
+                "unit_price": price.round_dp(4).normalize().to_string(),
+                "discount_percent": disc.normalize().to_string(),
+                "tax_id": r.try_get::<Option<Uuid>, _>("tax_id").ok().flatten().map(|t| t.to_string()),
+                "classification_code": r.try_get::<Option<String>, _>("classification_code").ok().flatten(),
+                "uom_id": r.try_get::<Option<Uuid>, _>("uom_id").ok().flatten().map(|u| u.to_string()),
+            })
+        })
+        .collect();
+    let lines_json = serde_json::to_string(&lines_arr).unwrap_or_else(|_| "[]".into());
+
+    let get = |k: &str| -> String { row.try_get::<Option<String>, _>(k).ok().flatten().unwrap_or_default() };
+    let content = render_quote_editor(
+        "Edit Quotation",
+        &format!("/sales/orders/{id}/save"),
+        &format!("/sales/orders/{id}"),
+        &customers,
+        &locations,
+        &currencies,
+        &payment_terms,
+        &get("order_date"),
+        &get("expected_date"),
+        &get("validity_date"),
+        &get("title"),
+        &get("summary"),
+        &get("note"),
+        &products,
+        &taxes,
+        &lines_json,
+        &cust_ctx,
+        &uoms,
+        &templates,
+        &get("global_discount_type"),
+        &get("global_discount_value"),
+    );
+    Html(page_shell(&sidebar, "Edit Quotation", &content)).into_response()
+}
+
+/// POST the edited draft quotation (JSON): replace header + lines wholesale.
+async fn save_quote(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<Uuid>,
+    vortex_plugin_sdk::axum::Json(payload): vortex_plugin_sdk::axum::Json<QuotePayload>,
+) -> Response {
+    use vortex_plugin_sdk::axum::http::StatusCode;
+    if !is_state(&db, id, "quotation").await {
+        return json_err(StatusCode::CONFLICT, "Only open quotations can be edited");
+    }
+    let Some(customer_id) = u_opt(&payload.customer_id) else {
+        return json_err(StatusCode::BAD_REQUEST, "Customer is required");
+    };
+
+    // Snapshot BEFORE mutating so we can diff header + line items for history.
+    let hdr_before = quote_header_snapshot(&db, id).await;
+    let lines_before = quote_line_snapshot(&db, id).await;
+
+    let order_date: Option<vortex_plugin_sdk::chrono::NaiveDate> =
+        s_opt(&payload.order_date).and_then(|s| s.parse().ok());
+    let expected_date: Option<vortex_plugin_sdk::chrono::NaiveDate> =
+        s_opt(&payload.expected_date).and_then(|s| s.parse().ok());
+    let validity_date: Option<vortex_plugin_sdk::chrono::NaiveDate> =
+        s_opt(&payload.validity_date).and_then(|s| s.parse().ok());
+
+    let (gd_type, gd_value) = parse_global_discount(&payload);
+
+    let res = vortex_plugin_sdk::sqlx::query(
+        "UPDATE sales_order SET customer_id = $2, \
+            order_date = COALESCE($3, order_date), expected_date = $4, \
+            validity_date = COALESCE($5, validity_date), currency_id = $6, \
+            source_location_id = $7, note = $8, title = $9, summary = $10, \
+            global_discount_type = $11, global_discount_value = $12, \
+            payment_term_id = $13, updated_at = NOW() \
+         WHERE id = $1",
+    )
+    .bind(id)
+    .bind(customer_id)
+    .bind(order_date)
+    .bind(expected_date)
+    .bind(validity_date)
+    .bind(u_opt(&payload.currency_id))
+    .bind(u_opt(&payload.source_location_id))
+    .bind(rich_opt(&payload.note))
+    .bind(rich_opt(&payload.title))
+    .bind(rich_opt(&payload.summary))
+    .bind(&gd_type)
+    .bind(gd_value)
+    .bind(u_opt(&payload.payment_term_id))
+    .execute(&db)
+    .await;
+    if let Err(e) = res {
+        error!(error = %e, "quotation header update failed");
+        return json_err(StatusCode::INTERNAL_SERVER_ERROR, "Failed to save quotation");
+    }
+
+    // Draft lines carry no delivery/invoice history, so a wholesale replace is
+    // safe and keeps the grid the single source of truth.
+    let _ = vortex_plugin_sdk::sqlx::query("DELETE FROM sales_order_line WHERE order_id = $1")
+        .bind(id)
+        .execute(&db)
+        .await;
+    let company_id = default_company(&db).await;
+    insert_quote_lines(&db, id, company_id, &payload.lines).await;
+    recompute_totals(&db, id).await;
+
+    // Diff header + line items and record the change set on the history trail.
+    let hdr_after = quote_header_snapshot(&db, id).await;
+    let lines_after = quote_line_snapshot(&db, id).await;
+    let mut changes = diff_header(&hdr_before, &hdr_after);
+    changes.extend(diff_lines(&lines_before, &lines_after));
+    audit_so_changes(&state, &db_ctx, &db, user.id, &user.username, id, "edited", changes).await;
+    json_redirect(format!("/sales/orders/{id}"))
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -615,6 +1762,7 @@ async fn edit_order(
                 po.order_date::text AS order_date, po.expected_date::text AS expected_date, \
                 po.state, po.currency_id, po.source_location_id, \
                 dl.name AS dest_name, c.code AS currency_code, po.note, \
+                po.title, po.summary, \
                 po.untaxed_amount, po.tax_amount, po.total_amount \
          FROM sales_order po \
          JOIN contacts v ON v.id = po.customer_id \
@@ -640,16 +1788,15 @@ async fn edit_order(
     let root_quote_id: Option<Uuid> = row.try_get("root_quote_id").ok().flatten();
     let validity_date: Option<String> = row.try_get("validity_date").ok().flatten();
     let lost_reason: Option<String> = row.try_get("lost_reason").ok().flatten();
-    let customer_id: Uuid = row.get("customer_id");
     let customer_name: String = row.get("customer_name");
     let order_date: Option<String> = row.try_get("order_date").ok();
     let expected_date: Option<String> = row.try_get("expected_date").ok();
     let po_state: String = row.get("state");
-    let currency_id: Option<Uuid> = row.try_get("currency_id").ok();
-    let source_location_id: Option<Uuid> = row.try_get("source_location_id").ok();
     let dest_name: Option<String> = row.try_get("dest_name").ok();
     let currency_code: Option<String> = row.try_get("currency_code").ok();
     let note: Option<String> = row.try_get("note").ok();
+    let quote_title: Option<String> = row.try_get("title").ok().flatten();
+    let quote_summary: Option<String> = row.try_get("summary").ok().flatten();
     let untaxed: Decimal = row.try_get("untaxed_amount").unwrap_or(Decimal::ZERO);
     let tax: Decimal = row.try_get("tax_amount").unwrap_or(Decimal::ZERO);
     let total: Decimal = row.try_get("total_amount").unwrap_or(Decimal::ZERO);
@@ -658,12 +1805,45 @@ async fn edit_order(
     let identity = doc_identity(number.as_deref(), quote_number.as_deref(), revision);
     let cur = currency_code.clone().unwrap_or_default();
 
+    // Whole-quote discount → show Subtotal (pre) + Discount rows above Untaxed.
+    let discount_rows = {
+        let (gd_type, gd_value) = order_global_discount(&db, id).await;
+        if gd_type.is_some() && gd_value > Decimal::ZERO {
+            let pre: Decimal = vortex_plugin_sdk::sqlx::query_scalar(
+                "SELECT COALESCE(SUM(quantity * unit_price * (100 - discount_percent) / 100), 0) \
+                 FROM sales_order_line WHERE order_id = $1 AND display_type IS NULL",
+            )
+            .bind(id)
+            .fetch_one(&db)
+            .await
+            .unwrap_or(Decimal::ZERO);
+            let factor = global_factor(gd_type.as_deref(), gd_value, pre);
+            let amt = (pre * (Decimal::ONE - factor)).round_dp(2);
+            let label = match gd_type.as_deref() {
+                Some("percent") => format!("Discount ({}%)", gd_value.normalize()),
+                _ => "Discount".to_string(),
+            };
+            format!(
+                "<tr><td class=\"text-base-content/60 pr-6\">Subtotal</td><td class=\"text-right font-mono\">{pre} {cur}</td></tr>\
+                 <tr><td class=\"text-base-content/60 pr-6\">{label}</td><td class=\"text-right font-mono text-error\">- {amt} {cur}</td></tr>",
+                pre = money(pre.round_dp(2)),
+                label = esc(&label),
+                amt = money(amt),
+                cur = esc(&cur),
+            )
+        } else {
+            String::new()
+        }
+    };
+
     // ── Lines table ──
     let line_rows = vortex_plugin_sdk::sqlx::query(
         "SELECT l.id, p.code AS product_code, p.name AS product_name, l.description, \
-                l.quantity, l.unit_price, t.name AS tax_name, \
-                l.classification_code, l.qty_delivered, l.qty_invoiced \
-         FROM sales_order_line l JOIN stock_product p ON p.id = l.product_id \
+                l.quantity, l.unit_price, l.discount_percent, t.name AS tax_name, \
+                l.classification_code, l.qty_delivered, l.qty_invoiced, l.display_type, \
+                u.code AS uom \
+         FROM sales_order_line l LEFT JOIN stock_product p ON p.id = l.product_id \
+         LEFT JOIN uoms u ON u.id = COALESCE(l.uom_id, p.uom_id) \
          LEFT JOIN taxes t ON t.id = l.tax_id \
          WHERE l.order_id = $1 ORDER BY l.sequence, l.created_at",
     )
@@ -675,17 +1855,47 @@ async fn edit_order(
     let mut lines_html = String::new();
     for r in &line_rows {
         let lid: Uuid = r.get("id");
-        let pcode: String = r.get("product_code");
-        let pname: String = r.get("product_name");
+        // Section / note rows span the whole table.
+        if let Some(dt) = r.try_get::<Option<String>, _>("display_type").ok().flatten() {
+            let text = r.try_get::<Option<String>, _>("description").ok().flatten().unwrap_or_default();
+            let del = if is_draft {
+                format!(
+                    r#"<td class="text-right"><form method="POST" action="/sales/orders/{id}/lines/{lid}/delete" onsubmit="return confirm('Remove this row?')"><button class="btn btn-ghost btn-xs text-error">✕</button></form></td>"#,
+                    id = id, lid = lid
+                )
+            } else {
+                r#"<td></td>"#.to_string()
+            };
+            if dt == "section" {
+                lines_html.push_str(&format!(
+                    r#"<tr class="bg-base-200"><td colspan="9" class="font-semibold">{}</td>{del}</tr>"#,
+                    esc(&text), del = del
+                ));
+            } else {
+                lines_html.push_str(&format!(
+                    r#"<tr><td colspan="9" class="italic text-base-content/60" style="white-space:pre-line">{}</td>{del}</tr>"#,
+                    esc(&text), del = del
+                ));
+            }
+            continue;
+        }
+        let pcode: String = r.try_get("product_code").ok().flatten().unwrap_or_default();
+        let pname: String = r.try_get("product_name").ok().flatten().unwrap_or_default();
         let desc: Option<String> = r.try_get("description").ok();
         let qty: Decimal = r.try_get("quantity").unwrap_or(Decimal::ZERO);
+        let uom: Option<String> = r.try_get("uom").ok().flatten();
+        let qty_disp = match uom.as_deref().filter(|u| !u.is_empty()) {
+            Some(u) => format!("{} {}", qty.normalize(), esc(u)),
+            None => qty.normalize().to_string(),
+        };
         let price: Decimal = r.try_get("unit_price").unwrap_or(Decimal::ZERO);
         let tax_name: Option<String> = r.try_get("tax_name").ok().flatten();
         let classification: Option<String> = r.try_get("classification_code").ok().flatten();
         let recv: Decimal = r.try_get("qty_delivered").unwrap_or(Decimal::ZERO);
         let invoiced: Decimal = r.try_get("qty_invoiced").unwrap_or(Decimal::ZERO);
         let backorder = qty - recv;
-        let subtotal = qty * price;
+        let disc: Decimal = r.try_get("discount_percent").unwrap_or(Decimal::ZERO);
+        let subtotal = (qty * price * (Decimal::from(100) - disc) / Decimal::from(100)).round_dp(2);
         let del = if is_draft {
             format!(
                 r#"<form method="POST" action="/sales/orders/{id}/lines/{lid}/delete" onsubmit="return confirm('Remove this line?')"><button class="btn btn-ghost btn-xs text-error">✕</button></form>"#,
@@ -703,8 +1913,8 @@ async fn edit_order(
             pcode = esc(&pcode),
             cls = classification.filter(|c| !c.is_empty()).map(|c| format!(r#"<br><span class="text-xs text-base-content/40">{}</span>"#, esc(&c))).unwrap_or_default(),
             pname = esc(&pname),
-            desc = desc.filter(|d| !d.is_empty()).map(|d| format!(r#"<br><span class="text-xs text-base-content/50">{}</span>"#, esc(&d))).unwrap_or_default(),
-            qty = qty,
+            desc = desc.filter(|d| !d.is_empty()).map(|d| format!(r#"<br><span class="text-xs text-base-content/50">{}</span>"#, crate::richtext::sanitize_rich(&d))).unwrap_or_default(),
+            qty = qty_disp,
             price = money(price),
             tax = tax_name.map(|t| esc(&t).to_string()).unwrap_or_else(|| "—".into()),
             subtotal = money(subtotal),
@@ -723,70 +1933,31 @@ async fn edit_order(
     }
 
     // ── Add-line form (draft only) ──
+    // Draft quotations are edited on the single-screen grid editor.
     let add_line_form = if is_draft {
-        let products = product_options(&db).await;
-        let taxes = sale_tax_options(&db).await;
         format!(
-            r#"<form method="POST" action="/sales/orders/{id}/lines" class="mt-4">
-<div class="grid grid-cols-12 gap-2 items-end">
-<div class="form-control col-span-4"><label class="label py-1"><span class="label-text text-xs">Product</span></label>
-<select name="product_id" data-vortex-autofill class="select select-bordered select-sm" required>{products}</select></div>
-<div class="form-control col-span-2"><label class="label py-1"><span class="label-text text-xs">Qty</span></label>
-<input name="quantity" type="number" step="0.0001" min="0.0001" value="1" class="input input-bordered input-sm" required/></div>
-<div class="form-control col-span-2"><label class="label py-1"><span class="label-text text-xs">Unit Price</span></label>
-<input name="unit_price" type="number" step="0.0001" min="0" class="input input-bordered input-sm" placeholder="list price"/></div>
-<div class="form-control col-span-2"><label class="label py-1"><span class="label-text text-xs">Tax</span></label>
-<select name="tax_id" class="select select-bordered select-sm">{taxes}</select></div>
-<div class="col-span-2"><button class="btn btn-primary btn-sm w-full">Add Line</button></div>
-</div>
-<div class="grid grid-cols-12 gap-2 mt-2">
-<div class="form-control col-span-9"><input name="description" class="input input-bordered input-sm" placeholder="Description (from product if blank)"/></div>
-<div class="form-control col-span-3"><input name="classification_code" class="input input-bordered input-sm" placeholder="LHDN class"/></div>
-</div>
-</form>"#,
-            id = id, products = products, taxes = taxes
+            r#"<div class="mt-4"><a href="/sales/orders/{id}/edit" class="btn btn-primary btn-sm">✎ Edit lines &amp; details</a></div>"#,
+            id = id
         )
     } else {
         String::new()
     };
 
     // ── Header (editable in draft, read-only otherwise) ──
-    let header = if is_draft {
-        let customers = customer_options(&db, Some(customer_id)).await;
-        let locations = location_options(&db, source_location_id).await;
-        let currencies = currency_options(&db, currency_id).await;
-        format!(
-            r#"<form method="POST" action="/sales/orders/{id}">
-<div class="grid grid-cols-1 md:grid-cols-2 gap-3">
-<div class="form-control"><label class="label"><span class="label-text">Customer *</span></label>
-<select name="customer_id" class="select select-bordered select-sm" required>{customers}</select></div>
-<div class="form-control"><label class="label"><span class="label-text">Ship-From Location</span></label>
-<select name="source_location_id" class="select select-bordered select-sm">{locations}</select></div>
-<div class="form-control"><label class="label"><span class="label-text">Order Date</span></label>
-<input name="order_date" type="date" value="{order_date}" class="input input-bordered input-sm"/></div>
-<div class="form-control"><label class="label"><span class="label-text">Expected Date</span></label>
-<input name="expected_date" type="date" value="{expected_date}" class="input input-bordered input-sm"/></div>
-<div class="form-control"><label class="label"><span class="label-text">Valid Until</span></label>
-<input name="validity_date" type="date" value="{validity_date}" class="input input-bordered input-sm"/></div>
-<div class="form-control"><label class="label"><span class="label-text">Currency</span></label>
-<select name="currency_id" class="select select-bordered select-sm">{currencies}</select></div>
-<div class="form-control"><label class="label"><span class="label-text">Note</span></label>
-<input name="note" value="{note}" class="input input-bordered input-sm"/></div>
-</div>
-<div class="mt-3"><button class="btn btn-primary btn-sm">Save Header</button></div>
-</form>"#,
-            id = id,
-            customers = customers,
-            locations = locations,
-            currencies = currencies,
-            order_date = esc(order_date.as_deref().unwrap_or("")),
-            expected_date = esc(expected_date.as_deref().unwrap_or("")),
-            validity_date = esc(validity_date.as_deref().unwrap_or("")),
-            note = esc(note.as_deref().unwrap_or("")),
-        )
-    } else {
-        format!(
-            r#"<div class="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
+    // Read-only header for every state; drafts edit on the grid editor
+    // (the "✎ Edit lines & details" button), so there's one edit surface.
+    let title_block = quote_title
+        .as_deref()
+        .filter(|t| !t.is_empty())
+        .map(|t| format!(r#"<div class="text-lg font-semibold mb-1">{}</div>"#, crate::richtext::sanitize_rich(t)))
+        .unwrap_or_default();
+    let summary_block = quote_summary
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(|s| format!(r#"<div class="text-sm text-base-content/70 mb-3">{}</div>"#, crate::richtext::sanitize_rich(s)))
+        .unwrap_or_default();
+    let header = format!(
+        r#"{title_block}{summary_block}<div class="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
 <div><div class="text-base-content/50">Customer</div><div class="font-medium">{customer}</div></div>
 <div><div class="text-base-content/50">Order Date</div><div class="font-medium">{order_date}</div></div>
 <div><div class="text-base-content/50">Expected</div><div class="font-medium">{expected}</div></div>
@@ -794,25 +1965,41 @@ async fn edit_order(
 <div><div class="text-base-content/50">Quotation</div><div class="font-medium">{quote_no}</div></div>
 <div><div class="text-base-content/50">Valid Until</div><div class="font-medium">{validity}</div></div>
 </div>{note}"#,
-            customer = esc(&customer_name),
-            order_date = esc(order_date.as_deref().unwrap_or("—")),
-            expected = esc(expected_date.as_deref().unwrap_or("—")),
-            dest = esc(dest_name.as_deref().unwrap_or("—")),
-            quote_no = {
-                let q = quote_number.as_deref().unwrap_or("—");
-                if revision > 1 { format!("{} (Rev {})", esc(q), revision) } else { esc(q).to_string() }
-            },
-            validity = esc(validity_date.as_deref().unwrap_or("—")),
-            note = note.filter(|n| !n.is_empty()).map(|n| format!(r#"<div class="mt-3 text-sm text-base-content/70">{}</div>"#, esc(&n))).unwrap_or_default(),
-        )
-    };
+        title_block = title_block,
+        summary_block = summary_block,
+        customer = esc(&customer_name),
+        order_date = esc(order_date.as_deref().unwrap_or("—")),
+        expected = esc(expected_date.as_deref().unwrap_or("—")),
+        dest = esc(dest_name.as_deref().unwrap_or("—")),
+        quote_no = {
+            let q = quote_number.as_deref().unwrap_or("—");
+            if revision > 1 { format!("{} (Rev {})", esc(q), revision) } else { esc(q).to_string() }
+        },
+        validity = esc(validity_date.as_deref().unwrap_or("—")),
+        note = note.filter(|n| !n.is_empty()).map(|n| format!(r#"<div class="mt-3 text-sm text-base-content/70">{}</div>"#, crate::richtext::sanitize_rich(&n))).unwrap_or_default(),
+    );
 
     // ── Action buttons by state ──
     let has_lines = !line_rows.is_empty();
     let mut actions = String::new();
+    // Print + (when the headless-Chromium PDF engine is enabled) a server-side
+    // Download PDF. Shared across every quote-visible state.
+    let pdf_btn = if vortex_plugin_sdk::framework::pdf::available() {
+        format!(
+            r#"<a href="/sales/orders/{id}/print-quote?format=pdf" class="btn btn-outline btn-sm ml-2" title="Download a PDF rendered on the server">Download PDF</a>"#,
+            id = id
+        )
+    } else {
+        String::new()
+    };
+    let print_btns = format!(
+        r#"<a href="/sales/orders/{id}/print-quote" target="_blank" class="btn btn-outline btn-sm">Print Quotation</a>{pdf}"#,
+        id = id,
+        pdf = pdf_btn
+    );
     match po_state.as_str() {
         "quotation" => {
-            actions.push_str(&format!(r#"<a href="/sales/orders/{id}/print-quote" target="_blank" class="btn btn-outline btn-sm">Print Quotation</a>"#, id = id));
+            actions.push_str(&print_btns);
             if has_lines {
                 actions.push_str(&format!(r#"<form method="POST" action="/sales/orders/{id}/send" class="inline ml-2"><button class="btn btn-primary btn-sm" title="Freezes this revision — the customer now holds a copy">Mark as Sent</button></form>"#, id = id));
                 actions.push_str(&format!(r#"<form method="POST" action="/sales/orders/{id}/confirm" class="inline ml-2"><button class="btn btn-success btn-sm">Confirm Order</button></form>"#, id = id));
@@ -820,17 +2007,17 @@ async fn edit_order(
             actions.push_str(&format!(r#"<form method="POST" action="/sales/orders/{id}/lost" class="inline ml-2" onsubmit="return confirm('Mark this quotation as lost?')"><button class="btn btn-ghost btn-sm">Mark Lost</button></form>"#, id = id));
         }
         "sent" => {
-            actions.push_str(&format!(r#"<a href="/sales/orders/{id}/print-quote" target="_blank" class="btn btn-outline btn-sm">Print Quotation</a>"#, id = id));
+            actions.push_str(&print_btns);
             actions.push_str(&format!(r#"<form method="POST" action="/sales/orders/{id}/confirm" class="inline ml-2"><button class="btn btn-primary btn-sm">Confirm Order</button></form>"#, id = id));
             actions.push_str(&format!(r#"<form method="POST" action="/sales/orders/{id}/revise" class="inline ml-2"><button class="btn btn-outline btn-sm" title="Creates the next revision; this one stays exactly as the customer received it">Revise</button></form>"#, id = id));
             actions.push_str(&format!(r#"<form method="POST" action="/sales/orders/{id}/lost" class="inline ml-2" onsubmit="return confirm('Mark this quotation as lost?')"><button class="btn btn-ghost btn-sm">Mark Lost</button></form>"#, id = id));
         }
         "expired" | "lost" => {
-            actions.push_str(&format!(r#"<a href="/sales/orders/{id}/print-quote" target="_blank" class="btn btn-outline btn-sm">Print Quotation</a>"#, id = id));
+            actions.push_str(&print_btns);
             actions.push_str(&format!(r#"<form method="POST" action="/sales/orders/{id}/revise" class="inline ml-2"><button class="btn btn-primary btn-sm">Revise</button></form>"#, id = id));
         }
         "superseded" => {
-            actions.push_str(&format!(r#"<a href="/sales/orders/{id}/print-quote" target="_blank" class="btn btn-outline btn-sm">Print Quotation</a>"#, id = id));
+            actions.push_str(&print_btns);
         }
         "confirmed" => {
             // Fulfilment splits by product type: goods (stockable +
@@ -877,6 +2064,12 @@ async fn edit_order(
             ));
         }
     }
+    // Duplicate is available from every state: unlike Revise (next
+    // revision of THIS family), it starts a brand-new quotation family.
+    actions.push_str(&format!(
+        r#"<span class="inline ml-2">{}</span>"#,
+        duplicate_button(&format!("/sales/orders/{id}/duplicate"))
+    ));
 
     // ── Fulfilment documents (DO / service confirmations) ──
     let deliveries = vortex_plugin_sdk::sqlx::query(
@@ -1014,6 +2207,11 @@ async fn edit_order(
         String::new()
     };
 
+    // Record history (audit trail: created, sent, confirmed, edited, …).
+    let history_panel = vortex_plugin_sdk::framework::render_audit_trail(&db, "sales_order", id).await;
+    // Activity stream: schedule/assign/complete tasks, messages, attachments.
+    let activity_panel = vortex_plugin_sdk::framework::render_chatter_panel("sales_order", id);
+
     let content = format!(
         r#"<div class="flex items-center justify-between mb-4">
 <div>
@@ -1022,6 +2220,7 @@ async fn edit_order(
 </div>
 <div class="vortex-actions">{actions}</div>
 </div>
+<div class="mb-4">{statusbar}</div>
 {lost_banner}
 
 <div class="card bg-base-100 shadow mb-6"><div class="card-body">
@@ -1040,7 +2239,7 @@ async fn edit_order(
 {add_line}
 <div class="flex justify-end mt-4">
 <table class="text-sm">
-<tr><td class="text-base-content/60 pr-6">Untaxed</td><td class="text-right font-mono">{untaxed} {cur}</td></tr>
+{discount_rows}<tr><td class="text-base-content/60 pr-6">Untaxed</td><td class="text-right font-mono">{untaxed} {cur}</td></tr>
 <tr><td class="text-base-content/60 pr-6">Tax</td><td class="text-right font-mono">{tax} {cur}</td></tr>
 <tr><td class="font-semibold pr-6">Total</td><td class="text-right font-mono font-semibold">{total} {cur}</td></tr>
 </table>
@@ -1049,17 +2248,23 @@ async fn edit_order(
 
 {deliveries_card}
 {invoices_card}
-{revisions_card}"#,
+{revisions_card}
+<div class="grid lg:grid-cols-2 gap-6 mt-6 items-start">
+<div>{history_panel}</div>
+<div>{activity_panel}</div>
+</div>"#,
         back_url = if is_quote_stage { "/sales/quotes" } else { "/sales" },
         back_label = if is_quote_stage { "Quotations" } else { "Sales Orders" },
         number = esc(&identity),
         quote_ref = quote_ref,
+        statusbar = order_statusbar(&po_state),
         lost_banner = lost_banner,
         badge = state_badge(&po_state),
         actions = actions,
         header = header,
         lines = lines_html,
         add_line = add_line_form,
+        discount_rows = discount_rows,
         untaxed = money(untaxed),
         tax = money(tax),
         total = money(total),
@@ -1240,7 +2445,7 @@ async fn confirm_order(
     Extension(db_ctx): Extension<DatabaseContext>,
     Path(id): Path<Uuid>,
 ) -> Response {
-    let line_count: i64 = vortex_plugin_sdk::sqlx::query_scalar("SELECT COUNT(*) FROM sales_order_line WHERE order_id = $1")
+    let line_count: i64 = vortex_plugin_sdk::sqlx::query_scalar("SELECT COUNT(*) FROM sales_order_line WHERE order_id = $1 AND display_type IS NULL")
         .bind(id)
         .fetch_one(&db)
         .await
@@ -1425,9 +2630,9 @@ async fn revise_quote(
     if let Err(e) = vortex_plugin_sdk::sqlx::query(
         "INSERT INTO sales_order \
          (id, quote_number, revision, root_quote_id, validity_date, customer_id, order_date, \
-          expected_date, currency_id, source_location_id, note, company_id, created_by) \
+          expected_date, currency_id, source_location_id, note, company_id, created_by, payment_term_id) \
          SELECT $1, quote_number, $3, root_quote_id, $4, customer_id, CURRENT_DATE, \
-                expected_date, currency_id, source_location_id, note, company_id, $5 \
+                expected_date, currency_id, source_location_id, note, company_id, $5, payment_term_id \
          FROM sales_order WHERE id = $2",
     )
     .bind(new_id)
@@ -1470,6 +2675,67 @@ async fn revise_quote(
     vortex_plugin_sdk::axum::response::Redirect::to(&format!("/sales/orders/{new_id}")).into_response()
 }
 
+/// POST /sales/orders/{id}/duplicate — Odoo-style Duplicate, distinct from
+/// Revise: works from ANY state and starts a brand-new document family
+/// (fresh QT number, revision 1, its own root_quote_id). Lifecycle state,
+/// SO number, fulfilment/invoice links and counters all reset; stored
+/// totals are recomputed from the cloned lines.
+async fn duplicate_order(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<Uuid>,
+) -> Response {
+    let quote_number = match vortex_plugin_sdk::orm::sequence::next(&state.pool, &QT_SEQ).await {
+        Ok(n) => n,
+        Err(e) => {
+            error!(error = %e, "duplicate QT sequence draw failed");
+            return (vortex_plugin_sdk::axum::http::StatusCode::INTERNAL_SERVER_ERROR, "Duplicate failed").into_response();
+        }
+    };
+    let today = vortex_plugin_sdk::chrono::Utc::now().date_naive();
+    let validity = today + vortex_plugin_sdk::chrono::Duration::days(30);
+
+    let new_id = Uuid::now_v7();
+    let spec = DuplicateSpec::new("sales_order")
+        .with_id(new_id)
+        // Fresh identity: new quotation family rooted at itself.
+        .set("quote_number", json!(quote_number))
+        .set("revision", json!(1))
+        .set("root_quote_id", json!(new_id))
+        // Back to the initial 'quotation' state via the DB default.
+        .skip("state")
+        // SO number is only minted at confirmation; lost verdicts,
+        // review stamps and the invoice bridge belong to the source.
+        .skip("number")
+        .skip("lost_reason")
+        .skip("updated_by")
+        .skip("customer_invoice_move_id")
+        // Stored totals restart at 0 and are recomputed below.
+        .skip("untaxed_amount")
+        .skip("tax_amount")
+        .skip("total_amount")
+        // Commercial dates restart from today.
+        .set("order_date", json!(today.to_string()))
+        .set("validity_date", json!(validity.to_string()))
+        .child(
+            ChildCopy::new("sales_order_line", "order_id")
+                // Fulfilment counters restart at zero, like revise_quote.
+                .set("qty_delivered", json!(0))
+                .set("qty_invoiced", json!(0)),
+        );
+    if let Err(e) = spec.execute(&db, id, Some(user.id)).await {
+        error!(error = %e, "sales order duplicate failed");
+        return (vortex_plugin_sdk::axum::http::StatusCode::INTERNAL_SERVER_ERROR, "Duplicate failed").into_response();
+    }
+    recompute_totals(&db, new_id).await;
+
+    audit_so(&state, &db_ctx, &db, user.id, &user.username, new_id, "duplicated").await;
+    info!(quote = %quote_number, source = %id, "sales order duplicated");
+    vortex_plugin_sdk::axum::response::Redirect::to(&format!("/sales/orders/{new_id}")).into_response()
+}
+
 async fn cancel_order(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
@@ -1508,6 +2774,23 @@ async fn audit_so(
     id: Uuid,
     action: &str,
 ) {
+    audit_so_changes(state, db_ctx, db, user_id, username, id, action, Vec::new()).await;
+}
+
+/// Like [`audit_so`] but with a field-level change set (`{field, from, to}`),
+/// so the History timeline shows exactly what was edited — header fields and
+/// individual line items.
+#[allow(clippy::too_many_arguments)]
+async fn audit_so_changes(
+    state: &AppState,
+    db_ctx: &DatabaseContext,
+    db: &vortex_plugin_sdk::sqlx::PgPool,
+    user_id: Uuid,
+    username: &str,
+    id: Uuid,
+    action: &str,
+    changes: Vec<serde_json::Value>,
+) {
     let number: String = vortex_plugin_sdk::sqlx::query_scalar("SELECT number FROM sales_order WHERE id = $1")
         .bind(id)
         .fetch_optional(db)
@@ -1515,6 +2798,11 @@ async fn audit_so(
         .ok()
         .flatten()
         .unwrap_or_default();
+    let details = if changes.is_empty() {
+        json!({ "action": action })
+    } else {
+        json!({ "action": action, "changes": changes })
+    };
     let entry = vortex_plugin_sdk::security::AuditEntry::new(
         vortex_plugin_sdk::security::AuditAction::RecordUpdated,
         vortex_plugin_sdk::security::AuditSeverity::Info,
@@ -1524,8 +2812,153 @@ async fn audit_so(
     .with_database(&db_ctx.db_name)
     .with_resource("sales_order", id.to_string())
     .with_resource_name(&number)
-    .with_details(json!({ "action": action }));
+    .with_details(details);
     let _ = state.audit.log(entry).await;
+}
+
+/// Ordered display values of the tracked header fields, for before/after diff.
+async fn quote_header_snapshot(
+    db: &vortex_plugin_sdk::sqlx::PgPool,
+    id: Uuid,
+) -> Vec<(&'static str, String)> {
+    let row = vortex_plugin_sdk::sqlx::query(
+        "SELECT c.name AS customer, o.order_date::text AS order_date, \
+                o.expected_date::text AS expected_date, o.validity_date::text AS validity_date, \
+                cur.code AS currency, loc.name AS location, o.title, o.summary, o.note, \
+                CASE WHEN o.global_discount_value > 0 THEN \
+                    o.global_discount_type || ' ' || o.global_discount_value::text \
+                    ELSE '' END AS global_discount \
+         FROM sales_order o JOIN contacts c ON c.id = o.customer_id \
+         LEFT JOIN currencies cur ON cur.id = o.currency_id \
+         LEFT JOIN stock_location loc ON loc.id = o.source_location_id \
+         WHERE o.id = $1",
+    )
+    .bind(id)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten();
+    let mut out = Vec::new();
+    if let Some(r) = row {
+        let g = |k: &str| -> String { r.try_get::<Option<String>, _>(k).ok().flatten().unwrap_or_default() };
+        out.push(("Customer", g("customer")));
+        out.push(("Quote Date", g("order_date")));
+        out.push(("Expected Date", g("expected_date")));
+        out.push(("Valid Until", g("validity_date")));
+        out.push(("Currency", g("currency")));
+        out.push(("Ship-From", g("location")));
+        out.push(("Title", g("title")));
+        out.push(("Summary", g("summary")));
+        out.push(("Note", g("note")));
+        out.push(("Discount", g("global_discount")));
+    }
+    out
+}
+
+/// One line reduced to a matching `key` (stable across edits) and a `label`
+/// (its full human display), for the line-item diff.
+struct LineSnap {
+    key: String,
+    label: String,
+}
+
+/// Snapshot every line of a quote as `(key, label)` for before/after diff.
+async fn quote_line_snapshot(db: &vortex_plugin_sdk::sqlx::PgPool, id: Uuid) -> Vec<LineSnap> {
+    let rows = vortex_plugin_sdk::sqlx::query(
+        "SELECT l.product_id, l.display_type, l.description, l.quantity, l.unit_price, \
+                l.discount_percent, p.code AS product_code, p.name AS product_name, t.name AS tax_name \
+         FROM sales_order_line l \
+         LEFT JOIN stock_product p ON p.id = l.product_id \
+         LEFT JOIN taxes t ON t.id = l.tax_id \
+         WHERE l.order_id = $1 ORDER BY l.sequence, l.created_at",
+    )
+    .bind(id)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+    let mut out = Vec::new();
+    for r in &rows {
+        let desc: String = r.try_get::<Option<String>, _>("description").ok().flatten().unwrap_or_default();
+        if let Some(dt) = r.try_get::<Option<String>, _>("display_type").ok().flatten() {
+            if dt == "section" {
+                out.push(LineSnap { key: format!("s:{}", desc.to_lowercase()), label: format!("Section: {desc}") });
+            } else {
+                out.push(LineSnap { key: format!("n:{}", desc.to_lowercase()), label: format!("Note: {desc}") });
+            }
+            continue;
+        }
+        let pid: Option<Uuid> = r.try_get("product_id").ok().flatten();
+        let code: String = r.try_get::<Option<String>, _>("product_code").ok().flatten().unwrap_or_default();
+        let pname: String = r.try_get::<Option<String>, _>("product_name").ok().flatten().unwrap_or_default();
+        let qty: Decimal = r.try_get("quantity").unwrap_or(Decimal::ZERO);
+        let price: Decimal = r.try_get("unit_price").unwrap_or(Decimal::ZERO);
+        let disc: Decimal = r.try_get("discount_percent").unwrap_or(Decimal::ZERO);
+        let tax: String = r.try_get::<Option<String>, _>("tax_name").ok().flatten().unwrap_or_default();
+        let name = if !desc.is_empty() { desc.clone() } else if !pname.is_empty() { pname.clone() } else { code.clone() };
+        let disc_s = if disc > Decimal::ZERO { format!(", {}% disc", disc.normalize()) } else { String::new() };
+        let tax_s = if !tax.is_empty() { format!(", {tax}") } else { String::new() };
+        let label = format!("{} — {} × {}{}{}", name, qty.normalize(), money(price), disc_s, tax_s);
+        let key = format!("p:{}", pid.map(|u| u.to_string()).unwrap_or_else(|| code.clone()));
+        out.push(LineSnap { key, label });
+    }
+    out
+}
+
+/// Diff two ordered `(label, value)` header snapshots into `{field, from, to}`.
+fn diff_header(before: &[(&'static str, String)], after: &[(&'static str, String)]) -> Vec<serde_json::Value> {
+    let bmap: HashMap<&'static str, String> = before.iter().map(|(k, v)| (*k, v.clone())).collect();
+    let mut changes = Vec::new();
+    for (label, aval) in after {
+        let bval = bmap.get(label).cloned().unwrap_or_default();
+        if &bval != aval {
+            changes.push(json!({ "field": label, "from": bval, "to": aval }));
+        }
+    }
+    changes
+}
+
+/// Diff two line snapshots, matching by `key` (multiset, paired in order) so a
+/// changed line reads as one change, not a remove+add, and reorders are quiet.
+fn diff_lines(old: &[LineSnap], new: &[LineSnap]) -> Vec<serde_json::Value> {
+    let mut old_by: HashMap<&str, Vec<&str>> = HashMap::new();
+    for l in old {
+        old_by.entry(l.key.as_str()).or_default().push(l.label.as_str());
+    }
+    let mut new_by: HashMap<&str, Vec<&str>> = HashMap::new();
+    for l in new {
+        new_by.entry(l.key.as_str()).or_default().push(l.label.as_str());
+    }
+    // Stable key order: new order first, then old-only keys.
+    let mut keys: Vec<&str> = Vec::new();
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for l in new {
+        if seen.insert(l.key.as_str()) {
+            keys.push(l.key.as_str());
+        }
+    }
+    for l in old {
+        if seen.insert(l.key.as_str()) {
+            keys.push(l.key.as_str());
+        }
+    }
+    let mut changes = Vec::new();
+    for k in keys {
+        let ol = old_by.get(k).cloned().unwrap_or_default();
+        let nl = new_by.get(k).cloned().unwrap_or_default();
+        let n = ol.len().min(nl.len());
+        for i in 0..n {
+            if ol[i] != nl[i] {
+                changes.push(json!({ "field": "Line changed", "from": ol[i], "to": nl[i] }));
+            }
+        }
+        for l in ol.iter().skip(n) {
+            changes.push(json!({ "field": "Line removed", "from": *l, "to": "" }));
+        }
+        for l in nl.iter().skip(n) {
+            changes.push(json!({ "field": "Line added", "from": "", "to": *l }));
+        }
+    }
+    changes
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1871,26 +3304,167 @@ async fn process_delivery(
 // Quotation print
 // ─────────────────────────────────────────────────────────────────────────
 
-/// Printable quotation — self-contained A4 page with prices, taxes,
-/// validity and an acceptance block. Reprintable for any revision,
-/// exactly as issued.
+/// Built-in quotation layout, expressed as a template for the sandboxed
+/// engine (`vortex_framework::user_reports`). This is what prints when no
+/// custom template has been saved, and what "Load default" offers in the
+/// layout editor — so users start from the real layout and tweak it. The
+/// surrounding page chrome + CSS (branding, paper size, print button) come
+/// from `print_layout::render_doc_page`; classes used here are documented in
+/// `print_layout::base_css`.
+pub const DEFAULT_QUOTATION_TEMPLATE: &str = r#"{% if doc.watermark %}<div class="watermark">{{ doc.watermark }}</div>{% endif %}
+<div class="head">
+  <div class="seller">
+    {% if company.logo %}<img class="logo" src="{{ company.logo }}"/>{% endif %}
+    <p class="name">{{ company.name }}</p>
+    {% if company.addr1 %}<p>{{ company.addr1 }}</p>{% endif %}
+    {% if company.addr2 %}<p>{{ company.addr2 }}</p>{% endif %}
+    {% if company.city_line %}<p>{{ company.city_line }}</p>{% endif %}
+    <p>{{ company.phone }} {{ company.email }}</p>
+    {% if company.reg %}<p class="label">Reg No: {{ company.reg }}</p>{% endif %}
+  </div>
+  <div style="text-align:right">
+    <h1 class="doc-title">Quotation</h1>
+    <table class="meta" style="margin-left:auto">
+      <tr><td class="label">Number</td><td><b>{{ doc.number }}</b></td></tr>
+      <tr><td class="label">Date</td><td>{{ doc.date }}</td></tr>
+      <tr><td class="label">Valid Until</td><td>{{ doc.validity }}</td></tr>
+    </table>
+  </div>
+</div>
+<div class="buyer" style="margin-bottom:1em">
+  <p class="label">To</p>
+  <p><b>{{ customer.name }}</b></p>
+  {% if customer.street %}<p>{{ customer.street }}</p>{% endif %}
+  {% if customer.street2 %}<p>{{ customer.street2 }}</p>{% endif %}
+  {% if customer.city_line %}<p>{{ customer.city_line }}</p>{% endif %}
+  <p>{{ customer.phone }} {{ customer.email }}</p>
+</div>
+{% if doc.headline %}<h2 class="doc-headline">{{ doc.headline }}</h2>{% endif %}
+{% if doc.summary %}<p class="doc-summary">{{ doc.summary }}</p>{% endif %}
+<table class="items">
+  <thead><tr><th>Code</th><th>Description</th><th class="num">Qty</th><th class="num">Unit Price</th><th>Tax</th><th class="num">Amount</th></tr></thead>
+  <tbody>
+  {% for line in lines %}{% if line.is_section %}<tr class="sec-row"><td colspan="6">{{ line.text }}</td></tr>{% endif %}{% if line.is_note %}<tr class="note-row"><td colspan="6">{{ line.text }}</td></tr>{% endif %}{% if line.is_line %}<tr>
+    <td class="mono">{{ line.code }}</td>
+    <td>{{ line.description }}</td>
+    <td class="num">{{ line.qty }}</td>
+    <td class="num">{{ line.unit_price }}</td>
+    <td>{{ line.tax }}</td>
+    <td class="num">{{ line.amount }}</td>
+  </tr>{% endif %}{% endfor %}
+  </tbody>
+</table>
+<table class="totals">
+  {% if totals.discount %}<tr><td class="label">Subtotal</td><td class="num">{{ totals.subtotal_pre }} {{ currency }}</td></tr>
+  <tr><td class="label">{{ totals.discount_label }}</td><td class="num">- {{ totals.discount }} {{ currency }}</td></tr>
+  <tr><td class="label">After discount</td><td class="num">{{ totals.untaxed }} {{ currency }}</td></tr>{% else %}<tr><td class="label">Subtotal</td><td class="num">{{ totals.untaxed }} {{ currency }}</td></tr>{% endif %}
+  <tr><td class="label">Tax</td><td class="num">{{ totals.tax }} {{ currency }}</td></tr>
+  <tr class="grand"><td>Total</td><td class="num">{{ totals.total }} {{ currency }}</td></tr>
+</table>
+{% if doc.payment_term %}<div class="note"><span class="label">Payment Terms</span><br/>{{ doc.payment_term }}{% if doc.due_date %} — due {{ doc.due_date }}{% endif %}</div>{% endif %}
+{% if doc.note %}<div class="note"><span class="label">Notes</span><br/>{{ doc.note }}</div>{% endif %}
+<div class="accept">
+  <div>Issued by<br><br>Name:<br>Date:</div>
+  <div>Accepted by (customer)<br><br>Name, company stamp:<br>Date:</div>
+</div>"#;
+
+/// The quotation's entry in the print-layout registry: label, default
+/// template, and the variables an author may use in a custom template.
+pub fn quotation_print_doc() -> vortex_plugin_sdk::framework::PrintDocType {
+    let vars = [
+        ("doc.number", "Quotation number (with revision)"),
+        ("doc.date", "Order date"),
+        ("doc.validity", "Valid-until date"),
+        ("doc.headline", "Quotation Title (headline text)"),
+        ("doc.summary", "Quotation Summary / intro paragraph"),
+        ("doc.note", "Free-text note on the quotation"),
+        ("doc.payment_term", "Payment terms name, e.g. Net 30"),
+        ("doc.due_date", "Payment due date (order date + term days)"),
+        ("doc.watermark", "SUPERSEDED / LOST / EXPIRED, else empty"),
+        ("currency", "Currency code, e.g. MYR"),
+        ("company.name / company.logo / company.addr1 / company.addr2 / company.city_line / company.phone / company.email / company.reg", "Your company (logo is a data URI)"),
+        ("customer.name / customer.street / customer.street2 / customer.city_line / customer.phone / customer.email", "Bill-to customer"),
+        ("totals.untaxed / totals.tax / totals.total", "Money totals"),
+        ("lines (loop)", "{% for line in lines %} product rows: {% if line.is_line %} line.code, line.description, line.qty, line.unit_price, line.discount, line.tax, line.amount {% endif %} — section/note rows: {% if line.is_section %}line.text{% endif %}{% if line.is_note %}line.text{% endif %} {% endfor %}"),
+    ];
+    // Sample data for the editor's live preview (no real record needed).
+    let g = |pairs: &[(&str, &str)]| -> std::collections::BTreeMap<String, String> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    };
+    let sample_globals = g(&[
+        ("doc.number", "SQ/2026/00042"),
+        ("doc.date", "2026-07-08"),
+        ("doc.validity", "2026-07-22"),
+        ("doc.headline", "Supply & installation of stainless fittings"),
+        ("doc.summary", "Thank you for the opportunity to quote. This proposal covers materials and on-site installation as discussed."),
+        ("doc.note", "Lead time 2–3 weeks. Prices exclude delivery."),
+        ("doc.payment_term", "Net 30"),
+        ("doc.due_date", "2026-08-07"),
+        ("doc.watermark", ""),
+        ("currency", "MYR"),
+        ("company.name", "Acme Trading Sdn Bhd"),
+        ("company.addr1", "12 Jalan Contoh"),
+        ("company.city_line", "50450 Kuala Lumpur"),
+        ("company.phone", "+60 3-1234 5678"),
+        ("company.email", "sales@acme.example"),
+        ("company.reg", "202001012345"),
+        ("customer.name", "Beta Industries Sdn Bhd"),
+        ("customer.street", "88 Persiaran Sample"),
+        ("customer.city_line", "40000 Shah Alam"),
+        ("customer.phone", "+60 3-8765 4321"),
+        ("customer.email", "ap@beta.example"),
+        ("totals.subtotal_pre", "1,388.00"),
+        ("totals.discount", "138.00"),
+        ("totals.discount_label", "Discount (10%)"),
+        ("totals.untaxed", "1,250.00"),
+        ("totals.tax", "75.00"),
+        ("totals.total", "1,325.00"),
+    ]);
+    let sample_lines = vec![
+        g(&[("is_section", "1"), ("text", "Phase 1 — Materials")]),
+        g(&[("is_line", "1"), ("code", "PRD-001"), ("description", "Widget, stainless"), ("qty", "10"), ("unit_price", "100.00"), ("discount", ""), ("tax", "SST 6%"), ("amount", "1,000.00")]),
+        g(&[("is_line", "1"), ("code", "PRD-014"), ("description", "Mounting bracket"), ("qty", "5"), ("unit_price", "50.00"), ("discount", "10%"), ("tax", "SST 6%"), ("amount", "225.00")]),
+        g(&[("is_note", "1"), ("text", "Installation scheduled within 2 weeks of acceptance.")]),
+    ];
+    vortex_plugin_sdk::framework::PrintDocType {
+        doc_type: "sales.quotation".to_string(),
+        label: "Quotation".to_string(),
+        default_template: DEFAULT_QUOTATION_TEMPLATE.to_string(),
+        variables: vars.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+        sample_globals,
+        sample_lines,
+        // Enables the no-code Visual editor. Its compiled output matches
+        // DEFAULT_QUOTATION_TEMPLATE, so "Visual" and "HTML" open on the same
+        // starting layout.
+        default_config: Some(vortex_plugin_sdk::framework::LayoutConfig::transactional("Quotation")),
+    }
+}
+
+/// Printable quotation — branded A4 page with prices, taxes, validity and an
+/// acceptance block, rendered through the customisable print-layout engine
+/// (custom template if the user saved one, [`DEFAULT_QUOTATION_TEMPLATE`]
+/// otherwise). Reprintable for any revision, exactly as issued.
 async fn print_quote(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
     Extension(_user): Extension<AuthUser>,
     Extension(db_ctx): Extension<DatabaseContext>,
     Path(id): Path<Uuid>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
-    let esc = vortex_plugin_sdk::framework::html_escape;
+    let want_pdf = q.get("format").map(|f| f == "pdf").unwrap_or(false);
     let head = vortex_plugin_sdk::sqlx::query(
         "SELECT o.quote_number, o.revision, o.number, o.state, o.order_date, o.validity_date, \
-                o.note, o.untaxed_amount, o.tax_amount, o.total_amount, \
+                o.note, o.title, o.summary, o.untaxed_amount, o.tax_amount, o.total_amount, \
+                o.global_discount_type, o.global_discount_value, \
                 cu.code AS currency_code, \
+                pt.name AS payment_term_name, pt.due_days AS payment_term_days, \
                 c.name AS customer_name, c.street, c.street2, c.city, c.zip, \
                 c.phone AS customer_phone, c.email AS customer_email \
          FROM sales_order o \
          JOIN contacts c ON c.id = o.customer_id \
          LEFT JOIN currencies cu ON cu.id = o.currency_id \
+         LEFT JOIN payment_term pt ON pt.id = o.payment_term_id \
          WHERE o.id = $1",
     )
     .bind(id)
@@ -1914,9 +3488,11 @@ async fn print_quote(
     .flatten();
     let lines = vortex_plugin_sdk::sqlx::query(
         "SELECT p.code, COALESCE(NULLIF(l.description, ''), p.name) AS description, \
-                l.quantity, l.unit_price, t.name AS tax_name \
+                l.quantity, l.unit_price, l.discount_percent, t.name AS tax_name, l.display_type, \
+                u.code AS uom \
          FROM sales_order_line l \
-         JOIN stock_product p ON p.id = l.product_id \
+         LEFT JOIN stock_product p ON p.id = l.product_id \
+         LEFT JOIN uoms u ON u.id = COALESCE(l.uom_id, p.uom_id) \
          LEFT JOIN taxes t ON t.id = l.tax_id \
          WHERE l.order_id = $1 ORDER BY l.sequence, l.created_at",
     )
@@ -1925,28 +3501,28 @@ async fn print_quote(
     .await
     .unwrap_or_default();
 
+    // Raw (unescaped) header/company getters — the template engine escapes on
+    // output, so pre-escaping here would double-escape.
     let hval = |k: &str| -> String {
-        head.try_get::<Option<String>, _>(k).ok().flatten().map(|v| esc(&v)).unwrap_or_default()
+        head.try_get::<Option<String>, _>(k).ok().flatten().unwrap_or_default()
     };
     let cval = |k: &str| -> String {
         company
             .as_ref()
             .and_then(|c| c.try_get::<Option<String>, _>(k).ok().flatten())
-            .map(|v| esc(&v))
             .unwrap_or_default()
     };
     let company_name = company
         .as_ref()
-        .map(|c| esc(&c.get::<String, _>("name")))
+        .map(|c| c.get::<String, _>("name"))
         .unwrap_or_else(|| "Company".into());
-    let logo_html = match state.files.get(&db_ctx.db_name, "company/logo").await {
+
+    // Logo as a data URI (empty when none uploaded).
+    let logo_data = match state.files.get(&db_ctx.db_name, "company/logo").await {
         Ok(Some(data)) => {
             use base64::Engine;
             let ct = if data.starts_with(&[0xFF, 0xD8, 0xFF]) { "image/jpeg" } else { "image/png" };
-            format!(
-                r#"<img src="data:{ct};base64,{}" alt="" style="max-height:64px;max-width:220px;margin-bottom:6px"/>"#,
-                base64::engine::general_purpose::STANDARD.encode(&data),
-            )
+            format!("data:{ct};base64,{}", base64::engine::general_purpose::STANDARD.encode(&data))
         }
         _ => String::new(),
     };
@@ -1957,133 +3533,222 @@ async fn print_quote(
         let q = hval("quote_number");
         if revision > 1 { format!("{q} (Rev {revision})") } else { q }
     };
-    let cur = hval("currency_code");
-    let cur = if cur.is_empty() { "MYR".to_string() } else { cur };
-    // A superseded/lost/expired print carries its status; a confirmed
-    // family's quote print points at the SO.
-    let status_mark = match quote_state.as_str() {
-        "superseded" => r#"<div class="watermark">SUPERSEDED</div>"#.to_string(),
-        "lost" => r#"<div class="watermark">LOST</div>"#.to_string(),
-        "expired" => r#"<div class="watermark">EXPIRED</div>"#.to_string(),
-        _ => String::new(),
+    let cur = {
+        let c = hval("currency_code");
+        if c.is_empty() { "MYR".to_string() } else { c }
+    };
+    // A superseded/lost/expired print carries its status as a watermark.
+    let watermark = match quote_state.as_str() {
+        "superseded" => "SUPERSEDED",
+        "lost" => "LOST",
+        "expired" => "EXPIRED",
+        _ => "",
+    };
+    let date = head
+        .try_get::<Option<vortex_plugin_sdk::chrono::NaiveDate>, _>("order_date")
+        .ok().flatten().map(|d| d.to_string()).unwrap_or_default();
+    let validity = head
+        .try_get::<Option<vortex_plugin_sdk::chrono::NaiveDate>, _>("validity_date")
+        .ok().flatten().map(|d| d.to_string()).unwrap_or_else(|| "—".into());
+    // "postcode city" as one address line, trimmed.
+    let join2 = |a: String, b: String| format!("{} {}", a.trim(), b.trim()).trim().to_string();
+
+    // Rich-text fields (title/summary/note/line descriptions) carry inline
+    // formatting. The template engine ESCAPES every `{{ }}`, so we substitute a
+    // collision-proof token here and splice the sanitized HTML back in after the
+    // template renders — the engine stays a pure escaper (no raw-output hole).
+    let nonce = Uuid::now_v7().simple().to_string();
+    let mut rich_tokens: Vec<(String, String)> = Vec::new();
+    let mut rich = |raw: &str| -> String {
+        let safe = crate::richtext::sanitize_rich(raw);
+        if safe.trim().is_empty() {
+            return String::new();
+        }
+        let tok = format!("\u{2063}RT{}_{}\u{2063}", nonce, rich_tokens.len());
+        rich_tokens.push((tok.clone(), safe));
+        tok
     };
 
-    let mut line_trs = String::new();
-    for l in &lines {
-        let qty: Decimal = l.get("quantity");
-        let price: Decimal = l.try_get("unit_price").unwrap_or(Decimal::ZERO);
-        line_trs.push_str(&format!(
-            r#"<tr><td class="mono-code">{code}</td><td>{desc}</td><td class="num">{qty}</td><td class="num">{price}</td><td>{tax}</td><td class="num">{amount}</td></tr>"#,
-            code = esc(&l.get::<String, _>("code")),
-            desc = esc(&l.get::<String, _>("description")),
-            qty = qty.normalize(),
-            price = money(price),
-            tax = l.try_get::<Option<String>, _>("tax_name").ok().flatten().map(|t| esc(&t).to_string()).unwrap_or_else(|| "—".into()),
-            amount = money((qty * price).round_dp(2)),
-        ));
+    use std::collections::BTreeMap;
+    let mut g: BTreeMap<String, String> = BTreeMap::new();
+    g.insert("doc.number".into(), display_number.clone());
+    g.insert("doc.date".into(), date);
+    g.insert("doc.validity".into(), validity);
+    g.insert("doc.watermark".into(), watermark.to_string());
+    g.insert("doc.note".into(), rich(&hval("note")));
+    g.insert("doc.headline".into(), rich(&hval("title")));
+    g.insert("doc.summary".into(), rich(&hval("summary")));
+    // Payment terms + a due date computed from the order date + term days.
+    g.insert("doc.payment_term".into(), hval("payment_term_name"));
+    let term_days: Option<i32> = head.try_get("payment_term_days").ok().flatten();
+    let order_nd = head
+        .try_get::<Option<vortex_plugin_sdk::chrono::NaiveDate>, _>("order_date")
+        .ok()
+        .flatten();
+    let due_date = match (order_nd, term_days) {
+        (Some(d), Some(days)) => {
+            (d + vortex_plugin_sdk::chrono::Duration::days(days as i64)).to_string()
+        }
+        _ => String::new(),
+    };
+    g.insert("doc.due_date".into(), due_date);
+    g.insert("currency".into(), cur);
+    g.insert("company.logo".into(), logo_data);
+    g.insert("company.name".into(), company_name);
+    g.insert("company.addr1".into(), cval("company_address1"));
+    g.insert("company.addr2".into(), cval("company_address2"));
+    g.insert("company.city_line".into(), join2(cval("company_postcode"), cval("company_city")));
+    g.insert("company.phone".into(), cval("company_phone"));
+    g.insert("company.email".into(), cval("company_email"));
+    g.insert("company.reg".into(), cval("company_id_value"));
+    g.insert("customer.name".into(), hval("customer_name"));
+    g.insert("customer.street".into(), hval("street"));
+    g.insert("customer.street2".into(), hval("street2"));
+    g.insert("customer.city_line".into(), join2(hval("zip"), hval("city")));
+    g.insert("customer.phone".into(), hval("customer_phone"));
+    g.insert("customer.email".into(), hval("customer_email"));
+    g.insert("totals.untaxed".into(), money(head.try_get("untaxed_amount").unwrap_or(Decimal::ZERO)));
+    g.insert("totals.tax".into(), money(head.try_get("tax_amount").unwrap_or(Decimal::ZERO)));
+    g.insert("totals.total".into(), money(head.try_get("total_amount").unwrap_or(Decimal::ZERO)));
+
+    // Whole-quote discount: show a pre-discount subtotal + the amount off, so
+    // the document reconciles (the stored `untaxed` is already post-discount).
+    let gd_type: Option<String> = head.try_get("global_discount_type").ok().flatten();
+    let gd_value: Decimal = head.try_get("global_discount_value").unwrap_or(Decimal::ZERO);
+    let hundred = Decimal::from(100);
+    let pre_subtotal: Decimal = lines
+        .iter()
+        .filter(|l| l.try_get::<Option<String>, _>("display_type").ok().flatten().is_none())
+        .map(|l| {
+            let qty: Decimal = l.try_get("quantity").unwrap_or(Decimal::ZERO);
+            let price: Decimal = l.try_get("unit_price").unwrap_or(Decimal::ZERO);
+            let disc: Decimal = l.try_get("discount_percent").unwrap_or(Decimal::ZERO);
+            qty * price * (hundred - disc) / hundred
+        })
+        .sum();
+    let factor = global_factor(gd_type.as_deref(), gd_value, pre_subtotal);
+    let discount_amount = (pre_subtotal * (Decimal::ONE - factor)).round_dp(2);
+    if gd_type.is_some() && discount_amount > Decimal::ZERO {
+        let label = match gd_type.as_deref() {
+            Some("percent") => format!("Discount ({}%)", gd_value.normalize()),
+            _ => "Discount".to_string(),
+        };
+        g.insert("totals.subtotal_pre".into(), money(pre_subtotal.round_dp(2)));
+        g.insert("totals.discount".into(), money(discount_amount));
+        g.insert("totals.discount_label".into(), label);
+    } else {
+        // Empty string reads as falsy in the template `{% if %}` truthy test.
+        g.insert("totals.subtotal_pre".into(), String::new());
+        g.insert("totals.discount".into(), String::new());
+        g.insert("totals.discount_label".into(), String::new());
     }
 
-    let html = format!(
-        r##"<!DOCTYPE html><html><head><meta charset="utf-8"><title>{number} — QUOTATION</title>
-<style>{css}
-body {{ max-width: 21cm; margin: 1.2cm auto; position: relative; }}
-@page {{ size: A4; margin: 0; }}
-@media print {{
-  body {{ max-width: none; margin: 0; padding: 1.2cm 1.4cm; }}
-}}
-.head {{ display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 1.2em; }}
-.head h1 {{ font-size: 1.5em; letter-spacing: 0.06em; }}
-.seller p, .buyer p {{ margin: 1px 0; font-size: 0.85em; }}
-.seller .name {{ font-size: 1.1em; font-weight: 700; }}
-.meta td {{ padding: 1px 8px 1px 0; font-size: 0.85em; border: none; }}
-.num {{ text-align: right; font-variant-numeric: tabular-nums; }}
-.mono-code {{ font-family: monospace; }}
-.totals td {{ font-weight: 600; }}
-.accept {{ margin-top: 3em; display: flex; gap: 3em; }}
-.accept div {{ flex: 1; border-top: 1px solid #333; padding-top: 0.4em; font-size: 0.8em; }}
-.footer {{ margin-top: 2em; font-size: 0.75em; color: #666; }}
-.watermark {{ position: absolute; top: 35%; left: 15%; font-size: 5em; color: rgba(200,0,0,0.12); transform: rotate(-25deg); pointer-events: none; }}
-.printbar {{ text-align: right; margin-bottom: 1em; }}
-.printbar button {{ padding: 0.4em 1.2em; cursor: pointer; }}
-@media print {{ .printbar {{ display: none; }} }}
-</style></head><body>
-{status_mark}
-<div class="printbar"><button onclick="window.print()">Print / Save as PDF</button></div>
-<div class="head">
-  <div class="seller">
-    {logo_html}
-    <p class="name">{company_name}</p>
-    <p>{addr1}</p><p>{addr2}</p><p>{postcode} {city}</p>
-    <p>{cphone} · {cemail}</p>
-  </div>
-  <div style="text-align:right">
-    <h1>QUOTATION</h1>
-    <table class="meta" style="margin-left:auto">
-      <tr><td>Number</td><td><b>{number}</b></td></tr>
-      <tr><td>Date</td><td>{date}</td></tr>
-      <tr><td>Valid Until</td><td>{validity}</td></tr>
-    </table>
-  </div>
-</div>
-<div class="buyer" style="margin-bottom:1em">
-  <p style="font-size:0.75em;color:#666">TO</p>
-  <p><b>{customer}</b></p>
-  <p>{pstreet}</p><p>{pstreet2}</p><p>{pzip} {pcity}</p>
-  <p>{pphone} {pemail}</p>
-</div>
-<table class="table table-sm" style="table-layout:fixed;width:100%">
-<colgroup><col style="width:7rem"/><col/><col style="width:4.5rem"/><col style="width:7rem"/><col style="width:8rem"/><col style="width:8.5rem"/></colgroup>
-<thead><tr><th>Code</th><th>Description</th><th class="num">Qty</th><th class="num">Unit Price</th><th>Tax</th><th class="num">Amount ({cur})</th></tr></thead>
-<tbody>{line_trs}</tbody>
-<tfoot>
-<tr><td colspan="5" class="num">Subtotal</td><td class="num">{untaxed}</td></tr>
-<tr><td colspan="5" class="num">Tax</td><td class="num">{tax}</td></tr>
-<tr class="totals"><td colspan="5" class="num">TOTAL</td><td class="num">{total}</td></tr>
-</tfoot>
-</table>
-<div class="accept">
-  <div>Issued by<br><br>Name:<br>Date:</div>
-  <div>Accepted by (customer)<br><br>Name, company stamp:<br>Date:</div>
-</div>
-<div class="footer">Prices are valid until the date stated above. This quotation is not an invoice. {note}</div>
-</body></html>"##,
-        css = vortex_plugin_sdk::framework::user_reports::REPORT_CSS,
-        status_mark = status_mark,
-        number = display_number,
-        logo_html = logo_html,
-        company_name = company_name,
-        addr1 = cval("company_address1"),
-        addr2 = cval("company_address2"),
-        postcode = cval("company_postcode"),
-        city = cval("company_city"),
-        cphone = cval("company_phone"),
-        cemail = cval("company_email"),
-        date = head
-            .try_get::<Option<vortex_plugin_sdk::chrono::NaiveDate>, _>("order_date")
-            .ok()
-            .flatten()
-            .map(|d| d.to_string())
-            .unwrap_or_default(),
-        validity = head
-            .try_get::<Option<vortex_plugin_sdk::chrono::NaiveDate>, _>("validity_date")
-            .ok()
-            .flatten()
-            .map(|d| d.to_string())
-            .unwrap_or_else(|| "—".into()),
-        customer = hval("customer_name"),
-        pstreet = hval("street"),
-        pstreet2 = hval("street2"),
-        pzip = hval("zip"),
-        pcity = hval("city"),
-        pphone = hval("customer_phone"),
-        pemail = hval("customer_email"),
-        cur = cur,
-        line_trs = line_trs,
-        untaxed = money(head.try_get("untaxed_amount").unwrap_or(Decimal::ZERO)),
-        tax = money(head.try_get("tax_amount").unwrap_or(Decimal::ZERO)),
-        total = money(head.try_get("total_amount").unwrap_or(Decimal::ZERO)),
-        note = hval("note"),
-    );
+    let mut line_maps: Vec<BTreeMap<String, String>> = Vec::new();
+    for l in &lines {
+        let mut m = BTreeMap::new();
+        let display_type: Option<String> = l.try_get("display_type").ok().flatten();
+        // Per-row kind flags — the template branches on these (truthy test).
+        if let Some(dt) = display_type {
+            let text = l.try_get::<Option<String>, _>("description").ok().flatten().unwrap_or_default();
+            if dt == "section" {
+                m.insert("is_section".into(), "1".into());
+            } else {
+                m.insert("is_note".into(), "1".into());
+            }
+            m.insert("text".into(), text);
+            line_maps.push(m);
+            continue;
+        }
+        let qty: Decimal = l.try_get("quantity").unwrap_or(Decimal::ZERO);
+        let price: Decimal = l.try_get("unit_price").unwrap_or(Decimal::ZERO);
+        let disc: Decimal = l.try_get("discount_percent").unwrap_or(Decimal::ZERO);
+        let net = (qty * price * (Decimal::from(100) - disc) / Decimal::from(100)).round_dp(2);
+        m.insert("is_line".into(), "1".into());
+        m.insert("code".into(), l.try_get::<Option<String>, _>("code").ok().flatten().unwrap_or_default());
+        let desc_raw = l.try_get::<Option<String>, _>("description").ok().flatten().unwrap_or_default();
+        m.insert("description".into(), rich(&desc_raw));
+        // Fold the unit into the qty so every layout shows "5 kg" with no
+        // template change needed.
+        let uom = l.try_get::<Option<String>, _>("uom").ok().flatten().unwrap_or_default();
+        let qty_disp = if uom.is_empty() {
+            qty.normalize().to_string()
+        } else {
+            format!("{} {}", qty.normalize(), uom)
+        };
+        m.insert("qty".into(), qty_disp);
+        m.insert("unit_price".into(), money(price));
+        m.insert(
+            "discount".into(),
+            if disc > Decimal::ZERO { format!("{}%", disc.normalize()) } else { String::new() },
+        );
+        m.insert(
+            "tax".into(),
+            l.try_get::<Option<String>, _>("tax_name").ok().flatten().unwrap_or_else(|| "—".into()),
+        );
+        // Amount is net of the line discount, matching the stored totals.
+        m.insert("amount".into(), money(net));
+        line_maps.push(m);
+    }
+
+    let title = format!("{display_number} — Quotation");
+    let mut html = vortex_plugin_sdk::framework::print_layout::render_document(
+        &db,
+        "sales.quotation",
+        DEFAULT_QUOTATION_TEMPLATE,
+        &title,
+        &g,
+        &line_maps,
+    )
+    .await;
+    // Splice the sanitized rich-text HTML back in over its placeholder tokens.
+    for (tok, safe_html) in &rich_tokens {
+        html = html.replace(tok, safe_html);
+    }
+
+    // `?format=pdf` renders the same branded page through the headless-Chromium
+    // PDF engine and returns it as a download; otherwise serve the print page
+    // (the browser's own Print → Save as PDF still works when the engine is off).
+    if want_pdf {
+        if !vortex_plugin_sdk::framework::pdf::available() {
+            return (
+                vortex_plugin_sdk::axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "PDF engine not enabled on this server — use Print and the browser's Save as PDF.",
+            )
+                .into_response();
+        }
+        let opts = vortex_plugin_sdk::framework::pdf::PdfOptions::default();
+        return match vortex_plugin_sdk::framework::pdf::html_to_pdf(&html, &opts).await {
+            Ok(bytes) => {
+                // Filename from the quote number, path-safe.
+                let fname = format!(
+                    "{}.pdf",
+                    display_number.replace(['/', '\\', ' '], "-")
+                );
+                (
+                    [
+                        (
+                            vortex_plugin_sdk::axum::http::header::CONTENT_TYPE,
+                            "application/pdf".to_string(),
+                        ),
+                        (
+                            vortex_plugin_sdk::axum::http::header::CONTENT_DISPOSITION,
+                            format!("attachment; filename=\"{fname}\""),
+                        ),
+                    ],
+                    bytes,
+                )
+                    .into_response()
+            }
+            Err(e) => {
+                error!(error = %e, "quotation pdf render failed");
+                (
+                    vortex_plugin_sdk::axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    "PDF rendering failed — check the server's Chromium (VORTEX_CHROMIUM).",
+                )
+                    .into_response()
+            }
+        };
+    }
     Html(html).into_response()
 }
 
@@ -2420,7 +4085,7 @@ async fn service_form(
 <td><input name="qty_{lid}" type="number" step="0.0001" min="0" max="{remaining}" value="{remaining}" class="input input-bordered input-xs w-28 text-right"/></td></tr>"#,
             pcode = esc(&pcode),
             pname = esc(&pname),
-            desc = desc.filter(|d| !d.is_empty()).map(|d| format!(r#"<br><span class="text-xs text-base-content/50">{}</span>"#, esc(&d))).unwrap_or_default(),
+            desc = desc.filter(|d| !d.is_empty()).map(|d| format!(r#"<br><span class="text-xs text-base-content/50" style="white-space:pre-line">{}</span>"#, esc(&d))).unwrap_or_default(),
             remaining = remaining,
             lid = lid,
         ));
@@ -2568,7 +4233,8 @@ async fn create_customer_invoice(
     use vortex_accounting::documents::{self, InvoiceLine, NewInvoice};
 
     let po = vortex_plugin_sdk::sqlx::query(
-        "SELECT number, state, customer_id, order_date, company_id, customer_invoice_move_id \
+        "SELECT number, state, customer_id, order_date, company_id, customer_invoice_move_id, \
+                payment_term_id \
          FROM sales_order WHERE id = $1",
     )
     .bind(id)
@@ -2587,6 +4253,11 @@ async fn create_customer_invoice(
     let customer_id: Uuid = po.get("customer_id");
     let company_id: Option<Uuid> = po.try_get("company_id").ok().flatten();
     let invoice_date = vortex_plugin_sdk::chrono::Utc::now().date_naive();
+    // Due date from the order's payment term (invoice date + term days).
+    let payment_term_id: Option<Uuid> = po.try_get("payment_term_id").ok().flatten();
+    let due_date =
+        vortex_accounting::handlers_payment_terms::due_date_for(&db, payment_term_id, invoice_date)
+            .await;
 
     let currency_id: Option<Uuid> = vortex_plugin_sdk::sqlx::query_scalar(
         "SELECT currency_id FROM sales_order WHERE id = $1",
@@ -2600,7 +4271,7 @@ async fn create_customer_invoice(
     let line_rows = vortex_plugin_sdk::sqlx::query(
         "SELECT l.id, COALESCE(NULLIF(l.description, ''), NULLIF(p.sales_description, ''), p.name) AS name, \
                 GREATEST(l.qty_delivered - l.qty_invoiced, 0) AS billable, \
-                l.unit_price, l.tax_id, l.product_id, \
+                l.unit_price, l.discount_percent, l.tax_id, l.product_id, \
                 COALESCE(l.classification_code, p.classification_code) AS classification_code, \
                 p.income_account_id \
          FROM sales_order_line l JOIN stock_product p ON p.id = l.product_id \
@@ -2615,13 +4286,37 @@ async fn create_customer_invoice(
         return (vortex_plugin_sdk::axum::http::StatusCode::CONFLICT, "Nothing to invoice — no delivered or confirmed quantity is awaiting billing.").into_response();
     }
 
+    // Whole-quote discount: bill the discounted price so partial invoices sum
+    // back to the quoted total. The factor is order-level (derived from the FULL
+    // order subtotal), so every partial invoice carries its proportional share.
+    let (gd_type, gd_value) = order_global_discount(&db, id).await;
+    let full_subtotal: Decimal = vortex_plugin_sdk::sqlx::query_scalar(
+        "SELECT COALESCE(SUM(quantity * unit_price * (100 - discount_percent) / 100), 0) \
+         FROM sales_order_line WHERE order_id = $1 AND display_type IS NULL",
+    )
+    .bind(id)
+    .fetch_one(&db)
+    .await
+    .unwrap_or(Decimal::ZERO);
+    let g_factor = global_factor(gd_type.as_deref(), gd_value, full_subtotal);
+
     let mut lines = Vec::new();
     let mut billed: Vec<(Uuid, Decimal)> = Vec::new();
     for r in &line_rows {
         let line_id: Uuid = r.get("id");
-        let name: String = r.get("name");
+        // Order-line descriptions are rich TEXT (formatted, multi-line); the
+        // accounting invoice-line description is a bounded plain VARCHAR(255),
+        // so strip formatting to plain text and cap the length.
+        let name: String = crate::richtext::strip_tags(&r.get::<String, _>("name"))
+            .chars()
+            .take(255)
+            .collect();
         let quantity: Decimal = r.get("billable");
-        let unit_price: Decimal = r.get("unit_price");
+        // Bill the net-of-discount unit price (per-line discount then the
+        // whole-quote factor, both applied before tax).
+        let list_price: Decimal = r.get("unit_price");
+        let discount: Decimal = r.try_get("discount_percent").unwrap_or(Decimal::ZERO);
+        let unit_price = (list_price * (Decimal::from(100) - discount) / Decimal::from(100) * g_factor).round_dp(4);
         billed.push((line_id, quantity));
         let mut line = InvoiceLine::new(&name, quantity, unit_price);
         if let Ok(Some(t)) = r.try_get::<Option<Uuid>, _>("tax_id") {
@@ -2648,7 +4343,7 @@ async fn create_customer_invoice(
             move_type: "customer_invoice",
             partner_id: customer_id,
             invoice_date,
-            due_date: None,
+            due_date,
             journal_code: None,
             currency_id,
             origin_ref: Some(&origin),
@@ -2691,4 +4386,228 @@ async fn create_customer_invoice(
     audit_so(&state, &db_ctx, &db, user.id, &user.username, id, "invoiced").await;
     info!(number = %number, invoice = %invoice, "customer invoice created from sales order");
     vortex_plugin_sdk::axum::response::Redirect::to(&format!("/accounting/documents/{invoice}")).into_response()
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Notes / Terms template library (Sales ▸ Configuration)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Sync the contenteditable body into the form's hidden field on submit.
+const TPL_SUBMIT_JS: &str = r#"var f=document.getElementById('tpl-form'); if(f){ f.addEventListener('submit', function(){ document.querySelector('[name=body]').value = document.getElementById('tpl-body').innerHTML; }); }"#;
+
+async fn list_note_templates(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    use vortex_plugin_sdk::framework::list::{execute_list, render_list, ListColumn, ListConfig, ListParams};
+    let sidebar = render_sidebar(&state, &user, &db_ctx);
+    let config = ListConfig::new("Terms Templates", "sales_note_template")
+        .custom_select("id, name, active")
+        .column(ListColumn::new("name", "Name").sortable().searchable().sql_expr("name"))
+        .column(ListColumn::new("active", "Status").bool_badge("Active", "badge-success", "Archived", "badge-warning").sql_expr("active"))
+        .detail_url("/sales/note-templates/{id}")
+        .create("New Template", "/sales/note-templates/new")
+        .default_sort("name");
+    let params = ListParams::from_query(&query);
+    let result = match execute_list(&db, &config, &params).await {
+        Ok(r) => r,
+        Err(e) => { error!(error = %e, "note template list failed"); return Html("<h1>Failed to load templates</h1>").into_response(); }
+    };
+    let list_html = render_list(&config, &result, &params, "/sales/note-templates");
+    Html(page_shell(&sidebar, "Terms Templates", &list_html)).into_response()
+}
+
+fn note_template_form_body(action: &str, title: &str, name: &str, body: &str, active: bool, is_new: bool) -> String {
+    let active_box = if is_new { String::new() } else {
+        format!(r#"<div class="form-control mb-3"><label class="cursor-pointer label justify-start gap-3"><input type="checkbox" name="active" class="checkbox checkbox-sm" {}/><span class="label-text">Active (offered in the quote editor)</span></label></div>"#, if active { "checked" } else { "" })
+    };
+    format!(
+        r##"<div class="max-w-3xl">
+{rt_head}
+<a href="/sales/note-templates" class="btn btn-ghost btn-sm mb-3">← Back to Templates</a>
+<h1 class="text-2xl font-bold mb-3">{title}</h1>
+{rt_toolbar}
+<form method="POST" action="{action}" id="tpl-form">
+<div class="card bg-base-100 shadow"><div class="card-body">
+<div class="form-control mb-3"><label class="label"><span class="label-text">Name *</span></label>
+<input name="name" class="input input-bordered input-sm" value="{name}" required placeholder="e.g. Standard payment terms"/></div>
+<div class="form-control mb-3"><label class="label"><span class="label-text">Body</span></label>
+<div id="tpl-body" contenteditable="true" data-ph="Type the terms… use the toolbar above for bold / colour / tables" class="rt-field textarea textarea-bordered leading-snug" style="min-height:12rem">{body}</div>
+<input type="hidden" name="body"/></div>
+{active_box}
+<div class="flex gap-2"><button class="btn btn-primary btn-sm">Save</button>
+<a href="/sales/note-templates" class="btn btn-ghost btn-sm">Cancel</a></div>
+</div></div></form>
+<script>{rt_js}</script>
+<script>{sync_js}</script>
+</div>"##,
+        rt_head = RICH_TEXT_HEAD,
+        rt_toolbar = RICH_TOOLBAR_HTML,
+        rt_js = RICH_TEXT_JS,
+        sync_js = TPL_SUBMIT_JS,
+        action = action, title = title, name = name, body = body, active_box = active_box,
+    )
+}
+
+async fn new_note_template_form(
+    State(state): State<Arc<AppState>>, Db(db): Db,
+    Extension(user): Extension<AuthUser>, Extension(db_ctx): Extension<DatabaseContext>,
+) -> Response {
+    let sidebar = render_sidebar(&state, &user, &db_ctx);
+    let body = note_template_form_body("/sales/note-templates/create", "New Terms Template", "", "", true, true);
+    Html(page_shell(&sidebar, "New Terms Template", &body)).into_response()
+}
+
+async fn create_note_template(
+    State(state): State<Arc<AppState>>, Db(db): Db,
+    Extension(user): Extension<AuthUser>, Extension(db_ctx): Extension<DatabaseContext>,
+    vortex_plugin_sdk::axum::extract::Form(form): vortex_plugin_sdk::axum::extract::Form<HashMap<String, String>>,
+) -> Response {
+    use vortex_plugin_sdk::axum::http::StatusCode;
+    let name = form.get("name").map(|s| s.trim().to_string()).unwrap_or_default();
+    if name.is_empty() {
+        return (StatusCode::BAD_REQUEST, "Name is required").into_response();
+    }
+    // Body is user rich text → sanitize to the allow-list before storing.
+    let body = crate::richtext::sanitize_rich(form.get("body").map(|s| s.as_str()).unwrap_or(""));
+    let company_id = default_company(&db).await;
+    let tpl_id = Uuid::now_v7();
+    if let Err(e) = vortex_plugin_sdk::sqlx::query(
+        "INSERT INTO sales_note_template (id, name, body, company_id) VALUES ($1,$2,$3,$4)",
+    )
+    .bind(tpl_id).bind(&name).bind(&body).bind(company_id)
+    .execute(&db).await
+    {
+        error!(error = %e, "note template insert failed");
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create template: {e}")).into_response();
+    }
+    let audit_entry = vortex_plugin_sdk::security::AuditEntry::new(
+        vortex_plugin_sdk::security::AuditAction::RecordCreated,
+        vortex_plugin_sdk::security::AuditSeverity::Info,
+    )
+    .with_user(vortex_plugin_sdk::common::UserId(user.id))
+    .with_username(&user.username)
+    .with_database(&db_ctx.db_name)
+    .with_resource("sales_note_template", tpl_id.to_string())
+    .with_resource_name(&name);
+    let _ = state.audit.log(audit_entry).await;
+    vortex_plugin_sdk::axum::response::Redirect::to("/sales/note-templates").into_response()
+}
+
+async fn edit_note_template(
+    State(state): State<Arc<AppState>>, Db(db): Db,
+    Extension(user): Extension<AuthUser>, Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<Uuid>,
+) -> Response {
+    let esc = vortex_plugin_sdk::framework::html_escape;
+    let sidebar = render_sidebar(&state, &user, &db_ctx);
+    let row = match vortex_plugin_sdk::sqlx::query("SELECT name, body, active FROM sales_note_template WHERE id = $1")
+        .bind(id).fetch_optional(&db).await {
+        Ok(Some(r)) => r,
+        _ => return (vortex_plugin_sdk::axum::http::StatusCode::NOT_FOUND, "Not found").into_response(),
+    };
+    let name: String = row.get("name");
+    let body: String = row.try_get("body").unwrap_or_default();
+    let active: bool = row.try_get("active").unwrap_or(true);
+    // Re-sanitize on the way out (defense in depth) before raw-embedding.
+    let body_safe = crate::richtext::sanitize_rich(&body);
+    let content = note_template_form_body(
+        &format!("/sales/note-templates/{id}"), &format!("Edit {}", esc(&name)),
+        &esc(&name), &body_safe, active, false,
+    );
+    Html(page_shell(&sidebar, "Edit Terms Template", &content)).into_response()
+}
+
+async fn update_note_template(
+    State(state): State<Arc<AppState>>, Db(db): Db,
+    Extension(user): Extension<AuthUser>, Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<Uuid>,
+    vortex_plugin_sdk::axum::extract::Form(form): vortex_plugin_sdk::axum::extract::Form<HashMap<String, String>>,
+) -> Response {
+    use vortex_plugin_sdk::axum::http::StatusCode;
+    let name = form.get("name").map(|s| s.trim().to_string()).unwrap_or_default();
+    if name.is_empty() {
+        return (StatusCode::BAD_REQUEST, "Name is required").into_response();
+    }
+    let body = crate::richtext::sanitize_rich(form.get("body").map(|s| s.as_str()).unwrap_or(""));
+    if let Err(e) = vortex_plugin_sdk::sqlx::query(
+        "UPDATE sales_note_template SET name=$1, body=$2, active=$3, updated_at=NOW() WHERE id=$4",
+    )
+    .bind(&name).bind(&body).bind(form.contains_key("active")).bind(id)
+    .execute(&db).await
+    {
+        error!(error = %e, "note template update failed");
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update template: {e}")).into_response();
+    }
+    let audit_entry = vortex_plugin_sdk::security::AuditEntry::new(
+        vortex_plugin_sdk::security::AuditAction::RecordUpdated,
+        vortex_plugin_sdk::security::AuditSeverity::Info,
+    )
+    .with_user(vortex_plugin_sdk::common::UserId(user.id))
+    .with_username(&user.username)
+    .with_database(&db_ctx.db_name)
+    .with_resource("sales_note_template", id.to_string())
+    .with_resource_name(&name);
+    let _ = state.audit.log(audit_entry).await;
+    vortex_plugin_sdk::axum::response::Redirect::to("/sales/note-templates").into_response()
+}
+
+/// JSON array of active Notes/Terms templates for the quote editor's
+/// "Apply template" picker (id + name + sanitized body).
+async fn note_templates_json(db: &vortex_plugin_sdk::sqlx::PgPool) -> String {
+    let rows = vortex_plugin_sdk::sqlx::query(
+        "SELECT id, name, body FROM sales_note_template WHERE active ORDER BY name",
+    )
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+    let arr: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|r| {
+            let id: Uuid = r.get("id");
+            json!({
+                "id": id.to_string(),
+                "name": r.get::<String, _>("name"),
+                "body": crate::richtext::sanitize_rich(&r.try_get::<String, _>("body").unwrap_or_default()),
+            })
+        })
+        .collect();
+    serde_json::to_string(&arr).unwrap_or_else(|_| "[]".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::global_factor;
+    use vortex_plugin_sdk::rust_decimal::Decimal;
+
+    fn d(n: i64) -> Decimal {
+        Decimal::from(n)
+    }
+
+    #[test]
+    fn no_discount_is_identity() {
+        assert_eq!(global_factor(None, d(0), d(300)), Decimal::ONE);
+        assert_eq!(global_factor(Some("bogus"), d(10), d(300)), Decimal::ONE);
+    }
+
+    #[test]
+    fn percent_discount() {
+        // 10% off → factor 0.9 (independent of subtotal).
+        assert_eq!(global_factor(Some("percent"), d(10), d(300)), d(90) / d(100));
+        // Over-100% is clamped → factor 0 (never negative).
+        assert_eq!(global_factor(Some("percent"), d(150), d(300)), Decimal::ZERO);
+    }
+
+    #[test]
+    fn fixed_discount() {
+        // 50 off a 300 subtotal → factor 250/300.
+        assert_eq!(global_factor(Some("fixed"), d(50), d(300)), d(250) / d(300));
+        // Fixed amount ≥ subtotal is clamped → factor 0, not negative.
+        assert_eq!(global_factor(Some("fixed"), d(400), d(300)), Decimal::ZERO);
+        // Zero subtotal can't divide → identity.
+        assert_eq!(global_factor(Some("fixed"), d(50), d(0)), Decimal::ONE);
+    }
 }

@@ -1,9 +1,12 @@
 -- __DISPLAY__ — initial schema.
 --
--- One example record type ("item"). Rename/extend to your domain;
--- keep the ir_model/ir_model_field registration in sync — that is
--- what makes the model visible to the list framework, the user
--- report builder, and the public REST API.
+-- One example record type ("item"). Rename/extend to your domain.
+-- The model is registered in `ir_model` / `ir_model_field`
+-- automatically from `#[derive(Model)]` (see `src/model.rs` and
+-- `Plugin::models()`) — that is what makes it visible to the list
+-- framework, the report builder, and the public REST API. Keep this
+-- table's columns in sync with the struct; do NOT hand-seed the
+-- registry here.
 
 CREATE TABLE IF NOT EXISTS __SNAKE___item (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -21,24 +24,8 @@ CREATE TABLE IF NOT EXISTS __SNAKE___item (
 
 CREATE INDEX IF NOT EXISTS idx___SNAKE___item_state ON __SNAKE___item(record_state);
 
--- Model registry: makes '__SNAKE___item' a first-class platform model
--- (list framework, report builder, public /api/v1 access).
-INSERT INTO ir_model (name, display_name, table_name, module, is_active, list_url)
-VALUES ('__SNAKE___item', '__DISPLAY__ Item', '__SNAKE___item', '__SNAKE__', true, '/__KEBAB__')
-ON CONFLICT (name) DO NOTHING;
-
-INSERT INTO ir_model_field (model_id, name, display_name, field_type, sequence)
-SELECT m.id, f.name, f.display_name, f.field_type, f.seq
-FROM ir_model m,
-     (VALUES
-        ('code',         'Code',        'string',    10),
-        ('name',         'Name',        'string',    20),
-        ('description',  'Description', 'text',      30),
-        ('record_state', 'State',       'selection', 40),
-        ('created_at',   'Created',     'datetime',  50)
-     ) AS f(name, display_name, field_type, seq)
-WHERE m.name = '__SNAKE___item'
-ON CONFLICT DO NOTHING;
+-- NOTE: the model registry (ir_model / ir_model_field) is populated from
+-- `#[derive(Model)]` via `Plugin::models()` on `db migrate` — not seeded here.
 
 -- Status bar stages (users can add/reorder in Settings ▸ Stages).
 INSERT INTO record_stages (model, code, label, color, sequence, always_visible) VALUES

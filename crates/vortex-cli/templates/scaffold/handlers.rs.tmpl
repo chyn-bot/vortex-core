@@ -29,16 +29,22 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/__KEBAB__/{id}", get(item_page))
         .route("/__KEBAB__/{id}", post(update_item))
         .route("/__KEBAB__/{id}/edit", get(edit_item_form))
+        .route("/__KEBAB__/{id}/duplicate", post(duplicate_item))
         .route("/__KEBAB__/{id}/status/{state}", post(change_status))
 }
 
-/// The form, declared once — rendering, validation, and persistence
-/// all derive from this. Add a field here and it exists everywhere.
+/// The create/edit form — *generated* from the `#[derive(Model)]`
+/// metadata (Initiative #6), narrowed to the fields a user actually
+/// types. Add a field in `model.rs`, then list its name here to surface
+/// it (order is honoured). Widgets, labels and required-ness come from
+/// the model; no need to restate them. For a fully hand-built form,
+/// swap this for `FormConfig::new(...).field(...)`.
 fn item_form() -> FormConfig {
-    FormConfig::new("__DISPLAY__ Item", "__SNAKE___item", "/__KEBAB__")
-        .section("Details")
-        .field(FormField::text("name", "Name").required().placeholder("A descriptive name"))
-        .field(FormField::textarea("description", "Description"))
+    FormConfig::from_model_fields(
+        <crate::model::__PASCAL__Item as vortex_plugin_sdk::orm::model::Model>::meta(),
+        "/__KEBAB__",
+        &["name", "description"],
+    )
 }
 
 /// Platform HTML shell: sidebar, vendored assets, mobile layout.
@@ -85,30 +91,19 @@ async fn list_items(
     Query(query): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     use vortex_plugin_sdk::framework::list::{
-        execute_list, render_list, ListColumn, ListConfig, ListParams,
+        execute_list, render_list, ListConfig, ListParams,
     };
 
-    let config = ListConfig::new("__DISPLAY__", "__SNAKE___item")
-        .detail_url("/__KEBAB__/{id}")
-        .create("+ New", "/__KEBAB__/new")
-        .column(ListColumn::new("code", "Code").sortable().code())
-        .column(ListColumn::new("name", "Name").sortable().searchable())
-        .column(
-            ListColumn::new("record_state", "State")
-                .filterable(&[
-                    ("draft", "Draft"),
-                    ("confirmed", "Confirmed"),
-                    ("done", "Done"),
-                    ("cancelled", "Cancelled"),
-                ])
-                .badge(&[
-                    ("draft", "Draft", "badge-neutral"),
-                    ("confirmed", "Confirmed", "badge-info"),
-                    ("done", "Done", "badge-success"),
-                    ("cancelled", "Cancelled", "badge-error"),
-                ]),
-        )
-        .column(ListColumn::new("created_at", "Created").sortable());
+    // Columns are *generated* from the `#[derive(Model)]` metadata
+    // (Initiative #6): scalar fields become sortable/searchable columns,
+    // booleans render as badges. To hand-pick columns, filters and
+    // coloured status badges, swap this for
+    // `ListConfig::new("__DISPLAY__", "__SNAKE___item").column(...)`.
+    let config = ListConfig::from_model(
+        <crate::model::__PASCAL__Item as vortex_plugin_sdk::orm::model::Model>::meta(),
+    )
+    .detail_url("/__KEBAB__/{id}")
+    .create("+ New", "/__KEBAB__/new");
 
     let params = ListParams::from_query(&query);
     let table = match execute_list(&db, &config, &params).await {
@@ -274,22 +269,55 @@ async fn item_page(
     <div><h1 class="text-2xl font-bold">{name}</h1>
     <p class="opacity-60"><code>{code}</code></p></div>
     <div class="flex items-center gap-3">{bar}
-    <a href="/__KEBAB__/{id}/edit" class="btn btn-sm btn-outline">Edit</a></div>
+    <a href="/__KEBAB__/{id}/edit" class="btn btn-sm btn-outline">Edit</a>{duplicate}</div>
   </div>
   <p class="mt-4">{description}</p>
 </div></div>
-<!-- Chatter: messages, activities, attachments — one include. -->
-<div hx-get="/partials/chatter/__SNAKE___item/{id}" hx-trigger="load" hx-swap="innerHTML">
-  <span class="loading loading-dots loading-sm"></span>
-</div>"##,
+<!-- Activity stream: messages, activities (schedule/assign/complete),
+     attachments — one reusable core primitive. -->
+{activity}"##,
         name = esc(&name),
         code = esc(code.as_deref().unwrap_or("—")),
         bar = bar,
+        duplicate = duplicate_button(&format!("/__KEBAB__/{id}/duplicate")),
         description = esc(description.as_deref().unwrap_or("")),
+        activity = vortex_plugin_sdk::framework::render_chatter_panel("__SNAKE___item", id),
         id = id,
     );
     let sidebar = sidebar_for(&state, &user, &db_ctx);
     Html(page_shell(&sidebar, &name, &content)).into_response()
+}
+
+/// POST /__KEBAB__/{id}/duplicate — copy the record into a fresh draft:
+/// new sequence code, state back to the DB default, name marked "(copy)".
+async fn duplicate_item(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<Uuid>,
+) -> Response {
+    let code = match vortex_plugin_sdk::orm::sequence::next(&db_ctx.pool, &ITEM_SEQ).await {
+        Ok(code) => code,
+        Err(e) => {
+            error!("duplicate sequence draw failed: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Duplicate failed").into_response();
+        }
+    };
+    let spec = DuplicateSpec::new("__SNAKE___item")
+        .set("code", json!(code))
+        .skip("record_state")
+        .copy_suffix("name");
+    match spec.execute(&db, id, Some(user.id)).await {
+        Ok(new_id) => {
+            audit_item(&state, &user, &db_ctx, new_id, AuditAction::RecordCreated, json!({"duplicated_from": id, "code": code})).await;
+            Redirect::to(&format!("/__KEBAB__/{new_id}")).into_response()
+        }
+        Err(e) => {
+            error!("duplicate failed: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "Duplicate failed").into_response()
+        }
+    }
 }
 
 /// POST /__KEBAB__/{id}/status/{state} — audited stage transition.

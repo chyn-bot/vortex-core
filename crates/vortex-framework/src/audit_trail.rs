@@ -24,6 +24,16 @@ use uuid::Uuid;
 use crate::ui::{format_time_ago, html_escape};
 
 /// Map a raw audit action code to a human label and a DaisyUI dot colour.
+/// Turn an event code like `services_confirmed` into a label `Services confirmed`.
+fn humanize(s: &str) -> String {
+    let spaced = s.replace('_', " ");
+    let mut chars = spaced.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
 fn action_style(action: &str) -> (&'static str, &'static str) {
     match action {
         "record_created" => ("Created", "bg-success"),
@@ -59,7 +69,17 @@ pub async fn render_audit_trail(pool: &PgPool, resource_type: &str, resource_id:
         let username: String = r.get("username");
         let action: String = r.get("action");
         let details: Option<serde_json::Value> = r.try_get("details").ok();
-        let (label, dot) = action_style(&action);
+        let (base_label, dot) = action_style(&action);
+        // Prefer a writer-supplied `details.action` event name (e.g. "sent",
+        // "confirmed", "validated") over the generic action label, so the
+        // timeline reads as the actual business event.
+        let label = details
+            .as_ref()
+            .and_then(|d| d.get("action"))
+            .and_then(|a| a.as_str())
+            .filter(|s| !s.is_empty())
+            .map(humanize)
+            .unwrap_or_else(|| base_label.to_string());
 
         // Render the field-level diff, if the writer recorded one.
         let mut changes_html = String::new();
@@ -89,7 +109,7 @@ pub async fn render_audit_trail(pool: &PgPool, resource_type: &str, resource_id:
 {changes}
 </li>"#,
             dot = dot,
-            label = label,
+            label = html_escape(&label),
             user = html_escape(&username),
             ago = html_escape(&format_time_ago(ts)),
             changes = changes_html,

@@ -180,7 +180,9 @@ async fn edit_agent(
     let cov: Vec<Uuid> = vortex_plugin_sdk::sqlx::query_scalar("SELECT kawasan_id FROM eam_field_agent_kawasan_rel WHERE agent_id=$1").bind(id).fetch_all(&db).await.unwrap_or_default();
     let body = agent_body(&db, &v, &cov, false).await;
     let header = form_header("/sesb-eam/agents", "Back to Agents", &format!("Agent · {}", v.get("name").cloned().unwrap_or_default()));
-    Html(page_shell(&sidebar, "Field Agent", &wide_form_page(&format!("/sesb-eam/agents/{id}"), &header, &body))).into_response()
+    let activity_panel = vortex_plugin_sdk::framework::render_chatter_panel("eam_agent", id);
+    let content = format!("{}<div class=\"max-w-4xl mt-6\">{activity_panel}</div>", wide_form_page(&format!("/sesb-eam/agents/{id}"), &header, &body));
+    Html(page_shell(&sidebar, "Field Agent", &content)).into_response()
 }
 
 async fn update_agent(
@@ -289,7 +291,8 @@ async fn edit_group(
     };
     let body = group_body(&db, &v, false).await;
     let header = form_header("/sesb-eam/agent-groups", "Back to Groups", &format!("Group · {}", v.get("name").cloned().unwrap_or_default()));
-    let content = format!("<div class=\"max-w-4xl\">{}{}<div class=\"card bg-base-100 shadow mt-4\"><div class=\"card-body\"><h2 class=\"font-semibold\">Members</h2>{}</div></div></div>",
+    let activity_panel = vortex_plugin_sdk::framework::render_chatter_panel("eam_group", id);
+    let content = format!("<div class=\"max-w-4xl\">{}{}<div class=\"card bg-base-100 shadow mt-4\"><div class=\"card-body\"><h2 class=\"font-semibold\">Members</h2>{}</div></div><div class=\"mt-6\">{activity_panel}</div></div>",
         header, wide_form_page(&format!("/sesb-eam/agent-groups/{id}"), "", &body), roster);
     Html(page_shell(&sidebar, "Agent Group", &content)).into_response()
 }
@@ -399,7 +402,8 @@ async fn edit_leave(
     let header = format!(r#"<a href="/sesb-eam/leaves" class="btn btn-ghost btn-sm mb-3">← Back to Leave</a>
 <h1 class="text-2xl font-bold mb-3">Leave Request {badge}</h1><div class="flex gap-2 mb-4">{actions}</div>"#,
         badge = LEAVE_STATE_BADGES.iter().find(|(v,_,_)| *v==lstate).map(|(_,l,c)| format!(r#"<span class="badge {c}">{l}</span>"#, c=c, l=l)).unwrap_or_default(), actions = actions);
-    let content = format!("<div class=\"max-w-4xl\">{}{}</div>", header, wide_form_page(&format!("/sesb-eam/leaves/{id}"), "", &body));
+    let activity_panel = vortex_plugin_sdk::framework::render_chatter_panel("eam_leave", id);
+    let content = format!("<div class=\"max-w-4xl\">{}{}<div class=\"mt-6\">{activity_panel}</div></div>", header, wide_form_page(&format!("/sesb-eam/leaves/{id}"), "", &body));
     Html(page_shell(&sidebar, "Leave Request", &content)).into_response()
 }
 

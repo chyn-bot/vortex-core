@@ -44,6 +44,13 @@ impl Plugin for ContactsPlugin {
         "Contacts"
     }
 
+    /// The `contacts` model, projected into the metadata registry from the
+    /// `#[derive(Model)]` struct — the single source of truth that supersedes
+    /// the hand-seeded rows in migration `003_pivot_metadata`.
+    fn models(&self) -> Vec<&'static vortex_orm::model::ModelMeta> {
+        vec![<crate::model::Contact as vortex_orm::model::Model>::meta()]
+    }
+
     fn version(&self) -> &'static str {
         "0.1.0"
     }

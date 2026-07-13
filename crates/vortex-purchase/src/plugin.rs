@@ -31,6 +31,13 @@ impl Plugin for PurchasePlugin {
         "purchase"
     }
 
+    /// Purchase models projected into the metadata registry from their
+    /// `#[derive(Model)]` structs — supersedes migration `002_purchase_registry`.
+    fn models(&self) -> Vec<&'static vortex_orm::model::ModelMeta> {
+        use vortex_orm::model::Model;
+        vec![crate::model::PurchaseOrder::meta()]
+    }
+
     fn display_name(&self) -> &'static str {
         "Purchasing"
     }

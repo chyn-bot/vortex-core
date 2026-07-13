@@ -31,6 +31,7 @@ pub fn inventory_routes() -> Router<Arc<AppState>> {
         .route("/inventory/products/{id}", get(edit_product))
         .route("/inventory/products/{id}", post(update_product))
         .route("/inventory/products/{id}/delete", post(delete_product))
+        .route("/inventory/products/{id}/duplicate", post(duplicate_product))
         // Product categories (configuration)
         .route("/inventory/categories", get(list_categories))
         .route("/inventory/categories/new", get(new_category_form))
@@ -44,6 +45,12 @@ pub fn inventory_routes() -> Router<Arc<AppState>> {
         .route("/inventory/locations/{id}", get(edit_location))
         .route("/inventory/locations/{id}", post(update_location))
         .route("/inventory/locations/{id}/delete", post(delete_location))
+        // Units of measure (configuration)
+        .route("/inventory/uoms", get(list_uoms))
+        .route("/inventory/uoms/new", get(new_uom_form))
+        .route("/inventory/uoms/create", post(create_uom))
+        .route("/inventory/uoms/{id}", get(edit_uom))
+        .route("/inventory/uoms/{id}", post(update_uom))
         // Stock moves
         .route("/inventory/moves", get(list_moves))
         .route("/inventory/moves/new", get(new_move_form))
@@ -76,8 +83,8 @@ fn page_shell(sidebar: &str, title: &str, content: &str) -> String {
 <title>{title} - Vortex</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=4" rel="stylesheet"/>
-<script src="/static/vortex.js?v=4" defer></script>
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script>
 <script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
@@ -610,7 +617,9 @@ async fn edit_category(
     let active: bool = row.try_get("active").unwrap_or(true);
     let parents = category_options(&db, parent_id).await;
     let body = category_form_body(&format!("/inventory/categories/{id}"), &format!("Edit {}", name), &esc(&name), &parents, active, false);
-    Html(page_shell(&sidebar, "Edit Category", &body)).into_response()
+    let activity_panel = vortex_plugin_sdk::framework::render_chatter_panel("stock_category", id);
+    let content = format!(r#"{body}<div class="mt-6">{activity_panel}</div>"#);
+    Html(page_shell(&sidebar, "Edit Category", &content)).into_response()
 }
 
 async fn update_category(
@@ -646,6 +655,254 @@ async fn update_category(
     }
 
     vortex_plugin_sdk::axum::response::Redirect::to("/inventory/categories").into_response()
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Units of measure (configuration) — the master list every commerce module
+// (sales/purchase/inventory) draws its per-line units from.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// `<option>` list of UoM categories (Unit, Weight, Length, …).
+async fn uom_category_options(db: &vortex_plugin_sdk::sqlx::PgPool, selected: Option<Uuid>) -> String {
+    let esc = vortex_plugin_sdk::framework::html_escape;
+    let rows = vortex_plugin_sdk::sqlx::query("SELECT id, name FROM uom_categories WHERE active ORDER BY name")
+        .fetch_all(db)
+        .await
+        .unwrap_or_default();
+    let mut out = String::from(r#"<option value="">-- Category --</option>"#);
+    for r in &rows {
+        let id: Uuid = r.get("id");
+        let name: String = r.get("name");
+        let sel = if selected == Some(id) { " selected" } else { "" };
+        out.push_str(&format!(r#"<option value="{id}"{sel}>{name}</option>"#, id = id, sel = sel, name = esc(&name)));
+    }
+    out
+}
+
+/// `<option>` list of the three UoM roles.
+fn uom_type_options(selected: &str) -> String {
+    let sel = |v: &str| if selected == v { " selected" } else { "" };
+    format!(
+        concat!(
+            r#"<option value="reference"{r}>Reference (base unit of its category)</option>"#,
+            r#"<option value="bigger"{b}>Bigger than the reference</option>"#,
+            r#"<option value="smaller"{s}>Smaller than the reference</option>"#,
+        ),
+        r = sel("reference"), b = sel("bigger"), s = sel("smaller"),
+    )
+}
+
+async fn list_uoms(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    use vortex_plugin_sdk::framework::list::{execute_list, render_list, ListColumn, ListConfig, ListParams};
+    let sidebar = render_sidebar_active(&state, &user, &db_ctx, "inventory.uoms");
+    let config = ListConfig::new("Units of Measure", "uoms")
+        .custom_from("uoms u JOIN uom_categories c ON c.id = u.category_id")
+        .custom_select("u.id, u.code, u.name, c.name AS category, u.uom_type, u.factor::text AS factor, u.active")
+        .column(ListColumn::new("code", "Code").sortable().searchable().code().sql_expr("u.code"))
+        .column(ListColumn::new("name", "Name").sortable().searchable().sql_expr("u.name"))
+        .column(ListColumn::new("category", "Category").sortable().sql_expr("c.name"))
+        .column(ListColumn::new("uom_type", "Type").sql_expr("u.uom_type"))
+        .column(ListColumn::new("factor", "Factor").sql_expr("u.factor"))
+        .column(ListColumn::new("active", "Status").bool_badge("Active", "badge-success", "Archived", "badge-warning").sql_expr("u.active"))
+        .detail_url("/inventory/uoms/{id}")
+        .create("New Unit", "/inventory/uoms/new")
+        .default_sort("category");
+    let params = ListParams::from_query(&query);
+    let result = match execute_list(&db, &config, &params).await {
+        Ok(r) => r,
+        Err(e) => { error!(error = %e, "uom list failed"); return Html("<h1>Failed to load units</h1>").into_response(); }
+    };
+    let list_html = render_list(&config, &result, &params, "/inventory/uoms");
+    Html(page_shell(&sidebar, "Units of Measure", &list_html)).into_response()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn uom_form_body(
+    action: &str, title: &str, name: &str, code: &str, categories: &str,
+    type_opts: &str, factor: &str, active: bool, is_new: bool,
+) -> String {
+    let active_box = if is_new { String::new() } else {
+        format!(r#"<div class="form-control mb-3"><label class="cursor-pointer label justify-start gap-3"><input type="checkbox" name="active" class="checkbox checkbox-sm" {}/><span class="label-text">Active (shown in unit pickers)</span></label></div>"#, if active { "checked" } else { "" })
+    };
+    format!(
+        r#"<div class="max-w-xl">
+<a href="/inventory/uoms" class="btn btn-ghost btn-sm mb-4">← Back to Units</a>
+<h1 class="text-2xl font-bold mb-6">{title}</h1>
+<form method="POST" action="{action}">
+<div class="card bg-base-100 shadow"><div class="card-body">
+<div class="grid grid-cols-2 gap-3">
+<div class="form-control mb-3"><label class="label"><span class="label-text">Name *</span></label>
+<input name="name" class="input input-bordered input-sm" value="{name}" required/></div>
+<div class="form-control mb-3"><label class="label"><span class="label-text">Code *</span></label>
+<input name="code" class="input input-bordered input-sm" value="{code}" required placeholder="e.g. box"/></div>
+</div>
+<div class="form-control mb-3"><label class="label"><span class="label-text">Category *</span></label>
+<select name="category_id" class="select select-bordered select-sm" required>{categories}</select></div>
+<div class="grid grid-cols-2 gap-3">
+<div class="form-control mb-3"><label class="label"><span class="label-text">Type</span></label>
+<select name="uom_type" class="select select-bordered select-sm">{type_opts}</select></div>
+<div class="form-control mb-3"><label class="label"><span class="label-text">Factor</span></label>
+<input name="factor" type="number" step="0.0000000001" min="0" class="input input-bordered input-sm" value="{factor}"/></div>
+</div>
+<p class="text-xs text-base-content/60 mb-3">The <b>factor</b> is how many reference units one of this unit equals (1 dozen = 12 units → factor 12). Keep exactly one <b>Reference</b> unit per category. For a simple count unit that isn't converted, a factor of 1 is fine.</p>
+{active_box}
+<div class="flex gap-2"><button class="btn btn-primary btn-sm">Save</button>
+<a href="/inventory/uoms" class="btn btn-ghost btn-sm">Cancel</a></div>
+</div></div></form></div>"#,
+        title = title, action = action, name = name, code = code, categories = categories,
+        type_opts = type_opts, factor = factor, active_box = active_box,
+    )
+}
+
+async fn new_uom_form(
+    State(state): State<Arc<AppState>>, Db(db): Db,
+    Extension(user): Extension<AuthUser>, Extension(db_ctx): Extension<DatabaseContext>,
+) -> Response {
+    let sidebar = render_sidebar(&state, &user, &db_ctx);
+    let categories = uom_category_options(&db, None).await;
+    let body = uom_form_body(
+        "/inventory/uoms/create", "New Unit", "", "", &categories,
+        &uom_type_options("bigger"), "1", true, true,
+    );
+    Html(page_shell(&sidebar, "New Unit", &body)).into_response()
+}
+
+async fn create_uom(
+    State(state): State<Arc<AppState>>, Db(db): Db,
+    Extension(user): Extension<AuthUser>, Extension(db_ctx): Extension<DatabaseContext>,
+    vortex_plugin_sdk::axum::extract::Form(form): vortex_plugin_sdk::axum::extract::Form<HashMap<String, String>>,
+) -> Response {
+    use vortex_plugin_sdk::axum::http::StatusCode;
+    let name = form.get("name").map(|s| s.trim().to_string()).unwrap_or_default();
+    let code = form.get("code").map(|s| s.trim().to_string()).unwrap_or_default();
+    let Some(category_id) = opt_uuid(&form, "category_id") else {
+        return (StatusCode::BAD_REQUEST, "Category is required").into_response();
+    };
+    if name.is_empty() || code.is_empty() {
+        return (StatusCode::BAD_REQUEST, "Name and code are required").into_response();
+    }
+    let uom_type = uom_type_value(&form);
+    let factor = form.get("factor").and_then(|f| f.trim().parse::<Decimal>().ok()).unwrap_or(Decimal::ONE);
+    // Friendlier than a raw unique-violation 500.
+    let taken: bool = vortex_plugin_sdk::sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM uoms WHERE code = $1)")
+        .bind(&code).fetch_one(&db).await.unwrap_or(false);
+    if taken {
+        return (StatusCode::CONFLICT, format!("The code '{code}' is already in use — pick another.")).into_response();
+    }
+    let uom_id = Uuid::now_v7();
+    if let Err(e) = vortex_plugin_sdk::sqlx::query(
+        "INSERT INTO uoms (id, category_id, name, code, factor, uom_type) VALUES ($1,$2,$3,$4,$5,$6)",
+    )
+    .bind(uom_id).bind(category_id).bind(&name).bind(&code).bind(factor).bind(&uom_type)
+    .execute(&db).await
+    {
+        error!(error = %e, "uom insert failed");
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to create unit: {e}")).into_response();
+    }
+    let audit_entry = vortex_plugin_sdk::security::AuditEntry::new(
+        vortex_plugin_sdk::security::AuditAction::RecordCreated,
+        vortex_plugin_sdk::security::AuditSeverity::Info,
+    )
+    .with_user(vortex_plugin_sdk::common::UserId(user.id))
+    .with_username(&user.username)
+    .with_database(&db_ctx.db_name)
+    .with_resource("uom", uom_id.to_string())
+    .with_resource_name(&name);
+    if let Err(e) = state.audit.log(audit_entry).await {
+        error!(error = %e, "audit log for uom creation failed");
+    }
+    vortex_plugin_sdk::axum::response::Redirect::to("/inventory/uoms").into_response()
+}
+
+async fn edit_uom(
+    State(state): State<Arc<AppState>>, Db(db): Db,
+    Extension(user): Extension<AuthUser>, Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<Uuid>,
+) -> Response {
+    let esc = vortex_plugin_sdk::framework::html_escape;
+    let sidebar = render_sidebar(&state, &user, &db_ctx);
+    let row = match vortex_plugin_sdk::sqlx::query("SELECT name, code, category_id, uom_type, factor::text AS factor, active FROM uoms WHERE id = $1")
+        .bind(id).fetch_optional(&db).await {
+        Ok(Some(r)) => r,
+        _ => return (vortex_plugin_sdk::axum::http::StatusCode::NOT_FOUND, "Not found").into_response(),
+    };
+    let name: String = row.get("name");
+    let code: String = row.get("code");
+    let category_id: Option<Uuid> = row.try_get("category_id").ok();
+    let uom_type: String = row.try_get("uom_type").unwrap_or_else(|_| "bigger".into());
+    let factor: String = row.try_get("factor").unwrap_or_else(|_| "1".into());
+    let active: bool = row.try_get("active").unwrap_or(true);
+    let categories = uom_category_options(&db, category_id).await;
+    let body = uom_form_body(
+        &format!("/inventory/uoms/{id}"), &format!("Edit {}", name),
+        &esc(&name), &esc(&code), &categories, &uom_type_options(&uom_type), &esc(&factor), active, false,
+    );
+    let activity_panel = vortex_plugin_sdk::framework::render_chatter_panel("uom", id);
+    let content = format!(r#"{body}<div class="mt-6">{activity_panel}</div>"#);
+    Html(page_shell(&sidebar, "Edit Unit", &content)).into_response()
+}
+
+async fn update_uom(
+    State(state): State<Arc<AppState>>, Db(db): Db,
+    Extension(user): Extension<AuthUser>, Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<Uuid>,
+    vortex_plugin_sdk::axum::extract::Form(form): vortex_plugin_sdk::axum::extract::Form<HashMap<String, String>>,
+) -> Response {
+    use vortex_plugin_sdk::axum::http::StatusCode;
+    let name = form.get("name").map(|s| s.trim().to_string()).unwrap_or_default();
+    let code = form.get("code").map(|s| s.trim().to_string()).unwrap_or_default();
+    let Some(category_id) = opt_uuid(&form, "category_id") else {
+        return (StatusCode::BAD_REQUEST, "Category is required").into_response();
+    };
+    if name.is_empty() || code.is_empty() {
+        return (StatusCode::BAD_REQUEST, "Name and code are required").into_response();
+    }
+    let uom_type = uom_type_value(&form);
+    let factor = form.get("factor").and_then(|f| f.trim().parse::<Decimal>().ok()).unwrap_or(Decimal::ONE);
+    // Guard the unique code against a *different* row.
+    let taken: bool = vortex_plugin_sdk::sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM uoms WHERE code = $1 AND id <> $2)")
+        .bind(&code).bind(id).fetch_one(&db).await.unwrap_or(false);
+    if taken {
+        return (StatusCode::CONFLICT, format!("The code '{code}' is already in use — pick another.")).into_response();
+    }
+    if let Err(e) = vortex_plugin_sdk::sqlx::query(
+        "UPDATE uoms SET name=$1, code=$2, category_id=$3, uom_type=$4, factor=$5, active=$6 WHERE id=$7",
+    )
+    .bind(&name).bind(&code).bind(category_id).bind(&uom_type).bind(factor).bind(form.contains_key("active")).bind(id)
+    .execute(&db).await
+    {
+        error!(error = %e, "uom update failed");
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update unit: {e}")).into_response();
+    }
+    let audit_entry = vortex_plugin_sdk::security::AuditEntry::new(
+        vortex_plugin_sdk::security::AuditAction::RecordUpdated,
+        vortex_plugin_sdk::security::AuditSeverity::Info,
+    )
+    .with_user(vortex_plugin_sdk::common::UserId(user.id))
+    .with_username(&user.username)
+    .with_database(&db_ctx.db_name)
+    .with_resource("uom", id.to_string())
+    .with_resource_name(&name);
+    if let Err(e) = state.audit.log(audit_entry).await {
+        error!(error = %e, "audit log for uom update failed");
+    }
+    vortex_plugin_sdk::axum::response::Redirect::to("/inventory/uoms").into_response()
+}
+
+/// Read a valid `uom_type` from the form, defaulting to `bigger`.
+fn uom_type_value(form: &HashMap<String, String>) -> String {
+    match form.get("uom_type").map(|s| s.as_str()) {
+        Some("reference") => "reference",
+        Some("smaller") => "smaller",
+        _ => "bigger",
+    }
+    .to_string()
 }
 
 async fn new_product_form(
@@ -973,6 +1230,8 @@ async fn edit_product(
     };
 
     let history_panel = vortex_plugin_sdk::framework::render_audit_trail(&db, "stock_product", id).await;
+    // Activity stream: schedule/assign/complete tasks, messages, attachments.
+    let activity_panel = vortex_plugin_sdk::framework::render_chatter_panel("stock_product", id);
 
     let content = format!(
         r#"<div class="flex items-center justify-between mb-6">
@@ -980,9 +1239,12 @@ async fn edit_product(
 <a href="/inventory" class="btn btn-ghost btn-sm mb-2">← Back to Products</a>
 <h1 class="text-2xl font-bold">{name} <span class="text-base-content/40 font-mono text-sm">{code}</span></h1>
 </div>
+<div class="flex items-center gap-2">
+{dup_btn}
 <form method="POST" action="/inventory/products/{id}/delete" onsubmit="return confirm('Archive this product?')">
 <button class="btn btn-error btn-sm btn-outline">Archive</button>
 </form>
+</div>
 </div>
 
 <form method="POST" action="/inventory/products/{id}">
@@ -1077,6 +1339,7 @@ async fn edit_product(
 <tbody>{onhand_rows}</tbody></table>
 </div></div>
 {lots_panel}
+{activity_panel}
 {history_panel}
 </div>
 </div>
@@ -1090,6 +1353,7 @@ async fn edit_product(
         id = id,
         name = esc(&name),
         code = esc(&code),
+        dup_btn = duplicate_button(&format!("/inventory/products/{id}/duplicate")),
         name_val = esc(&name),
         barcode_val = esc(barcode.as_deref().unwrap_or("")),
         desc_val = esc(description.as_deref().unwrap_or("")),
@@ -1112,6 +1376,7 @@ async fn edit_product(
         onhand_rows = onhand_rows,
         lots_panel = lots_panel,
         history_panel = history_panel,
+        activity_panel = activity_panel,
     );
 
     Html(page_shell(&sidebar, &format!("Edit {}", name), &content)).into_response()
@@ -1214,6 +1479,59 @@ async fn delete_product(
 
     info!(id = %id, "product archived");
     vortex_plugin_sdk::axum::response::Redirect::to("/inventory").into_response()
+}
+
+/// POST /inventory/products/{id}/duplicate — copy a product into a fresh,
+/// editable record. Master data only: the copy gets a freshly drawn PRD
+/// code (the (company_id, code) unique key forbids reuse) and a blank
+/// barcode (a barcode identifies one physical product). Stock moves,
+/// quants, lots, and adjustments are ledger entries and are deliberately
+/// never copied — the duplicate starts with zero on-hand.
+async fn duplicate_product(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<Uuid>,
+) -> Response {
+    // Same sequence source as create_product, so codes never collide.
+    let code = match vortex_plugin_sdk::orm::sequence::next(&state.pool, &PRODUCT_SEQ).await {
+        Ok(c) => c,
+        Err(e) => {
+            error!(error = %e, "product duplicate sequence draw failed");
+            return (vortex_plugin_sdk::axum::http::StatusCode::INTERNAL_SERVER_ERROR, "Duplicate failed").into_response();
+        }
+    };
+
+    let spec = DuplicateSpec::new("stock_product")
+        .set("code", json!(code)) // fresh sequence — UNIQUE (company_id, code)
+        .skip("barcode") // NULL — a barcode belongs to exactly one product
+        .skip("updated_by") // NULL — the copy has never been edited
+        .copy_suffix("name"); // "Widget" -> "Widget (copy)"
+
+    match spec.execute(&db, id, Some(user.id)).await {
+        Ok(new_id) => {
+            let audit_entry = vortex_plugin_sdk::security::AuditEntry::new(
+                vortex_plugin_sdk::security::AuditAction::RecordCreated,
+                vortex_plugin_sdk::security::AuditSeverity::Info,
+            )
+            .with_user(vortex_plugin_sdk::common::UserId(user.id))
+            .with_username(&user.username)
+            .with_database(&db_ctx.db_name)
+            .with_resource("stock_product", new_id.to_string())
+            .with_details(json!({ "duplicated_from": id, "code": code }));
+            if let Err(e) = state.audit.log(audit_entry).await {
+                error!(error = %e, "audit log for product duplicate failed");
+            }
+
+            info!(id = %new_id, code = %code, "product duplicated");
+            vortex_plugin_sdk::axum::response::Redirect::to(&format!("/inventory/products/{new_id}")).into_response()
+        }
+        Err(e) => {
+            error!(error = %e, "product duplicate failed");
+            (vortex_plugin_sdk::axum::http::StatusCode::INTERNAL_SERVER_ERROR, "Duplicate failed").into_response()
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1470,7 +1788,8 @@ async fn edit_location(
         r#"<div class="max-w-2xl mt-4"><form method="POST" action="/inventory/locations/{id}/delete" onsubmit="return confirm('Archive this location?')">
 <button class="btn btn-error btn-sm btn-outline">Archive Location</button></form></div>"#
     );
-    let content = format!("{}{}", body, delete);
+    let activity_panel = vortex_plugin_sdk::framework::render_chatter_panel("stock_location", id);
+    let content = format!(r#"{}{}<div class="mt-6">{activity_panel}</div>"#, body, delete);
     Html(page_shell(&sidebar, &format!("Edit {}", name), &content)).into_response()
 }
 
@@ -2304,6 +2623,8 @@ async fn edit_lot(
     }
 
     let history_panel = vortex_plugin_sdk::framework::render_audit_trail(&db, "stock_lot", id).await;
+    // Activity stream: schedule/assign/complete tasks, messages, attachments.
+    let activity_panel = vortex_plugin_sdk::framework::render_chatter_panel("stock_lot", id);
 
     let content = format!(
         r#"<div class="mb-6">
@@ -2342,12 +2663,14 @@ async fn edit_lot(
 <table class="table table-sm"><thead><tr><th>Location</th><th>Name</th><th>Type</th><th class="text-right">Qty</th></tr></thead>
 <tbody>{onhand_rows}</tbody></table>
 </div></div>
+{activity_panel}
 {history_panel}
 </div>
 </div>"#,
         id = id,
         name = esc(&name),
         name_val = esc(&name),
+        activity_panel = activity_panel,
         lot_type = esc(&lot_type),
         type_css = if lot_type == "serial" { "badge-secondary" } else { "badge-info" },
         product_code = esc(&product_code),

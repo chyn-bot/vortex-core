@@ -100,11 +100,17 @@ pub mod prelude {
     // ── QR codes ──
     pub use vortex_framework::qr_svg;
 
+    // ── Record duplication (the platform-wide "Duplicate" button) ──
+    pub use vortex_framework::{duplicate_button, ChildCopy, DuplicateSpec};
+
     // ── Record panels (cross-plugin detail-page contributions) ──
     pub use vortex_framework::{
         handle_record_panel_saves, render_record_panels, PanelSaveCtx, RecordPanel,
         RecordPanelDef, HOST_FORM_ID,
     };
+
+    // ── Printable documents (user-customisable print layouts) ──
+    pub use vortex_framework::{DocLayout, LayoutColumn, LayoutConfig, PrintDocRegistry, PrintDocType};
 
     // ── Reports ──
     pub use vortex_framework::{
@@ -127,8 +133,8 @@ pub mod prelude {
 
     // ── Form engine ── (declare once: render + validate + save)
     pub use vortex_framework::form::{
-        execute_form_save, load_record, render_form, FieldKind, FormConfig, FormField, FormMode,
-        SaveOutcome,
+        execute_form_save, load_record, render_form, typeahead_widget, FieldKind, FormConfig,
+        FormField, FormMode, LookupSource, SaveOutcome,
     };
 
     // ── Audit ledger ── (every state change: `state.audit.log(...)`)

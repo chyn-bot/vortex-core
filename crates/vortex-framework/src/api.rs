@@ -30,7 +30,7 @@ use uuid::Uuid;
 /// A conservative SQL-identifier check: non-empty, ≤63 chars, ASCII
 /// alphanumeric or underscore only. Mirrors `user_reports::ident` so the two
 /// safe-SQL layers agree on what a legal table/column name looks like.
-fn ident(s: &str) -> bool {
+pub(crate) fn ident(s: &str) -> bool {
     !s.is_empty() && s.len() <= 63 && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
@@ -277,6 +277,19 @@ fn is_protected_column(col: &str) -> bool {
 /// on top. `udt_name` (e.g. `uuid`, `int8`, `numeric`, `jsonb`) is a valid
 /// cast target, used to coerce the bound JSON value to the column's type.
 async fn writable_columns(db: &PgPool, table: &str) -> std::collections::HashMap<String, String> {
+    let mut cols = table_columns(db, table).await;
+    cols.retain(|c, _| !is_protected_column(c));
+    cols
+}
+
+/// Every real (non-generated) column of a table with a legal identifier,
+/// `column_name -> udt_name` — including the identity/audit columns the
+/// write allow-list strips. The duplication primitive uses this to copy
+/// full rows while handling identity columns itself.
+pub(crate) async fn table_columns(
+    db: &PgPool,
+    table: &str,
+) -> std::collections::HashMap<String, String> {
     let rows = sqlx::query(
         "SELECT column_name, udt_name FROM information_schema.columns \
          WHERE table_name = $1 AND is_generated = 'NEVER'",
@@ -287,7 +300,7 @@ async fn writable_columns(db: &PgPool, table: &str) -> std::collections::HashMap
     .unwrap_or_default();
     rows.iter()
         .map(|r| (r.get::<String, _>("column_name"), r.get::<String, _>("udt_name")))
-        .filter(|(c, udt)| ident(c) && ident(udt) && !is_protected_column(c))
+        .filter(|(c, udt)| ident(c) && ident(udt))
         .collect()
 }
 
@@ -440,6 +453,21 @@ pub async fn create_record(db: &PgPool, model: &str, body: &Value) -> Result<Uui
         .await
         .map_err(|e| format!("insert failed: {e}"))?;
     Ok(id)
+}
+
+/// Duplicate a record of `model` into a fresh row: id/timestamps are
+/// regenerated, `created_by` stamped, everything else copied verbatim.
+/// Modules with richer needs (sequence numbers, line tables, lifecycle
+/// resets) build a [`crate::duplicate::DuplicateSpec`] directly; this is
+/// the generic surface behind `POST /api/v1/{model}/{id}/duplicate`.
+pub async fn duplicate_record(
+    db: &PgPool,
+    model: &str,
+    id: Uuid,
+    created_by: Option<Uuid>,
+) -> Result<Uuid, String> {
+    let table = model_table(db, model).await.ok_or("unknown model")?;
+    crate::duplicate::DuplicateSpec::new(&table).execute(db, id, created_by).await
 }
 
 /// Update a record by id. Only registered, non-protected fields present in the

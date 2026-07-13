@@ -215,6 +215,28 @@ pub async fn execute_form_save(
         .fetch_one(db)
         .await
         .map_err(|e| format!("save failed: {e}"))?;
+
+    // Persist any per-tenant custom-field values submitted alongside the record.
+    // No-op when the model has no custom fields, so existing forms are
+    // unaffected. Best-effort: a custom-store failure must not roll back the
+    // record save the user just made.
+    if let Err(e) = crate::custom_fields::save_values(db, &config.table, id, pairs).await {
+        tracing::warn!("custom field save for {} {} failed: {}", config.table, id, e);
+    }
+
+    // Recompute and persist any computed / related virtual fields for this
+    // record (merged into the same overflow store). No-op when the model has
+    // none; best-effort so it never rolls back the record save.
+    if let Err(e) = crate::computed_fields::store_values(db, &config.table, id).await {
+        tracing::warn!("computed field store for {} {} failed: {}", config.table, id, e);
+    }
+
+    // Fire no-code automation rules for this model + trigger. No-op when the
+    // model has no rules. Actions write the row directly, so they cannot
+    // re-enter this save path.
+    let trigger = if record.is_some() { "update" } else { "create" };
+    let _ = crate::automation::run_rules(db, &config.table, trigger, id).await;
+
     Ok(SaveOutcome::Saved(id))
 }
 
