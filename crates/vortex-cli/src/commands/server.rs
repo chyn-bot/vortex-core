@@ -2197,6 +2197,10 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/blueprints", get(blueprints_list))
         .route("/blueprints", post(blueprint_create))
         .route("/blueprints/new", get(blueprint_new))
+        .route("/blueprints/approvals", get(blueprint_approvals))
+        .route("/blueprints/governance", post(blueprint_governance_toggle))
+        .route("/blueprints/approvals/{id}/approve", post(blueprint_approve))
+        .route("/blueprints/approvals/{id}/reject", post(blueprint_reject))
         .route("/blueprints/{model}", get(blueprint_designer))
         .route("/blueprints/{model}/archive", post(blueprint_archive))
         .route("/blueprints/{model}/history", get(blueprint_history))
@@ -5183,7 +5187,7 @@ async fn blueprints_list(
     let body = format!(
         r#"<div class="flex justify-between items-center mb-6">
 <div><h1 class="text-2xl font-bold">Blueprints</h1><p class="text-base-content/60">Build governed models at runtime — every schema change is policy-checked and written to the audit ledger.</p></div>
-<a href="/blueprints/new" class="btn btn-primary">+ New Blueprint</a>
+<div class="flex gap-2"><a href="/blueprints/approvals" class="btn btn-ghost">Approvals</a><a href="/blueprints/new" class="btn btn-primary">+ New Blueprint</a></div>
 </div>
 <div class="card bg-base-100 shadow"><div class="overflow-x-auto">
 <table class="table table-sm"><thead><tr><th>Name</th><th>Technical</th><th>Fields</th><th>Status</th><th>Records</th></tr></thead>
@@ -5221,8 +5225,20 @@ async fn blueprint_create(
     if !user.is_admin() {
         return blueprint_forbidden();
     }
-    match vortex_framework::blueprint::create(&state, &db, &db_ctx.db_name, &user, &form.label).await {
-        Ok(model) => Redirect::to(&format!("/blueprints/{model}")).into_response(),
+    use vortex_framework::blueprint::{BlueprintOp, SubmitOutcome};
+    match vortex_framework::blueprint::submit(
+        &state,
+        &db,
+        &db_ctx.db_name,
+        &user,
+        BlueprintOp::Create { label: form.label.clone() },
+    )
+    .await
+    {
+        Ok(SubmitOutcome::Applied { model: Some(m) }) => {
+            Redirect::to(&format!("/blueprints/{m}")).into_response()
+        }
+        Ok(_) => Redirect::to("/blueprints/approvals").into_response(),
         Err(e) => error_response(&e),
     }
 }
@@ -5446,20 +5462,24 @@ async fn blueprint_add_field(
     if !user.is_admin() {
         return blueprint_forbidden();
     }
-    match vortex_framework::blueprint::add_field(
+    use vortex_framework::blueprint::{BlueprintOp, SubmitOutcome};
+    match vortex_framework::blueprint::submit(
         &state,
         &db,
         &db_ctx.db_name,
         &user,
-        &model,
-        &form.label,
-        &form.field_type,
-        form.related_model.as_deref(),
-        form.options.as_deref(),
+        BlueprintOp::AddField {
+            model: model.clone(),
+            label: form.label.clone(),
+            field_type: form.field_type.clone(),
+            related_model: form.related_model.clone(),
+            options: form.options.clone(),
+        },
     )
     .await
     {
-        Ok(()) => Redirect::to(&format!("/blueprints/{model}")).into_response(),
+        Ok(SubmitOutcome::Applied { .. }) => Redirect::to(&format!("/blueprints/{model}")).into_response(),
+        Ok(SubmitOutcome::Pending) => Redirect::to("/blueprints/approvals").into_response(),
         Err(e) => error_response(&e),
     }
 }
@@ -5475,18 +5495,22 @@ async fn blueprint_rename_field(
     if !user.is_admin() {
         return blueprint_forbidden();
     }
-    match vortex_framework::blueprint::rename_field(
+    use vortex_framework::blueprint::{BlueprintOp, SubmitOutcome};
+    match vortex_framework::blueprint::submit(
         &state,
         &db,
         &db_ctx.db_name,
         &user,
-        &model,
-        &name,
-        &form.label,
+        BlueprintOp::RenameField {
+            model: model.clone(),
+            from: name.clone(),
+            new_label: form.label.clone(),
+        },
     )
     .await
     {
-        Ok(()) => Redirect::to(&format!("/blueprints/{model}")).into_response(),
+        Ok(SubmitOutcome::Applied { .. }) => Redirect::to(&format!("/blueprints/{model}")).into_response(),
+        Ok(SubmitOutcome::Pending) => Redirect::to("/blueprints/approvals").into_response(),
         Err(e) => error_response(&e),
     }
 }
@@ -5501,8 +5525,18 @@ async fn blueprint_remove_field(
     if !user.is_admin() {
         return blueprint_forbidden();
     }
-    match vortex_framework::blueprint::remove_field(&state, &db, &db_ctx.db_name, &user, &model, &name).await {
-        Ok(()) => Redirect::to(&format!("/blueprints/{model}")).into_response(),
+    use vortex_framework::blueprint::{BlueprintOp, SubmitOutcome};
+    match vortex_framework::blueprint::submit(
+        &state,
+        &db,
+        &db_ctx.db_name,
+        &user,
+        BlueprintOp::RemoveField { model: model.clone(), name: name.clone() },
+    )
+    .await
+    {
+        Ok(SubmitOutcome::Applied { .. }) => Redirect::to(&format!("/blueprints/{model}")).into_response(),
+        Ok(SubmitOutcome::Pending) => Redirect::to("/blueprints/approvals").into_response(),
         Err(e) => error_response(&e),
     }
 }
@@ -5517,8 +5551,18 @@ async fn blueprint_archive(
     if !user.is_admin() {
         return blueprint_forbidden();
     }
-    match vortex_framework::blueprint::archive(&state, &db, &db_ctx.db_name, &user, &model).await {
-        Ok(()) => Redirect::to("/blueprints").into_response(),
+    use vortex_framework::blueprint::{BlueprintOp, SubmitOutcome};
+    match vortex_framework::blueprint::submit(
+        &state,
+        &db,
+        &db_ctx.db_name,
+        &user,
+        BlueprintOp::Archive { model: model.clone() },
+    )
+    .await
+    {
+        Ok(SubmitOutcome::Applied { .. }) => Redirect::to("/blueprints").into_response(),
+        Ok(SubmitOutcome::Pending) => Redirect::to("/blueprints/approvals").into_response(),
         Err(e) => error_response(&e),
     }
 }
@@ -5635,6 +5679,127 @@ async fn blueprint_history(
         &format!("{} History - Blueprints", html_escape(&label)),
         &body,
     )
+}
+
+#[derive(serde::Deserialize)]
+struct GovernanceForm {
+    #[serde(default)]
+    require_approval: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct RejectForm {
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+/// GET /blueprints/approvals — the pending-change inbox + the governance toggle.
+/// Present only when approval-before-DDL matters; schema changes land here as
+/// pending requests when the tenant switch is on.
+async fn blueprint_approvals(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+) -> Response {
+    if !user.is_admin() {
+        return blueprint_forbidden();
+    }
+    let required = vortex_framework::blueprint::approval_required(&db).await;
+    let pending = vortex_framework::blueprint::pending_requests(&db).await;
+
+    let toggle = format!(
+        r#"<div class="card bg-base-100 shadow mb-6 max-w-2xl"><div class="card-body p-4">
+<form action="/blueprints/governance" method="POST" class="flex items-center gap-3">
+<input type="checkbox" name="require_approval" class="toggle toggle-primary"{checked}/>
+<div class="flex-1"><div class="font-semibold">Require approval for schema changes</div>
+<div class="text-sm opacity-60">When on, create / add / rename / delete / archive operations are queued here for a second admin to approve before any DDL runs.</div></div>
+<button class="btn btn-sm">Save</button>
+</form></div></div>"#,
+        checked = if required { " checked" } else { "" },
+    );
+
+    let mut rows = String::new();
+    for p in &pending {
+        rows.push_str(&format!(
+            r#"<tr class="hover"><td>{summary}</td><td class="text-xs opacity-70">{by} · {at}</td>
+<td class="text-right whitespace-nowrap">
+<form action="/blueprints/approvals/{id}/approve" method="POST" class="inline"><button class="btn btn-xs btn-success">Approve</button></form>
+<form action="/blueprints/approvals/{id}/reject" method="POST" class="inline ml-1" onsubmit="return confirm('Reject this change?')"><button class="btn btn-xs btn-ghost text-error">Reject</button></form>
+</td></tr>"#,
+            summary = html_escape(&p.summary),
+            by = html_escape(&p.requested_by),
+            at = p.requested_at.format("%Y-%m-%d %H:%M UTC"),
+            id = p.id,
+        ));
+    }
+    let table = if pending.is_empty() {
+        r#"<p class="opacity-60">No pending changes.</p>"#.to_string()
+    } else {
+        format!(
+            r#"<div class="card bg-base-100 shadow max-w-3xl"><div class="card-body p-4 overflow-x-auto">
+<table class="table table-sm"><thead><tr><th>Change</th><th>Requested</th><th></th></tr></thead>
+<tbody>{rows}</tbody></table></div></div>"#
+        )
+    };
+
+    let body = format!(
+        r#"<div class="flex items-center gap-2 mb-1"><a href="/blueprints" class="btn btn-ghost btn-sm btn-square">←</a><h1 class="text-2xl font-bold">Blueprint Approvals</h1></div>
+<p class="text-base-content/60 mb-6">Governed schema changes awaiting review. Approving runs the change; every decision is WORM-audited and no one can approve their own request.</p>
+{toggle}{table}"#
+    );
+    blueprint_shell(&state, &user, &db_ctx, "Blueprint Approvals - Remicle", &body)
+}
+
+async fn blueprint_governance_toggle(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Form(form): Form<GovernanceForm>,
+) -> Response {
+    if !user.is_admin() {
+        return blueprint_forbidden();
+    }
+    let on = form.require_approval.is_some();
+    match vortex_framework::blueprint::set_approval_required(&state, &db, &db_ctx.db_name, &user, on).await {
+        Ok(()) => Redirect::to("/blueprints/approvals").into_response(),
+        Err(e) => error_response(&e),
+    }
+}
+
+async fn blueprint_approve(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<uuid::Uuid>,
+) -> Response {
+    if !user.is_admin() {
+        return blueprint_forbidden();
+    }
+    match vortex_framework::blueprint::apply_request(&state, &db, &db_ctx.db_name, &user, id).await {
+        Ok(()) => Redirect::to("/blueprints/approvals").into_response(),
+        Err(e) => error_response(&e),
+    }
+}
+
+async fn blueprint_reject(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<uuid::Uuid>,
+    Form(form): Form<RejectForm>,
+) -> Response {
+    if !user.is_admin() {
+        return blueprint_forbidden();
+    }
+    let reason = form.reason.as_deref().unwrap_or("").trim().to_string();
+    match vortex_framework::blueprint::reject_request(&state, &db, &db_ctx.db_name, &user, id, &reason).await {
+        Ok(()) => Redirect::to("/blueprints/approvals").into_response(),
+        Err(e) => error_response(&e),
+    }
 }
 
 /// POST /blueprints/{model}/layout — save the field order + list-column layout.

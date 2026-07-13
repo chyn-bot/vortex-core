@@ -15,6 +15,7 @@
 
 use crate::auth::AuthUser;
 use crate::state::AppState;
+use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
@@ -746,9 +747,377 @@ pub async fn archive(
     Ok(())
 }
 
+// ===========================================================================
+// Approval-before-DDL (Phase 4b)
+//
+// When a tenant enables `require_approval`, a schema-changing operation is not
+// executed inline — it is captured as a `BlueprintOp` in `blueprint_change_request`
+// and applied only when an approver (never the requester) approves it. The op
+// enum IS the serialized payload, so approving simply replays it through the
+// same governed service functions above (which re-gate and audit as the original
+// requester). Layout/metadata changes are not gated here — only DDL.
+// ===========================================================================
+
+/// A schema-changing Blueprint operation, captured for (optional) approval and
+/// replayed verbatim on apply. Serialized into `blueprint_change_request.payload`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum BlueprintOp {
+    Create { label: String },
+    AddField {
+        model: String,
+        label: String,
+        field_type: String,
+        related_model: Option<String>,
+        options: Option<String>,
+    },
+    RenameField { model: String, from: String, new_label: String },
+    RemoveField { model: String, name: String },
+    Archive { model: String },
+}
+
+impl BlueprintOp {
+    /// The Cedar action that authorizes *requesting* this op.
+    fn gate_action(&self) -> &'static str {
+        match self {
+            BlueprintOp::Create { .. } => "blueprint.create",
+            BlueprintOp::AddField { .. }
+            | BlueprintOp::RenameField { .. }
+            | BlueprintOp::RemoveField { .. } => "blueprint.alter",
+            BlueprintOp::Archive { .. } => "blueprint.delete",
+        }
+    }
+
+    /// The model this op targets, for the policy resource and inbox display.
+    /// For a create the model does not exist yet, so we derive its future name.
+    fn model_hint(&self) -> String {
+        match self {
+            BlueprintOp::Create { label } => format!("{}{}", ddl::TABLE_PREFIX, slugify(label)),
+            BlueprintOp::AddField { model, .. }
+            | BlueprintOp::RenameField { model, .. }
+            | BlueprintOp::RemoveField { model, .. }
+            | BlueprintOp::Archive { model } => model.clone(),
+        }
+    }
+
+    fn op_name(&self) -> &'static str {
+        match self {
+            BlueprintOp::Create { .. } => "create",
+            BlueprintOp::AddField { .. } => "add_field",
+            BlueprintOp::RenameField { .. } => "rename_field",
+            BlueprintOp::RemoveField { .. } => "remove_field",
+            BlueprintOp::Archive { .. } => "archive",
+        }
+    }
+
+    /// One-line human summary for the approval inbox.
+    fn summary(&self) -> String {
+        match self {
+            BlueprintOp::Create { label } => format!("Create Blueprint “{label}”"),
+            BlueprintOp::AddField { model, label, field_type, .. } => {
+                format!("Add {field_type} field “{label}” to {model}")
+            }
+            BlueprintOp::RenameField { model, from, new_label } => {
+                format!("Rename “{from}” → “{new_label}” on {model}")
+            }
+            BlueprintOp::RemoveField { model, name } => format!("Delete field “{name}” from {model}"),
+            BlueprintOp::Archive { model } => format!("Archive {model}"),
+        }
+    }
+}
+
+/// Outcome of submitting a change: applied immediately, or queued for approval.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubmitOutcome {
+    /// Executed now (approval not required). `model` is set for a create.
+    Applied { model: Option<String> },
+    /// Queued as a pending change request awaiting approval.
+    Pending,
+}
+
+/// Read the single-row governance switch. Missing table/row ⇒ approval off (the
+/// feature is opt-in and must never block the common path on a fresh tenant).
+pub async fn approval_required(db: &PgPool) -> bool {
+    sqlx::query_scalar::<_, bool>("SELECT require_approval FROM blueprint_governance WHERE id = TRUE")
+        .fetch_optional(db)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(false)
+}
+
+/// Toggle the per-tenant "require approval for schema changes" switch.
+pub async fn set_approval_required(
+    state: &AppState,
+    db: &PgPool,
+    db_name: &str,
+    user: &AuthUser,
+    on: bool,
+) -> Result<(), String> {
+    // Changing the governance posture is itself a manage-level action.
+    gate(state, user, "blueprint.create", "*").await?;
+    sqlx::query(
+        "INSERT INTO blueprint_governance (id, require_approval) VALUES (TRUE, $1)
+         ON CONFLICT (id) DO UPDATE SET require_approval = EXCLUDED.require_approval",
+    )
+    .bind(on)
+    .execute(db)
+    .await
+    .map_err(dberr)?;
+    audit(
+        state,
+        db_name,
+        user,
+        "blueprint_approval_toggled",
+        AuditSeverity::Warning,
+        "*",
+        serde_json::json!({ "require_approval": on }),
+    )
+    .await;
+    Ok(())
+}
+
+/// Dispatch a `BlueprintOp` to the matching governed service function, acting as
+/// `user` (which re-gates and audits as that user). Returns the created model
+/// name for a create, `None` otherwise.
+async fn execute_op(
+    state: &AppState,
+    db: &PgPool,
+    db_name: &str,
+    user: &AuthUser,
+    op: &BlueprintOp,
+) -> Result<Option<String>, String> {
+    match op {
+        BlueprintOp::Create { label } => {
+            create(state, db, db_name, user, label).await.map(Some)
+        }
+        BlueprintOp::AddField { model, label, field_type, related_model, options } => add_field(
+            state, db, db_name, user, model, label, field_type,
+            related_model.as_deref(), options.as_deref(),
+        )
+        .await
+        .map(|_| None),
+        BlueprintOp::RenameField { model, from, new_label } => {
+            rename_field(state, db, db_name, user, model, from, new_label).await.map(|_| None)
+        }
+        BlueprintOp::RemoveField { model, name } => {
+            remove_field(state, db, db_name, user, model, name).await.map(|_| None)
+        }
+        BlueprintOp::Archive { model } => {
+            archive(state, db, db_name, user, model).await.map(|_| None)
+        }
+    }
+}
+
+/// Submit a schema change. If approval is off, it runs now. If on, the requester
+/// is gated (they must be allowed to make the change at all) and the op is queued
+/// as a pending request — no DDL runs until an approver applies it.
+pub async fn submit(
+    state: &AppState,
+    db: &PgPool,
+    db_name: &str,
+    user: &AuthUser,
+    op: BlueprintOp,
+) -> Result<SubmitOutcome, String> {
+    if !approval_required(db).await {
+        let model = execute_op(state, db, db_name, user, &op).await?;
+        return Ok(SubmitOutcome::Applied { model });
+    }
+
+    // Approval required: authorize the *request* (so a non-privileged user can't
+    // flood the queue), then enqueue it.
+    gate(state, user, op.gate_action(), &op.model_hint()).await?;
+    let model_name = match &op {
+        BlueprintOp::Create { .. } => None,
+        other => Some(other.model_hint()),
+    };
+    let payload = serde_json::to_value(&op).map_err(|e| format!("serialize op: {e}"))?;
+    sqlx::query(
+        "INSERT INTO blueprint_change_request (op, payload, model_name, target_label, requested_by)
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(op.op_name())
+    .bind(&payload)
+    .bind(&model_name)
+    .bind(op.summary())
+    .bind(user.id)
+    .execute(db)
+    .await
+    .map_err(dberr)?;
+
+    audit(
+        state,
+        db_name,
+        user,
+        "blueprint_change_requested",
+        AuditSeverity::Info,
+        &op.model_hint(),
+        serde_json::json!({ "op": op.op_name(), "summary": op.summary() }),
+    )
+    .await;
+    Ok(SubmitOutcome::Pending)
+}
+
+/// Reconstruct a minimal `AuthUser` (id + username + roles) for a stored user,
+/// so a queued op can be re-executed and audited as its original requester.
+async fn load_requester(db: &PgPool, user_id: Uuid) -> Result<AuthUser, String> {
+    let username: String = sqlx::query_scalar("SELECT username FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_optional(db)
+        .await
+        .map_err(dberr)?
+        .ok_or("Original requester no longer exists")?;
+    let roles: Vec<String> = sqlx::query_scalar(
+        "SELECT r.name FROM roles r JOIN user_roles ur ON ur.role_id = r.id WHERE ur.user_id = $1",
+    )
+    .bind(user_id)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+    Ok(AuthUser {
+        id: user_id,
+        username,
+        full_name: None,
+        session_id: Uuid::nil(),
+        roles,
+        contact_id: None,
+        is_portal: false,
+    })
+}
+
+/// Approve a pending change request: the DDL runs now, attributed to the original
+/// requester. The approver must hold `blueprint.approve` and must not be the
+/// requester (no self-approval).
+pub async fn apply_request(
+    state: &AppState,
+    db: &PgPool,
+    db_name: &str,
+    approver: &AuthUser,
+    request_id: Uuid,
+) -> Result<(), String> {
+    gate(state, approver, "blueprint.approve", "*").await?;
+
+    let row = sqlx::query(
+        "SELECT payload, requested_by, status FROM blueprint_change_request WHERE id = $1",
+    )
+    .bind(request_id)
+    .fetch_optional(db)
+    .await
+    .map_err(dberr)?
+    .ok_or("Change request not found")?;
+    let status: String = row.get("status");
+    if status != "pending" {
+        return Err(format!("This request is already {status}"));
+    }
+    let requested_by: Uuid = row.get("requested_by");
+    if requested_by == approver.id {
+        return Err("You can't approve your own change request".to_string());
+    }
+    let payload: serde_json::Value = row.get("payload");
+    let op: BlueprintOp = serde_json::from_value(payload).map_err(|e| format!("bad payload: {e}"))?;
+
+    let requester = load_requester(db, requested_by).await?;
+    // Runs the real DDL (transactional, audited as the requester).
+    execute_op(state, db, db_name, &requester, &op).await?;
+
+    sqlx::query(
+        "UPDATE blueprint_change_request
+         SET status = 'approved', decided_by = $2, decided_at = now()
+         WHERE id = $1",
+    )
+    .bind(request_id)
+    .bind(approver.id)
+    .execute(db)
+    .await
+    .map_err(dberr)?;
+
+    audit(
+        state,
+        db_name,
+        approver,
+        "blueprint_change_approved",
+        AuditSeverity::Warning,
+        &op.model_hint(),
+        serde_json::json!({ "request": request_id, "op": op.op_name() }),
+    )
+    .await;
+    Ok(())
+}
+
+/// Reject a pending change request. No DDL runs.
+pub async fn reject_request(
+    state: &AppState,
+    db: &PgPool,
+    db_name: &str,
+    approver: &AuthUser,
+    request_id: Uuid,
+    reason: &str,
+) -> Result<(), String> {
+    gate(state, approver, "blueprint.approve", "*").await?;
+
+    let updated = sqlx::query(
+        "UPDATE blueprint_change_request
+         SET status = 'rejected', decided_by = $2, decided_at = now(), reason = $3
+         WHERE id = $1 AND status = 'pending'",
+    )
+    .bind(request_id)
+    .bind(approver.id)
+    .bind(reason)
+    .execute(db)
+    .await
+    .map_err(dberr)?;
+    if updated.rows_affected() == 0 {
+        return Err("Request not found or already decided".to_string());
+    }
+
+    audit(
+        state,
+        db_name,
+        approver,
+        "blueprint_change_rejected",
+        AuditSeverity::Warning,
+        "*",
+        serde_json::json!({ "request": request_id, "reason": reason }),
+    )
+    .await;
+    Ok(())
+}
+
+/// A pending change request for the inbox view.
+pub struct PendingRequest {
+    pub id: Uuid,
+    pub op: String,
+    pub summary: String,
+    pub requested_by: String,
+    pub requested_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// List pending change requests, oldest first.
+pub async fn pending_requests(db: &PgPool) -> Vec<PendingRequest> {
+    sqlx::query(
+        "SELECT r.id, r.op, r.target_label, r.requested_at, u.username AS requested_by
+         FROM blueprint_change_request r
+         LEFT JOIN users u ON u.id = r.requested_by
+         WHERE r.status = 'pending'
+         ORDER BY r.requested_at ASC",
+    )
+    .fetch_all(db)
+    .await
+    .unwrap_or_default()
+    .iter()
+    .map(|r| PendingRequest {
+        id: r.get("id"),
+        op: r.get("op"),
+        summary: r.get("target_label"),
+        requested_by: r.try_get("requested_by").unwrap_or_default(),
+        requested_at: r.get("requested_at"),
+    })
+    .collect()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{parse_selection_options, plan_layout, slugify};
+    use super::{parse_selection_options, plan_layout, slugify, BlueprintOp};
     use std::collections::{HashMap, HashSet};
 
     #[test]
@@ -768,6 +1137,29 @@ mod tests {
     fn parse_selection_options_rejects_empty() {
         assert!(parse_selection_options("").is_err());
         assert!(parse_selection_options("\n  \n").is_err());
+    }
+
+    #[test]
+    fn blueprint_op_round_trips_and_describes() {
+        let op = BlueprintOp::AddField {
+            model: "x_ticket".into(),
+            label: "Amount".into(),
+            field_type: "monetary".into(),
+            related_model: None,
+            options: None,
+        };
+        // Payload survives a JSON round-trip (how it's stored + replayed).
+        let json = serde_json::to_value(&op).unwrap();
+        assert_eq!(json["op"], "add_field");
+        let back: BlueprintOp = serde_json::from_value(json).unwrap();
+        assert_eq!(back.gate_action(), "blueprint.alter");
+        assert_eq!(back.op_name(), "add_field");
+        assert!(back.summary().contains("Amount"));
+
+        // Create's target model is derived from the label (no model yet).
+        let c = BlueprintOp::Create { label: "Site Visit".into() };
+        assert_eq!(c.gate_action(), "blueprint.create");
+        assert_eq!(c.model_hint(), "x_site_visit");
     }
 
     #[test]
