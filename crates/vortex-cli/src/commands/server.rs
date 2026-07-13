@@ -5071,6 +5071,11 @@ struct BlueprintNewForm {
 struct BlueprintFieldForm {
     label: String,
     field_type: String,
+    // Only meaningful for many2one / selection respectively; ignored otherwise.
+    #[serde(default)]
+    related_model: Option<String>,
+    #[serde(default)]
+    options: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -5078,9 +5083,9 @@ struct BlueprintRenameForm {
     label: String,
 }
 
-/// The field-type vocabulary the builder offers — scalar types that need no
-/// extra configuration. (many2one/selection need a related model or an options
-/// list, so they are deferred to a later phase.)
+/// The field-type vocabulary the builder offers. `selection` additionally reads
+/// the Options textarea and `many2one` the "Links to" target; every other type
+/// needs no extra configuration.
 const BLUEPRINT_FIELD_TYPES: &[(&str, &str)] = &[
     ("string", "Text"),
     ("text", "Long text"),
@@ -5090,6 +5095,8 @@ const BLUEPRINT_FIELD_TYPES: &[(&str, &str)] = &[
     ("boolean", "Checkbox"),
     ("date", "Date"),
     ("datetime", "Date & time"),
+    ("selection", "Dropdown"),
+    ("many2one", "Link to a record"),
 ];
 
 fn blueprint_type_label(ft: &str) -> String {
@@ -5247,13 +5254,36 @@ async fn blueprint_designer(
     let status: String = head.get("status");
 
     let fields = sqlx::query(
-        "SELECT name, display_name, field_type, sequence, is_visible FROM ir_model_field
+        "SELECT name, display_name, field_type, sequence, is_visible, related_model
+         FROM ir_model_field
          WHERE model_id = $1 AND source = 'blueprint' ORDER BY sequence",
     )
     .bind(model_id)
     .fetch_all(&db)
     .await
     .unwrap_or_default();
+
+    // Candidate many2one targets: other Blueprints (and self) that carry a
+    // `name` display field, so the generic picker/JOIN can resolve a label.
+    let targets = sqlx::query(
+        "SELECT name, display_name FROM ir_model m
+         WHERE m.source = 'blueprint' AND m.is_active = true
+           AND EXISTS (SELECT 1 FROM ir_model_field f WHERE f.model_id = m.id AND f.name = 'name')
+         ORDER BY display_name",
+    )
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default();
+    let mut target_options = String::new();
+    for t in &targets {
+        let tname: String = t.get("name");
+        let tlabel: String = t.get("display_name");
+        target_options.push_str(&format!(
+            r#"<option value="{}">{}</option>"#,
+            html_escape(&tname),
+            html_escape(&tlabel),
+        ));
+    }
 
     // Layout rows: an order box + a "list column" checkbox per field, submitted
     // as one form (order__<f> / list__<f>). Sequence drives order in both the
@@ -5279,16 +5309,36 @@ async fn blueprint_designer(
         let fname: String = f.get("name");
         let flabel: String = f.get("display_name");
         let ftype: String = f.get("field_type");
-        field_rows.push_str(&format!(
-            r#"<tr class="hover"><td>{flabel}</td><td><code class="text-xs">{fname}</code></td><td>{tlabel}</td><td>
-<form action="/blueprints/{model}/fields/{fname}/rename" method="POST" class="join">
+        let related: Option<String> = f.get("related_model");
+        // For a relation, show what it links to next to the type label.
+        let type_display = match (&ftype[..], related.as_deref()) {
+            ("many2one", Some(rel)) => format!(
+                "{} → <code class=\"text-xs\">{}</code>",
+                html_escape(&blueprint_type_label(&ftype)),
+                html_escape(rel)
+            ),
+            _ => html_escape(&blueprint_type_label(&ftype)),
+        };
+        // The Name field is the record's display field — it can't be renamed or
+        // deleted (relations resolve their label through it).
+        let is_name = fname == "name";
+        let actions = if is_name {
+            r#"<td class="opacity-50 text-xs">Display field</td><td></td>"#.to_string()
+        } else {
+            format!(
+                r#"<td><form action="/blueprints/{model}/fields/{fname}/rename" method="POST" class="join">
 <input name="label" class="input input-bordered input-xs join-item" value="{flabel}" required/>
 <button class="btn btn-xs join-item">Rename</button></form></td>
-<td><form action="/blueprints/{model}/fields/{fname}/delete" method="POST" onsubmit="return confirm('Delete field {flabel}?')"><button class="btn btn-xs btn-ghost text-error">Delete</button></form></td></tr>"#,
+<td><form action="/blueprints/{model}/fields/{fname}/delete" method="POST" onsubmit="return confirm('Delete field {flabel}?')"><button class="btn btn-xs btn-ghost text-error">Delete</button></form></td>"#,
+                flabel = html_escape(&flabel),
+                fname = html_escape(&fname),
+                model = html_escape(&model),
+            )
+        };
+        field_rows.push_str(&format!(
+            r#"<tr class="hover"><td>{flabel}</td><td><code class="text-xs">{fname}</code></td><td>{type_display}</td>{actions}</tr>"#,
             flabel = html_escape(&flabel),
             fname = html_escape(&fname),
-            tlabel = html_escape(&blueprint_type_label(&ftype)),
-            model = html_escape(&model),
         ));
     }
     if field_rows.is_empty() {
@@ -5312,6 +5362,18 @@ async fn blueprint_designer(
         )
     };
 
+    // The "Links to" picker only appears when there's at least one valid target
+    // (a Blueprint with a Name field); otherwise a hidden empty value keeps the
+    // form well-formed and a many2one submission fails loud with guidance.
+    let target_field = if target_options.is_empty() {
+        r#"<input type="hidden" name="related_model" value=""/>"#.to_string()
+    } else {
+        format!(
+            r#"<div class="form-control"><label class="label py-1"><span class="label-text">Links to <span class="opacity-50">(Link fields)</span></span></label><select name="related_model" class="select select-bordered select-sm"><option value="">—</option>{target_options}</select></div>"#,
+            target_options = target_options,
+        )
+    };
+
     let body = format!(
         r#"<div class="flex justify-between items-center mb-6">
 <div><div class="flex items-center gap-2"><a href="/blueprints" class="btn btn-ghost btn-sm btn-square">←</a><h1 class="text-2xl font-bold">{label}</h1><span class="badge badge-ghost">{status}</span></div>
@@ -5327,10 +5389,14 @@ async fn blueprint_designer(
 {layout_card}
 <div class="card bg-base-100 shadow max-w-2xl"><div class="card-body p-4">
 <h2 class="card-title text-base mb-2">Add a field</h2>
-<form action="/blueprints/{model}/fields" method="POST" class="flex flex-wrap gap-3 items-end">
+<form action="/blueprints/{model}/fields" method="POST" class="flex flex-col gap-3">
+<div class="flex flex-wrap gap-3 items-end">
 <div class="form-control"><label class="label py-1"><span class="label-text">Label</span></label><input name="label" class="input input-bordered input-sm" placeholder="e.g. Amount" required/></div>
 <div class="form-control"><label class="label py-1"><span class="label-text">Type</span></label><select name="field_type" class="select select-bordered select-sm">{type_options}</select></div>
+{target_field}
 <button class="btn btn-primary btn-sm">Add field</button>
+</div>
+<div class="form-control w-full"><label class="label py-1"><span class="label-text">Options <span class="opacity-50">(for Dropdown — one per line)</span></span></label><textarea name="options" rows="3" class="textarea textarea-bordered textarea-sm" placeholder="Open&#10;In Progress&#10;Closed"></textarea></div>
 </form></div></div>"#,
         label = html_escape(&label),
         status = html_escape(&status),
@@ -5338,6 +5404,7 @@ async fn blueprint_designer(
         field_rows = field_rows,
         layout_card = layout_card,
         type_options = blueprint_type_options(),
+        target_field = target_field,
     );
     blueprint_shell(
         &state,
@@ -5367,6 +5434,8 @@ async fn blueprint_add_field(
         &model,
         &form.label,
         &form.field_type,
+        form.related_model.as_deref(),
+        form.options.as_deref(),
     )
     .await
     {

@@ -230,6 +230,24 @@ pub async fn create(
         .await
         .map_err(|e| format!("create table failed: {e}"))?;
 
+    // Every Blueprint gets a `name` display field. It gives each record a human
+    // label in lists, and — crucially — is the column a many2one to this
+    // Blueprint resolves for its picker/JOIN (the generic layer reads `name`).
+    // It is a normal, editable field; deleting it is refused while the Blueprint
+    // is a relation target (see `remove_field`).
+    ddl::add_column(&mut tx, &model, "name", "string", blueprint_id)
+        .await
+        .map_err(|e| format!("add name column failed: {e}"))?;
+    sqlx::query(
+        "INSERT INTO ir_model_field
+            (model_id, name, display_name, field_type, sequence, source, is_custom, is_visible)
+         VALUES ($1, 'name', 'Name', 'string', 10, 'blueprint', false, true)",
+    )
+    .bind(model_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(dberr)?;
+
     record_version(&mut tx, blueprint_id, model_id, user).await?;
     tx.commit().await.map_err(dberr)?;
 
@@ -246,7 +264,50 @@ pub async fn create(
     Ok(model)
 }
 
-/// Add a scalar (or many2one) field to a Blueprint.
+/// Parse a `selection` field's raw option text (one option per line) into the
+/// `[{"value","label"}]` JSON shape the generic form's `<select>` renderer
+/// expects. Blank lines are dropped; each option's value and label are the
+/// trimmed line (values are data, not identifiers). Values are capped at the
+/// column width (64). Returns an error if no options remain.
+fn parse_selection_options(raw: &str) -> Result<serde_json::Value, String> {
+    let opts: Vec<serde_json::Value> = raw
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .map(|l| {
+            let v: String = l.chars().take(64).collect();
+            serde_json::json!({ "value": v, "label": l })
+        })
+        .collect();
+    if opts.is_empty() {
+        return Err("A dropdown field needs at least one option".to_string());
+    }
+    Ok(serde_json::Value::Array(opts))
+}
+
+/// Resolve a many2one target: it must be an active Blueprint that carries a
+/// `name` field (the display column the generic picker/JOIN reads). Returns the
+/// target's physical table name. Restricting targets to name-bearing Blueprints
+/// keeps the relation robust — a target without `name` would break the generic
+/// list of the owning model. (Blueprint→compiled targets are a later phase that
+/// hardens the generic JOIN to resolve arbitrary display columns.)
+async fn resolve_relation_target(db: &PgPool, target_model: &str) -> Result<String, String> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT m.table_name FROM ir_model m
+         WHERE m.name = $1 AND m.source = 'blueprint' AND m.is_active = true
+           AND EXISTS (SELECT 1 FROM ir_model_field f WHERE f.model_id = m.id AND f.name = 'name')",
+    )
+    .bind(target_model)
+    .fetch_optional(db)
+    .await
+    .map_err(dberr)?
+    .ok_or_else(|| format!("'{target_model}' is not a valid relation target"))
+}
+
+/// Add a field to a Blueprint. Scalars add a typed column; `selection` also
+/// stores its options; `many2one` adds a real UUID FK to another Blueprint and
+/// stores the target's model name in `related_model` (which the generic layer
+/// uses to render the picker and resolve labels).
 pub async fn add_field(
     state: &AppState,
     db: &PgPool,
@@ -255,12 +316,31 @@ pub async fn add_field(
     model: &str,
     label: &str,
     field_type: &str,
+    related_model: Option<&str>,
+    options_raw: Option<&str>,
 ) -> Result<(), String> {
     let col = slugify(label);
     ddl::validate_identifier(&col).map_err(|e| format!("invalid field name: {e}"))?;
     // Validate the type against the physical-column vocabulary up front.
     ddl::column_type(field_type).map_err(|e| format!("unsupported field type: {e}"))?;
     gate(state, user, "blueprint.alter", model).await?;
+
+    // Type-specific inputs, validated before opening the transaction.
+    let selection_options: Option<serde_json::Value> = if field_type == "selection" {
+        Some(parse_selection_options(options_raw.unwrap_or(""))?)
+    } else {
+        None
+    };
+    let (related, target_table): (Option<String>, Option<String>) = if field_type == "many2one" {
+        let target = related_model
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or("Pick a record type this field links to")?;
+        let table = resolve_relation_target(db, target).await?;
+        (Some(target.to_string()), Some(table))
+    } else {
+        (None, None)
+    };
 
     let (model_id, blueprint_id, table) = resolve(db, model).await?;
     let mut tx = db.begin().await.map_err(dberr)?;
@@ -276,9 +356,14 @@ pub async fn add_field(
         return Err(format!("A field named '{col}' already exists"));
     }
 
-    ddl::add_column(&mut tx, &table, &col, field_type, blueprint_id)
-        .await
-        .map_err(|e| format!("add column failed: {e}"))?;
+    match &target_table {
+        Some(tt) => ddl::add_reference_column(&mut tx, &table, &col, tt, blueprint_id)
+            .await
+            .map_err(|e| format!("add relation column failed: {e}"))?,
+        None => ddl::add_column(&mut tx, &table, &col, field_type, blueprint_id)
+            .await
+            .map_err(|e| format!("add column failed: {e}"))?,
+    }
 
     let seq: i32 =
         sqlx::query_scalar("SELECT COALESCE(MAX(sequence), 0) + 10 FROM ir_model_field WHERE model_id = $1")
@@ -289,14 +374,17 @@ pub async fn add_field(
 
     sqlx::query(
         "INSERT INTO ir_model_field
-            (model_id, name, display_name, field_type, sequence, source, is_custom, is_visible)
-         VALUES ($1, $2, $3, $4, $5, 'blueprint', false, true)",
+            (model_id, name, display_name, field_type, sequence, source, is_custom, is_visible,
+             related_model, selection_options)
+         VALUES ($1, $2, $3, $4, $5, 'blueprint', false, true, $6, $7)",
     )
     .bind(model_id)
     .bind(&col)
     .bind(label)
     .bind(field_type)
     .bind(seq)
+    .bind(&related)
+    .bind(&selection_options)
     .execute(&mut *tx)
     .await
     .map_err(dberr)?;
@@ -311,7 +399,7 @@ pub async fn add_field(
         "blueprint_field_added",
         AuditSeverity::Info,
         model,
-        serde_json::json!({ "field": col, "type": field_type }),
+        serde_json::json!({ "field": col, "type": field_type, "related_model": related }),
     )
     .await;
     Ok(())
@@ -327,6 +415,9 @@ pub async fn rename_field(
     from: &str,
     new_label: &str,
 ) -> Result<(), String> {
+    if from == "name" {
+        return Err("The Name field is the record's display field and can't be renamed".to_string());
+    }
     let to = slugify(new_label);
     ddl::validate_identifier(&to).map_err(|e| format!("invalid field name: {e}"))?;
     gate(state, user, "blueprint.alter", model).await?;
@@ -375,6 +466,9 @@ pub async fn remove_field(
     model: &str,
     name: &str,
 ) -> Result<(), String> {
+    if name == "name" {
+        return Err("The Name field is the record's display field and can't be deleted".to_string());
+    }
     gate(state, user, "blueprint.alter", model).await?;
 
     let (model_id, blueprint_id, table) = resolve(db, model).await?;
@@ -544,8 +638,27 @@ pub async fn archive(
 
 #[cfg(test)]
 mod tests {
-    use super::{plan_layout, slugify};
+    use super::{parse_selection_options, plan_layout, slugify};
     use std::collections::{HashMap, HashSet};
+
+    #[test]
+    fn parse_selection_options_builds_object_shape() {
+        let json = parse_selection_options("Open\n  In Progress \n\nClosed\n").unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!([
+                {"value": "Open", "label": "Open"},
+                {"value": "In Progress", "label": "In Progress"},
+                {"value": "Closed", "label": "Closed"},
+            ])
+        );
+    }
+
+    #[test]
+    fn parse_selection_options_rejects_empty() {
+        assert!(parse_selection_options("").is_err());
+        assert!(parse_selection_options("\n  \n").is_err());
+    }
 
     #[test]
     fn plan_layout_reorders_and_renormalizes() {

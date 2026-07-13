@@ -187,6 +187,30 @@ pub async fn add_column(
     Ok(())
 }
 
+/// Add a `many2one` column: a real UUID foreign key to `target_table(id)`, set
+/// to NULL if the referenced row is deleted (never cascade-deletes the owning
+/// record). `target_table` is validated as a plain identifier — a relation may
+/// point at a compiled table without the `x_` prefix, so [`validate_table`] is
+/// deliberately not used; the caller must confirm it names a real registered
+/// model before calling.
+pub async fn add_reference_column(
+    tx: &mut Transaction<'_, Postgres>,
+    table: &str,
+    column: &str,
+    target_table: &str,
+    blueprint_id: Uuid,
+) -> Result<(), BlueprintError> {
+    validate_table(table)?;
+    validate_column(column)?;
+    validate_identifier(target_table)?;
+    let stmt = format!(
+        "ALTER TABLE {table} ADD COLUMN {column} UUID REFERENCES {target_table}(id) ON DELETE SET NULL"
+    );
+    sqlx::query(&stmt).execute(&mut **tx).await?;
+    log_ddl(tx, blueprint_id, &stmt).await?;
+    Ok(())
+}
+
 /// Drop a user column from a Blueprint's table. System columns are refused.
 pub async fn drop_column(
     tx: &mut Transaction<'_, Postgres>,
