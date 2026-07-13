@@ -9105,12 +9105,13 @@ async fn generic_pivot_view(
         let ftype: String = f.get("field_type");
         let label: String = f.get("display_name");
         let numeric = matches!(ftype.as_str(), "integer" | "float" | "decimal" | "monetary" | "number");
+        let date = matches!(ftype.as_str(), "date" | "datetime");
         let groupable = matches!(
             ftype.as_str(),
             "selection" | "string" | "char" | "many2one" | "boolean" | "date" | "datetime"
         );
         if groupable || numeric {
-            field_arr.push(serde_json::json!({"name": name, "label": label, "numeric": numeric}));
+            field_arr.push(serde_json::json!({"name": name, "label": label, "numeric": numeric, "date": date}));
         }
     }
     let fields_json = serde_json::to_string(&field_arr).unwrap_or_else(|_| "[]".to_string());
@@ -9126,16 +9127,20 @@ async fn generic_pivot_view(
     let agg_v = pick("agg").unwrap_or_else(|| "count".to_string());
     // New (all optional): multiple measures, pinned filters, saved collapse state.
     let vals_v = pick("vals").unwrap_or_default();
+    let mx_v = pick("mx").unwrap_or_default();
     let filters_v = pick("filters").unwrap_or_default();
     let collapsed_v = pick("collapsed").unwrap_or_default();
+    let coldesc_v = pick("coldesc").unwrap_or_default();
     let config_json = serde_json::json!({
         "rows": rows_v.split(',').filter(|s| !s.is_empty()).collect::<Vec<_>>(),
         "cols": cols_v.split(',').filter(|s| !s.is_empty()).collect::<Vec<_>>(),
         "measure": measure_v,
         "agg": agg_v,
         "vals": vals_v,
+        "mx": mx_v,
         "filters": filters_v,
         "collapsed": collapsed_v,
+        "coldesc": coldesc_v,
     })
     .to_string();
 
@@ -9149,8 +9154,10 @@ async fn generic_pivot_view(
         ("rows", &rows_v),
         ("cols", &cols_v),
         ("vals", &vals_v),
+        ("mx", &mx_v),
         ("filters", &filters_v),
         ("collapsed", &collapsed_v),
+        ("coldesc", &coldesc_v),
     ] {
         if !v.is_empty() {
             current_cfg.insert(k.to_string(), v.clone());
@@ -9184,7 +9191,7 @@ const PIVOT_SHELL: &str = r#"<!DOCTYPE html><html data-theme="dark"><head>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
 <link href="/static/vortex.css?v=18" rel="stylesheet"/>
-<link href="/static/pivot.css?v=18" rel="stylesheet"/>
+<link href="/static/pivot.css?v=25" rel="stylesheet"/>
 <script src="/static/vortex.js?v=18" defer></script>
 <script src="/static/vendor/tailwind.js"></script>
 <style>
@@ -9239,13 +9246,158 @@ body { background: oklch(var(--b2)); color: oklch(var(--bc)); }
   </div>
 </div>
 <div id="pivot-root" data-model="__MODEL__" data-data-url="/pivot/__MODEL__/data" data-fields="__FIELDS__" data-config="__CONFIG__"></div>
-<script src="/static/pivot.js?v=18"></script>
+<script src="/static/pivot.js?v=25"></script>
 </main>
 </div></body></html>"#;
 
 /// GET /pivot/{model}/data — aggregated pivot matrix as JSON. Every field name
 /// is allow-listed against the model registry; subtotals and grand totals are
 /// computed by SQL ROLLUP (correct for every aggregate, at every level).
+/// Compile a user-authored arithmetic expression over a model's numeric columns
+/// into a safe SQL fragment for use inside an aggregate. This is the ONLY place a
+/// calculated *field* becomes SQL, so it is deliberately strict:
+///
+/// - grammar is closed: `number | ident | + - * / ( )` and unary +/- only;
+/// - every identifier must be a *registered numeric field* (checked against
+///   `numeric`) AND pass `validate_identifier()` — nothing else reaches SQL, so
+///   no column names, function calls, subqueries, or comments are possible;
+/// - each column is emitted as `CAST(t.<col> AS NUMERIC)` (no interpolation of
+///   user text beyond the vetted identifier);
+/// - division is emitted as `/ NULLIF(rhs, 0)` so a zero divisor yields NULL
+///   instead of erroring the whole pivot query.
+///
+/// Returns the SQL fragment or an error describing the first rejection. The
+/// fragment is fully parenthesised, so operator precedence is preserved
+/// regardless of how the caller nests it.
+fn compile_pivot_expr(
+    expr: &str,
+    numeric: &std::collections::HashSet<String>,
+) -> Result<String, String> {
+    if expr.len() > 500 {
+        return Err("expression too long".into());
+    }
+    #[derive(Clone)]
+    enum Tk {
+        Num(String),
+        Id(String),
+        Op(char),
+    }
+    let chars: Vec<char> = expr.chars().collect();
+    let mut toks: Vec<Tk> = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c.is_whitespace() {
+            i += 1;
+        } else if c.is_ascii_digit() || c == '.' {
+            let start = i;
+            while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '.') {
+                i += 1;
+            }
+            let s: String = chars[start..i].iter().collect();
+            if s.parse::<f64>().is_err() {
+                return Err(format!("invalid number {s:?}"));
+            }
+            toks.push(Tk::Num(s));
+        } else if c.is_ascii_alphabetic() || c == '_' {
+            let start = i;
+            while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+                i += 1;
+            }
+            toks.push(Tk::Id(chars[start..i].iter().collect()));
+        } else if "+-*/()".contains(c) {
+            toks.push(Tk::Op(c));
+            i += 1;
+        } else {
+            return Err(format!("illegal character {c:?}"));
+        }
+    }
+    if toks.is_empty() {
+        return Err("empty expression".into());
+    }
+
+    struct P<'a> {
+        t: &'a [Tk],
+        i: usize,
+        numeric: &'a std::collections::HashSet<String>,
+    }
+    impl<'a> P<'a> {
+        fn peek(&self) -> Option<&Tk> {
+            self.t.get(self.i)
+        }
+        fn is_op(&self, c: char) -> bool {
+            matches!(self.peek(), Some(Tk::Op(x)) if *x == c)
+        }
+        fn expr(&mut self) -> Result<String, String> {
+            let mut l = self.term()?;
+            while self.is_op('+') || self.is_op('-') {
+                let op = if self.is_op('+') { '+' } else { '-' };
+                self.i += 1;
+                let r = self.term()?;
+                l = format!("({} {} {})", l, op, r);
+            }
+            Ok(l)
+        }
+        fn term(&mut self) -> Result<String, String> {
+            let mut l = self.factor()?;
+            while self.is_op('*') || self.is_op('/') {
+                let mul = self.is_op('*');
+                self.i += 1;
+                let r = self.factor()?;
+                l = if mul {
+                    format!("({} * {})", l, r)
+                } else {
+                    format!("({} / NULLIF({}, 0))", l, r)
+                };
+            }
+            Ok(l)
+        }
+        fn factor(&mut self) -> Result<String, String> {
+            match self.peek().cloned() {
+                Some(Tk::Op('(')) => {
+                    self.i += 1;
+                    let v = self.expr()?;
+                    if !self.is_op(')') {
+                        return Err("expected ')'".into());
+                    }
+                    self.i += 1;
+                    Ok(v)
+                }
+                Some(Tk::Op('-')) => {
+                    self.i += 1;
+                    Ok(format!("(- {})", self.factor()?))
+                }
+                Some(Tk::Op('+')) => {
+                    self.i += 1;
+                    self.factor()
+                }
+                Some(Tk::Num(s)) => {
+                    self.i += 1;
+                    Ok(format!("({})", s))
+                }
+                Some(Tk::Id(s)) => {
+                    self.i += 1;
+                    if !validate_identifier(&s) {
+                        return Err(format!("invalid identifier {s:?}"));
+                    }
+                    if !self.numeric.contains(&s) {
+                        return Err(format!("{s:?} is not a numeric field"));
+                    }
+                    Ok(format!("CAST(t.{} AS NUMERIC)", s))
+                }
+                _ => Err("unexpected end of expression".into()),
+            }
+        }
+    }
+
+    let mut p = P { t: &toks, i: 0, numeric };
+    let sql = p.expr()?;
+    if p.i != toks.len() {
+        return Err("unexpected trailing input".into());
+    }
+    Ok(sql)
+}
+
 async fn generic_pivot_data(
     State(_state): State<Arc<AppState>>,
     Db(db): Db,
@@ -9284,19 +9436,35 @@ async fn generic_pivot_data(
 
     use base64::Engine as _;
 
-    let parse_list = |key: &str| -> Vec<String> {
+    const GRANS: &[&str] = &["day", "week", "month", "quarter", "year"];
+    let is_date = |n: &str| -> bool {
+        finfo.get(n).map(|(t, _, _)| matches!(t.as_str(), "date" | "datetime")).unwrap_or(false)
+    };
+    // Row/column tokens are a field name, or — for a date/datetime field — the
+    // field name plus a grouping granularity, `order_date:month`. The granularity
+    // buckets rows by day/week/month/quarter/year instead of by the raw date.
+    let parse_dims = |key: &str| -> Vec<(String, Option<String>)> {
         params
             .get(key)
             .map(|s| s.as_str())
             .unwrap_or("")
             .split(',')
             .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-            .filter(|s| is_field(s))
+            .filter_map(|tok| {
+                let (f, g) = match tok.split_once(':') {
+                    Some((f, g)) => (f, Some(g)),
+                    None => (tok, None),
+                };
+                if !is_field(f) {
+                    return None;
+                }
+                let g = g.filter(|g| GRANS.contains(g)).map(|g| g.to_string());
+                Some((f.to_string(), g))
+            })
             .collect()
     };
-    let rows = parse_list("rows");
-    let cols = parse_list("cols");
+    let rows = parse_dims("rows");
+    let cols = parse_dims("cols");
 
     let is_numeric = |n: &str| -> bool {
         finfo
@@ -9334,6 +9502,20 @@ async fn generic_pivot_data(
         }
     }
 
+    // Bucket a date/datetime column to a granularity. The label doubles as the
+    // group key, so every form is lexically sortable in chronological order
+    // (YYYY-MM, YYYY-Www, YYYY-Qn, YYYY) — the client sorts on it directly.
+    fn date_group_expr(col: &str, gran: &str) -> String {
+        match gran {
+            "day" => format!("to_char({col}, 'YYYY-MM-DD')"),
+            "week" => format!("to_char({col}, 'IYYY-\"W\"IW')"),
+            "month" => format!("to_char({col}, 'YYYY-MM')"),
+            "quarter" => format!("to_char({col}, 'YYYY') || '-Q' || to_char({col}, 'Q')"),
+            "year" => format!("to_char({col}, 'YYYY')"),
+            _ => col.to_string(),
+        }
+    }
+
     let mut joins: Vec<String> = Vec::new();
     let mut selects: Vec<String> = Vec::new();
     let mut row_gbs: Vec<String> = Vec::new();
@@ -9341,18 +9523,24 @@ async fn generic_pivot_data(
     let mut jidx = 0usize;
 
     // Row/column grouping dimensions: emit the value, its GROUPING() flag, and
-    // record the group-by expression for the ROLLUP.
-    let mut build_group = |field: &str, alias: &str, gbs: &mut Vec<String>, joins: &mut Vec<String>, jidx: &mut usize, selects: &mut Vec<String>| {
-        let gb = dim_expr(field, &finfo, joins, jidx);
+    // record the group-by expression for the ROLLUP. A date dimension with a
+    // granularity is bucketed by `date_group_expr`.
+    let mut build_group = |field: &str, gran: Option<&str>, alias: &str, gbs: &mut Vec<String>, joins: &mut Vec<String>, jidx: &mut usize, selects: &mut Vec<String>| {
+        let base = dim_expr(field, &finfo, joins, jidx);
+        let is_date_field = finfo.get(field).map(|(t, _, _)| matches!(t.as_str(), "date" | "datetime")).unwrap_or(false);
+        let gb = match gran {
+            Some(g) if is_date_field => date_group_expr(&base, g),
+            _ => base,
+        };
         selects.push(format!("COALESCE(CAST({} AS TEXT), '(empty)') as {}", gb, alias));
         selects.push(format!("GROUPING({}) as g{}", gb, alias));
         gbs.push(gb);
     };
-    for (i, field) in rows.iter().enumerate() {
-        build_group(field, &format!("r{}", i), &mut row_gbs, &mut joins, &mut jidx, &mut selects);
+    for (i, (field, gran)) in rows.iter().enumerate() {
+        build_group(field, gran.as_deref(), &format!("r{}", i), &mut row_gbs, &mut joins, &mut jidx, &mut selects);
     }
-    for (i, field) in cols.iter().enumerate() {
-        build_group(field, &format!("c{}", i), &mut col_gbs, &mut joins, &mut jidx, &mut selects);
+    for (i, (field, gran)) in cols.iter().enumerate() {
+        build_group(field, gran.as_deref(), &format!("c{}", i), &mut col_gbs, &mut joins, &mut jidx, &mut selects);
     }
 
     // Measures (Values). `vals` is a comma list of `agg.field`; falls back to the
@@ -9360,9 +9548,15 @@ async fn generic_pivot_data(
     // Each measure yields one aggregate column m0, m1, … in the SELECT.
     struct Measure {
         agg: String,
-        field: String, // "id" == count of records
+        field: String,             // "id" == count of records
+        expr_sql: Option<String>,  // Some == calculated field (already-compiled SQL inner)
         label: String,
     }
+    let numeric_fields: std::collections::HashSet<String> = finfo
+        .iter()
+        .filter(|(_, (t, _, _))| matches!(t.as_str(), "integer" | "float" | "decimal" | "monetary" | "number"))
+        .map(|(k, _)| k.clone())
+        .collect();
     let mut measures: Vec<Measure> = Vec::new();
     let push_measure = |measures: &mut Vec<Measure>, agg: &str, field: &str| {
         let agg = if ["count", "sum", "avg", "min", "max"].contains(&agg) { agg } else { "count" };
@@ -9382,12 +9576,36 @@ async fn generic_pivot_data(
             ("count", f) => format!("Count of {}", label_of(f)),
             (a, f) => format!("{}{} of {}", a[..1].to_uppercase(), &a[1..], label_of(f)),
         };
-        measures.push(Measure { agg: agg.to_string(), field: field.to_string(), label });
+        measures.push(Measure { agg: agg.to_string(), field: field.to_string(), expr_sql: None, label });
+    };
+    // A calculated field: `agg.=<b64url(expression)>` — the expression is compiled
+    // to a safe SQL fragment over numeric columns, then wrapped in the aggregate.
+    let push_calc_field = |measures: &mut Vec<Measure>, agg: &str, sql: String| {
+        let agg = if ["count", "sum", "avg", "min", "max"].contains(&agg) { agg } else { "sum" };
+        if measures.len() >= 12 {
+            return;
+        }
+        measures.push(Measure { agg: agg.to_string(), field: String::new(), expr_sql: Some(sql), label: "Calc field".to_string() });
     };
     if let Some(vals) = params.get("vals").filter(|s| !s.is_empty()) {
         for tok in vals.split(',').filter(|s| !s.is_empty()) {
             let (agg, field) = tok.split_once('.').unwrap_or((tok, "id"));
-            push_measure(&mut measures, agg, field);
+            if let Some(b64) = field.strip_prefix('=') {
+                let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(b64)
+                    .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(b64))
+                    .ok()
+                    .and_then(|b| String::from_utf8(b).ok());
+                if let Some(src) = decoded {
+                    // Reject silently on a bad expression: the client keeps the chip
+                    // but the pivot just omits that measure rather than 500-ing.
+                    if let Ok(sql) = compile_pivot_expr(&src, &numeric_fields) {
+                        push_calc_field(&mut measures, agg, sql);
+                    }
+                }
+            } else {
+                push_measure(&mut measures, agg, field);
+            }
         }
     }
     if measures.is_empty() {
@@ -9396,13 +9614,23 @@ async fn generic_pivot_data(
         push_measure(&mut measures, agg, field);
     }
     for (i, m) in measures.iter().enumerate() {
-        let expr = match m.agg.as_str() {
-            "sum" => format!("SUM(CAST(t.{} AS NUMERIC))", m.field),
-            "avg" => format!("AVG(CAST(t.{} AS NUMERIC))", m.field),
-            "min" => format!("MIN(CAST(t.{} AS NUMERIC))", m.field),
-            "max" => format!("MAX(CAST(t.{} AS NUMERIC))", m.field),
-            _ if m.field == "id" => "COUNT(*)".to_string(),
-            _ => format!("COUNT(t.{})", m.field), // count of non-null values
+        let expr = if let Some(inner) = &m.expr_sql {
+            match m.agg.as_str() {
+                "avg" => format!("AVG({})", inner),
+                "min" => format!("MIN({})", inner),
+                "max" => format!("MAX({})", inner),
+                "count" => format!("COUNT({})", inner),
+                _ => format!("SUM({})", inner),
+            }
+        } else {
+            match m.agg.as_str() {
+                "sum" => format!("SUM(CAST(t.{} AS NUMERIC))", m.field),
+                "avg" => format!("AVG(CAST(t.{} AS NUMERIC))", m.field),
+                "min" => format!("MIN(CAST(t.{} AS NUMERIC))", m.field),
+                "max" => format!("MAX(CAST(t.{} AS NUMERIC))", m.field),
+                _ if m.field == "id" => "COUNT(*)".to_string(),
+                _ => format!("COUNT(t.{})", m.field), // count of non-null values
+            }
         };
         selects.push(format!("CAST({} AS DOUBLE PRECISION) as m{}", expr, i));
     }
@@ -9498,10 +9726,20 @@ async fn generic_pivot_data(
         cells.push(serde_json::json!({"r": rpath, "c": cpath, "vs": vs}));
     }
 
-    let field_meta = |names: &[String]| -> Vec<serde_json::Value> {
-        names
-            .iter()
-            .map(|n| serde_json::json!({"name": n, "label": label_of(n)}))
+    // Field headers; a date dimension shows its granularity, e.g. "Order Date (Month)".
+    let dim_meta = |dims: &[(String, Option<String>)]| -> Vec<serde_json::Value> {
+        dims.iter()
+            .map(|(n, g)| {
+                let label = match g {
+                    Some(g) if is_date(n) => {
+                        let mut ch = g.chars();
+                        let gcap = ch.next().map(|f| f.to_uppercase().collect::<String>() + ch.as_str()).unwrap_or_default();
+                        format!("{} ({})", label_of(n), gcap)
+                    }
+                    _ => label_of(n),
+                };
+                serde_json::json!({"name": n, "label": label})
+            })
             .collect()
     };
     let measure_meta: Vec<serde_json::Value> = measures
@@ -9512,8 +9750,8 @@ async fn generic_pivot_data(
     Json(serde_json::json!({
         "ok": true,
         "measures": measure_meta,
-        "rowFields": field_meta(&rows),
-        "colFields": field_meta(&cols),
+        "rowFields": dim_meta(&rows),
+        "colFields": dim_meta(&cols),
         "cells": cells,
     }))
     .into_response()
@@ -19804,5 +20042,77 @@ mod tenant_host_tests {
         // match every database once %h is escaped.
         assert!(host_filtered_databases("^%h$", ".*.vortex.com", &all).is_empty());
         assert!(host_filtered_databases("^%h$", "gaia|remicle.vortex.com", &all).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod pivot_expr_tests {
+    use super::compile_pivot_expr;
+    use std::collections::HashSet;
+
+    fn nums() -> HashSet<String> {
+        ["quantity", "unit_price", "discount", "amount_total"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn compiles_arithmetic_over_numeric_columns() {
+        let n = nums();
+        let sql = compile_pivot_expr("quantity * unit_price", &n).unwrap();
+        assert_eq!(sql, "(CAST(t.quantity AS NUMERIC) * CAST(t.unit_price AS NUMERIC))");
+    }
+
+    #[test]
+    fn precedence_is_parenthesised() {
+        let n = nums();
+        let sql = compile_pivot_expr("quantity + unit_price * discount", &n).unwrap();
+        // multiplication binds tighter than addition
+        assert_eq!(
+            sql,
+            "(CAST(t.quantity AS NUMERIC) + (CAST(t.unit_price AS NUMERIC) * CAST(t.discount AS NUMERIC)))"
+        );
+    }
+
+    #[test]
+    fn division_guards_against_zero() {
+        let n = nums();
+        let sql = compile_pivot_expr("amount_total / quantity", &n).unwrap();
+        assert_eq!(sql, "(CAST(t.amount_total AS NUMERIC) / NULLIF(CAST(t.quantity AS NUMERIC), 0))");
+    }
+
+    #[test]
+    fn parens_and_unary_minus() {
+        let n = nums();
+        let sql = compile_pivot_expr("-(quantity - 1)", &n).unwrap();
+        assert_eq!(sql, "(- (CAST(t.quantity AS NUMERIC) - (1)))");
+    }
+
+    #[test]
+    fn rejects_unknown_field() {
+        let n = nums();
+        assert!(compile_pivot_expr("quantity * evil", &n).is_err());
+    }
+
+    #[test]
+    fn rejects_non_numeric_or_injection_attempts() {
+        let n = nums();
+        // SQL injection / statement breaking
+        assert!(compile_pivot_expr("1; DROP TABLE sales_order", &n).is_err());
+        assert!(compile_pivot_expr("quantity) FROM users --", &n).is_err());
+        // function calls are not in the grammar
+        assert!(compile_pivot_expr("pg_sleep(5)", &n).is_err());
+        assert!(compile_pivot_expr("count(quantity)", &n).is_err());
+        // subquery / string literal characters are illegal tokens
+        assert!(compile_pivot_expr("'x'", &n).is_err());
+        assert!(compile_pivot_expr("quantity + (SELECT 1)", &n).is_err());
+        // dotted / qualified identifiers rejected by validate_identifier + grammar
+        assert!(compile_pivot_expr("t.password", &n).is_err());
+        // unbalanced parens
+        assert!(compile_pivot_expr("(quantity + unit_price", &n).is_err());
+        // empty / trailing operator
+        assert!(compile_pivot_expr("", &n).is_err());
+        assert!(compile_pivot_expr("quantity +", &n).is_err());
     }
 }

@@ -82,8 +82,15 @@ fn allowed_keys(view_type: &str) -> Vec<(&'static str, KeyKind)> {
             ("measure", KeyKind::Field),
             ("agg", KeyKind::Enum(AGGREGATES)),
             ("vals", KeyKind::Measures),
+            // `mx` is the client-authoritative full measure list (aggregate +
+            // calc-field + calculated measures + show-as), base64-JSON. The data
+            // endpoint reads its SQL measures from `vals`; `mx` only needs to be
+            // stored and replayed to the client verbatim.
+            ("mx", KeyKind::Opaque),
             ("filters", KeyKind::Filters),
             ("collapsed", KeyKind::Opaque),
+            // Display-only: reverse the column order (newest period first).
+            ("coldesc", KeyKind::Enum(&["1"])),
         ],
         "graph" => vec![
             ("group_by", KeyKind::Field),
@@ -197,9 +204,17 @@ pub async fn validate_config(
         };
         match kind {
             KeyKind::FieldList => {
+                // A token is a field name, or (for a pivot date dimension) a
+                // field name plus a grouping granularity: `order_date:month`.
                 for token in val.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-                    if !is_field(token) {
-                        return Err(format!("{token:?} is not a field of {model}."));
+                    let (name, gran) = token.split_once(':').unwrap_or((token, ""));
+                    if !is_field(name) {
+                        return Err(format!("{name:?} is not a field of {model}."));
+                    }
+                    if !gran.is_empty()
+                        && !["day", "week", "month", "quarter", "year"].contains(&gran)
+                    {
+                        return Err(format!("Invalid date grouping {gran:?}."));
                     }
                 }
             }
@@ -220,7 +235,14 @@ pub async fn validate_config(
                     if !AGGREGATES.contains(&agg) {
                         return Err(format!("Invalid aggregate {agg:?} in {key}."));
                     }
-                    if field != "id" && !is_field(field) {
+                    // A calculated field is `agg.=<base64url(expression)>`; the
+                    // expression is compiled/validated server-side at query time, so
+                    // here we only shape-check the base64 payload.
+                    if let Some(b64) = field.strip_prefix('=') {
+                        if b64.is_empty() || b64.len() > 800 || !b64.chars().all(is_base64url) {
+                            return Err(format!("Malformed calculated field in {key}."));
+                        }
+                    } else if field != "id" && !is_field(field) {
                         return Err(format!("{field:?} is not a field of {model}."));
                     }
                 }
@@ -573,7 +595,7 @@ mod tests {
     #[test]
     fn allowed_keys_per_type() {
         let keys = |t: &str| allowed_keys(t).into_iter().map(|(k, _)| k).collect::<Vec<_>>();
-        assert_eq!(keys("pivot"), vec!["rows", "cols", "measure", "agg", "vals", "filters", "collapsed"]);
+        assert_eq!(keys("pivot"), vec!["rows", "cols", "measure", "agg", "vals", "mx", "filters", "collapsed", "coldesc"]);
         assert_eq!(keys("graph"), vec!["group_by", "type"]);
         assert_eq!(keys("kanban"), vec!["group_by"]);
         assert_eq!(keys("calendar"), vec!["date_field"]);
@@ -636,6 +658,12 @@ mod tests {
         .expect("valid pivot config");
         assert_eq!(pv.get("vals").map(String::as_str), Some("sum.credit_limit,count.id"));
         assert!(pv.contains_key("filters") && pv.contains_key("collapsed"));
+        // A row/col field may carry a date grouping granularity (`field:month`);
+        // a valid granularity is accepted, an unknown one is rejected. (The field
+        // needn't be a date here — the data endpoint ignores granularity for
+        // non-dates; validation only guards the granularity token itself.)
+        assert!(validate_config(&db, "contacts", "pivot", &cfg(&[("rows", "name:month")])).await.is_ok());
+        assert!(validate_config(&db, "contacts", "pivot", &cfg(&[("rows", "name:decade")])).await.is_err());
         // A bad aggregate, an unknown measure field and a non-field filter are rejected.
         assert!(validate_config(&db, "contacts", "pivot", &cfg(&[("vals", "median.credit_limit")])).await.is_err());
         assert!(validate_config(&db, "contacts", "pivot", &cfg(&[("vals", "sum.not_a_field")])).await.is_err());

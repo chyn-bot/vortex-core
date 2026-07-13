@@ -43,8 +43,19 @@
 .pv-chip .pv-label { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .pv-chip .pv-x { margin-left: auto; cursor: pointer; opacity: .5; font-size: .95rem; line-height: 1; padding: 0 .1rem; }
 .pv-chip .pv-x:hover { opacity: 1; color: oklch(var(--er)); }
+.pv-chip { flex-wrap: wrap; }
 .pv-chip select { font-size: .7rem; background: oklch(var(--b2)); border: 1px solid oklch(var(--b3)); border-radius: .25rem; padding: 0 .2rem; max-width: 8.5rem; }
+/* The "show as / compare" selector — tinted so it reads as distinct from the
+   aggregation dropdown next to it. */
+.pv-chip select.pv-showas { color: #3b82f6; border-color: color-mix(in oklab, #3b82f6 45%, oklch(var(--b3))); }
 .pv-chip.pv-chip-default { opacity: .7; font-style: italic; }
+.pv-chip .pv-fx { color: #8BC53F; font-weight: 700; font-style: italic; font-family: Georgia, serif; }
+.pv-chip .pv-calc { cursor: pointer; text-decoration: underline dotted; text-underline-offset: 2px; }
+.pv-colsort { display: flex; align-items: center; gap: .35rem; margin-top: .4rem; font-size: .72rem; opacity: .8; cursor: pointer; }
+.pv-colsort input { cursor: pointer; }
+.pv-addcalc { margin-top: .4rem; }
+.pv-addcalc button { font-size: .72rem; width: 100%; padding: .3rem; border: 1px dashed oklch(var(--b3)); border-radius: .3rem; background: transparent; color: oklch(var(--bc)/.7); cursor: pointer; }
+.pv-addcalc button:hover { border-color: #8BC53F; color: oklch(var(--bc)); }
 
 /* Filters zone accent (distinct from the row/col/value zones) */
 #pv-zone-filters.pv-over { border-color: #3b82f6; background: color-mix(in oklab, #3b82f6 12%, transparent); }
@@ -59,6 +70,10 @@
 .pv-rowhdr { text-align: left !important; background: oklch(var(--b1)); font-weight: 400; position: sticky; left: 0; z-index: 1; }
 .pv-table tbody tr:hover td { background: oklch(var(--b2)/.4); }
 .pv-num-cell { font-variant-numeric: tabular-nums; color: oklch(var(--bc)/.85); }
+/* Paired comparison sub-column (value | variation) — tinted + lighter so the
+   variation reads as secondary to the raw value beside it. */
+.pv-table td.pv-variation { color: #3b82f6; background: color-mix(in oklab, #3b82f6 5%, transparent); font-size: .8rem; }
+.pv-table th.pv-variation { color: #3b82f6; font-weight: 500; }
 .pv-empty-cell { color: oklch(var(--bc)/.3); }
 .pv-subtotal > td { background: oklch(var(--b2)/.7); font-weight: 600; }
 .pv-grand > td, tfoot .pv-grand td { background: oklch(var(--b3)); font-weight: 700; }

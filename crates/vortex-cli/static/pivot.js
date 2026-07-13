@@ -31,6 +31,22 @@
   ];
   var AGG_CODES = { count: 1, sum: 1, avg: 1, min: 1, max: 1 };
 
+  // "Show value as" display modes (computed client-side from the aggregated
+  // cells + their ROLLUP totals — no server involvement).
+  var SHOWS = [
+    ["", "No comparison"], ["pct_grand", "% of grand total"],
+    ["pct_row", "% of row"], ["pct_col", "% of column"],
+    ["diff_prev", "Δ vs previous"], ["pct_prev", "% vs previous"],
+    ["diff_first", "Δ vs first"], ["pct_first", "% vs first"],
+    ["run_total", "Running total"],
+    ["rank_row", "Rank in row"], ["rank_col", "Rank in column"],
+  ];
+  var SHOW_OK = {
+    "": 1, pct_grand: 1, pct_row: 1, pct_col: 1, diff_prev: 1, pct_prev: 1,
+    diff_first: 1, pct_first: 1, run_total: 1, rank_row: 1, rank_col: 1,
+  };
+  function showLabel(s) { for (var i = 0; i < SHOWS.length; i++) if (SHOWS[i][0] === s) return SHOWS[i][1]; return s; }
+
   // ---- base64url (UTF-8 safe) for filter values & collapse keys -----------
   function b64e(s) {
     return btoa(unescape(encodeURIComponent(s)))
@@ -63,6 +79,33 @@
     }
     return out;
   }
+
+  // The value list: aggregate measures {field, agg, show}, calculated-field
+  // measures {expr, agg, label, show} (server-computed), and calculated measures
+  // {calc, label, show} (client-computed formula over the other value columns).
+  // `mx` (base64 JSON) is the authoritative full list; `vals` is the legacy
+  // aggregate-only fallback so old URLs/saved views keep working.
+  function parseMeasures(init) {
+    if (init.mx) {
+      try {
+        var arr = JSON.parse(b64d(init.mx));
+        if (Array.isArray(arr)) {
+          return arr.map(function (v) {
+            if (!v || typeof v !== "object") return null;
+            var show = SHOW_OK[v.show] ? v.show : "";
+            if (v.calc != null) return { calc: String(v.calc), label: String(v.label || "Calc"), show: show };
+            if (v.expr != null) {
+              return { expr: String(v.expr), agg: AGG_CODES[v.agg] ? v.agg : "sum", label: String(v.label || "Calc field"), show: show };
+            }
+            var f = v.field ? String(v.field) : "";
+            if (f && !FIELD_BY[f]) return null;
+            return { field: f, agg: AGG_CODES[v.agg] ? v.agg : "count", show: show };
+          }).filter(Boolean);
+        }
+      } catch (e) { /* fall through */ }
+    }
+    return parseVals(init).map(function (v) { return { field: v.field, agg: v.agg, show: "" }; });
+  }
   function parseFilters(str) {
     var out = [];
     if (!str) return out;
@@ -84,12 +127,35 @@
     return out;
   }
 
+  var GRANS = [["day", "Day"], ["week", "Week"], ["month", "Month"], ["quarter", "Quarter"], ["year", "Year"]];
+  var GRAN_OK = { day: 1, week: 1, month: 1, quarter: 1, year: 1 };
+  function isDateField(name) { return !!(FIELD_BY[name] && FIELD_BY[name].date); }
+
+  // Row/column tokens may be `field` or (for a date) `field:granularity`.
+  // Splits the granularity out into the shared `gran` map.
+  var gran = {};
+  function parseDims(arr) {
+    var out = [];
+    (arr || []).forEach(function (tok) {
+      var s = String(tok);
+      var i = s.indexOf(":");
+      var f = i < 0 ? s : s.slice(0, i);
+      var g = i < 0 ? "" : s.slice(i + 1);
+      if (!FIELD_BY[f]) return;
+      out.push(f);
+      if (g && GRAN_OK[g] && isDateField(f)) gran[f] = g;
+    });
+    return out;
+  }
+
   var state = {
-    rows: (initial.rows || []).filter(function (n) { return FIELD_BY[n]; }),
-    cols: (initial.cols || []).filter(function (n) { return FIELD_BY[n]; }),
-    values: parseVals(initial),            // [{field, agg}]; field "" == count of records
+    rows: parseDims(initial.rows),
+    cols: parseDims(initial.cols),
+    values: parseMeasures(initial),        // aggregate / calc-field / calc measures
     filters: parseFilters(initial.filters),// [{field, value}]
     expanded: parseCollapsed(initial.collapsed), // key -> false means collapsed
+    gran: gran,                            // field -> day|week|month|quarter|year
+    colDesc: String(initial.coldesc) === "1", // reverse column order (newest first)
   };
 
   // ---- helpers -----------------------------------------------------------
@@ -105,6 +171,62 @@
   function cellKey(r, c) { return keyOf(r) + "" + keyOf(c); }
   function capitalize(s) { return s.charAt(0).toUpperCase() + s.slice(1); }
   function displayVal(v) { return v === "" ? "(empty)" : v; }
+
+  // ---- calculated-measure formula evaluator (safe; NO eval) --------------
+  // Grammar: number | #k (k-th value column) | + - * / ( ). Recursive descent.
+  // `vs` is the cell's array of aggregated SQL-measure values.
+  function tokenizeFormula(s) {
+    var toks = [], re = /\s*(#\d+|\d+\.?\d*|\.\d+|[()+\-*/])/g, m, last = 0;
+    while ((m = re.exec(s)) !== null) {
+      if (m.index !== last) throw "bad";
+      toks.push(m[1]); last = re.lastIndex;
+    }
+    if (last !== s.length) throw "bad";
+    return toks;
+  }
+  function evalFormula(formula, vs) {
+    try {
+      var toks = tokenizeFormula(String(formula || ""));
+      if (!toks.length) return null;
+      var p = { i: 0 };
+      function peek() { return toks[p.i]; }
+      function next() { return toks[p.i++]; }
+      function factor() {
+        var t = peek();
+        if (t === "(") { next(); var v = expr(); if (next() !== ")") throw "paren"; return v; }
+        if (t === "-") { next(); return -factor(); }
+        if (t === "+") { next(); return factor(); }
+        if (t && t.charAt(0) === "#") {
+          next();
+          var k = parseInt(t.slice(1), 10);
+          var raw = vs ? vs[k - 1] : null;
+          if (raw == null) throw "null";
+          return Number(raw);
+        }
+        if (t != null && /^[\d.]/.test(t)) { next(); return parseFloat(t); }
+        throw "tok";
+      }
+      function term() {
+        var v = factor();
+        while (peek() === "*" || peek() === "/") {
+          var op = next(); var r = factor();
+          v = op === "*" ? v * r : v / r;
+        }
+        return v;
+      }
+      function expr() {
+        var v = term();
+        while (peek() === "+" || peek() === "-") {
+          var op = next(); var r = term();
+          v = op === "+" ? v + r : v - r;
+        }
+        return v;
+      }
+      var out = expr();
+      if (p.i !== toks.length) return null; // trailing junk
+      return isFinite(out) ? out : null;
+    } catch (e) { return null; }
+  }
 
   function fmtNum(v, agg) {
     if (v == null) return "";
@@ -162,7 +284,7 @@
 
   function renderZone(zone) {
     var box = zoneEls[zone];
-    box.querySelectorAll(".pv-chip, .pv-zone-empty").forEach(function (n) { n.remove(); });
+    box.querySelectorAll(".pv-chip, .pv-zone-empty, .pv-colsort").forEach(function (n) { n.remove(); });
     var arr = state[zone];
     if (!arr.length) {
       box.appendChild(el("div", "pv-zone-empty", "Drop fields here"));
@@ -172,6 +294,19 @@
       var chip = el("div", "pv-chip");
       chip.draggable = true;
       chip.appendChild(el("span", "pv-label", labelOf(name)));
+      // Date/datetime dimensions get a grouping-granularity selector.
+      if (isDateField(name)) {
+        var gsel = el("select");
+        gsel.title = "Group dates by";
+        GRANS.forEach(function (g) {
+          var o = el("option", null, g[1]); o.value = g[0];
+          if (g[0] === (state.gran[name] || "month")) o.selected = true;
+          gsel.appendChild(o);
+        });
+        gsel.addEventListener("click", function (ev) { ev.stopPropagation(); });
+        gsel.addEventListener("change", function () { state.gran[name] = gsel.value; changed(); });
+        chip.appendChild(gsel);
+      }
       var x = el("span", "pv-x", "×");
       x.title = "Remove";
       x.addEventListener("click", function () { arr.splice(idx, 1); changed(); });
@@ -185,23 +320,128 @@
       chip.addEventListener("drop", function (ev) { ev.preventDefault(); ev.stopPropagation(); onDrop(zone, ev, idx); });
       box.appendChild(chip);
     });
+    // Column-order toggle: reverse the displayed columns (newest period first).
+    // Comparisons still compute on chronological order, so only the view flips.
+    if (zone === "cols") {
+      var lbl = el("label", "pv-colsort");
+      var cb = el("input"); cb.type = "checkbox"; cb.checked = state.colDesc;
+      cb.addEventListener("change", function () { state.colDesc = cb.checked; changed(); });
+      lbl.appendChild(cb);
+      lbl.appendChild(el("span", null, "Newest first (reverse columns)"));
+      box.appendChild(lbl);
+    }
+  }
+
+  // A "show as / compare" selector, offered on every value chip. `onChange` lets
+  // the default Count chip materialise itself into a real measure when a
+  // comparison is picked (so you can compare without first adding a value field).
+  function showSelect(v, onChange) {
+    var ssel = el("select", "pv-showas"); ssel.title = "Show value as / compare (e.g. % vs previous month)";
+    SHOWS.forEach(function (s) {
+      var o = el("option", null, s[1]); o.value = s[0];
+      if (s[0] === (v.show || "")) o.selected = true;
+      ssel.appendChild(o);
+    });
+    ssel.addEventListener("change", function () { v.show = ssel.value; (onChange || changed)(); });
+    return ssel;
+  }
+
+  // Hint listing the numbered value columns a formula can reference (#1, #2…).
+  function measureRefsHint() {
+    var refs = [], k = 0;
+    state.values.forEach(function (v) {
+      if (v.calc != null) return; // calc measures aren't referenceable
+      k++;
+      var lbl = v.expr != null ? (v.label || "Calc field")
+        : (v.field ? (capitalize(v.agg) + " of " + labelOf(v.field)) : "Count of records");
+      refs.push("#" + k + " = " + lbl);
+    });
+    return refs.length ? refs.join("\n") : "(add value fields first, e.g. Sum of Revenue)";
+  }
+  function addCalc() {
+    var name = window.prompt("Name this calculation (e.g. Margin %)", "Margin %");
+    if (name == null) return;
+    var formula = window.prompt(
+      "Formula — reference the value columns by number:\n\n" + measureRefsHint() +
+      "\n\nOperators: + - * / ( )   Example:  (#1 - #2) / #1 * 100", "");
+    if (formula == null || !formula.trim()) return;
+    state.values.push({ calc: formula.trim(), label: name.trim() || "Calc", show: "" });
+    changed();
+  }
+  function editCalc(idx) {
+    var v = state.values[idx];
+    if (!v || v.calc == null) return;
+    var name = window.prompt("Name", v.label || "Calc");
+    if (name == null) return;
+    var formula = window.prompt("Formula:\n\n" + measureRefsHint(), v.calc);
+    if (formula == null || !formula.trim()) return;
+    v.label = name.trim() || v.label;
+    v.calc = formula.trim();
+    changed();
+  }
+
+  // Hint listing the numeric columns a calculated field's expression can use.
+  function numericFieldsHint() {
+    var ns = FIELDS.filter(function (f) { return f.numeric; })
+      .map(function (f) { return f.name + "  (" + f.label + ")"; });
+    return ns.length ? ns.join("\n") : "(this model has no numeric fields)";
+  }
+  // A calculated *field* is an expression over the raw numeric columns that is
+  // aggregated server-side (e.g. SUM(quantity * unit_price)). The expression is
+  // compiled to safe SQL on the server; here we just collect it.
+  function addCalcField() {
+    var name = window.prompt("Name this field (e.g. Line Total)", "Line Total");
+    if (name == null) return;
+    var expr = window.prompt(
+      "Expression over numeric columns (aggregated per cell):\n\n" + numericFieldsHint() +
+      "\n\nOperators: + - * / ( )   Example:  quantity * unit_price", "");
+    if (expr == null || !expr.trim()) return;
+    state.values.push({ expr: expr.trim(), agg: "sum", label: name.trim() || "Calc field", show: "" });
+    changed();
+  }
+  function editCalcField(idx) {
+    var v = state.values[idx];
+    if (!v || v.expr == null) return;
+    var name = window.prompt("Name", v.label || "Calc field");
+    if (name == null) return;
+    var expr = window.prompt("Expression over numeric columns:\n\n" + numericFieldsHint(), v.expr);
+    if (expr == null || !expr.trim()) return;
+    v.label = name.trim() || v.label;
+    v.expr = expr.trim();
+    changed();
   }
 
   function renderZoneValues() {
     var box = zoneEls.values;
-    box.querySelectorAll(".pv-chip, .pv-zone-empty").forEach(function (n) { n.remove(); });
+    box.querySelectorAll(".pv-chip, .pv-zone-empty, .pv-addcalc").forEach(function (n) { n.remove(); });
     if (!state.values.length) {
       var d = el("div", "pv-chip pv-chip-default");
       d.appendChild(el("span", "pv-label", "Count of records"));
+      // Picking a comparison here turns the implicit count into a real measure.
+      var dv = { field: "", agg: "count", show: "" };
+      d.appendChild(showSelect(dv, function () { state.values.push(dv); changed(); }));
       box.appendChild(d);
-      return;
     }
     state.values.forEach(function (v, idx) {
       var chip = el("div", "pv-chip");
-      if (v.field === "") {
+      if (v.calc != null) {
+        chip.appendChild(el("span", "pv-fx", "ƒ"));
+        var clbl = el("span", "pv-label pv-calc", v.label || "Calc");
+        clbl.title = "ƒ " + v.calc + "  ·  click to edit";
+        clbl.addEventListener("click", function () { editCalc(idx); });
+        chip.appendChild(clbl);
+      } else if (v.field === "" && v.expr == null) {
         chip.appendChild(el("span", "pv-label", "Count of records"));
       } else {
-        chip.appendChild(el("span", "pv-label", labelOf(v.field)));
+        if (v.expr != null) {
+          chip.appendChild(el("span", "pv-fx", "∑"));
+          var elbl = el("span", "pv-label pv-calc", v.label || "Calc field");
+          elbl.title = "∑ " + v.expr + "  ·  click to edit";
+          elbl.addEventListener("click", (function (i) { return function () { editCalcField(i); }; })(idx));
+          chip.appendChild(elbl);
+        } else {
+          chip.appendChild(el("span", "pv-label", labelOf(v.field)));
+        }
         var sel = el("select");
         AGGS.forEach(function (a) {
           var o = el("option", null, a[1]); o.value = a[0];
@@ -211,11 +451,22 @@
         sel.addEventListener("change", function () { v.agg = sel.value; changed(); });
         chip.appendChild(sel);
       }
+      chip.appendChild(showSelect(v));
       var x = el("span", "pv-x", "×"); x.title = "Remove";
       x.addEventListener("click", function () { state.values.splice(idx, 1); changed(); });
       chip.appendChild(x);
       box.appendChild(chip);
     });
+    var add = el("div", "pv-addcalc");
+    var btn = el("button", null, "ƒ Add calculation");
+    btn.type = "button";
+    btn.addEventListener("click", addCalc);
+    add.appendChild(btn);
+    var btn2 = el("button", null, "∑ Add calculated field");
+    btn2.type = "button";
+    btn2.addEventListener("click", addCalcField);
+    add.appendChild(btn2);
+    box.appendChild(add);
   }
 
   // ---- filters zone ------------------------------------------------------
@@ -288,6 +539,8 @@
       var at = (insertIdx == null) ? arr.length : insertIdx;
       if (at > arr.length) at = arr.length;
       arr.splice(at, 0, field);
+      // Dates default to grouping by month (like Odoo) rather than by raw day.
+      if (isDateField(field) && !state.gran[field]) state.gran[field] = "month";
     }
     changed();
   }
@@ -303,19 +556,40 @@
   });
 
   // ---- query / url / save-form sync -------------------------------------
+  // Encode a row/col list, appending `:granularity` for date dimensions.
+  function dimsParam(arr) {
+    return arr.map(function (f) {
+      return (isDateField(f) && state.gran[f]) ? f + ":" + state.gran[f] : f;
+    }).join(",");
+  }
+  // SQL measures the server computes (aggregate or calc-field), in order —
+  // calc measures are client-only and excluded. A calc field is `agg.=<b64expr>`.
   function valsParam() {
-    return state.values.map(function (v) { return v.agg + "." + (v.field || "id"); }).join(",");
+    return state.values.filter(function (v) { return v.calc == null; })
+      .map(function (v) {
+        if (v.expr != null) return v.agg + ".=" + b64e(v.expr);
+        return v.agg + "." + (v.field || "id");
+      }).join(",");
+  }
+  // The authoritative full value list (aggregate + calc-field + calc + show-as),
+  // base64-JSON. The server ignores it; the client rebuilds `state.values` from it.
+  function mxParam() {
+    return state.values.length ? b64e(JSON.stringify(state.values)) : "";
   }
   function filtersParam() {
     return activeFilters().map(function (f) { return f.field + "." + b64e(f.value); }).join(",");
   }
   function queryString() {
     var p = new URLSearchParams();
-    if (state.rows.length) p.set("rows", state.rows.join(","));
-    if (state.cols.length) p.set("cols", state.cols.join(","));
-    if (state.values.length) p.set("vals", valsParam());
+    if (state.rows.length) p.set("rows", dimsParam(state.rows));
+    if (state.cols.length) p.set("cols", dimsParam(state.cols));
+    var vp = valsParam();
+    if (vp) p.set("vals", vp);
+    var mx = mxParam();
+    if (mx) p.set("mx", mx);
     var fp = filtersParam();
     if (fp) p.set("filters", fp);
+    if (state.colDesc) p.set("coldesc", "1");
     return p.toString();
   }
 
@@ -336,11 +610,13 @@
     if (!form) return;
     form.querySelectorAll('input[name^="cfg_"]').forEach(function (n) { n.remove(); });
     var cfg = {
-      rows: state.rows.join(","),
-      cols: state.cols.join(","),
+      rows: dimsParam(state.rows),
+      cols: dimsParam(state.cols),
       vals: valsParam(),
+      mx: mxParam(),
       filters: filtersParam(),
       collapsed: collapsedKeys().map(b64e).join(","),
+      coldesc: state.colDesc ? "1" : "",
       // legacy single-measure keys, for older readers / defaults
       measure: state.values.length ? (state.values[0].field || "id") : "id",
       agg: state.values.length ? state.values[0].agg : "count",
@@ -389,35 +665,210 @@
 
   function escapeHtml(s) { var d = el("div"); d.textContent = s == null ? "" : String(s); return d.innerHTML; }
 
+  // ---- measures: resolve the client value list against the server cells --
+  // The server returns one aggregated value per SQL measure (aggregate or
+  // calc-field), in `vals`/`mx` order, in each cell's `vs`. The client value
+  // list interleaves those with client-only calc measures; here we tag each with
+  // how to get its number, and each carries an optional show-as mode.
+  function clientMeasures(data) {
+    var sqlMeasures = (data.measures && data.measures.length) ? data.measures : [{ agg: "count", field: "id", label: "Count" }];
+    var list = [], si = 0;
+    state.values.forEach(function (v) {
+      if (v.calc != null) {
+        list.push({ kind: "calc", label: v.label || "Calc", formula: v.calc, agg: "", show: v.show || "" });
+      } else {
+        var sm = sqlMeasures[si] || { agg: v.agg || "count", label: "Value" };
+        // A calc field carries its own client-side label/agg (the server labels
+        // it generically "Calc field"); a plain field uses the server metadata.
+        var label = (v.expr != null && v.label) ? v.label : sm.label;
+        var agg = (v.expr != null) ? (v.agg || "sum") : sm.agg;
+        list.push({ kind: "agg", label: label, agg: agg, sqlIndex: si, show: v.show || "" });
+        si++;
+      }
+    });
+    if (!list.length) list.push({ kind: "agg", label: sqlMeasures[0].label, agg: sqlMeasures[0].agg, sqlIndex: 0, show: "" });
+    return list;
+  }
+  // Expand measures into rendered sub-columns. A plain measure is one column; a
+  // measure with a comparison becomes a PAIR — the raw value plus the comparison
+  // beside it (Odoo-style), so the underlying number stays visible. Each part
+  // carries an effective measure (`mo`) whose `show` drives dispVal.
+  function renderColsOf(measures) {
+    var out = [];
+    measures.forEach(function (mo, mi) {
+      var base = {}; for (var k in mo) base[k] = mo[k]; base.show = "";
+      out.push({ mi: mi, mo: base, agg: mo.agg, label: mo.label, variation: false });
+      if (mo.show) {
+        var v = {}; for (var k2 in mo) v[k2] = mo[k2]; // keeps mo.show
+        out.push({ mi: mi, mo: v, agg: mo.agg, label: showLabel(mo.show), variation: true });
+      }
+    });
+    return out;
+  }
+  // Raw (pre-show-as) value of a measure at a cell.
+  function rawVal(vsAt, rowPath, colPath, mo) {
+    var vs = vsAt(rowPath, colPath);
+    if (!vs) return null;
+    if (mo.kind === "calc") return evalFormula(mo.formula, vs);
+    var v = vs[mo.sqlIndex];
+    return v == null ? null : v;
+  }
+  // The leaf column immediately before `colPath` that shares the same parent
+  // (all keys but the last) — i.e. the previous period when the innermost column
+  // dimension is a date grouping. `colLeaves` is chronologically sorted and
+  // same-parent leaves are contiguous, so it's the entry just before, provided
+  // its parent matches (else `colPath` is the first period in its group).
+  function prevColPath(colLeaves, colPath) {
+    if (!colPath || !colPath.length) return null;
+    var key = keyOf(colPath), idx = -1;
+    for (var i = 0; i < colLeaves.length; i++) {
+      if (keyOf(colLeaves[i]) === key) { idx = i; break; }
+    }
+    if (idx <= 0) return null;
+    var cand = colLeaves[idx - 1];
+    if (cand.length !== colPath.length) return null;
+    for (var j = 0; j < colPath.length - 1; j++) if (cand[j] !== colPath[j]) return null;
+    return cand;
+  }
+  // All leaf paths sharing `path`'s parent (same length, same keys but the last),
+  // in canonical order — `path`'s peers, used by first/running-total/rank modes.
+  // Empty when `path` has no dimension (grand row/col) or isn't a full leaf.
+  function siblingsOf(leaves, path) {
+    if (!path || !path.length) return [];
+    var res = [];
+    for (var i = 0; i < leaves.length; i++) {
+      var L = leaves[i];
+      if (L.length !== path.length) continue;
+      var ok = true;
+      for (var j = 0; j < path.length - 1; j++) if (L[j] !== path[j]) { ok = false; break; }
+      if (ok) res.push(L);
+    }
+    return res;
+  }
+  // 1-based rank of `base` among `values` (nulls ignored), largest = 1.
+  function rankOf(base, values) {
+    if (base == null) return null;
+    var higher = 0;
+    for (var i = 0; i < values.length; i++) if (values[i] != null && values[i] > base) higher++;
+    return higher + 1;
+  }
+  // Display value + whether it's a percentage. Applies the show-as transform:
+  // pct_* use the ROLLUP totals (grand / row / column) the server returned;
+  // diff_prev / pct_prev compare the cell to the previous column (period).
+  function dispVal(m, rowPath, colPath, mo) {
+    var vsAt = m.vsAt;
+    var base = rawVal(vsAt, rowPath, colPath, mo);
+    if (base == null || !mo.show) return { v: base, pct: false };
+    if (mo.show === "pct_grand" || mo.show === "pct_row" || mo.show === "pct_col") {
+      var denom = null;
+      if (mo.show === "pct_grand") denom = rawVal(vsAt, [], [], mo);
+      else if (mo.show === "pct_row") denom = rawVal(vsAt, rowPath, [], mo);
+      else denom = rawVal(vsAt, [], colPath, mo);
+      if (denom == null || denom === 0) return { v: null, pct: true };
+      return { v: base / denom * 100, pct: true };
+    }
+    if (mo.show === "diff_prev" || mo.show === "pct_prev") {
+      var pct = mo.show === "pct_prev";
+      var prev = prevColPath(m.colLeaves, colPath);
+      if (!prev) return { v: null, pct: pct };
+      var pv = rawVal(vsAt, rowPath, prev, mo);
+      if (pv == null) return { v: null, pct: pct };
+      if (!pct) return { v: base - pv, pct: false };
+      if (pv === 0) return { v: null, pct: true };
+      return { v: (base - pv) / pv * 100, pct: true };
+    }
+    if (mo.show === "diff_first" || mo.show === "pct_first") {
+      var pctf = mo.show === "pct_first";
+      var sibs = siblingsOf(m.colLeaves, colPath);
+      if (!sibs.length) return { v: null, pct: pctf };
+      var fv = rawVal(vsAt, rowPath, sibs[0], mo);
+      if (fv == null) return { v: null, pct: pctf };
+      if (!pctf) return { v: base - fv, pct: false };
+      if (fv === 0) return { v: null, pct: true };
+      return { v: (base - fv) / fv * 100, pct: true };
+    }
+    if (mo.show === "run_total") {
+      var run = siblingsOf(m.colLeaves, colPath);
+      if (!run.length) return { v: base, pct: false };
+      var key = keyOf(colPath), acc = null;
+      for (var i = 0; i < run.length; i++) {
+        var cv = rawVal(vsAt, rowPath, run[i], mo);
+        if (cv != null) acc = (acc == null ? 0 : acc) + cv;
+        if (keyOf(run[i]) === key) break; // stop at (and include) this column
+      }
+      return { v: acc, pct: false };
+    }
+    if (mo.show === "rank_row") {
+      var rs = siblingsOf(m.colLeaves, colPath);
+      if (!rs.length) return { v: null, pct: false };
+      var rvals = rs.map(function (c) { return rawVal(vsAt, rowPath, c, mo); });
+      return { v: rankOf(base, rvals), rank: true };
+    }
+    if (mo.show === "rank_col") {
+      var cs = siblingsOf(m.rowLeaves, rowPath);
+      if (!cs.length) return { v: null, pct: false };
+      var cvals = cs.map(function (r) { return rawVal(vsAt, r, colPath, mo); });
+      return { v: rankOf(base, cvals), rank: true };
+    }
+    return { v: base, pct: false };
+  }
+  function dataCellD(d, agg, extraCls) {
+    var td = el("td", "pv-num-cell" + (extraCls ? " " + extraCls : ""));
+    if (d.v == null) { td.className += " pv-empty-cell"; td.textContent = "—"; }
+    else if (d.rank) { td.textContent = "#" + d.v; }
+    else if (d.pct) { td.textContent = Number(d.v).toLocaleString(undefined, { minimumFractionDigits: 1, maximumFractionDigits: 1 }) + "%"; }
+    else td.textContent = fmtNum(d.v, agg);
+    return td;
+  }
+
   // ---- matrix rendering --------------------------------------------------
   // Shared shape used by both the table renderer and the CSV exporter.
   function matrix(data) {
     var rowFields = data.rowFields || [];
     var colFields = data.colFields || [];
-    var measures = (data.measures && data.measures.length) ? data.measures : [{ agg: "count", field: "id", label: "Count" }];
+    var measures = clientMeasures(data);
     var M = measures.length;
     var cells = {};
     data.cells.forEach(function (c) { cells[cellKey(c.r, c.c)] = c.vs; });
+    // `colLeaves` stays chronologically ascending — it is the CANONICAL order the
+    // positional show-as modes (vs previous/first, running total, rank) compute
+    // against, so those stay correct even when the display is reversed.
     var colLeaves = collectFullPaths(data.cells, "c", colFields.length);
-    var rowTree = buildTree(collectFullPaths(data.cells, "r", rowFields.length));
-    var leafColPaths = colFields.length === 0 ? [[]] : colLeaves;
+    var rowLeaves = collectFullPaths(data.cells, "r", rowFields.length);
+    var rowTree = buildTree(rowLeaves);
+    var displayColLeaves = state.colDesc ? colLeaves.slice().reverse() : colLeaves;
+    var leafColPaths = colFields.length === 0 ? [[]] : displayColLeaves;
+    var renderCols = renderColsOf(measures);   // value + paired-variation sub-columns
+    var RC = renderCols.length;
     var outputCols = [];
-    leafColPaths.forEach(function (cp) { measures.forEach(function (m, mi) { outputCols.push({ cp: cp, mi: mi }); }); });
+    leafColPaths.forEach(function (cp) {
+      renderCols.forEach(function (rc) {
+        outputCols.push({ cp: cp, mi: rc.mi, mo: rc.mo, agg: rc.agg, variation: rc.variation, label: rc.label });
+      });
+    });
     function vsAt(r, c) { return cells[cellKey(r, c)] || null; }
     return {
       rowFields: rowFields, colFields: colFields, measures: measures, M: M,
-      colLeaves: colLeaves, rowTree: rowTree, outputCols: outputCols,
-      showGrandCol: colFields.length > 0, showMeasureLevel: M > 1, vsAt: vsAt,
+      renderCols: renderCols, RC: RC,
+      colLeaves: colLeaves, displayColLeaves: displayColLeaves, rowLeaves: rowLeaves,
+      rowTree: rowTree, outputCols: outputCols,
+      showGrandCol: colFields.length > 0, showMeasureLevel: RC > 1, vsAt: vsAt,
     };
   }
 
   function renderTable(data) {
     lastData = data;
     var m = matrix(data);
-    var rowFields = m.rowFields, colFields = m.colFields, measures = m.measures, M = m.M;
-    var outputCols = m.outputCols, colLeaves = m.colLeaves;
+    var rowFields = m.rowFields, colFields = m.colFields, measures = m.measures;
+    var RC = m.RC, renderCols = m.renderCols;
+    var outputCols = m.outputCols, colLeaves = m.displayColLeaves;
     var showGrandCol = m.showGrandCol, showMeasureLevel = m.showMeasureLevel;
     var vsAt = m.vsAt;
+    // Sub-column header label: base part uses the measure name; a variation part
+    // used on its own line (no columns) is qualified with the measure name.
+    function subLabel(rc, qualify) {
+      return rc.variation && qualify ? measures[rc.mi].label + " · " + rc.label : rc.label;
+    }
 
     var table = el("table", "pv-table");
 
@@ -431,7 +882,10 @@
     if (baseLevels === 0) {
       var tr0 = el("tr");
       tr0.appendChild(corner);
-      measures.forEach(function (mm) { tr0.appendChild(el("th", null, mm.label)); });
+      renderCols.forEach(function (rc) {
+        var th = el("th", rc.variation ? "pv-variation" : null, subLabel(rc, true));
+        tr0.appendChild(th);
+      });
       thead.appendChild(tr0);
     } else {
       var levels = buildColHeaderLevels(colLeaves, baseLevels);
@@ -440,12 +894,12 @@
         if (li === 0) tr.appendChild(corner);
         cellsAtLevel.forEach(function (h) {
           var th = el("th", null, h.label);
-          th.colSpan = h.span * M;
+          th.colSpan = h.span * RC;
           tr.appendChild(th);
         });
         if (li === 0) {
           var gt = el("th", null, "Grand Total");
-          if (showMeasureLevel) { gt.colSpan = M; gt.rowSpan = baseLevels; }
+          if (showMeasureLevel) { gt.colSpan = RC; gt.rowSpan = baseLevels; }
           else { gt.rowSpan = headerRows; }
           tr.appendChild(gt);
         }
@@ -453,8 +907,10 @@
       });
       if (showMeasureLevel) {
         var trm = el("tr");
-        colLeaves.forEach(function () { measures.forEach(function (mm) { trm.appendChild(el("th", "pv-mhdr", mm.label)); }); });
-        measures.forEach(function (mm) { trm.appendChild(el("th", "pv-mhdr", mm.label)); }); // under grand total
+        colLeaves.forEach(function () {
+          renderCols.forEach(function (rc) { trm.appendChild(el("th", "pv-mhdr" + (rc.variation ? " pv-variation" : ""), subLabel(rc, false))); });
+        });
+        renderCols.forEach(function (rc) { trm.appendChild(el("th", "pv-mhdr" + (rc.variation ? " pv-variation" : ""), subLabel(rc, false))); }); // under grand total
         thead.appendChild(trm);
       }
     }
@@ -464,8 +920,8 @@
     var tbody = el("tbody");
     function rowCells(path) {
       var frag = [];
-      outputCols.forEach(function (oc) { var vs = vsAt(path, oc.cp); frag.push(dataCell(vs ? vs[oc.mi] : null, measures[oc.mi].agg)); });
-      if (showGrandCol) measures.forEach(function (mm, mi) { var vs = vsAt(path, []); frag.push(dataCell(vs ? vs[mi] : null, mm.agg, "pv-subtotal")); });
+      outputCols.forEach(function (oc) { frag.push(dataCellD(dispVal(m, path, oc.cp, oc.mo), oc.agg, oc.variation ? "pv-variation" : "")); });
+      if (showGrandCol) renderCols.forEach(function (rc) { frag.push(dataCellD(dispVal(m, path, [], rc.mo), rc.agg, "pv-subtotal" + (rc.variation ? " pv-variation" : ""))); });
       return frag;
     }
 
@@ -520,8 +976,8 @@
       var tfoot = el("tfoot");
       var trg = el("tr", "pv-grand");
       trg.appendChild(el("td", "pv-rowhdr pv-grand", "Grand Total"));
-      outputCols.forEach(function (oc) { var vs = vsAt([], oc.cp); trg.appendChild(dataCell(vs ? vs[oc.mi] : null, measures[oc.mi].agg)); });
-      if (showGrandCol) measures.forEach(function (mm, mi) { var vs = vsAt([], []); trg.appendChild(dataCell(vs ? vs[mi] : null, mm.agg)); });
+      outputCols.forEach(function (oc) { trg.appendChild(dataCellD(dispVal(m, [], oc.cp, oc.mo), oc.agg, oc.variation ? "pv-variation" : "")); });
+      if (showGrandCol) renderCols.forEach(function (rc) { trg.appendChild(dataCellD(dispVal(m, [], [], rc.mo), rc.agg, rc.variation ? "pv-variation" : "")); });
       tfoot.appendChild(trg);
       table.appendChild(tfoot);
     }
@@ -599,8 +1055,12 @@
     var data = lastData;
     var m = matrix(data);
     var rowFields = m.rowFields, colFields = m.colFields, measures = m.measures;
-    var outputCols = m.outputCols, showGrandCol = m.showGrandCol, vsAt = m.vsAt;
+    var outputCols = m.outputCols, renderCols = m.renderCols, showGrandCol = m.showGrandCol, vsAt = m.vsAt;
     var lines = [];
+    // Column header text for a rendered sub-column: measure name, plus the
+    // comparison tag for a variation part.
+    function ocLabel(oc) { return oc.variation ? measures[oc.mi].label + " " + oc.label : oc.label; }
+    function rcLabel(rc) { return rc.variation ? measures[rc.mi].label + " " + rc.label : rc.label; }
 
     // header row
     var head = [];
@@ -609,10 +1069,10 @@
     outputCols.forEach(function (oc) {
       var parts = [];
       if (oc.cp.length) parts.push(oc.cp.map(displayVal).join(" / "));
-      if (measures.length > 1 || colFields.length === 0) parts.push(measures[oc.mi].label);
-      head.push(parts.join(" / ") || measures[oc.mi].label);
+      if (renderCols.length > 1 || colFields.length === 0) parts.push(ocLabel(oc));
+      head.push(parts.join(" / ") || ocLabel(oc));
     });
-    if (showGrandCol) measures.forEach(function (mm) { head.push("Grand Total" + (measures.length > 1 ? " / " + mm.label : "")); });
+    if (showGrandCol) renderCols.forEach(function (rc) { head.push("Grand Total" + (renderCols.length > 1 ? " / " + rcLabel(rc) : "")); });
     lines.push(head);
 
     function emit(path) {
@@ -620,8 +1080,8 @@
       if (rowFields.length) {
         for (var i = 0; i < rowFields.length; i++) line.push(i < path.length ? displayVal(path[i]) : "");
       } else line.push("Total");
-      outputCols.forEach(function (oc) { var vs = vsAt(path, oc.cp); line.push(numStr(vs ? vs[oc.mi] : null)); });
-      if (showGrandCol) measures.forEach(function (mm, mi) { var vs = vsAt(path, []); line.push(numStr(vs ? vs[mi] : null)); });
+      outputCols.forEach(function (oc) { line.push(numStr(dispVal(m, path, oc.cp, oc.mo).v)); });
+      if (showGrandCol) renderCols.forEach(function (rc) { line.push(numStr(dispVal(m, path, [], rc.mo).v)); });
       lines.push(line);
     }
     function walk(node, path, depth) {
@@ -638,8 +1098,8 @@
     if (rowFields.length > 0) {
       var g = ["Grand Total"];
       for (var j = 1; j < rowFields.length; j++) g.push("");
-      outputCols.forEach(function (oc) { var vs = vsAt([], oc.cp); g.push(numStr(vs ? vs[oc.mi] : null)); });
-      if (showGrandCol) measures.forEach(function (mm, mi) { var vs = vsAt([], []); g.push(numStr(vs ? vs[mi] : null)); });
+      outputCols.forEach(function (oc) { g.push(numStr(dispVal(m, [], oc.cp, oc.mo).v)); });
+      if (showGrandCol) renderCols.forEach(function (rc) { g.push(numStr(dispVal(m, [], [], rc.mo).v)); });
       lines.push(g);
     }
 
