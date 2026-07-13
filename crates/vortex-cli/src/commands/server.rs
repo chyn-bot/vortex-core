@@ -2332,6 +2332,12 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/settings/api-tokens", get(api_tokens_list))
         .route("/settings/api-tokens", post(api_token_create))
         .route("/settings/api-tokens/{id}/revoke", post(api_token_revoke))
+        // Portal user provisioning (admin-gated in-handler)
+        .route("/settings/portal-users", get(portal_users_list))
+        .route("/settings/portal-users/invite", post(portal_user_invite))
+        .route("/settings/portal-users/contact/{id}", get(portal_user_for_contact))
+        .route("/settings/portal-users/{id}/revoke", post(portal_user_revoke))
+        .route("/settings/portal-users/{id}/resend", post(portal_user_resend))
         // Webhooks (outbound event subscriptions, admin)
         .route("/settings/webhooks", get(webhooks_list))
         .route("/settings/webhooks", post(webhook_create))
@@ -2494,6 +2500,8 @@ fn build_router(state: Arc<AppState>) -> Router {
     });
     let portal_public = Router::new()
         .route("/portal/login", get(portal_login_page).post(portal_login_submit))
+        // Invite acceptance (set-password) is pre-auth, like login.
+        .route("/portal/invite/{token}", get(portal_invite_page).post(portal_invite_submit))
         .layer(middleware::from_fn(vortex_server::middleware::rate_limit::rate_limit_middleware))
         .layer(Extension(portal_login_limiter));
 
@@ -3589,6 +3597,576 @@ async fn portal_statement(Db(db): Db, Extension(user): Extension<AuthUser>) -> R
         trs = trs,
     );
     Html(portal_shell("Statement", &name, "statement", &body)).into_response()
+}
+
+// ── Portal provisioning (Phase 3) — staff-facing invite/revoke + accept ──────
+//
+// Staff invite a partner from `/settings/portal-users`: the portal `users` row
+// is created inactive with a placeholder password, a single-use invite token is
+// issued (only its hash stored), and the invitee sets a password via the emailed
+// `/portal/invite/{token}` link, which activates the account.
+
+/// An unusable password placeholder — never a valid PHC string, so
+/// `verify_password` can never match it even if `active` were somehow true.
+const PORTAL_INVITE_PLACEHOLDER: &str = "!invite-pending";
+
+fn absolute_url(headers: &HeaderMap, path: &str) -> String {
+    let host = headers.get(header::HOST).and_then(|h| h.to_str().ok()).unwrap_or("localhost:3000");
+    let proto = headers
+        .get("x-forwarded-proto")
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| {
+            if host.starts_with("localhost") || host.starts_with("127.") { "http".into() } else { "https".into() }
+        });
+    format!("{proto}://{host}{path}")
+}
+
+fn portal_admin_shell(user: &AuthUser, title: &str, inner: &str) -> Html<String> {
+    use vortex_framework::ui::html_escape;
+    Html(format!(
+        r##"<!DOCTYPE html><html lang="en" data-theme="dark"><head>
+<script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>{title} - Settings</title>
+<link href="/static/vendor/daisyui.min.css" rel="stylesheet">
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script></head>
+<body class="min-h-screen bg-base-200">
+<div class="navbar bg-base-100 shadow-lg"><div class="flex-1"><a href="/settings" class="btn btn-ghost text-xl">remicle</a></div><div class="flex-none"><span class="text-sm">@{user}</span></div></div>
+<div class="container mx-auto p-6 max-w-5xl">{inner}</div></body></html>"##,
+        title = html_escape(title),
+        user = html_escape(&user.username),
+        inner = inner,
+    ))
+}
+
+async fn portal_users_list(
+    State(_state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+) -> Response {
+    use vortex_framework::ui::html_escape;
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Portal Users"))).into_response();
+    }
+
+    // Existing portal users + their partner + invite status.
+    let users = sqlx::query(
+        "SELECT u.id, u.username, u.email, u.active, u.last_login_at, c.name AS contact_name, \
+                EXISTS(SELECT 1 FROM portal_invite i WHERE i.user_id = u.id AND i.consumed_at IS NULL AND i.expires_at > NOW()) AS pending \
+         FROM users u LEFT JOIN contacts c ON c.id = u.contact_id \
+         WHERE u.is_portal = true ORDER BY u.username",
+    )
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default();
+
+    let mut rows = String::new();
+    for u in &users {
+        let id: uuid::Uuid = u.get("id");
+        let uname: String = u.get("username");
+        let email: Option<String> = u.try_get("email").ok().flatten();
+        let active: bool = u.get("active");
+        let pending: bool = u.try_get("pending").unwrap_or(false);
+        let contact: Option<String> = u.try_get("contact_name").ok().flatten();
+        let last: Option<chrono::DateTime<chrono::Utc>> = u.try_get("last_login_at").ok().flatten();
+        let status = if active {
+            r#"<span class="badge badge-success badge-sm">Active</span>"#
+        } else if pending {
+            r#"<span class="badge badge-info badge-sm">Invited</span>"#
+        } else {
+            r#"<span class="badge badge-ghost badge-sm">Disabled</span>"#
+        };
+        let actions = if active {
+            format!(r#"<form method="post" action="/settings/portal-users/{id}/revoke" class="inline" onsubmit="return confirm('Disable this portal login? They will be signed out immediately.')"><button class="btn btn-xs btn-error btn-outline">Disable</button></form>"#, id = id)
+        } else {
+            format!(r#"<form method="post" action="/settings/portal-users/{id}/resend" class="inline"><button class="btn btn-xs btn-outline">Resend invite</button></form>"#, id = id)
+        };
+        rows.push_str(&format!(
+            r##"<tr><td>{contact}</td><td class="text-xs">@{uname}</td><td class="text-xs">{email}</td><td class="text-xs">{last}</td><td>{status}</td><td class="text-right">{actions}</td></tr>"##,
+            contact = html_escape(contact.as_deref().unwrap_or("—")),
+            uname = html_escape(&uname),
+            email = html_escape(email.as_deref().unwrap_or("—")),
+            last = last.map(|d| d.format("%Y-%m-%d %H:%M").to_string()).unwrap_or_else(|| "—".into()),
+            status = status,
+            actions = actions,
+        ));
+    }
+    if users.is_empty() {
+        rows.push_str(r#"<tr><td colspan="6" class="text-center opacity-50 py-8">No portal users yet — invite a customer below.</td></tr>"#);
+    }
+
+    // Eligible contacts: customers without a portal login yet.
+    let contacts = sqlx::query(
+        "SELECT c.id, c.name FROM contacts c \
+         WHERE c.contact_type IN ('customer','both') AND c.active = true \
+           AND NOT EXISTS (SELECT 1 FROM users u WHERE u.contact_id = c.id AND u.is_portal = true) \
+         ORDER BY c.name LIMIT 1000",
+    )
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default();
+    let mut options = String::new();
+    for c in &contacts {
+        let id: uuid::Uuid = c.get("id");
+        let name: String = c.get("name");
+        options.push_str(&format!(r#"<option value="{id}">{name}</option>"#, id = id, name = html_escape(&name)));
+    }
+    let invite_card = if contacts.is_empty() {
+        r#"<div class="alert">Every active customer already has a portal login.</div>"#.to_string()
+    } else {
+        format!(
+            r##"<div class="card bg-base-100 shadow mb-6"><div class="card-body">
+<h2 class="card-title text-lg">Invite a customer</h2>
+<p class="text-base-content/60 text-sm">Creates a self-service login bound to the selected customer and emails them a link to set a password. They only ever see their own documents.</p>
+<form method="post" action="/settings/portal-users/invite" class="grid md:grid-cols-3 gap-3 items-end">
+<label class="form-control"><span class="label-text">Customer</span><select name="contact_id" required class="select select-bordered select-sm">{options}</select></label>
+<label class="form-control"><span class="label-text">Email</span><input name="email" type="email" required placeholder="person@company.com" class="input input-bordered input-sm"/></label>
+<label class="form-control"><span class="label-text">Username (optional)</span><input name="username" placeholder="defaults to email" class="input input-bordered input-sm"/></label>
+<div class="md:col-span-3"><button class="btn btn-primary btn-sm">Send invitation</button></div>
+</form></div></div>"##,
+            options = options,
+        )
+    };
+
+    let inner = format!(
+        r##"<div class="mb-4"><h1 class="text-2xl font-bold">Portal Users</h1>
+<p class="text-base-content/60">External customer self-service logins. Each is bound to one contact and confined to <code>/portal</code>.</p></div>
+{invite_card}
+<div class="card bg-base-100 shadow"><div class="card-body">
+<table class="table table-sm"><thead><tr><th>Customer</th><th>Username</th><th>Email</th><th>Last login</th><th>Status</th><th></th></tr></thead>
+<tbody>{rows}</tbody></table></div></div>"##,
+        invite_card = invite_card,
+        rows = rows,
+    );
+    portal_admin_shell(&user, "Portal Users", &inner).into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct PortalInviteForm {
+    contact_id: uuid::Uuid,
+    email: String,
+    username: Option<String>,
+}
+
+/// Create the invite token row + email it. Shared by invite and resend. Returns
+/// the absolute accept link so the caller can also show it to the admin.
+async fn issue_portal_invite(
+    db: &PgPool,
+    headers: &HeaderMap,
+    user_id: uuid::Uuid,
+    email: &str,
+    inviter: uuid::Uuid,
+) -> Result<String, String> {
+    // Invalidate any outstanding invites for this user first.
+    let _ = sqlx::query("UPDATE portal_invite SET consumed_at = NOW() WHERE user_id = $1 AND consumed_at IS NULL")
+        .bind(user_id).execute(db).await;
+    let token = generate_session_token();
+    let token_hash = hash_token(&token);
+    sqlx::query(
+        "INSERT INTO portal_invite (user_id, token_hash, email, expires_at, created_by) \
+         VALUES ($1, $2, $3, NOW() + INTERVAL '7 days', $4)",
+    )
+    .bind(user_id)
+    .bind(&token_hash)
+    .bind(email)
+    .bind(inviter)
+    .execute(db)
+    .await
+    .map_err(|e| format!("could not create invite: {e}"))?;
+
+    let link = absolute_url(headers, &format!("/portal/invite/{token}"));
+    let msg = vortex_framework::mail::EmailMessage::text(
+        email,
+        "You're invited to the customer portal",
+        format!(
+            "Hello,\n\nYou've been given access to the customer self-service portal, where you can view your invoices, orders and account statement.\n\nSet your password to get started:\n{link}\n\nThis link expires in 7 days.\n"
+        ),
+    )
+    .with_html(format!(
+        r#"<p>Hello,</p><p>You've been given access to the customer self-service portal, where you can view your invoices, orders and account statement.</p><p><a href="{link}" style="display:inline-block;padding:.6rem 1rem;background:#8BC53F;color:#000;border-radius:.4rem;text-decoration:none">Set your password</a></p><p style="color:#666;font-size:.85rem">Or paste this link into your browser: {link}<br>This link expires in 7 days.</p>"#
+    ));
+    // Best-effort: a missing SMTP config must not block provisioning — the admin
+    // can copy the link shown on the result page.
+    let _ = vortex_framework::mail::send_default(db, &msg, "portal_invite").await;
+    Ok(link)
+}
+
+async fn portal_user_invite(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    headers: HeaderMap,
+    Form(form): Form<PortalInviteForm>,
+) -> Response {
+    use vortex_framework::ui::html_escape;
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Portal Users"))).into_response();
+    }
+    let email = form.email.trim().to_string();
+    let username = form.username.as_deref().map(str::trim).filter(|s| !s.is_empty()).unwrap_or(&email).to_string();
+    let back = r#"<a href="/settings/portal-users" class="btn btn-sm mt-4">Back</a>"#;
+    let err = |e: String| portal_admin_shell(&user, "Portal Users", &format!(r#"<div class="alert alert-error">{}</div>{}"#, html_escape(&e), back)).into_response();
+
+    if email.is_empty() || !email.contains('@') {
+        return err("A valid email is required.".into());
+    }
+    // Contact must exist and be a customer.
+    let contact = sqlx::query("SELECT name, company_id, contact_type FROM contacts WHERE id = $1 AND active = true")
+        .bind(form.contact_id).fetch_optional(&db).await.ok().flatten();
+    let Some(contact) = contact else { return err("That customer no longer exists.".into()) };
+    let ctype: String = contact.get("contact_type");
+    if !matches!(ctype.as_str(), "customer" | "both") {
+        return err("Portal logins can only be created for customers.".into());
+    }
+    let contact_name: String = contact.get("name");
+    let company_id: Option<uuid::Uuid> = contact.try_get("company_id").ok().flatten();
+
+    // One portal login per contact.
+    let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE contact_id = $1 AND is_portal = true")
+        .bind(form.contact_id).fetch_one(&db).await.unwrap_or(0);
+    if exists > 0 {
+        return err(format!("{contact_name} already has a portal login."));
+    }
+    // Username must be free.
+    let taken: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE username = $1")
+        .bind(&username).fetch_one(&db).await.unwrap_or(0);
+    if taken > 0 {
+        return err(format!("The username {username:?} is taken — pick another."));
+    }
+
+    let placeholder = hash_password(PORTAL_INVITE_PLACEHOLDER);
+    let new_id: Result<uuid::Uuid, _> = sqlx::query_scalar(
+        "INSERT INTO users (company_id, username, email, password_hash, full_name, active, is_portal, contact_id, password_changed_at) \
+         VALUES ($1, $2, $3, $4, $5, false, true, $6, NOW()) RETURNING id",
+    )
+    .bind(company_id)
+    .bind(&username)
+    .bind(&email)
+    .bind(&placeholder)
+    .bind(&contact_name)
+    .bind(form.contact_id)
+    .fetch_one(&db)
+    .await;
+    let new_id = match new_id {
+        Ok(id) => id,
+        Err(e) => return err(format!("Could not create the login: {e}")),
+    };
+    let _ = sqlx::query("INSERT INTO user_roles (user_id, role_id) VALUES ($1, '00000000-0000-0000-0000-000000000005') ON CONFLICT DO NOTHING")
+        .bind(new_id).execute(&db).await;
+
+    let link = match issue_portal_invite(&db, &headers, new_id, &email, user.id).await {
+        Ok(l) => l,
+        Err(e) => return err(e),
+    };
+
+    // Audit the provisioning (state-changing).
+    api_audit(
+        &state, &db_ctx.db_name, &user,
+        AuditAction::Custom("portal_user_invited".into()), AuditSeverity::Warning,
+        "portal_user", Some(&new_id.to_string()),
+        serde_json::json!({"contact_id": form.contact_id, "email": email, "username": username}),
+    ).await;
+
+    let inner = format!(
+        r##"<div class="mb-4"><h1 class="text-2xl font-bold">Invitation sent</h1></div>
+<div class="alert alert-success mb-4"><span>Portal login created for <strong>{contact}</strong> and an invite emailed to <strong>{email}</strong>.</span></div>
+<div class="card bg-base-100 shadow"><div class="card-body">
+<p class="text-sm text-base-content/60">If email isn't configured, share this one-time link (expires in 7 days):</p>
+<code class="text-xs break-all bg-base-200 p-2 rounded">{link}</code>
+<a href="/settings/portal-users" class="btn btn-primary btn-sm mt-4 w-fit">Done</a>
+</div></div>"##,
+        contact = html_escape(&contact_name),
+        email = html_escape(&email),
+        link = html_escape(&link),
+    );
+    portal_admin_shell(&user, "Portal Users", &inner).into_response()
+}
+
+async fn portal_user_revoke(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<uuid::Uuid>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Portal Users"))).into_response();
+    }
+    // Only ever touch portal accounts.
+    let affected = sqlx::query("UPDATE users SET active = false WHERE id = $1 AND is_portal = true")
+        .bind(id).execute(&db).await.map(|r| r.rows_affected()).unwrap_or(0);
+    if affected > 0 {
+        let _ = sqlx::query("UPDATE sessions SET revoked = true, revoked_at = NOW(), revoked_reason = 'portal_access_revoked' WHERE user_id = $1 AND revoked = false")
+            .bind(id).execute(&db).await;
+        let _ = sqlx::query("UPDATE portal_invite SET consumed_at = NOW() WHERE user_id = $1 AND consumed_at IS NULL")
+            .bind(id).execute(&db).await;
+        api_audit(
+            &state, &db_ctx.db_name, &user,
+            AuditAction::Custom("portal_user_revoked".into()), AuditSeverity::Warning,
+            "portal_user", Some(&id.to_string()), serde_json::json!({}),
+        ).await;
+    }
+    Redirect::to("/settings/portal-users").into_response()
+}
+
+async fn portal_user_resend(
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    headers: HeaderMap,
+    Path(id): Path<uuid::Uuid>,
+) -> Response {
+    use vortex_framework::ui::html_escape;
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Portal Users"))).into_response();
+    }
+    let row = sqlx::query("SELECT email FROM users WHERE id = $1 AND is_portal = true AND active = false")
+        .bind(id).fetch_optional(&db).await.ok().flatten();
+    let Some(row) = row else { return Redirect::to("/settings/portal-users").into_response() };
+    let email: Option<String> = row.try_get("email").ok().flatten();
+    let Some(email) = email else { return Redirect::to("/settings/portal-users").into_response() };
+    let link = match issue_portal_invite(&db, &headers, id, &email, user.id).await {
+        Ok(l) => l,
+        Err(e) => return portal_admin_shell(&user, "Portal Users", &format!(r#"<div class="alert alert-error">{}</div><a href="/settings/portal-users" class="btn btn-sm mt-4">Back</a>"#, html_escape(&e))).into_response(),
+    };
+    let inner = format!(
+        r##"<div class="mb-4"><h1 class="text-2xl font-bold">Invitation re-sent</h1></div>
+<div class="alert alert-success mb-4"><span>A fresh invite was emailed to <strong>{email}</strong>.</span></div>
+<div class="card bg-base-100 shadow"><div class="card-body">
+<p class="text-sm text-base-content/60">One-time link (expires in 7 days):</p>
+<code class="text-xs break-all bg-base-200 p-2 rounded">{link}</code>
+<a href="/settings/portal-users" class="btn btn-primary btn-sm mt-4 w-fit">Done</a></div></div>"##,
+        email = html_escape(&email),
+        link = html_escape(&link),
+    );
+    portal_admin_shell(&user, "Portal Users", &inner).into_response()
+}
+
+/// GET /settings/portal-users/contact/{id} — the portal panel for one contact,
+/// reachable from the "Invite to portal" button on the contact record. Shows an
+/// invite form for a customer with no login yet, or the current login's status
+/// with manage actions.
+async fn portal_user_for_contact(
+    State(_state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Path(id): Path<uuid::Uuid>,
+) -> Response {
+    use vortex_framework::ui::html_escape;
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Portal Users"))).into_response();
+    }
+    let back = r#"<a href="/settings/portal-users" class="btn btn-sm btn-ghost mt-4">All portal users</a>"#;
+    let contact = sqlx::query("SELECT name, contact_type FROM contacts WHERE id = $1")
+        .bind(id).fetch_optional(&db).await.ok().flatten();
+    let Some(contact) = contact else {
+        return portal_admin_shell(&user, "Portal Users", &format!(r#"<div class="alert alert-error">Contact not found.</div>{back}"#)).into_response();
+    };
+    let cname: String = contact.get("name");
+    let ctype: String = contact.get("contact_type");
+    if !matches!(ctype.as_str(), "customer" | "both") {
+        return portal_admin_shell(&user, "Portal Users", &format!(
+            r#"<div class="mb-4"><h1 class="text-2xl font-bold">Portal access</h1></div><div class="alert">Portal logins are only available for customers. <strong>{}</strong> is not a customer.</div>{back}"#,
+            html_escape(&cname),
+        )).into_response();
+    }
+
+    let existing = sqlx::query(
+        "SELECT u.id, u.username, u.email, u.active, u.last_login_at, \
+                EXISTS(SELECT 1 FROM portal_invite i WHERE i.user_id = u.id AND i.consumed_at IS NULL AND i.expires_at > NOW()) AS pending \
+         FROM users u WHERE u.contact_id = $1 AND u.is_portal = true",
+    )
+    .bind(id)
+    .fetch_optional(&db)
+    .await
+    .ok()
+    .flatten();
+
+    let inner = if let Some(u) = existing {
+        let uid: uuid::Uuid = u.get("id");
+        let uname: String = u.get("username");
+        let email: Option<String> = u.try_get("email").ok().flatten();
+        let active: bool = u.get("active");
+        let pending: bool = u.try_get("pending").unwrap_or(false);
+        let last: Option<chrono::DateTime<chrono::Utc>> = u.try_get("last_login_at").ok().flatten();
+        let (status, action) = if active {
+            (
+                r#"<span class="badge badge-success">Active</span>"#.to_string(),
+                format!(r#"<form method="post" action="/settings/portal-users/{uid}/revoke" onsubmit="return confirm('Disable this portal login? They will be signed out immediately.')"><button class="btn btn-sm btn-error btn-outline">Disable access</button></form>"#),
+            )
+        } else if pending {
+            (
+                r#"<span class="badge badge-info">Invited (awaiting sign-up)</span>"#.to_string(),
+                format!(r#"<form method="post" action="/settings/portal-users/{uid}/resend"><button class="btn btn-sm btn-outline">Resend invite</button></form>"#),
+            )
+        } else {
+            (
+                r#"<span class="badge badge-ghost">Disabled</span>"#.to_string(),
+                format!(r#"<form method="post" action="/settings/portal-users/{uid}/resend"><button class="btn btn-sm btn-outline">Re-invite</button></form>"#),
+            )
+        };
+        format!(
+            r##"<div class="mb-4"><h1 class="text-2xl font-bold">Portal access · {cname}</h1></div>
+<div class="card bg-base-100 shadow"><div class="card-body">
+<div class="flex items-center justify-between flex-wrap gap-3">
+  <div>
+    <div>Username: <code>@{uname}</code></div>
+    <div class="text-sm text-base-content/60">Email: {email} · Last login: {last}</div>
+    <div class="mt-2">{status}</div>
+  </div>
+  <div>{action}</div>
+</div></div></div>{back}"##,
+            cname = html_escape(&cname),
+            uname = html_escape(&uname),
+            email = html_escape(email.as_deref().unwrap_or("—")),
+            last = last.map(|d| d.format("%Y-%m-%d %H:%M").to_string()).unwrap_or_else(|| "never".into()),
+            status = status,
+            action = action,
+            back = back,
+        )
+    } else {
+        // No login yet → pre-filled invite form locked to this contact.
+        format!(
+            r##"<div class="mb-4"><h1 class="text-2xl font-bold">Invite {cname} to the portal</h1>
+<p class="text-base-content/60">Creates a self-service login bound to this customer and emails them a link to set a password. They only ever see their own documents.</p></div>
+<div class="card bg-base-100 shadow"><div class="card-body">
+<form method="post" action="/settings/portal-users/invite" class="grid md:grid-cols-2 gap-3 items-end">
+<input type="hidden" name="contact_id" value="{id}"/>
+<label class="form-control"><span class="label-text">Email</span><input name="email" type="email" required placeholder="person@company.com" class="input input-bordered input-sm"/></label>
+<label class="form-control"><span class="label-text">Username (optional)</span><input name="username" placeholder="defaults to email" class="input input-bordered input-sm"/></label>
+<div class="md:col-span-2"><button class="btn btn-primary btn-sm">Send invitation</button></div>
+</form></div></div>{back}"##,
+            cname = html_escape(&cname),
+            id = id,
+            back = back,
+        )
+    };
+    portal_admin_shell(&user, "Portal Users", &inner).into_response()
+}
+
+/// Look up a valid (unconsumed, unexpired) invite by raw token → its user id.
+async fn portal_invite_lookup(db: &PgPool, token: &str) -> Option<uuid::Uuid> {
+    let token_hash = hash_token(token);
+    sqlx::query_scalar(
+        "SELECT user_id FROM portal_invite \
+         WHERE token_hash = $1 AND consumed_at IS NULL AND expires_at > NOW()",
+    )
+    .bind(&token_hash)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
+}
+
+fn portal_invite_page_html(token: &str, err: Option<&str>) -> String {
+    use vortex_framework::ui::html_escape;
+    let err_html = err
+        .map(|e| format!(r#"<div class="alert alert-error text-sm mb-3">{}</div>"#, html_escape(e)))
+        .unwrap_or_default();
+    format!(
+        r#"<!DOCTYPE html><html data-theme="dark"><head>
+<title>Set your password</title><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
+<script src="/static/vendor/tailwind.js"></script>
+<style>body{{background:#0b0f0a;color:#e5e7eb}}</style></head>
+<body class="min-h-screen flex items-center justify-center p-4">
+<div class="w-full max-w-sm" style="background:#12160f;border:1px solid #263019;border-radius:.75rem;padding:1.5rem">
+  <div class="text-center mb-5"><div class="text-2xl font-bold"><span style="color:#8BC53F">re</span><span style="color:#9ca3af">micle</span></div>
+  <div class="text-sm mt-1" style="color:#9ca3af">Set your portal password</div></div>
+  {err_html}
+  <form method="post" action="/portal/invite/{token}" class="flex flex-col gap-3">
+    <label class="text-sm">New password
+      <input name="password" type="password" required minlength="8" autocomplete="new-password" class="input input-bordered w-full mt-1" style="background:#0b0f0a"/>
+    </label>
+    <label class="text-sm">Confirm password
+      <input name="confirm" type="password" required minlength="8" autocomplete="new-password" class="input input-bordered w-full mt-1" style="background:#0b0f0a"/>
+    </label>
+    <button class="btn mt-2" style="background:#8BC53F;border-color:#8BC53F;color:#000">Set password &amp; sign in</button>
+  </form>
+</div></body></html>"#,
+        err_html = err_html,
+        token = html_escape(token),
+    )
+}
+
+/// Resolve the tenant pool for a public (pre-auth) portal request from the Host
+/// header — the invite/login routes have no `DatabaseContext` injected.
+async fn portal_public_pool(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+) -> Result<sqlx::PgPool, Response> {
+    let db_name = resolve_database(state, headers, None).await;
+    state
+        .pool_manager
+        .get_pool(&db_name)
+        .await
+        .map(|p| p.pool().clone())
+        .map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, Html("Service unavailable")).into_response())
+}
+
+async fn portal_invite_page(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(token): Path<String>,
+) -> Response {
+    let db = match portal_public_pool(&state, &headers).await {
+        Ok(d) => d,
+        Err(r) => return r,
+    };
+    if portal_invite_lookup(&db, &token).await.is_none() {
+        let body = r#"<!DOCTYPE html><html data-theme="dark"><head><title>Invite</title><link href="/static/vendor/daisyui.min.css" rel="stylesheet"/><script src="/static/vendor/tailwind.js"></script><style>body{background:#0b0f0a;color:#e5e7eb}</style></head><body class="min-h-screen flex items-center justify-center p-4"><div class="text-center"><h1 class="text-xl font-bold mb-2">Invitation not valid</h1><p class="text-base-content/60">This invite link has expired or already been used. Ask your account manager to resend it.</p></div></body></html>"#;
+        return (StatusCode::NOT_FOUND, Html(body)).into_response();
+    }
+    Html(portal_invite_page_html(&token, None)).into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct PortalInviteAccept {
+    password: String,
+    confirm: String,
+}
+
+async fn portal_invite_submit(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(token): Path<String>,
+    Form(form): Form<PortalInviteAccept>,
+) -> Response {
+    let db = match portal_public_pool(&state, &headers).await {
+        Ok(d) => d,
+        Err(r) => return r,
+    };
+    let Some(user_id) = portal_invite_lookup(&db, &token).await else {
+        return (StatusCode::NOT_FOUND, Html(portal_invite_page_html(&token, Some("This invite is no longer valid.")))).into_response();
+    };
+    if form.password.len() < 8 {
+        return Html(portal_invite_page_html(&token, Some("Password must be at least 8 characters."))).into_response();
+    }
+    if form.password != form.confirm {
+        return Html(portal_invite_page_html(&token, Some("Passwords don't match."))).into_response();
+    }
+    let hash = hash_password(&form.password);
+    // Activate the account and consume the token in one go. Re-check is_portal
+    // defensively so this can only ever activate a portal login.
+    let updated = sqlx::query(
+        "UPDATE users SET password_hash = $1, active = true, must_change_password = false, \
+                password_changed_at = NOW() WHERE id = $2 AND is_portal = true",
+    )
+    .bind(&hash)
+    .bind(user_id)
+    .execute(&db)
+    .await
+    .map(|r| r.rows_affected())
+    .unwrap_or(0);
+    if updated == 0 {
+        return (StatusCode::NOT_FOUND, Html(portal_invite_page_html(&token, Some("This invite is no longer valid.")))).into_response();
+    }
+    let th = hash_token(&token);
+    let _ = sqlx::query("UPDATE portal_invite SET consumed_at = NOW() WHERE token_hash = $1")
+        .bind(&th).execute(&db).await;
+    Redirect::to("/portal/login").into_response()
 }
 
 // NOTE: error_response / forbidden_page moved to vortex_framework::ui
@@ -11331,6 +11909,12 @@ async fn settings_index(
                     <div class="card-body p-4">
                         <h3 class="card-title text-base md:text-lg">Webhooks</h3>
                         <p class="text-muted text-sm">Outbound event subscriptions (signed, retried)</p>
+                    </div>
+                </a>
+                <a href="/settings/portal-users" class="card transition-all">
+                    <div class="card-body p-4">
+                        <h3 class="card-title text-base md:text-lg">Portal Users</h3>
+                        <p class="text-muted text-sm">Invite customers to the self-service portal</p>
                     </div>
                 </a>
             </div>

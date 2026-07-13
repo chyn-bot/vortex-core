@@ -758,6 +758,27 @@ async fn edit_contact(
     let record_panels =
         vortex_plugin_sdk::framework::render_record_panels(&state, &db, "contacts", id).await;
 
+    // "Invite to portal" — the host's external portal lives at /portal; from a
+    // customer record an admin can provision self-service access. Shown only to
+    // admins, only for customers; the label reflects whether a login exists.
+    let portal_button = if user.is_admin() && matches!(contact_type.as_str(), "customer" | "both") {
+        let has_login = vortex_plugin_sdk::sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM users WHERE contact_id = $1 AND is_portal = true",
+        )
+        .bind(id)
+        .fetch_one(&db)
+        .await
+        .map(|n| n > 0)
+        .unwrap_or(false);
+        let label = if has_login { "Portal access" } else { "Invite to portal" };
+        format!(
+            r#"<a href="/settings/portal-users/contact/{id}" class="btn btn-sm btn-outline">{label}</a>"#,
+            id = id, label = label,
+        )
+    } else {
+        String::new()
+    };
+
     // Admin-defined custom fields (Initiative #2), prefilled from stored values.
     // Anchored ones render inline after their field; the rest sit at the bottom.
     let ids = id.to_string();
@@ -770,6 +791,7 @@ async fn edit_contact(
 <h1 class="text-2xl font-bold">{name} <span class="text-base-content/40 font-mono text-sm">{code}</span></h1>
 </div>
 <div class="flex items-center gap-2">
+{portal_button}
 {duplicate_button}
 {archive_button}
 </div>
@@ -973,6 +995,7 @@ async function loadStates(countryId) {{
         form_disabled = form_disabled,
         duplicate_button = duplicate_button(&format!("/contacts/{id}/duplicate")),
         archive_button = archive_button,
+        portal_button = portal_button,
     );
 
     Html(page_shell(&sidebar, &format!("Edit {}", name), &content)).into_response()

@@ -1,0 +1,5 @@
+# Migration metadata for 144_portal_invites
+module = "core"
+description = "Portal invitations: single-use, hashed, expiring invite tokens that let an invited partner set their password and activate their portal login."
+reversible = true
+dependencies = ["143_portal_users"]
