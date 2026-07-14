@@ -2197,6 +2197,9 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/blueprints", get(blueprints_list))
         .route("/blueprints", post(blueprint_create))
         .route("/blueprints/new", get(blueprint_new))
+        .route("/blueprints/import", get(blueprint_import_form))
+        .route("/blueprints/import", post(blueprint_import))
+        .route("/blueprints/{model}/export", get(blueprint_export))
         .route("/blueprints/approvals", get(blueprint_approvals))
         .route("/blueprints/governance", post(blueprint_governance_toggle))
         .route("/blueprints/approvals/{id}/approve", post(blueprint_approve))
@@ -5187,7 +5190,7 @@ async fn blueprints_list(
     let body = format!(
         r#"<div class="flex justify-between items-center mb-6">
 <div><h1 class="text-2xl font-bold">Blueprints</h1><p class="text-base-content/60">Build governed models at runtime — every schema change is policy-checked and written to the audit ledger.</p></div>
-<div class="flex gap-2"><a href="/blueprints/approvals" class="btn btn-ghost">Approvals</a><a href="/blueprints/new" class="btn btn-primary">+ New Blueprint</a></div>
+<div class="flex gap-2"><a href="/blueprints/import" class="btn btn-ghost">Import</a><a href="/blueprints/approvals" class="btn btn-ghost">Approvals</a><a href="/blueprints/new" class="btn btn-primary">+ New Blueprint</a></div>
 </div>
 <div class="card bg-base-100 shadow"><div class="overflow-x-auto">
 <table class="table table-sm"><thead><tr><th>Name</th><th>Technical</th><th>Fields</th><th>Status</th><th>Records</th></tr></thead>
@@ -5415,6 +5418,7 @@ async fn blueprint_designer(
 <p class="text-base-content/60 mt-1">Technical name <code>{model}</code></p></div>
 <div class="flex gap-2"><a href="/list/{model}" class="btn btn-primary">Open records →</a>
 <a href="/blueprints/{model}/history" class="btn btn-ghost">History</a>
+<a href="/blueprints/{model}/export" class="btn btn-ghost">Export</a>
 <form action="/blueprints/{model}/archive" method="POST" onsubmit="return confirm('Archive this Blueprint? Its records are kept.')"><button class="btn btn-ghost text-error">Archive</button></form></div>
 </div>
 <div class="card bg-base-100 shadow mb-6"><div class="card-body p-4 overflow-x-auto">
@@ -5679,6 +5683,73 @@ async fn blueprint_history(
         &format!("{} History - Blueprints", html_escape(&label)),
         &body,
     )
+}
+
+/// GET /blueprints/{model}/export — download the Blueprint as a signed manifest.
+async fn blueprint_export(
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Path(model): Path<String>,
+) -> Response {
+    if !user.is_admin() {
+        return blueprint_forbidden();
+    }
+    match vortex_framework::blueprint::export_manifest(&db, &model).await {
+        Ok(json) => (
+            [
+                (header::CONTENT_TYPE, "application/json".to_string()),
+                (
+                    header::CONTENT_DISPOSITION,
+                    format!("attachment; filename=\"{}.blueprint.json\"", model),
+                ),
+            ],
+            json,
+        )
+            .into_response(),
+        Err(e) => error_response(&e),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ImportForm {
+    manifest: String,
+}
+
+/// GET /blueprints/import — paste-a-manifest form.
+async fn blueprint_import_form(
+    State(state): State<Arc<AppState>>,
+    Db(_db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+) -> Response {
+    if !user.is_admin() {
+        return blueprint_forbidden();
+    }
+    let body = r#"<div class="flex items-center gap-2 mb-1"><a href="/blueprints" class="btn btn-ghost btn-sm btn-square">←</a><h1 class="text-2xl font-bold">Import Blueprint</h1></div>
+<p class="text-base-content/60 mb-6">Paste a signed Blueprint manifest exported from another Vortex instance. The signature is verified before anything is created — a modified or foreign manifest is rejected.</p>
+<form action="/blueprints/import" method="POST" class="card bg-base-100 shadow p-6 max-w-2xl">
+<div class="form-control"><label class="label"><span class="label-text">Manifest JSON</span></label>
+<textarea name="manifest" rows="16" class="textarea textarea-bordered font-mono text-xs" placeholder='{ "manifest": { ... }, "signature": "..." }' required></textarea></div>
+<div class="flex gap-2 mt-4"><a href="/blueprints" class="btn btn-ghost">Cancel</a><button class="btn btn-primary">Import</button></div>
+</form>"#;
+    blueprint_shell(&state, &user, &db_ctx, "Import Blueprint - Remicle", body)
+}
+
+/// POST /blueprints/import — verify + recreate from a manifest.
+async fn blueprint_import(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Form(form): Form<ImportForm>,
+) -> Response {
+    if !user.is_admin() {
+        return blueprint_forbidden();
+    }
+    match vortex_framework::blueprint::import_manifest(&state, &db, &db_ctx.db_name, &user, &form.manifest).await {
+        Ok(model) => Redirect::to(&format!("/blueprints/{model}")).into_response(),
+        Err(e) => error_response(&e),
+    }
 }
 
 #[derive(serde::Deserialize)]

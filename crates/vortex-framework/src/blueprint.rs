@@ -1115,9 +1115,254 @@ pub async fn pending_requests(db: &PgPool) -> Vec<PendingRequest> {
     .collect()
 }
 
+// ===========================================================================
+// Portability: signed manifest export / import (Phase 5)
+//
+// A Blueprint's definition (model + fields + layout) serializes to a JSON
+// manifest, HMAC-signed with the instance master key. Exported from dev and
+// imported into prod, the signature makes promotion tamper-evident: prod only
+// recreates a Blueprint from a manifest produced by an instance sharing the
+// secret. Import replays the definition faithfully (exact field names/types),
+// governed exactly like a create.
+// ===========================================================================
+
+const MANIFEST_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FieldManifest {
+    pub name: String,
+    pub label: String,
+    pub field_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub related_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection_options: Option<serde_json::Value>,
+    pub sequence: i32,
+    pub in_list: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlueprintManifest {
+    pub manifest_version: u32,
+    pub model: String,
+    pub display_name: String,
+    pub fields: Vec<FieldManifest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignedManifest {
+    pub manifest: BlueprintManifest,
+    pub signature: String,
+}
+
+/// HMAC-SHA256 of the manifest under the instance master key. Deterministic:
+/// serde serializes struct fields in declaration order and `serde_json` sorts
+/// object keys, so the same definition always yields the same signature.
+fn manifest_signature(m: &BlueprintManifest) -> Result<String, String> {
+    let bytes = serde_json::to_vec(m).map_err(|e| format!("serialize manifest: {e}"))?;
+    Ok(vortex_security::crypto::hmac_sha256_hex(
+        &vortex_security::crypto::master_key(),
+        &bytes,
+    ))
+}
+
+/// Constant-time byte compare, so signature verification doesn't leak via timing.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Export a Blueprint as a signed manifest (pretty JSON).
+pub async fn export_manifest(db: &PgPool, model: &str) -> Result<String, String> {
+    let head = sqlx::query(
+        "SELECT id, display_name FROM ir_model WHERE name = $1 AND source = 'blueprint'",
+    )
+    .bind(model)
+    .fetch_optional(db)
+    .await
+    .map_err(dberr)?
+    .ok_or_else(|| format!("Blueprint '{model}' not found"))?;
+    let model_id: Uuid = head.get("id");
+    let display_name: String = head.get("display_name");
+
+    let rows = sqlx::query(
+        "SELECT name, display_name, field_type, related_model, selection_options, sequence, is_visible
+         FROM ir_model_field WHERE model_id = $1 AND source = 'blueprint' ORDER BY sequence, name",
+    )
+    .bind(model_id)
+    .fetch_all(db)
+    .await
+    .map_err(dberr)?;
+    let fields: Vec<FieldManifest> = rows
+        .iter()
+        .map(|r| FieldManifest {
+            name: r.get("name"),
+            label: r.get("display_name"),
+            field_type: r.get("field_type"),
+            related_model: r.get("related_model"),
+            selection_options: r.get("selection_options"),
+            sequence: r.get("sequence"),
+            in_list: r.get("is_visible"),
+        })
+        .collect();
+
+    let manifest = BlueprintManifest {
+        manifest_version: MANIFEST_VERSION,
+        model: model.to_string(),
+        display_name,
+        fields,
+    };
+    let signature = manifest_signature(&manifest)?;
+    serde_json::to_string_pretty(&SignedManifest { manifest, signature })
+        .map_err(|e| format!("serialize: {e}"))
+}
+
+/// Import a signed manifest: verify the signature, then recreate the Blueprint
+/// (model + table + every field) exactly as exported. Governed like a create.
+pub async fn import_manifest(
+    state: &AppState,
+    db: &PgPool,
+    db_name: &str,
+    user: &AuthUser,
+    json: &str,
+) -> Result<String, String> {
+    let signed: SignedManifest =
+        serde_json::from_str(json).map_err(|e| format!("Invalid manifest JSON: {e}"))?;
+    if signed.manifest.manifest_version != MANIFEST_VERSION {
+        return Err(format!(
+            "Unsupported manifest version {} (this instance expects {MANIFEST_VERSION})",
+            signed.manifest.manifest_version
+        ));
+    }
+    let expected = manifest_signature(&signed.manifest)?;
+    if !ct_eq(expected.as_bytes(), signed.signature.as_bytes()) {
+        return Err(
+            "Manifest signature is invalid — it was not produced by a trusted Vortex instance, or it was modified after export.".to_string(),
+        );
+    }
+    let m = signed.manifest;
+
+    ddl::validate_identifier(&m.model).map_err(|e| format!("invalid model name: {e}"))?;
+    if !m.model.starts_with(ddl::TABLE_PREFIX) {
+        return Err(format!("model name must start with '{}'", ddl::TABLE_PREFIX));
+    }
+    gate(state, user, "blueprint.create", &m.model).await?;
+
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM blueprint")
+        .fetch_one(db)
+        .await
+        .map_err(dberr)?;
+    if count >= MAX_BLUEPRINTS_PER_TENANT {
+        return Err(format!("Blueprint limit reached ({MAX_BLUEPRINTS_PER_TENANT} per tenant)."));
+    }
+
+    // Pre-resolve every many2one target before opening the transaction — a
+    // missing target is a clear, actionable error, not a rolled-back DDL.
+    let mut resolved_targets: HashMap<String, String> = HashMap::new();
+    for f in &m.fields {
+        if f.field_type == "many2one" {
+            let target = f
+                .related_model
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| format!("Field '{}' is a link but names no target", f.name))?;
+            let table = resolve_relation_target(db, target).await.map_err(|_| {
+                format!("Relation target '{target}' for field '{}' is not present in this database — import it first", f.name)
+            })?;
+            resolved_targets.insert(f.name.clone(), table);
+        }
+    }
+
+    let mut tx = db.begin().await.map_err(dberr)?;
+    let exists: Option<Uuid> = sqlx::query_scalar("SELECT id FROM ir_model WHERE name = $1")
+        .bind(&m.model)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(dberr)?;
+    if exists.is_some() {
+        return Err(format!("A model named '{}' already exists here", m.model));
+    }
+
+    let model_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO ir_model (name, display_name, table_name, module, source, is_virtual)
+         VALUES ($1, $2, $1, 'blueprint', 'blueprint', true) RETURNING id",
+    )
+    .bind(&m.model)
+    .bind(&m.display_name)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(dberr)?;
+    let blueprint_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO blueprint (model_id, status, created_by) VALUES ($1, 'active', $2) RETURNING id",
+    )
+    .bind(model_id)
+    .bind(user.id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(dberr)?;
+
+    ddl::create_model_table(&mut tx, &m.model, blueprint_id)
+        .await
+        .map_err(|e| format!("create table failed: {e}"))?;
+
+    for f in &m.fields {
+        ddl::validate_identifier(&f.name).map_err(|e| format!("invalid field '{}': {e}", f.name))?;
+        ddl::column_type(&f.field_type).map_err(|e| format!("field '{}': {e}", f.name))?;
+        match resolved_targets.get(&f.name) {
+            Some(tt) => ddl::add_reference_column(&mut tx, &m.model, &f.name, tt, blueprint_id)
+                .await
+                .map_err(|e| format!("add relation '{}' failed: {e}", f.name))?,
+            None => ddl::add_column(&mut tx, &m.model, &f.name, &f.field_type, blueprint_id)
+                .await
+                .map_err(|e| format!("add field '{}' failed: {e}", f.name))?,
+        }
+        sqlx::query(
+            "INSERT INTO ir_model_field
+                (model_id, name, display_name, field_type, sequence, source, is_custom, is_visible,
+                 related_model, selection_options)
+             VALUES ($1, $2, $3, $4, $5, 'blueprint', false, $6, $7, $8)",
+        )
+        .bind(model_id)
+        .bind(&f.name)
+        .bind(&f.label)
+        .bind(&f.field_type)
+        .bind(f.sequence)
+        .bind(f.in_list)
+        .bind(&f.related_model)
+        .bind(&f.selection_options)
+        .execute(&mut *tx)
+        .await
+        .map_err(dberr)?;
+    }
+
+    record_version(&mut tx, blueprint_id, model_id, user).await?;
+    tx.commit().await.map_err(dberr)?;
+
+    audit(
+        state,
+        db_name,
+        user,
+        "blueprint_imported",
+        AuditSeverity::Warning,
+        &m.model,
+        serde_json::json!({ "fields": m.fields.len(), "display_name": m.display_name }),
+    )
+    .await;
+    Ok(m.model)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{parse_selection_options, plan_layout, slugify, BlueprintOp};
+    use super::{
+        manifest_signature, parse_selection_options, plan_layout, slugify, BlueprintManifest,
+        BlueprintOp, FieldManifest,
+    };
     use std::collections::{HashMap, HashSet};
 
     #[test]
@@ -1137,6 +1382,36 @@ mod tests {
     fn parse_selection_options_rejects_empty() {
         assert!(parse_selection_options("").is_err());
         assert!(parse_selection_options("\n  \n").is_err());
+    }
+
+    fn sample_manifest() -> BlueprintManifest {
+        BlueprintManifest {
+            manifest_version: 1,
+            model: "x_widget".into(),
+            display_name: "Widget".into(),
+            fields: vec![FieldManifest {
+                name: "name".into(),
+                label: "Name".into(),
+                field_type: "string".into(),
+                related_model: None,
+                selection_options: None,
+                sequence: 10,
+                in_list: true,
+            }],
+        }
+    }
+
+    #[test]
+    fn manifest_signature_is_deterministic_and_tamper_evident() {
+        let m = sample_manifest();
+        let s1 = manifest_signature(&m).unwrap();
+        let s2 = manifest_signature(&m).unwrap();
+        assert_eq!(s1, s2, "same manifest must sign identically");
+
+        let mut tampered = sample_manifest();
+        tampered.fields[0].label = "Renamed".into();
+        let s3 = manifest_signature(&tampered).unwrap();
+        assert_ne!(s1, s3, "a modified manifest must not keep the signature");
     }
 
     #[test]
