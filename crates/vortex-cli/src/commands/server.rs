@@ -2393,6 +2393,9 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/settings/forms/{id}", get(intake_form_edit))
         .route("/settings/forms/{id}", post(intake_form_update))
         .route("/settings/forms/{id}/delete", post(intake_form_delete))
+        .route("/settings/forms/{id}/submissions", get(intake_submissions))
+        .route("/settings/forms/{id}/submissions/{sid}/approve", post(intake_submission_approve))
+        .route("/settings/forms/{id}/submissions/{sid}/reject", post(intake_submission_reject))
         // Print layout designer — document branding + per-document templates
         .route("/settings/document-layout", get(document_layout_page))
         .route("/settings/document-layout", post(document_layout_save))
@@ -3315,10 +3318,17 @@ async fn intake_submit(
         );
     }
 
-    // 6. Governed write (server-side stamping + WORM audit) inside intake.
+    // 6. Governed write (daily cap → quarantine|accept → stamp + WORM audit).
     let (client_ip, _ua) = request_fingerprint(&headers);
     match intake::submit(&state, db, &ctx.db_name, &form, &writable, client_ip).await {
-        Ok(_) => intake_success_page(&form),
+        Ok(intake::SubmitOutcome::Accepted(_)) | Ok(intake::SubmitOutcome::Quarantined(_)) => {
+            intake_success_page(&form)
+        }
+        Ok(intake::SubmitOutcome::Capped) => intake_error_page(
+            StatusCode::TOO_MANY_REQUESTS,
+            &slug,
+            "This form is not accepting more responses today. Please try again tomorrow.",
+        ),
         Err(e) => {
             error!("intake submit failed for '{}': {}", slug, e);
             intake_error_page(StatusCode::BAD_REQUEST, &slug, &e)
@@ -3498,10 +3508,28 @@ async fn intake_form_edit(
 
     let origins_val = form.origins.join("\n");
     let success_val = form.success_msg.clone().unwrap_or_default();
+    let notify_val = form.notify_to.clone().unwrap_or_default();
+    let cap_val = form.daily_cap.unwrap_or(0);
+
+    // Submission counts for the inbox banner.
+    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM web_form_submission WHERE form_id = $1")
+        .bind(id).fetch_one(&db).await.unwrap_or(0);
+    let pending: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM web_form_submission WHERE form_id = $1 AND status = 'quarantined'")
+        .bind(id).fetch_one(&db).await.unwrap_or(0);
+    let pending_badge = if pending > 0 {
+        format!(r#" <span class="badge badge-warning badge-sm">{pending} awaiting review</span>"#)
+    } else {
+        String::new()
+    };
+
     let inner = format!(
         r##"<div class="mb-4"><a href="/settings/forms" class="btn btn-ghost btn-sm">← Intake Forms</a>
 <h1 class="text-2xl font-bold mt-2">{title}</h1>
 <div class="text-sm opacity-60">Target <code>{model}</code> · Public URL <a href="/i/{slug}" target="_blank" class="link">/i/{slug}</a></div></div>
+<div class="alert bg-base-100 shadow mb-6 flex justify-between items-center">
+<span>{total} submission(s){pending_badge}</span>
+<a href="/settings/forms/{id}/submissions" class="btn btn-sm btn-outline">Open inbox →</a></div>
 <form method="post" action="/settings/forms/{id}">
 <div class="card bg-base-100 shadow mb-6"><div class="card-body">
 <h2 class="card-title text-lg">Published fields</h2>
@@ -3514,7 +3542,14 @@ async fn intake_form_edit(
 <input name="success_msg" value="{success}" placeholder="Thank you — your response has been recorded." class="input input-bordered input-sm"/></label>
 <label class="form-control"><span class="label-text">Allowed origins (one per line, blank = same-site only)</span>
 <textarea name="origins" class="textarea textarea-bordered textarea-sm" rows="3" placeholder="https://example.com">{origins}</textarea></label>
-<label class="label cursor-pointer gap-2 justify-start mt-2"><input type="checkbox" name="active" value="1" {checked} class="checkbox checkbox-sm"/><span class="label-text">Published (accepting responses)</span></label>
+<div class="grid md:grid-cols-2 gap-3 mt-2">
+<label class="form-control"><span class="label-text">Notify on submit (email, optional)</span>
+<input name="notify_to" type="email" value="{notify}" placeholder="ops@example.com" class="input input-bordered input-sm"/></label>
+<label class="form-control"><span class="label-text">Daily cap (0 = unlimited)</span>
+<input name="daily_cap" type="number" min="0" value="{cap}" class="input input-bordered input-sm"/></label>
+</div>
+<label class="label cursor-pointer gap-2 justify-start mt-2"><input type="checkbox" name="quarantine" value="1" {quar} class="checkbox checkbox-sm"/><span class="label-text">Hold submissions for review (quarantine) — no record is written until approved</span></label>
+<label class="label cursor-pointer gap-2 justify-start"><input type="checkbox" name="active" value="1" {checked} class="checkbox checkbox-sm"/><span class="label-text">Published (accepting responses)</span></label>
 </div></div>
 <div class="flex gap-2"><button class="btn btn-primary btn-sm">Save</button></div>
 </form>
@@ -3523,6 +3558,9 @@ async fn intake_form_edit(
         title = html_escape(&form.title), model = html_escape(&form.model),
         slug = html_escape(&form.slug), id = id, frows = frows,
         success = html_escape(&success_val), origins = html_escape(&origins_val),
+        notify = html_escape(&notify_val), cap = cap_val,
+        total = total, pending_badge = pending_badge,
+        quar = if form.quarantine { "checked" } else { "" },
         checked = if active { "checked" } else { "" },
     );
     intake_admin_shell(&user, &form.title, &inner).into_response()
@@ -3576,11 +3614,15 @@ async fn intake_form_update(
                 .collect()
         })
         .unwrap_or_default();
+    let notify_to = pairs.get("notify_to").map(|s| s.trim()).unwrap_or("");
+    let daily_cap = pairs.get("daily_cap").and_then(|s| s.trim().parse::<i64>().ok()).unwrap_or(0);
+    let quarantine = pairs.get("quarantine").is_some();
     let active = pairs.get("active").is_some();
 
-    if let Err(e) =
-        vortex_framework::intake::update_form(&db, id, &fields, success_msg, &origins, active).await
-    {
+    let settings = vortex_framework::intake::FormSettings {
+        success_msg, origins: &origins, quarantine, notify_to, daily_cap, active,
+    };
+    if let Err(e) = vortex_framework::intake::update_form(&db, id, &fields, &settings).await {
         return intake_admin_shell(
             &user, "Intake Forms",
             &format!(r#"<div class="alert alert-error">{}</div><a href="/settings/forms/{id}" class="btn btn-sm mt-4">Back</a>"#, html_escape(&e)),
@@ -3590,7 +3632,7 @@ async fn intake_form_update(
         &state, &db_ctx.db_name, &user,
         AuditAction::Custom("intake_form_updated".into()), AuditSeverity::Info,
         "web_form", Some(&id.to_string()),
-        serde_json::json!({"slug": form.slug, "fields": fields.len(), "active": active}),
+        serde_json::json!({"slug": form.slug, "fields": fields.len(), "active": active, "quarantine": quarantine, "daily_cap": daily_cap}),
     ).await;
     Redirect::to(&format!("/settings/forms/{id}")).into_response()
 }
@@ -3613,6 +3655,123 @@ async fn intake_form_delete(
         "web_form", Some(&id.to_string()), serde_json::json!({}),
     ).await;
     Redirect::to("/settings/forms").into_response()
+}
+
+/// `GET /settings/forms/{id}/submissions` — the triage inbox.
+async fn intake_submissions(
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Path(id): Path<uuid::Uuid>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Intake Forms"))).into_response();
+    }
+    let Some((form, _)) = vortex_framework::intake::load_form(&db, id).await else {
+        return (StatusCode::NOT_FOUND, Html(forbidden_page("Intake Forms"))).into_response();
+    };
+    let subs = vortex_framework::intake::list_submissions(&db, id, 200).await;
+
+    let mut rows = String::new();
+    for s in &subs {
+        let (badge, cls) = match s.status.as_str() {
+            "accepted" => ("accepted", "badge-success"),
+            "quarantined" => ("awaiting review", "badge-warning"),
+            "rejected" => ("rejected", "badge-error"),
+            other => (other, "badge-ghost"),
+        };
+        // Compact payload preview.
+        let preview = if s.payload.is_empty() {
+            "<span class='opacity-40'>—</span>".to_string()
+        } else {
+            s.payload.iter()
+                .map(|(k, v)| format!("<span class='opacity-50'>{}</span>&nbsp;{}", html_escape(k), html_escape(v)))
+                .collect::<Vec<_>>()
+                .join("<br>")
+        };
+        let record = match s.record_id {
+            Some(r) => format!(r#"<a href="/form/{model}/{r}" class="link text-xs">record</a>"#, model = html_escape(&form.model), r = r),
+            None => "<span class='opacity-40 text-xs'>—</span>".to_string(),
+        };
+        let actions = if s.status == "quarantined" {
+            format!(
+                r##"<div class="flex gap-1">
+<form method="post" action="/settings/forms/{id}/submissions/{sid}/approve"><button class="btn btn-success btn-xs">Approve</button></form>
+<form method="post" action="/settings/forms/{id}/submissions/{sid}/reject"><button class="btn btn-error btn-outline btn-xs">Reject</button></form></div>"##,
+                id = id, sid = s.id,
+            )
+        } else {
+            let reviewer = s.reviewed_by.as_deref().map(html_escape).unwrap_or_default();
+            format!("<span class='text-xs opacity-50'>{reviewer}</span>")
+        };
+        rows.push_str(&format!(
+            r##"<tr><td><span class="badge {cls} badge-sm">{badge}</span></td>
+<td class="text-xs">{preview}</td><td>{record}</td>
+<td class="text-xs opacity-50">{ip}</td><td class="text-xs opacity-50">{at}</td><td>{actions}</td></tr>"##,
+            cls = cls, badge = badge, preview = preview, record = record,
+            ip = html_escape(s.source_ip.as_deref().unwrap_or("")),
+            at = s.created_at.format("%Y-%m-%d %H:%M"), actions = actions,
+        ));
+    }
+    if subs.is_empty() {
+        rows.push_str(r#"<tr><td colspan="6" class="text-center opacity-50 py-8">No submissions yet.</td></tr>"#);
+    }
+
+    let inner = format!(
+        r##"<div class="mb-4"><a href="/settings/forms/{id}" class="btn btn-ghost btn-sm">← {title}</a>
+<h1 class="text-2xl font-bold mt-2">Submissions</h1>
+<div class="text-sm opacity-60">Public URL <a href="/i/{slug}" target="_blank" class="link">/i/{slug}</a>{quar}</div></div>
+<div class="card bg-base-100 shadow"><div class="card-body">
+<table class="table table-sm"><thead><tr><th>Status</th><th>Values</th><th>Record</th><th>Source IP</th><th>Received</th><th>Action</th></tr></thead>
+<tbody>{rows}</tbody></table></div></div>"##,
+        id = id, title = html_escape(&form.title), slug = html_escape(&form.slug),
+        quar = if form.quarantine { " · <span class=\"badge badge-warning badge-xs\">quarantine on</span>" } else { "" },
+        rows = rows,
+    );
+    intake_admin_shell(&user, "Submissions", &inner).into_response()
+}
+
+/// `POST /settings/forms/{id}/submissions/{sid}/approve` — commit a held record.
+async fn intake_submission_approve(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path((id, sid)): Path<(uuid::Uuid, uuid::Uuid)>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Intake Forms"))).into_response();
+    }
+    if let Err(e) = vortex_framework::intake::approve_submission(
+        &state.audit, &db, &db_ctx.db_name, sid, user.id, &user.username,
+    ).await {
+        return intake_admin_shell(
+            &user, "Submissions",
+            &format!(r#"<div class="alert alert-error">{}</div><a href="/settings/forms/{id}/submissions" class="btn btn-sm mt-4">Back</a>"#, html_escape(&e)),
+        ).into_response();
+    }
+    Redirect::to(&format!("/settings/forms/{id}/submissions")).into_response()
+}
+
+/// `POST /settings/forms/{id}/submissions/{sid}/reject` — discard a held submission.
+async fn intake_submission_reject(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path((id, sid)): Path<(uuid::Uuid, uuid::Uuid)>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Intake Forms"))).into_response();
+    }
+    if let Err(e) = vortex_framework::intake::reject_submission(
+        &state.audit, &db, &db_ctx.db_name, sid, user.id, &user.username,
+    ).await {
+        return intake_admin_shell(
+            &user, "Submissions",
+            &format!(r#"<div class="alert alert-error">{}</div><a href="/settings/forms/{id}/submissions" class="btn btn-sm mt-4">Back</a>"#, html_escape(&e)),
+        ).into_response();
+    }
+    Redirect::to(&format!("/settings/forms/{id}/submissions")).into_response()
 }
 
 async fn portal_login_page() -> Response {
