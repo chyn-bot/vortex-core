@@ -1624,6 +1624,39 @@ fn parse_av_config() -> vortex_framework::antivirus::AvConfig {
     }
 }
 
+/// Parse `[captcha]` from vortex.toml into a [`CaptchaConfig`]. Absent/`none`
+/// ⇒ disabled (the no-op verifier). A recognised provider needs a `sitekey`
+/// (public, ships in the page) and `secret` (private, server-side); a missing
+/// secret disables it with a warning rather than shipping an inert widget.
+fn parse_captcha_config() -> vortex_framework::captcha::CaptchaConfig {
+    use vortex_framework::captcha::{CaptchaConfig, CaptchaProvider};
+    let config_str = std::fs::read_to_string("vortex.toml").unwrap_or_default();
+    let config: toml::Value =
+        config_str.parse::<toml::Value>().unwrap_or(toml::Value::Table(Default::default()));
+    let section = config.get("captcha");
+    let backend = section.and_then(|s| s.get("provider")).and_then(|v| v.as_str()).unwrap_or("none");
+    if matches!(backend.trim(), "" | "none") {
+        return CaptchaConfig::Disabled;
+    }
+    let Some(provider) = CaptchaProvider::parse(backend) else {
+        warn!("[captcha] provider {backend:?} not recognised — CAPTCHA disabled");
+        return CaptchaConfig::Disabled;
+    };
+    let str_field = |k: &str| section.and_then(|s| s.get(k)).and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let sitekey = str_field("sitekey");
+    let secret = str_field("secret");
+    if sitekey.is_empty() || secret.is_empty() {
+        warn!("[captcha] provider set but sitekey/secret missing — CAPTCHA disabled");
+        return CaptchaConfig::Disabled;
+    }
+    let verify_url = {
+        let u = str_field("verify_url");
+        if u.is_empty() { None } else { Some(u) }
+    };
+    let fail_open = section.and_then(|s| s.get("fail_open")).and_then(|v| v.as_bool()).unwrap_or(false);
+    CaptchaConfig::Enabled { provider, sitekey, secret, verify_url, fail_open }
+}
+
 /// Global connection budget from `[database] max_connections` in
 /// vortex.toml. This caps the SUM of every pool the manager opens
 /// (primary + master + one per active tenant) — keep it below the
@@ -2122,6 +2155,11 @@ pub async fn run(host: String, port: u16, _workers: Option<usize>) -> Result<()>
     let av = vortex_framework::antivirus::from_config(&parse_av_config());
     info!("Upload scanning backend: {} (active: {})", av.backend_name(), av.is_active());
 
+    // CAPTCHA verifier for public Intake forms ([captcha] in vortex.toml).
+    // Default is a no-op; a configured provider verifies client tokens.
+    let captcha = vortex_framework::captcha::from_config(&parse_captcha_config());
+    info!("CAPTCHA backend: {} (active: {})", captcha.backend_name(), captcha.is_active());
+
     // Create app state
     let state = Arc::new(AppState {
         db,
@@ -2143,6 +2181,7 @@ pub async fn run(host: String, port: u16, _workers: Option<usize>) -> Result<()>
         i18n,
         files,
         av,
+        captcha,
     });
 
     // Spawn the scheduler supervisor now that AppState exists.
@@ -3218,8 +3257,54 @@ fn with_embed_csp(mut resp: Response, origins: &[String]) -> Response {
     resp
 }
 
+/// CSP for the public form page, combining embedding (`frame-ancestors`) with a
+/// CAPTCHA widget's external `script-src`/`frame-src`/`connect-src` needs. When
+/// neither applies, returns the response untouched so the middleware's locked
+/// defaults + `X-Frame-Options: DENY` stand. Any CSP we set here contains
+/// `frame-ancestors`, which the security-headers middleware treats as the
+/// signal to honour our CSP and drop its global overrides.
+fn with_form_csp(
+    mut resp: Response,
+    origins: &[String],
+    captcha: &dyn vortex_framework::captcha::CaptchaVerifier,
+) -> Response {
+    let cap_active = captcha.is_active();
+    if origins.is_empty() && !cap_active {
+        return resp; // default headers, XFO DENY stays
+    }
+    let extra = if cap_active {
+        captcha.csp_hosts().join(" ")
+    } else {
+        String::new()
+    };
+    let with_extra = |base: &str| -> String {
+        if extra.is_empty() { base.to_string() } else { format!("{base} {extra}") }
+    };
+    // No allow-listed origins ⇒ deny framing (frame-ancestors 'none') while still
+    // letting the page embed the CAPTCHA iframe via frame-src.
+    let ancestors = if origins.is_empty() {
+        "'none'".to_string()
+    } else {
+        format!("'self' {}", origins.join(" "))
+    };
+    let csp = format!(
+        "default-src 'self'; script-src {script}; style-src 'self' 'unsafe-inline'; \
+         img-src 'self' data:; frame-src {frame}; connect-src {connect}; base-uri 'none'; \
+         form-action 'self'; frame-ancestors {ancestors}",
+        script = with_extra("'self'"),
+        frame = with_extra("'self'"),
+        connect = with_extra("'self'"),
+        ancestors = ancestors,
+    );
+    if let Ok(v) = header::HeaderValue::from_str(&csp) {
+        resp.headers_mut().insert(header::CONTENT_SECURITY_POLICY, v);
+    }
+    resp
+}
+
 /// `GET /i/{slug}` — render the public form with a fresh signed nonce.
 async fn intake_form_page(
+    State(state): State<Arc<AppState>>,
     Extension(ctx): Extension<DatabaseContext>,
     Path(slug): Path<String>,
 ) -> Response {
@@ -3288,6 +3373,21 @@ async fn intake_form_page(
         .map(|d| format!(r#"<p class="desc">{}</p>"#, html_escape(d)))
         .unwrap_or_default();
 
+    // CAPTCHA widget — only when the form opts in AND a provider is configured.
+    // The provider script (external `<script src>`, no inline JS) auto-renders
+    // the widget div and injects a hidden response field into the form on solve.
+    let captcha_active = form.captcha && state.captcha.is_active();
+    let (captcha_widget, captcha_script) = if captcha_active {
+        let script = state
+            .captcha
+            .script_url()
+            .map(|u| format!(r#"<script src="{}" async defer></script>"#, html_escape(u)))
+            .unwrap_or_default();
+        (format!(r#"<div class="field">{}</div>"#, state.captcha.widget_html()), script)
+    } else {
+        (String::new(), String::new())
+    };
+
     let body = format!(
         r#"<div class="card">
 <h1>{title}</h1>{desc}
@@ -3297,8 +3397,9 @@ async fn intake_form_page(
 <div class="hp" aria-hidden="true"><label for="{hp_field}">Leave this field empty</label>
 <input type="text" id="{hp_field}" name="{hp_field}" tabindex="-1" autocomplete="off"></div>
 {fields}
+{captcha_widget}
 <button type="submit">Submit</button>
-</form></div>
+</form></div>{captcha_script}
 <div class="foot">Protected by Vortex Intake</div>"#,
         title = html_escape(&form.title),
         desc = desc,
@@ -3310,8 +3411,14 @@ async fn intake_form_page(
         nonce = html_escape(&nonce),
         hp_field = vortex_framework::intake::HONEYPOT_FIELD,
         fields = fields_html,
+        captcha_widget = captcha_widget,
+        captcha_script = captcha_script,
     );
-    with_embed_csp(Html(intake_page_shell(&form.title, &body)).into_response(), &form.origins)
+    with_form_csp(
+        Html(intake_page_shell(&form.title, &body)).into_response(),
+        &form.origins,
+        state.captcha.as_ref(),
+    )
 }
 
 /// Render a public error page for a rejected submission (same chrome). `origins`
@@ -3453,7 +3560,7 @@ async fn intake_submit(
         None => return intake_error_page(StatusCode::NOT_FOUND, &slug, "This form is no longer available.", &[]),
     };
 
-    let (submitted, raws) = match parse_intake_submission(request).await {
+    let (mut submitted, raws) = match parse_intake_submission(request).await {
         Ok(x) => x,
         Err(e) => return intake_error_page(StatusCode::BAD_REQUEST, &slug, &e, &form.origins),
     };
@@ -3487,6 +3594,37 @@ async fn intake_submit(
                 "This form cannot be submitted from here.",
                 &form.origins,
             );
+        }
+    }
+
+    // 3b. CAPTCHA: when the form opts in and a provider is configured, the
+    //     client must have solved a challenge. Verified server-side before any
+    //     write; the honeypot/nonce already ran, this is the human layer. The
+    //     provider's response field is a control field — consume it so the
+    //     allow-list (which rejects unknown keys loudly) never sees it.
+    if form.captcha && state.captcha.is_active() {
+        let field = state.captcha.response_field();
+        let cap_token = submitted.remove(field).unwrap_or_default();
+        let (cap_ip, _) = request_fingerprint(&headers);
+        match state.captcha.verify(&cap_token, cap_ip.as_deref()).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return intake_error_page(
+                    StatusCode::BAD_REQUEST,
+                    &slug,
+                    "CAPTCHA verification failed — please try again.",
+                    &form.origins,
+                )
+            }
+            Err(e) => {
+                error!("intake captcha verify error for '{}': {}", slug, e);
+                return intake_error_page(
+                    StatusCode::BAD_GATEWAY,
+                    &slug,
+                    "Could not verify the CAPTCHA right now. Please try again.",
+                    &form.origins,
+                );
+            }
         }
     }
 
@@ -3678,6 +3816,7 @@ async fn intake_form_create(
 
 /// `GET /settings/forms/{id}` — allow-list + settings editor.
 async fn intake_form_edit(
+    State(state): State<Arc<AppState>>,
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
     headers: HeaderMap,
@@ -3806,6 +3945,11 @@ async fn intake_form_edit(
 <select name="partner_field" class="select select-bordered select-sm">{pf_opts}</select></label>
 </div></div>
 <div class="card bg-base-100 shadow mb-6"><div class="card-body">
+<h2 class="card-title text-lg">Spam protection (CAPTCHA)</h2>
+<p class="text-xs opacity-50">Require a solved CAPTCHA challenge on the public form. The signed token + honeypot + fill-time gate already block dumb bots; add this for a human-verification layer on high-value or heavily-spammed forms. {captcha_status}</p>
+<label class="label cursor-pointer gap-2 justify-start"><input type="checkbox" name="captcha" value="1" {captcha} class="checkbox checkbox-sm"/><span class="label-text">Require CAPTCHA on the public form</span></label>
+</div></div>
+<div class="card bg-base-100 shadow mb-6"><div class="card-body">
 <h2 class="card-title text-lg">Attachments</h2>
 <p class="text-xs opacity-50">File-upload fields. Uploads are stored in the file store and linked to the record as attachments (not written as columns). One field per line: <code>name | Label | required</code> (the trailing <code>| required</code> is optional).</p>
 <label class="form-control"><span class="label-text">Upload fields</span>
@@ -3833,6 +3977,12 @@ async fn intake_form_edit(
         quar = if form.quarantine { "checked" } else { "" },
         checked = if active { "checked" } else { "" },
         portal = if form.portal { "checked" } else { "" }, pf_opts = pf_opts,
+        captcha = if form.captcha { "checked" } else { "" },
+        captcha_status = if state.captcha.is_active() {
+            format!(r#"<span class="text-success">Provider configured: <code>{}</code>.</span>"#, html_escape(state.captcha.backend_name()))
+        } else {
+            r#"<span class="text-warning">No provider configured — set <code>[captcha]</code> in vortex.toml for this to take effect.</span>"#.to_string()
+        },
         attach = html_escape(&attach_val), max_mb = form.attach_max_mb,
         accept = html_escape(&accept_val),
         embed_snippet = html_escape(&embed_snippet),
@@ -3897,6 +4047,7 @@ async fn intake_form_update(
     let active = pairs.get("active").is_some();
     let portal = pairs.get("portal").is_some();
     let partner_field = pairs.get("partner_field").map(|s| s.trim()).unwrap_or("");
+    let captcha = pairs.get("captcha").is_some();
 
     // Attachment fields: one per line "name | Label | required".
     let attach_fields: Vec<vortex_framework::intake::FormField> = pairs
@@ -3917,7 +4068,7 @@ async fn intake_form_update(
 
     let settings = vortex_framework::intake::FormSettings {
         success_msg, origins: &origins, quarantine, notify_to, daily_cap, active, portal, partner_field,
-        attach_fields: &attach_fields, attach_max_mb, attach_accept: &attach_accept,
+        attach_fields: &attach_fields, attach_max_mb, attach_accept: &attach_accept, captcha,
     };
     if let Err(e) = vortex_framework::intake::update_form(&db, id, &fields, &settings).await {
         return intake_admin_shell(

@@ -121,6 +121,12 @@ pub struct AppState {
     /// backend screens blobs before they are stored/linked. Upload paths call
     /// `state.av.scan(..)`. See `crate::antivirus`.
     pub av: Arc<dyn crate::antivirus::AvScanner>,
+    /// CAPTCHA verifier for public Intake forms (`[captcha]` in vortex.toml).
+    /// The default is a no-op that accepts everything; a configured provider
+    /// (Turnstile / hCaptcha / reCAPTCHA) verifies a client-solved token
+    /// server-side before a public form writes anything. Forms opt in per-form.
+    /// See `crate::captcha`.
+    pub captcha: Arc<dyn crate::captcha::CaptchaVerifier>,
 }
 
 /// Database context injected by the auth middleware for request-scoped
