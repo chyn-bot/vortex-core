@@ -103,6 +103,7 @@ fn render_sidebar(state: &AppState, user: &AuthUser, db_ctx: &DatabaseContext) -
         user.is_admin(),
         &state.plugin_registry,
         &user.roles,
+        "",
     )
 }
 

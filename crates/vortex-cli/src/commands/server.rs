@@ -2293,6 +2293,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/blueprints/approvals/{id}/reject", post(blueprint_reject))
         .route("/blueprints/{model}", get(blueprint_designer))
         .route("/blueprints/{model}/archive", post(blueprint_archive))
+        .route("/blueprints/{model}/menu", post(blueprint_toggle_menu))
         .route("/blueprints/{model}/history", get(blueprint_history))
         .route("/blueprints/{model}/layout", post(blueprint_set_layout))
         .route("/blueprints/{model}/fields", post(blueprint_add_field))
@@ -5770,7 +5771,8 @@ async fn home_page(
     let display_name = user.full_name.as_deref().unwrap_or(&user.username);
     let initials = get_initials(display_name);
     let installed = db_ctx.installed_modules.clone();
-    let sidebar = build_sidebar("home", display_name, &initials, &installed, user.is_admin(), &state.plugin_registry, &user.roles);
+    let apps = custom_apps_nav(db_ctx.pool.pool(), "").await;
+    let sidebar = build_sidebar("home", display_name, &initials, &installed, user.is_admin(), &state.plugin_registry, &user.roles, &apps);
 
     // Build condensed module links for the "Modules" section.
     // Contacts is now contributed by the plugin registry (below),
@@ -6540,7 +6542,7 @@ fn blueprint_type_options() -> String {
         .collect()
 }
 
-fn blueprint_shell(
+async fn blueprint_shell(
     state: &Arc<AppState>,
     user: &AuthUser,
     db_ctx: &DatabaseContext,
@@ -6549,6 +6551,7 @@ fn blueprint_shell(
 ) -> Response {
     let display_name = user.full_name.as_deref().unwrap_or(&user.username);
     let initials = get_initials(display_name);
+    let apps = custom_apps_nav(db_ctx.pool.pool(), "").await;
     let sidebar = build_sidebar(
         "blueprints",
         display_name,
@@ -6557,6 +6560,7 @@ fn blueprint_shell(
         user.is_admin(),
         &state.plugin_registry,
         &user.roles,
+        &apps,
     );
     Html(vortex_framework::render_app_shell(title, &sidebar, body)).into_response()
 }
@@ -6614,7 +6618,7 @@ async fn blueprints_list(
 <table class="table table-sm"><thead><tr><th>Name</th><th>Technical</th><th>Fields</th><th>Status</th><th>Records</th></tr></thead>
 <tbody>{table_rows}</tbody></table></div></div>"#,
     );
-    blueprint_shell(&state, &user, &db_ctx, "Blueprints - Remicle", &body)
+    blueprint_shell(&state, &user, &db_ctx, "Blueprints - Remicle", &body).await
 }
 
 async fn blueprint_new(
@@ -6633,7 +6637,7 @@ async fn blueprint_new(
 <span class="label-text-alt mt-1 opacity-60">A technical name like <code>x_site_visit</code> is generated automatically.</span></div>
 <div class="flex gap-2 mt-4"><a href="/blueprints" class="btn btn-ghost">Cancel</a><button class="btn btn-primary">Create Blueprint</button></div>
 </form>"#;
-    blueprint_shell(&state, &user, &db_ctx, "New Blueprint - Remicle", body)
+    blueprint_shell(&state, &user, &db_ctx, "New Blueprint - Remicle", body).await
 }
 
 async fn blueprint_create(
@@ -6675,7 +6679,7 @@ async fn blueprint_designer(
         return blueprint_forbidden();
     }
     let head = sqlx::query(
-        "SELECT m.id, m.display_name, b.status
+        "SELECT m.id, m.display_name, b.status, b.show_in_menu
          FROM ir_model m JOIN blueprint b ON b.model_id = m.id
          WHERE m.name = $1 AND m.source = 'blueprint'",
     )
@@ -6690,6 +6694,7 @@ async fn blueprint_designer(
     let model_id: uuid::Uuid = head.get("id");
     let label: String = head.get("display_name");
     let status: String = head.get("status");
+    let show_in_menu: bool = head.try_get("show_in_menu").unwrap_or(false);
 
     let fields = sqlx::query(
         "SELECT name, display_name, field_type, sequence, is_visible, related_model
@@ -6835,6 +6840,7 @@ async fn blueprint_designer(
 <div><div class="flex items-center gap-2"><a href="/blueprints" class="btn btn-ghost btn-sm btn-square">←</a><h1 class="text-2xl font-bold">{label}</h1><span class="badge badge-ghost">{status}</span></div>
 <p class="text-base-content/60 mt-1">Technical name <code>{model}</code></p></div>
 <div class="flex gap-2"><a href="/list/{model}" class="btn btn-primary">Open records →</a>
+{menu_btn}
 <a href="/blueprints/{model}/history" class="btn btn-ghost">History</a>
 <a href="/blueprints/{model}/export" class="btn btn-ghost">Export</a>
 <form action="/blueprints/{model}/archive" method="POST" onsubmit="return confirm('Archive this Blueprint? Its records are kept.')"><button class="btn btn-ghost text-error">Archive</button></form></div>
@@ -6863,6 +6869,11 @@ async fn blueprint_designer(
         layout_card = layout_card,
         type_options = blueprint_type_options(),
         target_field = target_field,
+        menu_btn = if show_in_menu {
+            format!(r#"<form action="/blueprints/{m}/menu" method="POST"><input type="hidden" name="show" value="0"><button class="btn btn-ghost" title="Remove this app from the sidebar">✓ In menu — remove</button></form>"#, m = html_escape(&model))
+        } else {
+            format!(r#"<form action="/blueprints/{m}/menu" method="POST"><input type="hidden" name="show" value="1"><button class="btn btn-ghost" title="Add this app to the sidebar navigation">+ Add to menu</button></form>"#, m = html_escape(&model))
+        },
     );
     blueprint_shell(
         &state,
@@ -6870,7 +6881,7 @@ async fn blueprint_designer(
         &db_ctx,
         &format!("{} - Blueprints", html_escape(&label)),
         &body,
-    )
+    ).await
 }
 
 async fn blueprint_add_field(
@@ -6989,6 +7000,54 @@ async fn blueprint_archive(
     }
 }
 
+/// Form body for the "Add to menu" / "Remove from menu" toggle.
+#[derive(serde::Deserialize)]
+struct BlueprintMenuForm {
+    show: String,
+}
+
+/// `POST /blueprints/{model}/menu` — toggle whether this Blueprint appears in
+/// the "Custom Apps" sidebar group. This is presentation metadata, not a schema
+/// change, so it applies directly (no DDL, no approval gate) — but is still
+/// admin-only and WORM-audited.
+async fn blueprint_toggle_menu(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(model): Path<String>,
+    Form(form): Form<BlueprintMenuForm>,
+) -> Response {
+    if !user.is_admin() {
+        return blueprint_forbidden();
+    }
+    let show = form.show == "1";
+    let res = sqlx::query(
+        "UPDATE blueprint b SET show_in_menu = $2, updated_at = now()
+         FROM ir_model m
+         WHERE b.model_id = m.id AND m.name = $1 AND m.source = 'blueprint'",
+    )
+    .bind(&model)
+    .bind(show)
+    .execute(&db)
+    .await;
+    if let Err(e) = res {
+        return error_response(&format!("Could not update the menu: {e}"));
+    }
+    api_audit(
+        &state,
+        &db_ctx.db_name,
+        &user,
+        AuditAction::Custom("blueprint_menu_toggled".into()),
+        AuditSeverity::Info,
+        "blueprint",
+        Some(&model),
+        serde_json::json!({ "show_in_menu": show }),
+    )
+    .await;
+    Redirect::to(&format!("/blueprints/{model}")).into_response()
+}
+
 /// GET /blueprints/{model}/history — the schema-history timeline. Renders each
 /// version snapshot (who/when) with the field-level diff against the previous
 /// one, computed by `vortex_framework::blueprint::diff_definitions`. Read-only:
@@ -7100,7 +7159,7 @@ async fn blueprint_history(
         &db_ctx,
         &format!("{} History - Blueprints", html_escape(&label)),
         &body,
-    )
+    ).await
 }
 
 /// GET /blueprints/{model}/export — download the Blueprint as a signed manifest.
@@ -7150,7 +7209,7 @@ async fn blueprint_import_form(
 <textarea name="manifest" rows="16" class="textarea textarea-bordered font-mono text-xs" placeholder='{ "manifest": { ... }, "signature": "..." }' required></textarea></div>
 <div class="flex gap-2 mt-4"><a href="/blueprints" class="btn btn-ghost">Cancel</a><button class="btn btn-primary">Import</button></div>
 </form>"#;
-    blueprint_shell(&state, &user, &db_ctx, "Import Blueprint - Remicle", body)
+    blueprint_shell(&state, &user, &db_ctx, "Import Blueprint - Remicle", body).await
 }
 
 /// POST /blueprints/import — verify + recreate from a manifest.
@@ -7237,7 +7296,7 @@ async fn blueprint_approvals(
 <p class="text-base-content/60 mb-6">Governed schema changes awaiting review. Approving runs the change; every decision is WORM-audited and no one can approve their own request.</p>
 {toggle}{table}"#
     );
-    blueprint_shell(&state, &user, &db_ctx, "Blueprint Approvals - Remicle", &body)
+    blueprint_shell(&state, &user, &db_ctx, "Blueprint Approvals - Remicle", &body).await
 }
 
 async fn blueprint_governance_toggle(
@@ -7359,7 +7418,8 @@ async fn announcements_list(
     let display_name = user.full_name.as_deref().unwrap_or(&user.username);
     let initials = get_initials(display_name);
     let installed = db_ctx.installed_modules.clone();
-    let sidebar = build_sidebar("home", display_name, &initials, &installed, user.is_admin(), &state.plugin_registry, &user.roles);
+    let apps = custom_apps_nav(db_ctx.pool.pool(), "").await;
+    let sidebar = build_sidebar("home", display_name, &initials, &installed, user.is_admin(), &state.plugin_registry, &user.roles, &apps);
 
     let rows = sqlx::query(
         "SELECT a.id, a.title, a.severity, a.is_pinned, a.active, a.created_at,
@@ -7432,7 +7492,8 @@ async fn announcement_new(
     let display_name = user.full_name.as_deref().unwrap_or(&user.username);
     let initials = get_initials(display_name);
     let installed = db_ctx.installed_modules.clone();
-    let sidebar = build_sidebar("home", display_name, &initials, &installed, user.is_admin(), &state.plugin_registry, &user.roles);
+    let apps = custom_apps_nav(db_ctx.pool.pool(), "").await;
+    let sidebar = build_sidebar("home", display_name, &initials, &installed, user.is_admin(), &state.plugin_registry, &user.roles, &apps);
 
     let body = format!(r#"<h1 class="text-2xl font-bold mb-6">New Announcement</h1>
 <form action="/announcements" method="POST" class="card bg-base-100 shadow p-6 max-w-2xl">
@@ -7538,7 +7599,8 @@ async fn announcement_edit(
     let display_name = user.full_name.as_deref().unwrap_or(&user.username);
     let initials = get_initials(display_name);
     let installed = db_ctx.installed_modules.clone();
-    let sidebar = build_sidebar("home", display_name, &initials, &installed, user.is_admin(), &state.plugin_registry, &user.roles);
+    let apps = custom_apps_nav(db_ctx.pool.pool(), "").await;
+    let sidebar = build_sidebar("home", display_name, &initials, &installed, user.is_admin(), &state.plugin_registry, &user.roles, &apps);
 
     let page_body = format!(r#"<h1 class="text-2xl font-bold mb-6">Edit Announcement</h1>
 <form action="/announcements/{id}" method="POST" class="card bg-base-100 shadow p-6 max-w-2xl">
@@ -9934,19 +9996,59 @@ async fn module_upgrade(
 /// every plugin page — via [`vortex_framework::build_sidebar_nav`] — instead
 /// of the sparse `ir_ui_menu` fallback in [`build_sidebar_menu`], so the
 /// left-hand menu no longer vanishes when switching into a non-list view.
-fn generic_view_sidebar(
+async fn generic_view_sidebar(
     state: &AppState,
     user: &AuthUser,
     db_ctx: &DatabaseContext,
     active: &str,
 ) -> String {
+    let apps = custom_apps_nav(db_ctx.pool.pool(), active).await;
     vortex_framework::build_sidebar_nav(
         active,
         &db_ctx.installed_modules,
         user.is_admin(),
         &state.plugin_registry,
         &user.roles,
+        &apps,
     )
+}
+
+/// Render the "Custom Apps" sidebar group: Blueprint models an admin has
+/// explicitly added to the menu (`blueprint.show_in_menu`). Each links to the
+/// generic list view at `/list/{model}`. Returns an empty string when none are
+/// flagged, so the group disappears entirely. `active_model` marks the matching
+/// entry active. Best-effort — any query error yields no group.
+async fn custom_apps_nav(db: &sqlx::PgPool, active_model: &str) -> String {
+    let rows = sqlx::query(
+        "SELECT m.name, m.display_name
+         FROM ir_model m JOIN blueprint b ON b.model_id = m.id
+         WHERE m.source = 'blueprint' AND m.is_active = true
+           AND b.status = 'active' AND b.show_in_menu = true
+         ORDER BY m.display_name",
+    )
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+    if rows.is_empty() {
+        return String::new();
+    }
+    // One generic "cube" glyph for every custom app — Blueprint models don't
+    // carry a per-item sidebar icon yet.
+    const ICON: &str = r#"<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4"/></svg>"#;
+    let mut html = String::from(r#"<li class="menu-title mt-2">Custom Apps</li>"#);
+    for r in &rows {
+        let name: String = r.get("name");
+        let label: String = r.get("display_name");
+        let active = if name == active_model { " active" } else { "" };
+        html.push_str(&format!(
+            r#"<li><a href="/list/{name}" class="{active}">{icon}{label}</a></li>"#,
+            name = vortex_framework::html_escape(&name),
+            active = active,
+            icon = ICON,
+            label = vortex_framework::html_escape(&label),
+        ));
+    }
+    html
 }
 
 async fn build_sidebar_menu(db: &PgPool, user_roles: &[String], current_model: &str) -> String {
@@ -10495,7 +10597,7 @@ async fn generic_list_view(
     }
 
     // Build dynamic sidebar
-    let sidebar_menu = generic_view_sidebar(&state, &user, &db_ctx, &model_name);
+    let sidebar_menu = generic_view_sidebar(&state, &user, &db_ctx, &model_name).await;
 
     // Fetch saved filters for this model
     let saved_filters = sqlx::query(
@@ -10909,7 +11011,7 @@ async fn generic_kanban_view(
     let agg = pick("agg").filter(|a| ["count", "sum", "avg", "min", "max"].contains(&a.as_str())).unwrap_or_else(|| "sum".to_string());
     let drag_enabled = pick("drag").as_deref() != Some("0");
 
-    let sidebar_menu = generic_view_sidebar(&state, &user, &db_ctx, &model_name);
+    let sidebar_menu = generic_view_sidebar(&state, &user, &db_ctx, &model_name).await;
     let mut current_cfg = std::collections::BTreeMap::new();
     if !group_by.is_empty() { current_cfg.insert("group_by".to_string(), group_by.clone()); }
     let view_bar = vortex_framework::saved_views::render_view_bar(
@@ -11299,7 +11401,7 @@ async fn generic_graph_view(
     )
     .await;
 
-    let sidebar_menu = generic_view_sidebar(&state, &user, &db_ctx, &model_name);
+    let sidebar_menu = generic_view_sidebar(&state, &user, &db_ctx, &model_name).await;
 
     let html = GRAPH_SHELL
         .replace("__TITLE__", &html_escape(&model_display_name))
@@ -11532,7 +11634,7 @@ async fn generic_calendar_view(
     })
     .to_string();
 
-    let sidebar_menu = generic_view_sidebar(&state, &user, &db_ctx, &model_name);
+    let sidebar_menu = generic_view_sidebar(&state, &user, &db_ctx, &model_name).await;
 
     let html = CALENDAR_SHELL
         .replace("__TITLE__", &html_escape(&model_display_name))
@@ -11947,7 +12049,7 @@ async fn generic_pivot_view(
     )
     .await;
 
-    let sidebar_menu = generic_view_sidebar(&state, &user, &db_ctx, &model_name);
+    let sidebar_menu = generic_view_sidebar(&state, &user, &db_ctx, &model_name).await;
 
     // Shell built by token replacement (not format!) so the inline navbar JS
     // keeps its braces without escaping. Dynamic JSON goes into HTML-escaped
@@ -12940,7 +13042,8 @@ async fn contacts_list(
     let display_name = user.full_name.as_deref().unwrap_or(&user.username);
     let initials = get_initials(display_name);
     let installed = db_ctx.installed_modules.clone();
-    let sidebar = build_sidebar("contacts", display_name, &initials, &installed, user.is_admin(), &state.plugin_registry, &user.roles);
+    let apps = custom_apps_nav(db_ctx.pool.pool(), "").await;
+    let sidebar = build_sidebar("contacts", display_name, &initials, &installed, user.is_admin(), &state.plugin_registry, &user.roles, &apps);
 
     let contacts = sqlx::query(
         "SELECT id, name, display_name, contact_type, email, phone, city, active FROM contacts ORDER BY name LIMIT 200"
@@ -15283,7 +15386,8 @@ async fn audit_log_page(
     let display_name = user.full_name.as_deref().unwrap_or(&user.username);
     let initials = get_initials(display_name);
     let installed = db_ctx.installed_modules.clone();
-    let sidebar = build_sidebar("audit", display_name, &initials, &installed, user.is_admin(), &state.plugin_registry, &user.roles);
+    let apps = custom_apps_nav(db_ctx.pool.pool(), "").await;
+    let sidebar = build_sidebar("audit", display_name, &initials, &installed, user.is_admin(), &state.plugin_registry, &user.roles, &apps);
 
     let content = format!(
         r##"<div class="flex items-center justify-between mb-6 flex-wrap gap-2">
@@ -16249,7 +16353,8 @@ async fn dashboards_index(
     let display_name = user.full_name.as_deref().unwrap_or(&user.username);
     let initials = get_initials(display_name);
     let installed = db_ctx.installed_modules.clone();
-    let sidebar = build_sidebar("dashboards", display_name, &initials, &installed, user.is_admin(), &state.plugin_registry, &user.roles);
+    let apps = custom_apps_nav(db_ctx.pool.pool(), "").await;
+    let sidebar = build_sidebar("dashboards", display_name, &initials, &installed, user.is_admin(), &state.plugin_registry, &user.roles, &apps);
     Html(dashboard_full_page(&sidebar, "Dashboards", &body)).into_response()
 }
 
@@ -16388,7 +16493,8 @@ async fn dashboard_view(
     let display_name = user.full_name.as_deref().unwrap_or(&user.username);
     let initials = get_initials(display_name);
     let installed = db_ctx.installed_modules.clone();
-    let sidebar = build_sidebar("dashboards", display_name, &initials, &installed, user.is_admin(), &state.plugin_registry, &user.roles);
+    let apps = custom_apps_nav(db_ctx.pool.pool(), "").await;
+    let sidebar = build_sidebar("dashboards", display_name, &initials, &installed, user.is_admin(), &state.plugin_registry, &user.roles, &apps);
     Html(dashboard_full_page(&sidebar, &board.name, &body)).into_response()
 }
 
@@ -18587,7 +18693,8 @@ async fn approvals_inbox(
     let display_name = user.full_name.as_deref().unwrap_or(&user.username);
     let initials = get_initials(display_name);
     let installed = db_ctx.installed_modules.clone();
-    let sidebar = build_sidebar("approvals", display_name, &initials, &installed, user.is_admin(), &state.plugin_registry, &user.roles);
+    let apps = custom_apps_nav(db_ctx.pool.pool(), "").await;
+    let sidebar = build_sidebar("approvals", display_name, &initials, &installed, user.is_admin(), &state.plugin_registry, &user.roles, &apps);
 
     let content = format!(
         r##"<div class="mb-6"><h1 class="text-2xl font-bold">Approvals</h1>
@@ -21913,7 +22020,8 @@ async fn reports_hub(
     let display_name = user.full_name.as_deref().unwrap_or(&user.username);
     let initials = get_initials(display_name);
     let installed = db_ctx.installed_modules.clone();
-    let sidebar = build_sidebar("reports", display_name, &initials, &installed, user.is_admin(), &state.plugin_registry, &user.roles);
+    let apps = custom_apps_nav(db_ctx.pool.pool(), "").await;
+    let sidebar = build_sidebar("reports", display_name, &initials, &installed, user.is_admin(), &state.plugin_registry, &user.roles, &apps);
     let content = format!(
         r##"<div class="flex justify-between items-center mb-6"><div><h1 class="text-2xl font-bold">Reports</h1><p class="text-base-content/60 text-sm">Run now, or queue in the background (⏱) and pick it up from Generated Reports</p></div>
         <div class="flex gap-2"><a href="/reports/runs" class="btn btn-sm btn-outline">🗂 Generated Reports</a>{author_btn}</div></div>
@@ -22103,7 +22211,8 @@ async fn report_runs_page(
     let display_name = user.full_name.as_deref().unwrap_or(&user.username);
     let initials = get_initials(display_name);
     let installed = db_ctx.installed_modules.clone();
-    let sidebar = build_sidebar("reports", display_name, &initials, &installed, user.is_admin(), &state.plugin_registry, &user.roles);
+    let apps = custom_apps_nav(db_ctx.pool.pool(), "").await;
+    let sidebar = build_sidebar("reports", display_name, &initials, &installed, user.is_admin(), &state.plugin_registry, &user.roles, &apps);
     let content = format!(
         r##"<div class="flex justify-between items-center mb-6"><div><h1 class="text-2xl font-bold">Generated Reports</h1>
         <p class="text-base-content/60 text-sm">Background report runs — artifacts are kept for {days} days</p></div>
@@ -22528,6 +22637,18 @@ async fn render_dynamic_form(
     // Build sidebar
     let sidebar_menu = build_sidebar_menu(db, &user.roles, model_name).await;
 
+    // Activity stream (chatter) + History (audit trail) — same record primitives
+    // every plugin record page uses. Only meaningful for an existing record, so
+    // a brand-new form shows neither. `model_name` is the res_model/resource_type
+    // for both, matching what the generic create/update handlers audit under.
+    let (activity_panel, history_panel) = match record_id {
+        Some(rid) => (
+            vortex_framework::render_chatter_panel(model_name, rid),
+            vortex_framework::render_audit_trail(db, model_name, rid).await,
+        ),
+        None => (String::new(), String::new()),
+    };
+
     let html = format!(
         r##"<!DOCTYPE html>
 <html data-theme="dark">
@@ -22567,6 +22688,7 @@ async fn render_dynamic_form(
                 </form>
             </div>
         </div>
+        <div class="max-w-2xl mt-6 flex flex-col gap-6">{}{}</div>
     </main>
 </div>
 </body>
@@ -22578,7 +22700,9 @@ async fn render_dynamic_form(
         action_url,
         form_fields,
         model_name,
-        submit_text
+        submit_text,
+        activity_panel,
+        history_panel
     );
 
     Html(html).into_response()
@@ -22587,6 +22711,8 @@ async fn render_dynamic_form(
 async fn dynamic_form_create(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
     Path(model_name): Path<String>,
     Form(form_data): Form<std::collections::HashMap<String, String>>,
 ) -> Response {
@@ -22661,6 +22787,15 @@ async fn dynamic_form_create(
     match q.fetch_one(&db).await {
         Ok(row) => {
             let new_id: uuid::Uuid = row.get("id");
+            // Audit the create so the record's History panel is populated and the
+            // write goes through the WORM ledger (CLAUDE.md rule #5). resource_type
+            // = model_name, matching what render_audit_trail queries.
+            api_audit(
+                &state, &db_ctx.db_name, &user,
+                AuditAction::Custom("record_created".into()), AuditSeverity::Info,
+                &model_name, Some(&new_id.to_string()),
+                serde_json::json!({ "fields": columns.len() }),
+            ).await;
             Redirect::to(&format!("/form/{}/{}", model_name, new_id)).into_response()
         }
         Err(e) => {
@@ -22672,6 +22807,8 @@ async fn dynamic_form_create(
 async fn dynamic_form_update(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
     Path((model_name, record_id)): Path<(String, uuid::Uuid)>,
     Form(form_data): Form<std::collections::HashMap<String, String>>,
 ) -> Response {
@@ -22738,7 +22875,16 @@ async fn dynamic_form_update(
     q = q.bind(record_id);
 
     match q.execute(&db).await {
-        Ok(_) => Redirect::to(&format!("/form/{}/{}", model_name, record_id)).into_response(),
+        Ok(_) => {
+            // Audit the update — feeds the History panel + WORM ledger.
+            api_audit(
+                &state, &db_ctx.db_name, &user,
+                AuditAction::Custom("record_updated".into()), AuditSeverity::Info,
+                &model_name, Some(&record_id.to_string()),
+                serde_json::json!({ "fields": set_clauses.len() }),
+            ).await;
+            Redirect::to(&format!("/form/{}/{}", model_name, record_id)).into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Html(format!("Error: {}", e))).into_response(),
     }
 }

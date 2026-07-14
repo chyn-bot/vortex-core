@@ -130,6 +130,7 @@ async fn list_contacts(
         user.is_admin(),
         &state.plugin_registry,
         &user.roles,
+        "",
     );
 
     let config = ListConfig::new("Contacts", "contacts")
@@ -232,6 +233,7 @@ async fn new_contact_form(
         "contacts", display_name, &initials, &installed,
         user.is_admin(),
         &state.plugin_registry, &user.roles,
+        "",
     );
 
     // Country dropdown, same source as the edit form. Malaysia is
@@ -602,6 +604,7 @@ async fn edit_contact(
         "contacts", display_name, &initials, &installed,
         user.is_admin(),
         &state.plugin_registry, &user.roles,
+        "",
     );
 
     let row = match vortex_plugin_sdk::sqlx::query(
