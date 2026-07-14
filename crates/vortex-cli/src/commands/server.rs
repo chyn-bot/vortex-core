@@ -3945,7 +3945,9 @@ async fn intake_form_delete(
     if !user.is_admin() {
         return (StatusCode::FORBIDDEN, Html(forbidden_page("Intake Forms"))).into_response();
     }
-    let _ = vortex_framework::intake::delete_form(&db, id).await;
+    let _ = vortex_framework::intake::delete_form(
+        state.files.as_ref(), &db, &db_ctx.db_name, id,
+    ).await;
     api_audit(
         &state, &db_ctx.db_name, &user,
         AuditAction::Custom("intake_form_deleted".into()), AuditSeverity::Warning,

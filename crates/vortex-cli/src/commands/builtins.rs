@@ -313,6 +313,47 @@ impl Plugin for SystemBuiltinPlugin {
                 }
                 Ok(())
             },
+        ),
+        ScheduledAction::new(
+            ScheduledActionDef {
+                code: "system.intake_blob_sweep",
+                name: "System: intake orphaned-attachment sweep",
+                schedule: Schedule::Every(Duration::from_secs(24 * 60 * 60)),
+                enabled_by_default: true,
+            },
+            |state| async move {
+                // Reclaim FileStore blobs left by rejected quarantine
+                // submissions (never linked to a record). Per-tenant, exactly
+                // like the report retention sweep above.
+                let tenants: Vec<String> = match (&state.master_db, state.multi_db) {
+                    (Some(master), true) => sqlx::query_scalar(
+                        "SELECT name FROM managed_databases WHERE state = 'active'",
+                    )
+                    .fetch_all(master)
+                    .await
+                    .unwrap_or_default(),
+                    _ => vec![state.default_db.clone()],
+                };
+                let grace = vortex_framework::intake::blob_grace_days();
+                let mut total = 0u64;
+                for tenant in &tenants {
+                    let Ok(pool) = state.pool_manager.get_pool(tenant).await else {
+                        warn!(%tenant, "intake sweep: tenant pool unavailable, skipping");
+                        continue;
+                    };
+                    total += vortex_framework::intake::sweep_orphaned_attachments(
+                        state.files.as_ref(),
+                        pool.pool(),
+                        tenant,
+                        grace,
+                    )
+                    .await;
+                }
+                if total > 0 {
+                    info!(removed = total, "intake sweep removed orphaned attachment blobs");
+                }
+                Ok(())
+            },
         )]
     }
 }

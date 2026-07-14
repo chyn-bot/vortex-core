@@ -138,6 +138,10 @@ Refactor: extract the pure "build typed INSERT from (table, allowed cols, values
 
 **Phase 4 — Attachments & embedding.** A policy-bounded file field (size/type/AV, FileStore-backed) and a documented embed snippet (iframe + origin allowlist) so a form drops into an external site.
 
+**Post-Phase-4 follow-ups (shipped).**
+- *AV scanning hook* — pluggable `AvScanner` (no-op default, `clamd` INSTREAM backend) screening every upload before it is stored; wired on `AppState.av`, configured from `[antivirus]`.
+- *Orphaned-blob sweep* — a rejected quarantine never creates a record, so its stored blobs are never linked to an `ir_attachment`. A daily `system.intake_blob_sweep` scheduled action (`intake::sweep_orphaned_attachments`, per-tenant, `VORTEX_INTAKE_BLOB_GRACE_DAYS` grace window) reclaims those blobs — skipping any key still referenced by a live record — and clears the stale pointers. `delete_form` proactively purges held quarantine/rejected blobs before its cascade drops the rows that hold the keys. DB-driven (no `FileStore::list`); a blob stranded by a store-then-DB-failure is the accepted out-of-reach case.
+
 ## 8. What we reuse (net-new surface is small)
 
 | Capability | Source | Status |

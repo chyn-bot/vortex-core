@@ -244,3 +244,160 @@ async fn reject_writes_no_record() {
     .await;
     assert!(again.is_err(), "second reject must be refused");
 }
+
+/// Insert a `rejected` submission reviewed an hour ago, carrying `attachments`.
+async fn rejected_hour_ago(
+    pool: &PgPool,
+    attachments: &[vortex_framework::intake::StoredUpload],
+) -> Uuid {
+    let fid = form_id(pool).await;
+    sqlx::query_scalar(
+        "INSERT INTO web_form_submission (form_id, status, payload, attachments, reviewed_at)
+         VALUES ($1, 'rejected', '{}'::jsonb, $2, NOW() - INTERVAL '1 hour') RETURNING id",
+    )
+    .bind(fid)
+    .bind(serde_json::to_value(attachments).unwrap())
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn sweep_reclaims_rejected_blobs_and_spares_linked_ones() {
+    let Some(h) = setup().await else { return };
+    use vortex_framework::files::{FileStore, LocalDirStore};
+    use vortex_framework::intake::StoredUpload;
+
+    let root = std::env::temp_dir().join(format!("vortex-intake-sweep-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let files = LocalDirStore::new(root.to_str().unwrap()).expect("local store");
+    let tenant = "intake_test";
+
+    // Two rejected submissions: one truly orphaned blob, one whose blob is still
+    // referenced by a live ir_attachment and so must be spared (defensive guard).
+    let orphan = StoredUpload {
+        key: "intake/sweep-orphan.pdf".into(),
+        name: "o.pdf".into(),
+        size: 3,
+        mime: "application/pdf".into(),
+        checksum: "aa".into(),
+    };
+    let linked = StoredUpload {
+        key: "intake/sweep-linked.pdf".into(),
+        name: "l.pdf".into(),
+        size: 3,
+        mime: "application/pdf".into(),
+        checksum: "bb".into(),
+    };
+    files.put(tenant, &orphan.key, b"pdf", Some("application/pdf")).await.unwrap();
+    files.put(tenant, &linked.key, b"pdf", Some("application/pdf")).await.unwrap();
+
+    // A live record still points at the "linked" blob.
+    sqlx::query(
+        "INSERT INTO ir_attachment (name, res_model, res_id, store_fname, file_size, mimetype, checksum)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+    )
+    .bind("l.pdf")
+    .bind(MODEL)
+    .bind(Uuid::from_u128(0xBEEF))
+    .bind(&linked.key)
+    .bind(3i64)
+    .bind("application/pdf")
+    .bind("bb")
+    .execute(&h.pool)
+    .await
+    .unwrap();
+
+    let fid = form_id(&h.pool).await;
+    rejected_hour_ago(&h.pool, std::slice::from_ref(&orphan)).await;
+    rejected_hour_ago(&h.pool, std::slice::from_ref(&linked)).await;
+
+    let deleted =
+        vortex_framework::intake::sweep_orphaned_attachments(&files, &h.pool, tenant, 0).await;
+    assert_eq!(deleted, 1, "only the unreferenced blob is reclaimed");
+    assert!(files.get(tenant, &orphan.key).await.unwrap().is_none(), "orphan blob deleted");
+    assert!(files.get(tenant, &linked.key).await.unwrap().is_some(), "linked blob spared");
+
+    // Both swept rows had their (now-stale) attachment pointers cleared.
+    let remaining: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM web_form_submission
+         WHERE form_id = $1 AND status = 'rejected' AND jsonb_array_length(attachments) > 0",
+    )
+    .bind(fid)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    assert_eq!(remaining, 0, "swept rows have empty attachments");
+
+    // Second run is a no-op — nothing left to reclaim.
+    let again =
+        vortex_framework::intake::sweep_orphaned_attachments(&files, &h.pool, tenant, 0).await;
+    assert_eq!(again, 0, "sweep is idempotent");
+
+    // The grace window protects fresh rejections: a just-now rejection is not swept.
+    let now_key = StoredUpload {
+        key: "intake/sweep-fresh.pdf".into(),
+        name: "f.pdf".into(),
+        size: 3,
+        mime: "application/pdf".into(),
+        checksum: "cc".into(),
+    };
+    files.put(tenant, &now_key.key, b"pdf", None).await.unwrap();
+    let fresh_fid = form_id(&h.pool).await;
+    sqlx::query(
+        "INSERT INTO web_form_submission (form_id, status, payload, attachments, reviewed_at)
+         VALUES ($1, 'rejected', '{}'::jsonb, $2, NOW())",
+    )
+    .bind(fresh_fid)
+    .bind(serde_json::to_value([&now_key]).unwrap())
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    let within_grace =
+        vortex_framework::intake::sweep_orphaned_attachments(&files, &h.pool, tenant, 7).await;
+    assert_eq!(within_grace, 0, "a rejection inside the grace window is retained");
+    assert!(files.get(tenant, &now_key.key).await.unwrap().is_some(), "fresh blob retained");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn delete_form_purges_held_quarantine_blobs() {
+    let Some(h) = setup().await else { return };
+    use vortex_framework::files::{FileStore, LocalDirStore};
+    use vortex_framework::intake::StoredUpload;
+
+    let root = std::env::temp_dir().join(format!("vortex-intake-del-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let files = LocalDirStore::new(root.to_str().unwrap()).unwrap();
+    let tenant = "intake_test";
+
+    let held = StoredUpload {
+        key: "intake/del-held.pdf".into(),
+        name: "h.pdf".into(),
+        size: 3,
+        mime: "application/pdf".into(),
+        checksum: "dd".into(),
+    };
+    files.put(tenant, &held.key, b"pdf", None).await.unwrap();
+    // Still quarantined (never linked) — its blob is only reachable via the row.
+    quarantined(&h.pool, "Held", None, None, std::slice::from_ref(&held)).await;
+
+    let fid = form_id(&h.pool).await;
+    vortex_framework::intake::delete_form(&files, &h.pool, tenant, fid)
+        .await
+        .expect("delete_form");
+
+    assert!(
+        files.get(tenant, &held.key).await.unwrap().is_none(),
+        "held blob purged before the cascade dropped the row"
+    );
+    let forms: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM web_form WHERE slug = $1")
+        .bind(SLUG)
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+    assert_eq!(forms, 0, "form deleted");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
