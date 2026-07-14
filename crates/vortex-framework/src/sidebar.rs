@@ -46,9 +46,10 @@ pub fn build_sidebar(
     is_admin: bool,
     plugin_registry: &PluginRegistry,
     user_roles: &[String],
+    apps_html: &str,
 ) -> String {
     let nav_html =
-        build_sidebar_nav(active_page, installed, is_admin, plugin_registry, user_roles);
+        build_sidebar_nav(active_page, installed, is_admin, plugin_registry, user_roles, apps_html);
     format!(r##"<aside id="sidebar" class="w-64 bg-base-100 shadow-lg flex flex-col fixed top-0 left-0 z-40 h-full -translate-x-full transition-transform duration-200 lg:translate-x-0 lg:sticky lg:top-0 lg:h-screen lg:self-start overflow-y-auto">
 <div class="p-4 border-b border-base-300"><a href="/home" class="text-xl font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a></div>
 <nav class="flex-1 p-4 overflow-y-auto"><ul class="menu menu-sm gap-1">{}</ul></nav>
@@ -72,6 +73,7 @@ pub fn build_sidebar_nav(
     is_admin: bool,
     plugin_registry: &PluginRegistry,
     user_roles: &[String],
+    apps_html: &str,
 ) -> String {
     let mut nav_html = String::new();
 
@@ -172,6 +174,11 @@ pub fn build_sidebar_nav(
             }
         }
     }
+
+    // Custom Apps — Blueprint models the admin explicitly added to the menu.
+    // The group HTML is pre-rendered by the host (the framework has no DB access
+    // here); empty when no Blueprint is flagged for the sidebar.
+    nav_html.push_str(apps_html);
 
     nav_html
 }
@@ -311,7 +318,7 @@ mod tests {
         let mut r = PluginRegistry::new();
         r.register(Arc::new(Dummy));
         let installed: HashSet<String> = ["field_service".to_string()].into_iter().collect();
-        let html = build_sidebar("home", "Alice", "AL", &installed, true, &r, &[]);
+        let html = build_sidebar("home", "Alice", "AL", &installed, true, &r, &[], "");
         assert!(html.contains("Leads"));
         assert!(html.contains("Field Service"));
         assert!(html.contains("/crm/leads"));
@@ -328,13 +335,13 @@ mod tests {
         r.register(Arc::new(Dummy));
         let installed: HashSet<String> = ["field_service".to_string()].into_iter().collect();
 
-        let nav = build_sidebar_nav("home", &installed, true, &r, &[]);
+        let nav = build_sidebar_nav("home", &installed, true, &r, &[], "");
         assert!(nav.contains("Leads"), "nav should carry plugin entries");
         assert!(nav.contains(r#"href="/home""#), "nav should carry core entries");
         assert!(!nav.contains("<aside"), "nav must not include the aside chrome");
         assert!(!nav.contains("Logout"), "nav must not include the user footer");
 
-        let full = build_sidebar("home", "Alice", "AL", &installed, true, &r, &[]);
+        let full = build_sidebar("home", "Alice", "AL", &installed, true, &r, &[], "");
         assert!(full.contains("<aside"), "full sidebar keeps the aside chrome");
         assert!(full.contains(&nav), "full sidebar embeds the bare nav verbatim");
     }
@@ -344,14 +351,14 @@ mod tests {
         let mut r = PluginRegistry::new();
         r.register(Arc::new(Dummy));
         let installed: HashSet<String> = HashSet::new();
-        let html = build_sidebar("home", "Alice", "AL", &installed, true, &r, &[]);
+        let html = build_sidebar("home", "Alice", "AL", &installed, true, &r, &[], "");
         assert!(!html.contains("Leads"));
     }
 
     #[test]
     fn sidebar_always_has_home_link() {
         let r = PluginRegistry::new();
-        let html = build_sidebar("home", "Alice", "AL", &HashSet::new(), false, &r, &[]);
+        let html = build_sidebar("home", "Alice", "AL", &HashSet::new(), false, &r, &[], "");
         assert!(html.contains(r#"href="/home""#));
     }
 
@@ -391,7 +398,7 @@ mod tests {
         let mut r = PluginRegistry::new();
         r.register(Arc::new(NestedPlugin));
         let installed: HashSet<String> = ["inventory".to_string()].into_iter().collect();
-        let html = build_sidebar("home", "Alice", "AL", &installed, true, &r, &[]);
+        let html = build_sidebar("home", "Alice", "AL", &installed, true, &r, &[], "");
         // Parent rendered as a <details> submenu, child link nested inside it.
         assert!(html.contains("<details"));
         assert!(html.contains("<summary"));
@@ -406,10 +413,10 @@ mod tests {
         r.register(Arc::new(NestedPlugin));
         let installed: HashSet<String> = ["inventory".to_string()].into_iter().collect();
         // Collapsed when elsewhere…
-        let html = build_sidebar("home", "Alice", "AL", &installed, true, &r, &[]);
+        let html = build_sidebar("home", "Alice", "AL", &installed, true, &r, &[], "");
         assert!(!html.contains("<details open"));
         // …auto-opens when the active page is a child of the submenu.
-        let html = build_sidebar("inventory.categories", "Alice", "AL", &installed, true, &r, &[]);
+        let html = build_sidebar("inventory.categories", "Alice", "AL", &installed, true, &r, &[], "");
         assert!(html.contains("<details open"));
     }
 }

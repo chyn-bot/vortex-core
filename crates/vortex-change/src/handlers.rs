@@ -203,6 +203,7 @@ async fn cr_list(
         user.is_admin(),
         &state.plugin_registry,
         &user.roles,
+        "",
     );
 
     let mut body = String::new();
@@ -259,6 +260,7 @@ async fn cr_new_form(
         user.is_admin(),
         &state.plugin_registry,
         &user.roles,
+        "",
     );
 
     let mut cat_opts = String::new();
@@ -561,6 +563,7 @@ async fn cr_detail(
         user.is_admin(),
         &state.plugin_registry,
         &user.roles,
+        "",
     );
 
     let requester_display = requester_name.as_deref().unwrap_or(&requester_username);

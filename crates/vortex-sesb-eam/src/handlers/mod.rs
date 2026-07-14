@@ -100,6 +100,7 @@ pub(crate) fn render_sidebar_active(
         user.is_admin(),
         &state.plugin_registry,
         &user.roles,
+        "",
     )
 }
 

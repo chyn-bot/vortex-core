@@ -81,6 +81,7 @@ pub(crate) fn render_sidebar(state: &AppState, user: &AuthUser, db_ctx: &Databas
         user.is_admin(),
         &state.plugin_registry,
         &user.roles,
+        "",
     )
 }
 
