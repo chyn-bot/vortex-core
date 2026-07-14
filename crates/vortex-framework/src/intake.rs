@@ -88,7 +88,19 @@ pub struct WebForm {
     /// Target column that receives the portal submitter's partner id (owner
     /// stamping). Validated identifier; only stamped for portal submissions.
     pub partner_field: Option<String>,
+    /// File-upload fields (Phase 4). Distinct from `fields` — a file is stored
+    /// via the FileStore and linked as an `ir_attachment` on the record, never
+    /// written as a column, so these never touch the column allow-list.
+    pub attach_fields: Vec<FormField>,
+    /// Max size per uploaded file, in MB (defaults to `DEFAULT_MAX_UPLOAD_MB`).
+    pub attach_max_mb: i64,
+    /// Accepted upload types: lowercase extensions (".pdf") and/or MIME globs
+    /// ("image/*", "application/pdf"). Empty = a safe built-in default set.
+    pub attach_accept: Vec<String>,
 }
+
+/// Default per-file upload ceiling when a form doesn't set one.
+pub const DEFAULT_MAX_UPLOAD_MB: i64 = 10;
 
 /// The governance knobs parsed out of a form's `settings` JSONB.
 struct ParsedSettings {
@@ -99,12 +111,30 @@ struct ParsedSettings {
     daily_cap: Option<i64>,
     portal: bool,
     partner_field: Option<String>,
+    attach_fields: Vec<FormField>,
+    attach_max_mb: i64,
+    attach_accept: Vec<String>,
 }
 
 fn parse_settings(settings: &serde_json::Value) -> ParsedSettings {
     let str_opt = |k: &str| {
         settings.get(k).and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string)
     };
+    let attach = settings.get("attachments");
+    let attach_fields: Vec<FormField> = attach
+        .and_then(|a| a.get("fields"))
+        .and_then(|f| serde_json::from_value(f.clone()).ok())
+        .unwrap_or_default();
+    let attach_max_mb = attach
+        .and_then(|a| a.get("max_mb"))
+        .and_then(|v| v.as_i64())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_MAX_UPLOAD_MB);
+    let attach_accept: Vec<String> = attach
+        .and_then(|a| a.get("accept"))
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.trim().to_lowercase())).filter(|s| !s.is_empty()).collect())
+        .unwrap_or_default();
     ParsedSettings {
         success_msg: settings.get("success_msg").and_then(|v| v.as_str()).map(str::to_string),
         origins: settings
@@ -115,6 +145,9 @@ fn parse_settings(settings: &serde_json::Value) -> ParsedSettings {
         quarantine: settings.get("quarantine").and_then(|v| v.as_bool()).unwrap_or(false),
         notify_to: str_opt("notify_to"),
         daily_cap: settings.get("daily_cap").and_then(|v| v.as_i64()).filter(|n| *n > 0),
+        attach_fields,
+        attach_max_mb,
+        attach_accept,
         portal: settings.get("portal").and_then(|v| v.as_bool()).unwrap_or(false),
         partner_field: str_opt("partner_field").filter(|s| valid_ident(s)),
     }
@@ -177,6 +210,122 @@ impl OwnerStamp {
             },
         }
     }
+}
+
+// ===========================================================================
+// Attachments (Phase 4) — policy-bounded file uploads, FileStore-backed.
+// ===========================================================================
+
+/// A raw uploaded file parsed from a multipart submission (pre-validation).
+pub struct RawUpload {
+    pub field: String,
+    pub filename: String,
+    pub mime: String,
+    pub data: Vec<u8>,
+}
+
+/// A stored upload, recorded on the submission and linked as an `ir_attachment`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredUpload {
+    pub key: String,
+    pub name: String,
+    pub size: i64,
+    pub mime: String,
+    pub checksum: String,
+}
+
+/// Strip any path components and keep a filesystem-safe basename.
+pub fn sanitize_filename(name: &str) -> String {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    let cleaned: String = base
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') { c } else { '_' })
+        .collect();
+    let trimmed = cleaned.trim_matches(['.', '_']).to_string();
+    if trimmed.is_empty() { "upload".to_string() } else { trimmed.chars().take(120).collect() }
+}
+
+/// Does `mime`/`filename` satisfy the form's accept list? An empty list means a
+/// safe built-in default (common documents + images); otherwise a rule matches
+/// if it equals the mime, is a `type/*` glob prefix, or a matching `.ext`.
+pub fn upload_accepted(form: &WebForm, mime: &str, filename: &str) -> bool {
+    const DEFAULT_ACCEPT: &[&str] = &[
+        "application/pdf", "image/png", "image/jpeg", "image/gif", "image/webp",
+        "text/plain", "text/csv",
+        "application/msword",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "application/vnd.ms-excel",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ];
+    let mime = mime.to_lowercase();
+    let fname = filename.to_lowercase();
+    let rule_matches = |rule: &str| -> bool {
+        if let Some(prefix) = rule.strip_suffix("/*") {
+            mime.starts_with(&format!("{prefix}/"))
+        } else if let Some(ext) = rule.strip_prefix('.') {
+            fname.ends_with(&format!(".{ext}"))
+        } else {
+            mime == rule
+        }
+    };
+    if form.attach_accept.is_empty() {
+        DEFAULT_ACCEPT.iter().any(|r| mime == *r)
+    } else {
+        form.attach_accept.iter().any(|r| rule_matches(r))
+    }
+}
+
+/// Validate one upload against the form's size + type policy. `Ok(())` to store.
+pub fn validate_upload(form: &WebForm, up: &RawUpload) -> Result<(), String> {
+    if up.data.is_empty() {
+        return Err(format!("'{}' is empty.", up.filename));
+    }
+    let max_bytes = form.attach_max_mb.max(1) * 1024 * 1024;
+    if up.data.len() as i64 > max_bytes {
+        return Err(format!("'{}' exceeds the {} MB limit.", up.filename, form.attach_max_mb));
+    }
+    if !upload_accepted(form, &up.mime, &up.filename) {
+        return Err(format!("'{}' is not an accepted file type.", up.filename));
+    }
+    Ok(())
+}
+
+/// Required file fields with no uploaded file (by field name).
+pub fn missing_required_files(form: &WebForm, present: &HashSet<String>) -> Vec<String> {
+    form.attach_fields
+        .iter()
+        .filter(|f| f.required && !present.contains(&f.name))
+        .map(|f| f.label.clone())
+        .collect()
+}
+
+/// Insert `ir_attachment` rows linking already-stored blobs to a record.
+async fn link_attachments(
+    db: &PgPool,
+    model: &str,
+    record_id: Uuid,
+    uploads: &[StoredUpload],
+    created_by: Option<Uuid>,
+) -> Result<(), String> {
+    for u in uploads {
+        sqlx::query(
+            "INSERT INTO ir_attachment
+                 (name, res_model, res_id, store_fname, file_size, mimetype, checksum, created_by)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+        )
+        .bind(&u.name)
+        .bind(model)
+        .bind(record_id)
+        .bind(&u.key)
+        .bind(u.size)
+        .bind(&u.mime)
+        .bind(&u.checksum)
+        .bind(created_by)
+        .execute(db)
+        .await
+        .map_err(dberr)?;
+    }
+    Ok(())
 }
 
 /// Sign a form nonce: `HMAC(master_key, "<slug>|<issued_at>")`. Stateless — the
@@ -282,6 +431,9 @@ fn web_form_from_row(row: &sqlx::postgres::PgRow, fields: Vec<FormField>, s: Par
         daily_cap: s.daily_cap,
         portal: s.portal,
         partner_field: s.partner_field,
+        attach_fields: s.attach_fields,
+        attach_max_mb: s.attach_max_mb,
+        attach_accept: s.attach_accept,
     }
 }
 
@@ -470,6 +622,7 @@ pub async fn submit(
     writable: &BTreeMap<String, String>,
     source_ip: Option<String>,
     submitter: &Submitter,
+    attachments: &[StoredUpload],
 ) -> Result<SubmitOutcome, String> {
     // Daily cap — counts today's accepted + quarantined submissions.
     if let Some(cap) = form.daily_cap {
@@ -479,21 +632,24 @@ pub async fn submit(
     }
 
     let payload = serde_json::to_value(writable).unwrap_or_else(|_| serde_json::json!({}));
+    let attach_json = serde_json::to_value(attachments).unwrap_or_else(|_| serde_json::json!([]));
     let partner_id = submitter.partner_id();
     let submitted_by = submitter.user_id();
 
     if form.quarantine {
-        // Hold for review: capture the payload + actor, write NO record yet.
+        // Hold for review: capture the payload + actor + stored blobs (linked to
+        // the record only on approval), write NO record yet.
         let sub_id: Uuid = sqlx::query_scalar(
             "INSERT INTO web_form_submission
-                 (form_id, record_id, status, source_ip, payload, partner_id, submitted_by)
-             VALUES ($1, NULL, 'quarantined', $2::inet, $3, $4, $5) RETURNING id",
+                 (form_id, record_id, status, source_ip, payload, partner_id, submitted_by, attachments)
+             VALUES ($1, NULL, 'quarantined', $2::inet, $3, $4, $5, $6) RETURNING id",
         )
         .bind(form.id)
         .bind(&source_ip)
         .bind(&payload)
         .bind(partner_id)
         .bind(submitted_by)
+        .bind(&attach_json)
         .fetch_one(db)
         .await
         .map_err(dberr)?;
@@ -501,7 +657,8 @@ pub async fn submit(
         audit_submit(
             state, db_name, submitter, "intake_quarantined", AuditSeverity::Info,
             "web_form_submission", &sub_id.to_string(),
-            serde_json::json!({ "form": form.slug, "model": form.model, "source_ip": source_ip }),
+            serde_json::json!({ "form": form.slug, "model": form.model, "source_ip": source_ip,
+                                "attachments": attachments.len() }),
         ).await;
         notify_submission(state, db_name, form, true).await;
         return Ok(SubmitOutcome::Quarantined(sub_id));
@@ -510,10 +667,11 @@ pub async fn submit(
     // Immediate write, with owner stamping for portal submissions.
     let stamp = OwnerStamp::for_submitter(submitter, form);
     let record_id = insert_target_record(db, form, writable, &stamp).await?;
+    link_attachments(db, &form.model, record_id, attachments, submitted_by).await?;
     sqlx::query(
         "INSERT INTO web_form_submission
-             (form_id, record_id, status, source_ip, payload, partner_id, submitted_by)
-         VALUES ($1, $2, 'accepted', $3::inet, $4, $5, $6)",
+             (form_id, record_id, status, source_ip, payload, partner_id, submitted_by, attachments)
+         VALUES ($1, $2, 'accepted', $3::inet, $4, $5, $6, $7)",
     )
     .bind(form.id)
     .bind(record_id)
@@ -521,6 +679,7 @@ pub async fn submit(
     .bind(&payload)
     .bind(partner_id)
     .bind(submitted_by)
+    .bind(&attach_json)
     .execute(db)
     .await
     .map_err(dberr)?;
@@ -720,6 +879,10 @@ pub struct FormSettings<'a> {
     pub portal: bool,
     /// Target column stamped with the portal submitter's partner id ("" = none).
     pub partner_field: &'a str,
+    /// File-upload fields (Phase 4).
+    pub attach_fields: &'a [FormField],
+    pub attach_max_mb: i64,
+    pub attach_accept: &'a [String],
 }
 
 /// Update a form's allow-list + settings + active flag.
@@ -742,6 +905,11 @@ pub async fn update_form(
         "daily_cap": s.daily_cap.max(0),
         "portal": s.portal,
         "partner_field": partner_field,
+        "attachments": {
+            "fields": s.attach_fields,
+            "max_mb": s.attach_max_mb.max(0),
+            "accept": s.attach_accept,
+        },
     });
     sqlx::query(
         "UPDATE web_form SET fields = $2, settings = $3, active = $4, updated_at = now() WHERE id = $1",
@@ -845,13 +1013,16 @@ pub struct SubmissionRow {
     pub reviewed_by: Option<String>,
     /// Allow-listed values captured at submit (for quarantine preview).
     pub payload: BTreeMap<String, String>,
+    /// Number of files attached to this submission.
+    pub attachments: i64,
 }
 
 /// List a form's submissions, newest first (capped).
 pub async fn list_submissions(db: &PgPool, form_id: Uuid, limit: i64) -> Vec<SubmissionRow> {
     sqlx::query(
         "SELECT s.id, s.status, s.record_id, host(s.source_ip) AS source_ip, s.created_at,
-                s.payload, u.username AS reviewed_by
+                s.payload, COALESCE(jsonb_array_length(s.attachments), 0) AS n_attach,
+                u.username AS reviewed_by
          FROM web_form_submission s
          LEFT JOIN users u ON u.id = s.reviewed_by
          WHERE s.form_id = $1 ORDER BY s.created_at DESC LIMIT $2",
@@ -877,6 +1048,7 @@ pub async fn list_submissions(db: &PgPool, form_id: Uuid, limit: i64) -> Vec<Sub
             created_at: r.get("created_at"),
             reviewed_by: r.try_get("reviewed_by").ok().flatten(),
             payload,
+            attachments: r.try_get::<Option<i32>, _>("n_attach").ok().flatten().unwrap_or(0) as i64,
         }
     })
     .collect()
@@ -894,7 +1066,7 @@ pub async fn approve_submission(
     reviewer_name: &str,
 ) -> Result<Uuid, String> {
     let row = sqlx::query(
-        "SELECT form_id, status, payload, partner_id, submitted_by
+        "SELECT form_id, status, payload, partner_id, submitted_by, attachments
          FROM web_form_submission WHERE id = $1",
     )
     .bind(submission_id)
@@ -917,6 +1089,13 @@ pub async fn approve_submission(
     // carries the same owner it would have had on an immediate write.
     let partner_id: Option<Uuid> = row.try_get("partner_id").ok().flatten();
     let submitted_by: Option<Uuid> = row.try_get("submitted_by").ok().flatten();
+    // Blobs stored at submit time — linked to the record now that it exists.
+    let held_uploads: Vec<StoredUpload> = row
+        .try_get::<Option<serde_json::Value>, _>("attachments")
+        .ok()
+        .flatten()
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default();
 
     let (form, _active) = load_form(db, form_id).await.ok_or("Form no longer exists.")?;
     // Re-validate against the current allow-list (the form may have changed
@@ -931,6 +1110,7 @@ pub async fn approve_submission(
         partner: form.partner_field.clone().zip(partner_id),
     };
     let record_id = insert_target_record(db, &form, &writable, &stamp).await?;
+    link_attachments(db, &form.model, record_id, &held_uploads, submitted_by).await?;
 
     sqlx::query(
         "UPDATE web_form_submission
@@ -1055,7 +1235,50 @@ mod tests {
             description: None, fields: vec![], company_id: None, success_msg: None,
             origins: vec![], quarantine: false, notify_to: None, daily_cap: None,
             portal: true, partner_field: partner_field.map(str::to_string),
+            attach_fields: vec![], attach_max_mb: DEFAULT_MAX_UPLOAD_MB, attach_accept: vec![],
         }
+    }
+
+    fn upload(name: &str, mime: &str, size: usize) -> RawUpload {
+        RawUpload { field: "file".into(), filename: name.into(), mime: mime.into(), data: vec![0u8; size] }
+    }
+
+    #[test]
+    fn sanitize_filename_strips_paths_and_unsafe_chars() {
+        assert_eq!(sanitize_filename("../../etc/passwd"), "passwd");
+        assert_eq!(sanitize_filename("my file (1).PDF"), "my_file__1_.PDF");
+        assert_eq!(sanitize_filename("C:\\Users\\a\\x.png"), "x.png");
+        assert_eq!(sanitize_filename("..."), "upload");
+    }
+
+    #[test]
+    fn upload_policy_enforces_type_and_size() {
+        let mut form = form_with_partner(None);
+        // Default accept-set: pdf ok, exe rejected.
+        assert!(upload_accepted(&form, "application/pdf", "a.pdf"));
+        assert!(!upload_accepted(&form, "application/x-msdownload", "a.exe"));
+        // Custom accept: image/* glob + .csv extension.
+        form.attach_accept = vec!["image/*".into(), ".csv".into()];
+        assert!(upload_accepted(&form, "image/png", "a.png"));
+        assert!(upload_accepted(&form, "text/plain", "data.csv")); // by extension
+        assert!(!upload_accepted(&form, "application/pdf", "a.pdf")); // not in custom set
+
+        form.attach_accept = vec![];
+        form.attach_max_mb = 1;
+        assert!(validate_upload(&form, &upload("a.pdf", "application/pdf", 500)).is_ok());
+        assert!(validate_upload(&form, &upload("a.pdf", "application/pdf", 2 * 1024 * 1024)).is_err()); // too big
+        assert!(validate_upload(&form, &upload("a.pdf", "application/pdf", 0)).is_err()); // empty
+        assert!(validate_upload(&form, &upload("a.exe", "application/x-msdownload", 100)).is_err()); // bad type
+    }
+
+    #[test]
+    fn missing_required_files_reports_absent() {
+        let mut form = form_with_partner(None);
+        form.attach_fields = vec![f("id_doc", true), f("extra", false)];
+        let present: HashSet<String> = ["extra".to_string()].into_iter().collect();
+        assert_eq!(missing_required_files(&form, &present), vec!["id_doc".to_string()]);
+        let both: HashSet<String> = ["id_doc".to_string(), "extra".to_string()].into_iter().collect();
+        assert!(missing_required_files(&form, &both).is_empty());
     }
 
     #[test]

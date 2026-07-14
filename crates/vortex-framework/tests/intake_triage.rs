@@ -45,6 +45,7 @@ async fn setup() -> Option<Harness> {
 
     // Clean any prior run (submissions cascade from web_form).
     sqlx::query("DELETE FROM web_form WHERE slug = $1").bind(SLUG).execute(&pool).await.ok();
+    sqlx::query("DELETE FROM ir_attachment WHERE res_model = $1").bind(MODEL).execute(&pool).await.ok();
     sqlx::query("DELETE FROM ir_model WHERE name = $1").bind(MODEL).execute(&pool).await.ok();
     sqlx::query(&format!("DROP TABLE IF EXISTS {TARGET_TABLE}")).execute(&pool).await.ok();
 
@@ -111,24 +112,27 @@ async fn form_id(pool: &PgPool) -> Uuid {
         .unwrap()
 }
 
-/// Insert a quarantined submission carrying `payload` + optional actor, return its id.
+/// Insert a quarantined submission carrying `payload` + optional actor + held
+/// attachments, return its id.
 async fn quarantined(
     pool: &PgPool,
     name: &str,
     partner_id: Option<Uuid>,
     submitted_by: Option<Uuid>,
+    attachments: &[vortex_framework::intake::StoredUpload],
 ) -> Uuid {
     let fid = form_id(pool).await;
     let mut payload = BTreeMap::new();
     payload.insert("name".to_string(), name.to_string());
     sqlx::query_scalar(
-        "INSERT INTO web_form_submission (form_id, status, payload, partner_id, submitted_by)
-         VALUES ($1, 'quarantined', $2, $3, $4) RETURNING id",
+        "INSERT INTO web_form_submission (form_id, status, payload, partner_id, submitted_by, attachments)
+         VALUES ($1, 'quarantined', $2, $3, $4, $5) RETURNING id",
     )
     .bind(fid)
     .bind(serde_json::to_value(&payload).unwrap())
     .bind(partner_id)
     .bind(submitted_by)
+    .bind(serde_json::to_value(attachments).unwrap())
     .fetch_one(pool)
     .await
     .unwrap()
@@ -140,13 +144,35 @@ async fn approve_writes_the_held_record_and_settles_the_ledger() {
     // A portal-origin held submission: it carries the partner + submitter, which
     // approval must stamp onto the replayed record (owner stamping).
     let partner = Uuid::from_u128(0xA0);
-    let sub = quarantined(&h.pool, "Approved Row", Some(partner), Some(h.reviewer)).await;
+    // A held attachment that approval must link to the new record.
+    let held = vortex_framework::intake::StoredUpload {
+        key: "intake/held-blob.pdf".into(),
+        name: "held.pdf".into(),
+        size: 42,
+        mime: "application/pdf".into(),
+        checksum: "deadbeef".into(),
+    };
+    let sub = quarantined(&h.pool, "Approved Row", Some(partner), Some(h.reviewer), &[held]).await;
 
     let rec = vortex_framework::intake::approve_submission(
         &h.audit, &h.pool, "intake_test", sub, h.reviewer, "tester",
     )
     .await
     .expect("approve should succeed");
+
+    // The held blob is now linked as an ir_attachment on the new record.
+    let attach = sqlx::query(
+        "SELECT name, store_fname, file_size, created_by FROM ir_attachment
+         WHERE res_model = $1 AND res_id = $2",
+    )
+    .bind(MODEL)
+    .bind(rec)
+    .fetch_one(&h.pool)
+    .await
+    .expect("attachment linked on approval");
+    assert_eq!(attach.get::<String, _>("name"), "held.pdf");
+    assert_eq!(attach.get::<String, _>("store_fname"), "intake/held-blob.pdf");
+    assert_eq!(attach.get::<Option<Uuid>, _>("created_by"), Some(h.reviewer));
 
     // The record now exists in the target table with the captured value AND the
     // owner stamps replayed from the held submission.
@@ -185,7 +211,7 @@ async fn approve_writes_the_held_record_and_settles_the_ledger() {
 #[tokio::test]
 async fn reject_writes_no_record() {
     let Some(h) = setup().await else { return };
-    let sub = quarantined(&h.pool, "Rejected Row", None, None).await;
+    let sub = quarantined(&h.pool, "Rejected Row", None, None, &[]).await;
 
     let before: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {TARGET_TABLE}"))
         .fetch_one(&h.pool)

@@ -1,0 +1,5 @@
+# Migration metadata for 151_intake_attachments
+module = "core"
+description = "Vortex Intake Phase 4: web_form_submission.attachments JSONB — stored-blob metadata held until an ir_attachment link is created (immediately on accept, on approval for quarantine)."
+reversible = true
+dependencies = ["150_intake_portal"]

@@ -2490,6 +2490,8 @@ fn build_router(state: Arc<AppState>) -> Router {
     });
     let intake_public = Router::new()
         .route("/i/{slug}", get(intake_form_page).post(intake_submit))
+        // Allow file uploads (axum's default body limit is 2 MB).
+        .layer(axum::extract::DefaultBodyLimit::max(32 * 1024 * 1024))
         .route_layer(middleware::from_fn_with_state(state.clone(), public_context_middleware))
         .layer(middleware::from_fn(vortex_server::middleware::rate_limit::rate_limit_middleware))
         .layer(Extension(intake_limiter));
@@ -2561,6 +2563,8 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/portal/requests", get(portal_requests))
         .route("/portal/forms/{slug}", get(portal_form_page).post(portal_form_submit))
         .route("/portal/logout", post(portal_logout))
+        // Allow file uploads on portal request forms (default body limit is 2 MB).
+        .layer(axum::extract::DefaultBodyLimit::max(32 * 1024 * 1024))
         .route_layer(middleware::from_fn_with_state(state.clone(), portal_auth_middleware));
 
     // Public portal login (pre-auth), rate-limited like the staff login.
@@ -3191,6 +3195,25 @@ async fn intake_form_page(
         ));
     }
 
+    // File-upload fields (Phase 4). Their presence switches the form to
+    // multipart/form-data.
+    let accept_attr = if form.attach_accept.is_empty() {
+        String::new()
+    } else {
+        format!(r#" accept="{}""#, html_escape(&form.attach_accept.join(",")))
+    };
+    for f in &form.attach_fields {
+        let req = if f.required { r#" <span class="req">*</span>"# } else { "" };
+        let ra = if f.required { " required" } else { "" };
+        fields_html.push_str(&format!(
+            r#"<div class="field"><label for="a_{name}">{label}{req}</label>
+<input type="file" id="a_{name}" name="{name}"{accept}{ra}></div>"#,
+            name = html_escape(&f.name), label = html_escape(&f.label),
+            req = req, accept = accept_attr, ra = ra,
+        ));
+    }
+    let enctype = if form.attach_fields.is_empty() { "" } else { r#" enctype="multipart/form-data""# };
+
     let desc = form
         .description
         .as_deref()
@@ -3201,7 +3224,7 @@ async fn intake_form_page(
     let body = format!(
         r#"<div class="card">
 <h1>{title}</h1>{desc}
-<form method="post" action="/i/{slug}">
+<form method="post" action="/i/{slug}"{enctype}>
 <input type="hidden" name="{ts_field}" value="{issued_at}">
 <input type="hidden" name="{nonce_field}" value="{nonce}">
 <div class="hp" aria-hidden="true"><label for="{hp_field}">Leave this field empty</label>
@@ -3213,6 +3236,7 @@ async fn intake_form_page(
         title = html_escape(&form.title),
         desc = desc,
         slug = html_escape(&slug),
+        enctype = enctype,
         ts_field = vortex_framework::intake::TS_FIELD,
         issued_at = issued_at,
         nonce_field = vortex_framework::intake::NONCE_FIELD,
@@ -3255,24 +3279,113 @@ fn intake_success_page(form: &vortex_framework::intake::WebForm) -> Response {
     Html(intake_page_shell(&form.title, &body)).into_response()
 }
 
-/// `POST /i/{slug}` — verify, allow-list, and write a governed anonymous record.
+/// Parse an intake submission body — urlencoded (no files) or
+/// `multipart/form-data` (with files) — into text fields + raw uploads.
+async fn parse_intake_submission(
+    request: Request,
+) -> Result<(std::collections::BTreeMap<String, String>, Vec<vortex_framework::intake::RawUpload>), String> {
+    use axum::extract::{FromRequest, Multipart};
+    use vortex_framework::intake::RawUpload;
+    let ct = request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let mut fields = std::collections::BTreeMap::new();
+    let mut files = Vec::new();
+    if ct.starts_with("multipart/form-data") {
+        let mut mp = Multipart::from_request(request, &())
+            .await
+            .map_err(|e| format!("Invalid upload: {e}"))?;
+        while let Ok(Some(field)) = mp.next_field().await {
+            let name = field.name().unwrap_or("").to_string();
+            if name.is_empty() {
+                continue;
+            }
+            let filename = field.file_name().map(|s| s.to_string());
+            let mime = field.content_type().map(|s| s.to_string());
+            match filename {
+                Some(fname) if !fname.trim().is_empty() => {
+                    let mime = mime.unwrap_or_else(|| "application/octet-stream".into());
+                    let data = field.bytes().await.map_err(|e| format!("Failed to read '{fname}': {e}"))?;
+                    files.push(RawUpload { field: name, filename: fname, mime, data: data.to_vec() });
+                }
+                _ => {
+                    let val = field.text().await.map_err(|e| format!("Invalid field: {e}"))?;
+                    fields.insert(name, val);
+                }
+            }
+        }
+    } else {
+        // Plain urlencoded form (no files) — let axum's Form parse it.
+        let Form(pairs) = Form::<Vec<(String, String)>>::from_request(request, &())
+            .await
+            .map_err(|_| "Malformed submission.".to_string())?;
+        fields = pairs.into_iter().collect();
+    }
+    Ok((fields, files))
+}
+
+/// Validate uploads against the form policy and store the blobs in the tenant
+/// FileStore, returning the linkable metadata (nothing is linked to a record
+/// here). Fails closed on the first bad file.
+async fn store_intake_uploads(
+    state: &AppState,
+    db_name: &str,
+    form: &vortex_framework::intake::WebForm,
+    raws: Vec<vortex_framework::intake::RawUpload>,
+) -> Result<Vec<vortex_framework::intake::StoredUpload>, String> {
+    use vortex_framework::intake::{self, StoredUpload};
+    let mut out = Vec::new();
+    for raw in raws {
+        intake::validate_upload(form, &raw)?;
+        let key = new_store_key("intake/", &raw.filename);
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(&raw.data);
+        let checksum = hex::encode(h.finalize());
+        let size = raw.data.len() as i64;
+        state
+            .files
+            .put(db_name, &key, &raw.data, Some(&raw.mime))
+            .await
+            .map_err(|e| {
+                error!("intake attachment store failed: {e}");
+                "Could not store an uploaded file. Please try again.".to_string()
+            })?;
+        out.push(StoredUpload {
+            key,
+            name: intake::sanitize_filename(&raw.filename),
+            size,
+            mime: raw.mime,
+            checksum,
+        });
+    }
+    Ok(out)
+}
+
+/// `POST /i/{slug}` — verify, allow-list, store files, and write a governed
+/// anonymous record. Accepts urlencoded or multipart (when the form has files).
 async fn intake_submit(
     State(state): State<Arc<AppState>>,
     Extension(ctx): Extension<DatabaseContext>,
-    headers: HeaderMap,
     Path(slug): Path<String>,
-    Form(raw): Form<Vec<(String, String)>>,
+    request: Request,
 ) -> Response {
     use vortex_framework::intake;
     let db = ctx.pool.pool();
+    let headers = request.headers().clone();
 
     let form = match intake::fetch_form(db, &slug).await {
         Some(f) => f,
         None => return intake_error_page(StatusCode::NOT_FOUND, &slug, "This form is no longer available."),
     };
 
-    // Collect posted pairs into a map (last value wins).
-    let submitted: std::collections::BTreeMap<String, String> = raw.into_iter().collect();
+    let (submitted, raws) = match parse_intake_submission(request).await {
+        Ok(x) => x,
+        Err(e) => return intake_error_page(StatusCode::BAD_REQUEST, &slug, &e),
+    };
 
     // 1. Honeypot: a filled trap ⇒ bot. Respond with a success page (don't tip
     //    the bot off) but write nothing.
@@ -3311,7 +3424,7 @@ async fn intake_submit(
         Err(e) => return intake_error_page(StatusCode::BAD_REQUEST, &slug, &e),
     };
 
-    // 5. Required fields present?
+    // 5. Required text fields + required file fields present?
     let missing = intake::missing_required(&form.fields, &writable);
     if !missing.is_empty() {
         return intake_error_page(
@@ -3320,10 +3433,26 @@ async fn intake_submit(
             &format!("Please fill in the required field(s): {}.", missing.join(", ")),
         );
     }
+    let present_files: std::collections::HashSet<String> =
+        raws.iter().filter(|r| !r.data.is_empty()).map(|r| r.field.clone()).collect();
+    let missing_files = intake::missing_required_files(&form, &present_files);
+    if !missing_files.is_empty() {
+        return intake_error_page(
+            StatusCode::BAD_REQUEST,
+            &slug,
+            &format!("Please attach: {}.", missing_files.join(", ")),
+        );
+    }
 
-    // 6. Governed write (daily cap → quarantine|accept → stamp + WORM audit).
+    // 6. Store uploads (validated + written to FileStore, not yet linked).
+    let uploads = match store_intake_uploads(&state, &ctx.db_name, &form, raws).await {
+        Ok(u) => u,
+        Err(e) => return intake_error_page(StatusCode::BAD_REQUEST, &slug, &e),
+    };
+
+    // 7. Governed write (daily cap → quarantine|accept → stamp + WORM audit).
     let (client_ip, _ua) = request_fingerprint(&headers);
-    match intake::submit(&state, db, &ctx.db_name, &form, &writable, client_ip, &intake::Submitter::Anonymous).await {
+    match intake::submit(&state, db, &ctx.db_name, &form, &writable, client_ip, &intake::Submitter::Anonymous, &uploads).await {
         Ok(intake::SubmitOutcome::Accepted(_)) | Ok(intake::SubmitOutcome::Quarantined(_)) => {
             intake_success_page(&form)
         }
@@ -3539,6 +3668,13 @@ async fn intake_form_edit(
     .fetch_all(&db)
     .await
     .unwrap_or_default();
+    // Attachment config → textarea "name | Label | required" per line.
+    let attach_val = form.attach_fields.iter().map(|f| {
+        let r = if f.required { " | required" } else { "" };
+        format!("{} | {}{}", f.name, f.label, r)
+    }).collect::<Vec<_>>().join("\n");
+    let accept_val = form.attach_accept.join(", ");
+
     let cur_pf = form.partner_field.clone().unwrap_or_default();
     let mut pf_opts = String::from(r#"<option value="">— none —</option>"#);
     for c in &uuid_cols {
@@ -3585,6 +3721,17 @@ async fn intake_form_edit(
 <label class="form-control"><span class="label-text">Partner field (stamped with the portal submitter)</span>
 <select name="partner_field" class="select select-bordered select-sm">{pf_opts}</select></label>
 </div></div>
+<div class="card bg-base-100 shadow mb-6"><div class="card-body">
+<h2 class="card-title text-lg">Attachments</h2>
+<p class="text-xs opacity-50">File-upload fields. Uploads are stored in the file store and linked to the record as attachments (not written as columns). One field per line: <code>name | Label | required</code> (the trailing <code>| required</code> is optional).</p>
+<label class="form-control"><span class="label-text">Upload fields</span>
+<textarea name="attach_fields" class="textarea textarea-bordered textarea-sm font-mono" rows="3" placeholder="id_doc | ID document | required&#10;photo | Site photo">{attach}</textarea></label>
+<div class="grid md:grid-cols-2 gap-3 mt-2">
+<label class="form-control"><span class="label-text">Max size per file (MB)</span>
+<input name="attach_max_mb" type="number" min="1" value="{max_mb}" class="input input-bordered input-sm"/></label>
+<label class="form-control"><span class="label-text">Accepted types (comma-sep; blank = safe defaults)</span>
+<input name="attach_accept" value="{accept}" placeholder=".pdf, image/*" class="input input-bordered input-sm"/></label>
+</div></div></div>
 <div class="flex gap-2"><button class="btn btn-primary btn-sm">Save</button></div>
 </form>
 <form method="post" action="/settings/forms/{id}/delete" onsubmit="return confirm('Delete this form and its submission ledger?')" class="mt-4">
@@ -3597,6 +3744,8 @@ async fn intake_form_edit(
         quar = if form.quarantine { "checked" } else { "" },
         checked = if active { "checked" } else { "" },
         portal = if form.portal { "checked" } else { "" }, pf_opts = pf_opts,
+        attach = html_escape(&attach_val), max_mb = form.attach_max_mb,
+        accept = html_escape(&accept_val),
     );
     intake_admin_shell(&user, &form.title, &inner).into_response()
 }
@@ -3656,8 +3805,26 @@ async fn intake_form_update(
     let portal = pairs.get("portal").is_some();
     let partner_field = pairs.get("partner_field").map(|s| s.trim()).unwrap_or("");
 
+    // Attachment fields: one per line "name | Label | required".
+    let attach_fields: Vec<vortex_framework::intake::FormField> = pairs
+        .get("attach_fields")
+        .map(|s| s.lines().filter_map(|line| {
+            let mut parts = line.split('|').map(|p| p.trim());
+            let name = parts.next().unwrap_or("").to_string();
+            if name.is_empty() { return None; }
+            let label = parts.next().filter(|s| !s.is_empty()).map(str::to_string).unwrap_or_else(|| name.clone());
+            let required = parts.next().map(|p| p.eq_ignore_ascii_case("required")).unwrap_or(false);
+            Some(vortex_framework::intake::FormField { name, label, help: None, required })
+        }).collect())
+        .unwrap_or_default();
+    let attach_max_mb = pairs.get("attach_max_mb").and_then(|s| s.trim().parse::<i64>().ok()).unwrap_or(0);
+    let attach_accept: Vec<String> = pairs.get("attach_accept")
+        .map(|s| s.split(',').map(|a| a.trim().to_string()).filter(|a| !a.is_empty()).collect())
+        .unwrap_or_default();
+
     let settings = vortex_framework::intake::FormSettings {
         success_msg, origins: &origins, quarantine, notify_to, daily_cap, active, portal, partner_field,
+        attach_fields: &attach_fields, attach_max_mb, attach_accept: &attach_accept,
     };
     if let Err(e) = vortex_framework::intake::update_form(&db, id, &fields, &settings).await {
         return intake_admin_shell(
@@ -3717,7 +3884,7 @@ async fn intake_submissions(
             other => (other, "badge-ghost"),
         };
         // Compact payload preview.
-        let preview = if s.payload.is_empty() {
+        let mut preview = if s.payload.is_empty() {
             "<span class='opacity-40'>—</span>".to_string()
         } else {
             s.payload.iter()
@@ -3725,6 +3892,12 @@ async fn intake_submissions(
                 .collect::<Vec<_>>()
                 .join("<br>")
         };
+        if s.attachments > 0 {
+            preview.push_str(&format!(
+                r#"<br><span class="badge badge-ghost badge-xs mt-1">📎 {} file(s)</span>"#,
+                s.attachments,
+            ));
+        }
         let record = match s.record_id {
             Some(r) => format!(r#"<a href="/form/{model}/{r}" class="link text-xs">record</a>"#, model = html_escape(&form.model), r = r),
             None => "<span class='opacity-40 text-xs'>—</span>".to_string(),
@@ -4528,6 +4701,23 @@ async fn portal_form_page(
             label = html_escape(&f.label), req = req, fname = html_escape(&f.name), ra = ra, help = help,
         ));
     }
+    // File-upload fields (Phase 4) — switch to multipart.
+    let accept_attr = if form.attach_accept.is_empty() {
+        String::new()
+    } else {
+        format!(r#" accept="{}""#, html_escape(&form.attach_accept.join(",")))
+    };
+    for f in &form.attach_fields {
+        let req = if f.required { r#" <span style="color:#e53e3e">*</span>"# } else { "" };
+        let ra = if f.required { " required" } else { "" };
+        fields_html.push_str(&format!(
+            r#"<label class="form-control mb-3"><span class="label-text">{label}{req}</span>
+<input type="file" name="{fname}"{accept}{ra} class="file-input file-input-bordered file-input-sm"/></label>"#,
+            label = html_escape(&f.label), req = req, fname = html_escape(&f.name), accept = accept_attr, ra = ra,
+        ));
+    }
+    let enctype = if form.attach_fields.is_empty() { "" } else { r#" enctype="multipart/form-data""# };
+
     let desc = form.description.as_deref().filter(|d| !d.trim().is_empty())
         .map(|d| format!(r#"<p class="text-base-content/60 mb-4">{}</p>"#, html_escape(d)))
         .unwrap_or_default();
@@ -4535,11 +4725,12 @@ async fn portal_form_page(
     let body = format!(
         r#"<a href="/portal/requests" class="link text-sm">← Requests</a>
 <h1 class="text-2xl font-bold mt-2 mb-1">{title}</h1>{desc}
-<form method="post" action="/portal/forms/{slug}" class="pcard p-5 mt-3 max-w-xl">
+<form method="post" action="/portal/forms/{slug}"{enctype} class="pcard p-5 mt-3 max-w-xl">
 {fields}
 <button class="btn btn-sm mt-2" style="background:#8BC53F;border-color:#8BC53F;color:#000">Submit request</button>
 </form>"#,
-        title = html_escape(&form.title), desc = desc, slug = html_escape(&slug), fields = fields_html,
+        title = html_escape(&form.title), desc = desc, slug = html_escape(&slug),
+        enctype = enctype, fields = fields_html,
     );
     Html(portal_shell(&form.title, &name, "requests", &body)).into_response()
 }
@@ -4551,7 +4742,7 @@ async fn portal_form_submit(
     Extension(user): Extension<AuthUser>,
     Extension(db_ctx): Extension<DatabaseContext>,
     Path(slug): Path<String>,
-    Form(raw): Form<Vec<(String, String)>>,
+    request: Request,
 ) -> Response {
     use vortex_framework::intake;
     use vortex_framework::ui::html_escape;
@@ -4570,7 +4761,10 @@ async fn portal_form_submit(
             r#"<div class="pcard p-6">This form is not available.</div>"#))).into_response();
     };
 
-    let submitted: std::collections::BTreeMap<String, String> = raw.into_iter().collect();
+    let (submitted, raws) = match parse_intake_submission(request).await {
+        Ok(x) => x,
+        Err(e) => return err_page(&name, &e, &slug),
+    };
     let writable = match intake::select_writable(&form.fields, &submitted) {
         Ok(w) => w,
         Err(e) => return err_page(&name, &e, &slug),
@@ -4579,13 +4773,23 @@ async fn portal_form_submit(
     if !missing.is_empty() {
         return err_page(&name, &format!("Please fill in: {}.", missing.join(", ")), &slug);
     }
+    let present_files: std::collections::HashSet<String> =
+        raws.iter().filter(|r| !r.data.is_empty()).map(|r| r.field.clone()).collect();
+    let missing_files = intake::missing_required_files(&form, &present_files);
+    if !missing_files.is_empty() {
+        return err_page(&name, &format!("Please attach: {}.", missing_files.join(", ")), &slug);
+    }
+    let uploads = match store_intake_uploads(&state, &db_ctx.db_name, &form, raws).await {
+        Ok(u) => u,
+        Err(e) => return err_page(&name, &e, &slug),
+    };
 
     let submitter = intake::Submitter::Portal {
         user_id: user.id,
         partner_id: partner,
         username: user.username.clone(),
     };
-    let outcome = intake::submit(&state, &db, &db_ctx.db_name, &form, &writable, None, &submitter).await;
+    let outcome = intake::submit(&state, &db, &db_ctx.db_name, &form, &writable, None, &submitter, &uploads).await;
     let msg = match outcome {
         Ok(intake::SubmitOutcome::Quarantined(_)) => "Thanks — your request was received and is pending review.",
         Ok(intake::SubmitOutcome::Accepted(_)) => "Thanks — your request has been received.",
