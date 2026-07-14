@@ -1,6 +1,8 @@
 # Vortex Intake — Public Web-Forms & Interactive Portal — Design Plan
 
-**Status:** Draft / proposal · **Author:** design session 2026-07-14 · **Depends on:** Blueprints (shipped, `f4f1e2c`), the model registry, `public_context_middleware` / `Plugin::public_routes`, the generic write path (`dynamic_form_create`), `vortex_security::crypto`, the in-memory rate limiter.
+**Status:** ✅ **Shipped to `master`** (2026-07-14) · **Author:** design session 2026-07-14 · **Depends on:** Blueprints (shipped, `f4f1e2c`), the model registry, `public_context_middleware` / `Plugin::public_routes`, the generic write path (`dynamic_form_create`), `vortex_security::crypto`, the in-memory rate limiter.
+
+> **Delivery record.** Every phase and follow-up below is merged. Phases 0–4b: PR #4 (`9b5cf83`). AV scanning hook: PR #5 (`3ee3265`). Orphaned-blob sweep: PR #6 (`c2c2dd4`). CAPTCHA adapter: PR #7 (`9f44050`). Portal record-stage tracking: PR #8 (`1c85618`). Service in `vortex-framework/src/intake.rs` (+ `captcha.rs`); migrations 148–151. Nothing in this plan is left open.
 
 ---
 
@@ -128,15 +130,15 @@ Refactor: extract the pure "build typed INSERT from (table, allowed cols, values
 
 ## 7. Phase plan
 
-**Phase 0 — Anonymous write path + safety core (no UI).** Extract the shared typed-INSERT builder; add server-side stamping (company/owner/stage) and `ir_model_field` required/type validation; the signed-nonce + honeypot + rate-limit + origin primitives; the `intake` audit action; migration 148 (`web_form`, `web_form_submission`, system user). Unit-test the nonce, the allow-list intersection, and the validator.
+**Phase 0 ✅ — Anonymous write path + safety core (no UI).** Extract the shared typed-INSERT builder; add server-side stamping (company/owner/stage) and `ir_model_field` required/type validation; the signed-nonce + honeypot + rate-limit + origin primitives; the `intake` audit action; migration 148 (`web_form`, `web_form_submission`, system user). Unit-test the nonce, the allow-list intersection, and the validator.
 
-**Phase 1 — Public form engine (the "aha").** `web_form` CRUD in the admin (`/settings/forms` or a Blueprint-adjacent builder), a public `GET/POST /i/{slug}` that renders the allow-listed fields and writes a governed record. Demo: publish a form for a Blueprint, submit it logged-out, watch an audited row appear. Fail-closed tenant guard.
+**Phase 1 ✅ — Public form engine (the "aha").** `web_form` CRUD in the admin (`/settings/forms` or a Blueprint-adjacent builder), a public `GET/POST /i/{slug}` that renders the allow-listed fields and writes a governed record. Demo: publish a form for a Blueprint, submit it logged-out, watch an audited row appear. Fail-closed tenant guard.
 
-**Phase 2 — Governance depth.** Per-form quarantine + a triage inbox; approval-before-commit (reuse the Blueprints approval shape); assignee/notification on submit; per-form daily cap + spam metrics; the submission ledger UI.
+**Phase 2 ✅ — Governance depth.** Per-form quarantine + a triage inbox; approval-before-commit (reuse the Blueprints approval shape); assignee/notification on submit; per-form daily cap + spam metrics; the submission ledger UI.
 
-**Phase 3 — Interactive portal.** Let authenticated portal users submit/track records via the same engine, scoped to `contact_id` (e.g. "raise a ticket", "request a quote", then see its status). Extends `/portal/*` from read-only to read-write, reusing the form definitions and the stamping/validation path (owner = the portal partner, not the anon user). Optional captcha adapter.
+**Phase 3 ✅ — Interactive portal.** Let authenticated portal users submit/track records via the same engine, scoped to `contact_id` (e.g. "raise a ticket", "request a quote", then see its status). Extends `/portal/*` from read-only to read-write, reusing the form definitions and the stamping/validation path (owner = the portal partner, not the anon user). Live record-stage tracking on `/portal/requests`; the captcha adapter shipped as a follow-up below.
 
-**Phase 4 — Attachments & embedding.** A policy-bounded file field (size/type/AV, FileStore-backed) and a documented embed snippet (iframe + origin allowlist) so a form drops into an external site.
+**Phase 4 ✅ — Attachments & embedding.** A policy-bounded file field (size/type/AV, FileStore-backed) and a documented embed snippet (iframe + origin allowlist) so a form drops into an external site.
 
 **Post-Phase-4 follow-ups (shipped).**
 - *AV scanning hook* — pluggable `AvScanner` (no-op default, `clamd` INSTREAM backend) screening every upload before it is stored; wired on `AppState.av`, configured from `[antivirus]`.
