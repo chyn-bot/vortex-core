@@ -2387,6 +2387,15 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/settings/webhooks/{id}", post(webhook_update))
         .route("/settings/webhooks/{id}/delete", post(webhook_delete))
         .route("/settings/webhooks/{id}/test", post(webhook_test))
+        // Vortex Intake — public web-form definitions (admin CRUD)
+        .route("/settings/forms", get(intake_forms_list))
+        .route("/settings/forms", post(intake_form_create))
+        .route("/settings/forms/{id}", get(intake_form_edit))
+        .route("/settings/forms/{id}", post(intake_form_update))
+        .route("/settings/forms/{id}/delete", post(intake_form_delete))
+        .route("/settings/forms/{id}/submissions", get(intake_submissions))
+        .route("/settings/forms/{id}/submissions/{sid}/approve", post(intake_submission_approve))
+        .route("/settings/forms/{id}/submissions/{sid}/reject", post(intake_submission_reject))
         // Print layout designer — document branding + per-document templates
         .route("/settings/document-layout", get(document_layout_page))
         .route("/settings/document-layout", post(document_layout_save))
@@ -2467,6 +2476,26 @@ fn build_router(state: Arc<AppState>) -> Router {
         public_plugin_routes
     };
 
+    // ─── Vortex Intake public form engine (`/i/{slug}`) ────────────
+    // Anonymous surface. `public_context_middleware` resolves the tenant
+    // from Host and injects `DatabaseContext` (no `AuthUser`), exactly like
+    // plugin public routes. Rate-limited per IP against submission floods.
+    // Layer order mirrors the login routes: `Extension` outermost so the
+    // rate-limit middleware can read the limiter; the context middleware is a
+    // `route_layer` (inner) so the pool is present when the handler runs.
+    let intake_limiter = RateLimiter::new(RateLimitConfig {
+        max_requests: 20,
+        window: std::time::Duration::from_secs(60),
+        per_user: false,
+    });
+    let intake_public = Router::new()
+        .route("/i/{slug}", get(intake_form_page).post(intake_submit))
+        // Allow file uploads (axum's default body limit is 2 MB).
+        .layer(axum::extract::DefaultBodyLimit::max(32 * 1024 * 1024))
+        .route_layer(middleware::from_fn_with_state(state.clone(), public_context_middleware))
+        .layer(middleware::from_fn(vortex_server::middleware::rate_limit::rate_limit_middleware))
+        .layer(Extension(intake_limiter));
+
     // Login-specific rate limiter: 5 attempts per 60 seconds per IP
     let login_limiter = RateLimiter::new(RateLimitConfig {
         max_requests: 5,
@@ -2531,7 +2560,11 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/portal/invoices/{id}", get(portal_invoice_detail))
         .route("/portal/orders", get(portal_orders))
         .route("/portal/statement", get(portal_statement))
+        .route("/portal/requests", get(portal_requests))
+        .route("/portal/forms/{slug}", get(portal_form_page).post(portal_form_submit))
         .route("/portal/logout", post(portal_logout))
+        // Allow file uploads on portal request forms (default body limit is 2 MB).
+        .layer(axum::extract::DefaultBodyLimit::max(32 * 1024 * 1024))
         .route_layer(middleware::from_fn_with_state(state.clone(), portal_auth_middleware));
 
     // Public portal login (pre-auth), rate-limited like the staff login.
@@ -2568,6 +2601,9 @@ fn build_router(state: Arc<AppState>) -> Router {
         // Plugin public portal routes (anonymous, tenant-resolved,
         // module-gated) — Plugin::public_routes()
         .merge(public_plugin_routes)
+
+        // Vortex Intake public form engine (anonymous, tenant-resolved)
+        .merge(intake_public)
 
         // Database manager (public, master-password protected)
         .nest("/web/database/manager", super::db_manager::db_manager_routes())
@@ -3000,7 +3036,7 @@ table.ptbl td.num, table.ptbl th.num {{ text-align: right; font-variant-numeric:
 <nav class="pbar px-4 py-3 flex items-center justify-between gap-4">
   <a href="/portal" class="text-lg font-bold"><span style="color:#8BC53F">re</span><span class="text-base-content/60">micle</span> <span class="font-normal text-sm text-base-content/50">Portal</span></a>
   <div class="flex items-center gap-4 text-sm overflow-x-auto">
-    {home}{invoices}{orders}{statement}
+    {home}{invoices}{orders}{statement}{requests}
     <span class="text-base-content/40 hidden sm:inline">|</span>
     <span class="text-base-content/70 hidden sm:inline">{who}</span>
     <form method="post" action="/portal/logout" class="inline"><button class="text-error hover:underline">Sign out</button></form>
@@ -3014,6 +3050,7 @@ table.ptbl td.num, table.ptbl th.num {{ text-align: right; font-variant-numeric:
         invoices = nav("/portal/invoices", "invoices", "Invoices"),
         orders = nav("/portal/orders", "orders", "Orders"),
         statement = nav("/portal/statement", "statement", "Statement"),
+        requests = nav("/portal/requests", "requests", "Requests"),
         body = body,
     )
 }
@@ -3058,6 +3095,935 @@ fn portal_login_html(err: Option<&str>) -> String {
 </div></body></html>"#,
         err_html = err_html,
     )
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Vortex Intake — public web-form engine (`/i/{slug}`).
+//
+// Anonymous surface. `public_context_middleware` has already resolved the
+// tenant from Host and injected `DatabaseContext` (no `AuthUser`). Every write
+// is treated as hostile: signed nonce + honeypot + min-fill-time + allow-list
+// + server-side stamping, all inside `vortex_framework::intake`.
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Standalone chrome for a public Intake page — no app shell (that needs auth),
+/// no sidebar. CSP permits inline `<style>`; no inline script is used.
+fn intake_page_shell(title: &str, body: &str) -> String {
+    format!(
+        r#"<!DOCTYPE html><html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>{title}</title>
+<style>
+:root{{color-scheme:light}}
+*{{box-sizing:border-box}}
+body{{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:#f4f5f7;color:#1a202c;line-height:1.5}}
+.wrap{{max-width:560px;margin:0 auto;padding:2.5rem 1.25rem}}
+.card{{background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:2rem;box-shadow:0 1px 3px rgba(0,0,0,.06)}}
+h1{{font-size:1.5rem;margin:0 0 .35rem}}
+.desc{{color:#4a5568;margin:0 0 1.5rem}}
+.field{{margin-bottom:1.1rem}}
+label{{display:block;font-weight:600;font-size:.9rem;margin-bottom:.3rem}}
+.req{{color:#e53e3e}}
+.help{{color:#718096;font-size:.8rem;margin-top:.25rem}}
+input[type=text],textarea{{width:100%;padding:.6rem .7rem;border:1px solid #cbd5e0;border-radius:8px;font-size:1rem;font-family:inherit}}
+input:focus,textarea:focus{{outline:2px solid #8BC53F;outline-offset:0;border-color:#8BC53F}}
+textarea{{min-height:120px;resize:vertical}}
+.hp{{position:absolute;left:-9999px;top:-9999px;width:1px;height:1px;overflow:hidden}}
+button{{background:#8BC53F;color:#123;border:none;border-radius:8px;padding:.7rem 1.4rem;font-size:1rem;font-weight:600;cursor:pointer}}
+button:hover{{background:#7cb332}}
+.alert{{padding:.8rem 1rem;border-radius:8px;margin-bottom:1.25rem;font-size:.9rem}}
+.alert-error{{background:#fff5f5;border:1px solid #feb2b2;color:#c53030}}
+.ok{{text-align:center;padding:1rem 0}}
+.ok svg{{width:56px;height:56px;color:#48bb78}}
+.foot{{text-align:center;color:#a0aec0;font-size:.75rem;margin-top:1.5rem}}
+</style></head><body><div class="wrap">{body}</div></body></html>"#,
+        title = html_escape(title),
+        body = body,
+    )
+}
+
+/// Render the current UNIX time (seconds), used to stamp the nonce.
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// When a form allow-lists embedding origins, set a self-contained CSP with
+/// `frame-ancestors` so the page can be iframed by exactly those origins (the
+/// security-headers middleware then skips its global `X-Frame-Options: DENY`).
+/// With no origins, the page stays same-origin only under the default headers.
+fn with_embed_csp(mut resp: Response, origins: &[String]) -> Response {
+    if origins.is_empty() {
+        return resp;
+    }
+    let ancestors = origins.join(" ");
+    let csp = format!(
+        "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; \
+         base-uri 'none'; form-action 'self'; frame-ancestors 'self' {ancestors}"
+    );
+    if let Ok(v) = header::HeaderValue::from_str(&csp) {
+        resp.headers_mut().insert(header::CONTENT_SECURITY_POLICY, v);
+    }
+    resp
+}
+
+/// `GET /i/{slug}` — render the public form with a fresh signed nonce.
+async fn intake_form_page(
+    Extension(ctx): Extension<DatabaseContext>,
+    Path(slug): Path<String>,
+) -> Response {
+    let db = ctx.pool.pool();
+    let form = match vortex_framework::intake::fetch_form(db, &slug).await {
+        Some(f) => f,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Html(intake_page_shell(
+                    "Not found",
+                    r#"<div class="card"><h1>Form not found</h1><p class="desc">This form does not exist or is no longer accepting responses.</p></div>"#,
+                )),
+            )
+                .into_response()
+        }
+    };
+
+    let issued_at = unix_now();
+    let nonce = vortex_framework::intake::sign_nonce(&slug, issued_at);
+
+    let mut fields_html = String::new();
+    for f in &form.fields {
+        let req = if f.required { r#" <span class="req">*</span>"# } else { "" };
+        let required_attr = if f.required { " required" } else { "" };
+        let help = f
+            .help
+            .as_deref()
+            .filter(|h| !h.trim().is_empty())
+            .map(|h| format!(r#"<div class="help">{}</div>"#, html_escape(h)))
+            .unwrap_or_default();
+        fields_html.push_str(&format!(
+            r#"<div class="field"><label for="f_{name}">{label}{req}</label>
+<input type="text" id="f_{name}" name="{name}"{required_attr} autocomplete="off">{help}</div>"#,
+            name = html_escape(&f.name),
+            label = html_escape(&f.label),
+            req = req,
+            required_attr = required_attr,
+            help = help,
+        ));
+    }
+
+    // File-upload fields (Phase 4). Their presence switches the form to
+    // multipart/form-data.
+    let accept_attr = if form.attach_accept.is_empty() {
+        String::new()
+    } else {
+        format!(r#" accept="{}""#, html_escape(&form.attach_accept.join(",")))
+    };
+    for f in &form.attach_fields {
+        let req = if f.required { r#" <span class="req">*</span>"# } else { "" };
+        let ra = if f.required { " required" } else { "" };
+        fields_html.push_str(&format!(
+            r#"<div class="field"><label for="a_{name}">{label}{req}</label>
+<input type="file" id="a_{name}" name="{name}"{accept}{ra}></div>"#,
+            name = html_escape(&f.name), label = html_escape(&f.label),
+            req = req, accept = accept_attr, ra = ra,
+        ));
+    }
+    let enctype = if form.attach_fields.is_empty() { "" } else { r#" enctype="multipart/form-data""# };
+
+    let desc = form
+        .description
+        .as_deref()
+        .filter(|d| !d.trim().is_empty())
+        .map(|d| format!(r#"<p class="desc">{}</p>"#, html_escape(d)))
+        .unwrap_or_default();
+
+    let body = format!(
+        r#"<div class="card">
+<h1>{title}</h1>{desc}
+<form method="post" action="/i/{slug}"{enctype}>
+<input type="hidden" name="{ts_field}" value="{issued_at}">
+<input type="hidden" name="{nonce_field}" value="{nonce}">
+<div class="hp" aria-hidden="true"><label for="{hp_field}">Leave this field empty</label>
+<input type="text" id="{hp_field}" name="{hp_field}" tabindex="-1" autocomplete="off"></div>
+{fields}
+<button type="submit">Submit</button>
+</form></div>
+<div class="foot">Protected by Vortex Intake</div>"#,
+        title = html_escape(&form.title),
+        desc = desc,
+        slug = html_escape(&slug),
+        enctype = enctype,
+        ts_field = vortex_framework::intake::TS_FIELD,
+        issued_at = issued_at,
+        nonce_field = vortex_framework::intake::NONCE_FIELD,
+        nonce = html_escape(&nonce),
+        hp_field = vortex_framework::intake::HONEYPOT_FIELD,
+        fields = fields_html,
+    );
+    with_embed_csp(Html(intake_page_shell(&form.title, &body)).into_response(), &form.origins)
+}
+
+/// Render a public error page for a rejected submission (same chrome). `origins`
+/// keeps the page frameable for an embedded form (else it stays same-origin).
+fn intake_error_page(status: StatusCode, slug: &str, message: &str, origins: &[String]) -> Response {
+    let body = format!(
+        r#"<div class="card">
+<div class="alert alert-error">{msg}</div>
+<a href="/i/{slug}"><button type="button">Back to the form</button></a>
+</div>"#,
+        msg = html_escape(message),
+        slug = html_escape(slug),
+    );
+    with_embed_csp((status, Html(intake_page_shell("Submission error", &body))).into_response(), origins)
+}
+
+/// Render the public success page.
+fn intake_success_page(form: &vortex_framework::intake::WebForm) -> Response {
+    let msg = form
+        .success_msg
+        .as_deref()
+        .filter(|m| !m.trim().is_empty())
+        .unwrap_or("Thank you — your response has been recorded.");
+    let body = format!(
+        r#"<div class="card ok">
+<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
+<h1>{title}</h1>
+<p class="desc">{msg}</p>
+</div>"#,
+        title = html_escape(&form.title),
+        msg = html_escape(msg),
+    );
+    with_embed_csp(Html(intake_page_shell(&form.title, &body)).into_response(), &form.origins)
+}
+
+/// Parse an intake submission body — urlencoded (no files) or
+/// `multipart/form-data` (with files) — into text fields + raw uploads.
+async fn parse_intake_submission(
+    request: Request,
+) -> Result<(std::collections::BTreeMap<String, String>, Vec<vortex_framework::intake::RawUpload>), String> {
+    use axum::extract::{FromRequest, Multipart};
+    use vortex_framework::intake::RawUpload;
+    let ct = request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let mut fields = std::collections::BTreeMap::new();
+    let mut files = Vec::new();
+    if ct.starts_with("multipart/form-data") {
+        let mut mp = Multipart::from_request(request, &())
+            .await
+            .map_err(|e| format!("Invalid upload: {e}"))?;
+        while let Ok(Some(field)) = mp.next_field().await {
+            let name = field.name().unwrap_or("").to_string();
+            if name.is_empty() {
+                continue;
+            }
+            let filename = field.file_name().map(|s| s.to_string());
+            let mime = field.content_type().map(|s| s.to_string());
+            match filename {
+                Some(fname) if !fname.trim().is_empty() => {
+                    let mime = mime.unwrap_or_else(|| "application/octet-stream".into());
+                    let data = field.bytes().await.map_err(|e| format!("Failed to read '{fname}': {e}"))?;
+                    files.push(RawUpload { field: name, filename: fname, mime, data: data.to_vec() });
+                }
+                _ => {
+                    let val = field.text().await.map_err(|e| format!("Invalid field: {e}"))?;
+                    fields.insert(name, val);
+                }
+            }
+        }
+    } else {
+        // Plain urlencoded form (no files) — let axum's Form parse it.
+        let Form(pairs) = Form::<Vec<(String, String)>>::from_request(request, &())
+            .await
+            .map_err(|_| "Malformed submission.".to_string())?;
+        fields = pairs.into_iter().collect();
+    }
+    Ok((fields, files))
+}
+
+/// Validate uploads against the form policy and store the blobs in the tenant
+/// FileStore, returning the linkable metadata (nothing is linked to a record
+/// here). Fails closed on the first bad file.
+async fn store_intake_uploads(
+    state: &AppState,
+    db_name: &str,
+    form: &vortex_framework::intake::WebForm,
+    raws: Vec<vortex_framework::intake::RawUpload>,
+) -> Result<Vec<vortex_framework::intake::StoredUpload>, String> {
+    use vortex_framework::intake::{self, StoredUpload};
+    let mut out = Vec::new();
+    for raw in raws {
+        intake::validate_upload(form, &raw)?;
+        let key = new_store_key("intake/", &raw.filename);
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(&raw.data);
+        let checksum = hex::encode(h.finalize());
+        let size = raw.data.len() as i64;
+        state
+            .files
+            .put(db_name, &key, &raw.data, Some(&raw.mime))
+            .await
+            .map_err(|e| {
+                error!("intake attachment store failed: {e}");
+                "Could not store an uploaded file. Please try again.".to_string()
+            })?;
+        out.push(StoredUpload {
+            key,
+            name: intake::sanitize_filename(&raw.filename),
+            size,
+            mime: raw.mime,
+            checksum,
+        });
+    }
+    Ok(out)
+}
+
+/// `POST /i/{slug}` — verify, allow-list, store files, and write a governed
+/// anonymous record. Accepts urlencoded or multipart (when the form has files).
+async fn intake_submit(
+    State(state): State<Arc<AppState>>,
+    Extension(ctx): Extension<DatabaseContext>,
+    Path(slug): Path<String>,
+    request: Request,
+) -> Response {
+    use vortex_framework::intake;
+    let db = ctx.pool.pool();
+    let headers = request.headers().clone();
+
+    let form = match intake::fetch_form(db, &slug).await {
+        Some(f) => f,
+        None => return intake_error_page(StatusCode::NOT_FOUND, &slug, "This form is no longer available.", &[]),
+    };
+
+    let (submitted, raws) = match parse_intake_submission(request).await {
+        Ok(x) => x,
+        Err(e) => return intake_error_page(StatusCode::BAD_REQUEST, &slug, &e, &form.origins),
+    };
+
+    // 1. Honeypot: a filled trap ⇒ bot. Respond with a success page (don't tip
+    //    the bot off) but write nothing.
+    if !intake::honeypot_ok(&submitted) {
+        return intake_success_page(&form);
+    }
+
+    // 2. Nonce: proves we issued the form + gates replay and instant-submit bots.
+    let issued_at: i64 = submitted
+        .get(intake::TS_FIELD)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let token = submitted.get(intake::NONCE_FIELD).map(String::as_str).unwrap_or("");
+    if let Err(e) = intake::verify_nonce(&slug, issued_at, token, unix_now()) {
+        return intake_error_page(StatusCode::BAD_REQUEST, &slug, &e, &form.origins);
+    }
+
+    // 3. Origin: if the form pins allowed origins, enforce them.
+    if !form.origins.is_empty() {
+        let origin = headers
+            .get(axum::http::header::ORIGIN)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if !form.origins.iter().any(|o| o == origin) {
+            return intake_error_page(
+                StatusCode::FORBIDDEN,
+                &slug,
+                "This form cannot be submitted from here.",
+                &form.origins,
+            );
+        }
+    }
+
+    // 4. Allow-list: keep only published fields; reject unknown keys loudly.
+    let writable = match intake::select_writable(&form.fields, &submitted) {
+        Ok(w) => w,
+        Err(e) => return intake_error_page(StatusCode::BAD_REQUEST, &slug, &e, &form.origins),
+    };
+
+    // 5. Required text fields + required file fields present?
+    let missing = intake::missing_required(&form.fields, &writable);
+    if !missing.is_empty() {
+        return intake_error_page(
+            StatusCode::BAD_REQUEST,
+            &slug,
+            &format!("Please fill in the required field(s): {}.", missing.join(", ")),
+            &form.origins,
+        );
+    }
+    let present_files: std::collections::HashSet<String> =
+        raws.iter().filter(|r| !r.data.is_empty()).map(|r| r.field.clone()).collect();
+    let missing_files = intake::missing_required_files(&form, &present_files);
+    if !missing_files.is_empty() {
+        return intake_error_page(
+            StatusCode::BAD_REQUEST,
+            &slug,
+            &format!("Please attach: {}.", missing_files.join(", ")),
+            &form.origins,
+        );
+    }
+
+    // 6. Store uploads (validated + written to FileStore, not yet linked).
+    let uploads = match store_intake_uploads(&state, &ctx.db_name, &form, raws).await {
+        Ok(u) => u,
+        Err(e) => return intake_error_page(StatusCode::BAD_REQUEST, &slug, &e, &form.origins),
+    };
+
+    // 7. Governed write (daily cap → quarantine|accept → stamp + WORM audit).
+    let (client_ip, _ua) = request_fingerprint(&headers);
+    match intake::submit(&state, db, &ctx.db_name, &form, &writable, client_ip, &intake::Submitter::Anonymous, &uploads).await {
+        Ok(intake::SubmitOutcome::Accepted(_)) | Ok(intake::SubmitOutcome::Quarantined(_)) => {
+            intake_success_page(&form)
+        }
+        Ok(intake::SubmitOutcome::Capped) => intake_error_page(
+            StatusCode::TOO_MANY_REQUESTS,
+            &slug,
+            "This form is not accepting more responses today. Please try again tomorrow.",
+            &form.origins,
+        ),
+        Err(e) => {
+            error!("intake submit failed for '{}': {}", slug, e);
+            intake_error_page(StatusCode::BAD_REQUEST, &slug, &e, &form.origins)
+        }
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Vortex Intake — admin CRUD for form definitions (`/settings/forms`).
+// Admin-only. Publishing a public form is a governed act, so create/update/
+// delete are WORM-audited.
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Generic settings-page chrome (sidebar-free, like the webhooks admin).
+fn intake_admin_shell(user: &AuthUser, title: &str, inner: &str) -> Html<String> {
+    Html(format!(
+        r##"<!DOCTYPE html><html lang="en" data-theme="dark"><head>
+<script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>{title} - Settings</title>
+<link href="/static/vendor/daisyui.min.css" rel="stylesheet">
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script></head>
+<body class="min-h-screen bg-base-200">
+<div class="navbar bg-base-100 shadow-lg"><div class="flex-1"><a href="/" class="btn btn-ghost text-xl">remicle</a></div><div class="flex-none"><span class="text-sm">@{user}</span></div></div>
+<div class="container mx-auto p-6 max-w-4xl">{inner}</div></body></html>"##,
+        title = html_escape(title), user = html_escape(&user.username), inner = inner,
+    ))
+}
+
+/// `GET /settings/forms` — list forms + create panel.
+async fn intake_forms_list(Db(db): Db, Extension(user): Extension<AuthUser>) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Intake Forms"))).into_response();
+    }
+    let forms = vortex_framework::intake::list_forms(&db).await;
+    let mut rows = String::new();
+    for f in &forms {
+        let active = if f.active {
+            r#"<span class="badge badge-success badge-sm">published</span>"#
+        } else {
+            r#"<span class="badge badge-ghost badge-sm">unpublished</span>"#
+        };
+        rows.push_str(&format!(
+            r##"<tr><td><a href="/settings/forms/{id}" class="link link-primary font-medium">{title}</a>
+<div class="text-xs opacity-50"><code>{model}</code> · {nf} field(s)</div></td>
+<td><a href="/i/{slug}" target="_blank" class="link text-xs">/i/{slug}</a></td>
+<td>{active}</td><td class="text-center">{subs}</td></tr>"##,
+            id = f.id, title = html_escape(&f.title), model = html_escape(&f.model),
+            nf = f.fields, slug = html_escape(&f.slug), active = active, subs = f.submissions,
+        ));
+    }
+    if forms.is_empty() {
+        rows.push_str(r#"<tr><td colspan="4" class="text-center opacity-50 py-8">No forms yet.</td></tr>"#);
+    }
+
+    // Model picker — any active model with a physical table.
+    let models = sqlx::query(
+        "SELECT name, display_name FROM ir_model
+         WHERE is_active = true AND table_name IS NOT NULL ORDER BY display_name",
+    )
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default();
+    let mut opts = String::new();
+    for m in &models {
+        let name: String = m.get("name");
+        let disp: String = m.try_get("display_name").unwrap_or_else(|_| name.clone());
+        opts.push_str(&format!(
+            r#"<option value="{n}">{d} ({n})</option>"#,
+            n = html_escape(&name), d = html_escape(&disp),
+        ));
+    }
+
+    let inner = format!(
+        r##"<div class="mb-4"><h1 class="text-2xl font-bold">Intake Forms</h1>
+<p class="text-base-content/60">Publish a chosen subset of a model's fields at a public URL. A logged-out visitor submits it and a governed record is written — only the fields you publish are writable, tenant/owner are stamped server-side, and every submission is audited. Pairs directly with Blueprints.</p></div>
+<div class="card bg-base-100 shadow mb-6"><div class="card-body">
+<h2 class="card-title text-lg">New form</h2>
+<form method="post" action="/settings/forms" class="grid md:grid-cols-2 gap-3">
+<label class="form-control"><span class="label-text">Title</span><input name="title" required class="input input-bordered input-sm"/></label>
+<label class="form-control"><span class="label-text">URL slug</span><input name="slug" required pattern="[a-z0-9-]+" placeholder="contact-us" class="input input-bordered input-sm"/></label>
+<label class="form-control md:col-span-2"><span class="label-text">Target model</span><select name="model" required class="select select-bordered select-sm">{opts}</select></label>
+<label class="form-control md:col-span-2"><span class="label-text">Description (optional)</span><input name="description" class="input input-bordered input-sm"/></label>
+<div class="md:col-span-2"><button class="btn btn-primary btn-sm">Create form</button>
+<span class="text-xs opacity-50 ml-2">All of the model's fields are published unpublished by default — refine the allow-list next.</span></div>
+</form></div></div>
+<div class="card bg-base-100 shadow"><div class="card-body">
+<table class="table table-sm"><thead><tr><th>Form</th><th>Public URL</th><th>Status</th><th>Submissions</th></tr></thead>
+<tbody>{rows}</tbody></table></div></div>"##,
+        opts = opts, rows = rows,
+    );
+    intake_admin_shell(&user, "Intake Forms", &inner).into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct IntakeCreateForm {
+    title: String,
+    slug: String,
+    model: String,
+    #[serde(default)]
+    description: String,
+}
+
+/// `POST /settings/forms` — create a form (all model fields published by default).
+async fn intake_form_create(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Form(form): Form<IntakeCreateForm>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Intake Forms"))).into_response();
+    }
+    match vortex_framework::intake::create_form(
+        &db,
+        user.id,
+        form.slug.trim(),
+        form.model.trim(),
+        form.title.trim(),
+        form.description.trim(),
+    )
+    .await
+    {
+        Ok(id) => {
+            api_audit(
+                &state, &db_ctx.db_name, &user,
+                AuditAction::Custom("intake_form_created".into()), AuditSeverity::Info,
+                "web_form", Some(&id.to_string()),
+                serde_json::json!({"slug": form.slug.trim(), "model": form.model.trim()}),
+            ).await;
+            Redirect::to(&format!("/settings/forms/{id}")).into_response()
+        }
+        Err(e) => intake_admin_shell(
+            &user, "Intake Forms",
+            &format!(r#"<div class="alert alert-error">{}</div><a href="/settings/forms" class="btn btn-sm mt-4">Back</a>"#, html_escape(&e)),
+        ).into_response(),
+    }
+}
+
+/// `GET /settings/forms/{id}` — allow-list + settings editor.
+async fn intake_form_edit(
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    headers: HeaderMap,
+    Path(id): Path<uuid::Uuid>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Intake Forms"))).into_response();
+    }
+    let Some((form, active)) = vortex_framework::intake::load_form(&db, id).await else {
+        return (StatusCode::NOT_FOUND, Html(forbidden_page("Intake Forms"))).into_response();
+    };
+    // Merge the model's exposable fields with the form's current allow-list.
+    let candidates = vortex_framework::intake::exposable_fields(&db, &form.model).await;
+    let current: std::collections::HashMap<&str, &vortex_framework::intake::FormField> =
+        form.fields.iter().map(|f| (f.name.as_str(), f)).collect();
+
+    let mut frows = String::new();
+    for (name, deflabel, ftype) in &candidates {
+        let cur = current.get(name.as_str());
+        let exposed = cur.is_some();
+        let required = cur.map(|f| f.required).unwrap_or(false);
+        let label = cur.map(|f| f.label.clone()).unwrap_or_else(|| deflabel.clone());
+        frows.push_str(&format!(
+            r##"<tr><td><input type="checkbox" name="expose__{n}" value="1" {exp} class="checkbox checkbox-sm"/></td>
+<td><code class="text-xs">{n}</code><div class="text-xs opacity-40">{ty}</div></td>
+<td><input name="label__{n}" value="{lbl}" class="input input-bordered input-xs w-full"/></td>
+<td class="text-center"><input type="checkbox" name="required__{n}" value="1" {req} class="checkbox checkbox-sm"/></td></tr>"##,
+            n = html_escape(name), exp = if exposed { "checked" } else { "" },
+            ty = html_escape(ftype), lbl = html_escape(&label),
+            req = if required { "checked" } else { "" },
+        ));
+    }
+    if candidates.is_empty() {
+        frows.push_str(r#"<tr><td colspan="4" class="text-center opacity-50 py-6">This model has no exposable fields.</td></tr>"#);
+    }
+
+    let origins_val = form.origins.join("\n");
+    let success_val = form.success_msg.clone().unwrap_or_default();
+    let notify_val = form.notify_to.clone().unwrap_or_default();
+    let cap_val = form.daily_cap.unwrap_or(0);
+
+    // Submission counts for the inbox banner.
+    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM web_form_submission WHERE form_id = $1")
+        .bind(id).fetch_one(&db).await.unwrap_or(0);
+    let pending: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM web_form_submission WHERE form_id = $1 AND status = 'quarantined'")
+        .bind(id).fetch_one(&db).await.unwrap_or(0);
+    let pending_badge = if pending > 0 {
+        format!(r#" <span class="badge badge-warning badge-sm">{pending} awaiting review</span>"#)
+    } else {
+        String::new()
+    };
+
+    // Candidate partner columns: the target model's UUID-typed columns (a
+    // many2one to the portal partner), minus system columns.
+    let uuid_cols: Vec<String> = sqlx::query_scalar(
+        "SELECT c.column_name FROM information_schema.columns c
+         JOIN ir_model m ON m.table_name = c.table_name
+         WHERE m.name = $1 AND c.udt_name = 'uuid'
+           AND c.column_name NOT IN ('id','company_id','created_by')
+         ORDER BY c.column_name",
+    )
+    .bind(&form.model)
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default();
+    // Embed snippet — an iframe pointing at this tenant's public form URL.
+    let scheme = headers.get("x-forwarded-proto").and_then(|v| v.to_str().ok()).unwrap_or("https");
+    let host = headers.get(header::HOST).and_then(|v| v.to_str().ok()).unwrap_or("your-host");
+    let embed_snippet = format!(
+        r#"<iframe src="{scheme}://{host}/i/{slug}" width="100%" height="640" style="border:1px solid #e2e8f0;border-radius:8px" title="{title}"></iframe>"#,
+        scheme = scheme, host = host, slug = form.slug, title = form.title,
+    );
+
+    // Attachment config → textarea "name | Label | required" per line.
+    let attach_val = form.attach_fields.iter().map(|f| {
+        let r = if f.required { " | required" } else { "" };
+        format!("{} | {}{}", f.name, f.label, r)
+    }).collect::<Vec<_>>().join("\n");
+    let accept_val = form.attach_accept.join(", ");
+
+    let cur_pf = form.partner_field.clone().unwrap_or_default();
+    let mut pf_opts = String::from(r#"<option value="">— none —</option>"#);
+    for c in &uuid_cols {
+        let sel = if *c == cur_pf { " selected" } else { "" };
+        pf_opts.push_str(&format!(r#"<option value="{c}"{sel}>{c}</option>"#, c = html_escape(c), sel = sel));
+    }
+    // A partner_field configured but no longer a real column — keep it visible.
+    if !cur_pf.is_empty() && !uuid_cols.iter().any(|c| *c == cur_pf) {
+        pf_opts.push_str(&format!(r#"<option value="{c}" selected>{c} (missing)</option>"#, c = html_escape(&cur_pf)));
+    }
+
+    let inner = format!(
+        r##"<div class="mb-4"><a href="/settings/forms" class="btn btn-ghost btn-sm">← Intake Forms</a>
+<h1 class="text-2xl font-bold mt-2">{title}</h1>
+<div class="text-sm opacity-60">Target <code>{model}</code> · Public URL <a href="/i/{slug}" target="_blank" class="link">/i/{slug}</a></div></div>
+<div class="alert bg-base-100 shadow mb-6 flex justify-between items-center">
+<span>{total} submission(s){pending_badge}</span>
+<a href="/settings/forms/{id}/submissions" class="btn btn-sm btn-outline">Open inbox →</a></div>
+<form method="post" action="/settings/forms/{id}">
+<div class="card bg-base-100 shadow mb-6"><div class="card-body">
+<h2 class="card-title text-lg">Published fields</h2>
+<p class="text-xs opacity-50">Only checked fields are writable from the public form. The allow-list is the security seam — unchecked fields can never be set by a submitter.</p>
+<table class="table table-sm"><thead><tr><th>Publish</th><th>Field</th><th>Label</th><th>Required</th></tr></thead>
+<tbody>{frows}</tbody></table></div></div>
+<div class="card bg-base-100 shadow mb-6"><div class="card-body">
+<h2 class="card-title text-lg">Settings</h2>
+<label class="form-control"><span class="label-text">Success message</span>
+<input name="success_msg" value="{success}" placeholder="Thank you — your response has been recorded." class="input input-bordered input-sm"/></label>
+<label class="form-control"><span class="label-text">Allowed origins (one per line, blank = same-site only)</span>
+<textarea name="origins" class="textarea textarea-bordered textarea-sm" rows="3" placeholder="https://example.com">{origins}</textarea></label>
+<div class="grid md:grid-cols-2 gap-3 mt-2">
+<label class="form-control"><span class="label-text">Notify on submit (email, optional)</span>
+<input name="notify_to" type="email" value="{notify}" placeholder="ops@example.com" class="input input-bordered input-sm"/></label>
+<label class="form-control"><span class="label-text">Daily cap (0 = unlimited)</span>
+<input name="daily_cap" type="number" min="0" value="{cap}" class="input input-bordered input-sm"/></label>
+</div>
+<label class="label cursor-pointer gap-2 justify-start mt-2"><input type="checkbox" name="quarantine" value="1" {quar} class="checkbox checkbox-sm"/><span class="label-text">Hold submissions for review (quarantine) — no record is written until approved</span></label>
+<label class="label cursor-pointer gap-2 justify-start"><input type="checkbox" name="active" value="1" {checked} class="checkbox checkbox-sm"/><span class="label-text">Published (accepting responses)</span></label>
+</div></div>
+<div class="card bg-base-100 shadow mb-6"><div class="card-body">
+<h2 class="card-title text-lg">Customer portal</h2>
+<p class="text-xs opacity-50">Offer this form to signed-in portal users too. Their submission is owned by their partner — the partner field below is stamped server-side (never from the form).</p>
+<label class="label cursor-pointer gap-2 justify-start"><input type="checkbox" name="portal" value="1" {portal} class="checkbox checkbox-sm"/><span class="label-text">Available in the customer portal (/portal/forms)</span></label>
+<label class="form-control"><span class="label-text">Partner field (stamped with the portal submitter)</span>
+<select name="partner_field" class="select select-bordered select-sm">{pf_opts}</select></label>
+</div></div>
+<div class="card bg-base-100 shadow mb-6"><div class="card-body">
+<h2 class="card-title text-lg">Attachments</h2>
+<p class="text-xs opacity-50">File-upload fields. Uploads are stored in the file store and linked to the record as attachments (not written as columns). One field per line: <code>name | Label | required</code> (the trailing <code>| required</code> is optional).</p>
+<label class="form-control"><span class="label-text">Upload fields</span>
+<textarea name="attach_fields" class="textarea textarea-bordered textarea-sm font-mono" rows="3" placeholder="id_doc | ID document | required&#10;photo | Site photo">{attach}</textarea></label>
+<div class="grid md:grid-cols-2 gap-3 mt-2">
+<label class="form-control"><span class="label-text">Max size per file (MB)</span>
+<input name="attach_max_mb" type="number" min="1" value="{max_mb}" class="input input-bordered input-sm"/></label>
+<label class="form-control"><span class="label-text">Accepted types (comma-sep; blank = safe defaults)</span>
+<input name="attach_accept" value="{accept}" placeholder=".pdf, image/*" class="input input-bordered input-sm"/></label>
+</div></div></div>
+<div class="flex gap-2"><button class="btn btn-primary btn-sm">Save</button></div>
+</form>
+<div class="card bg-base-100 shadow mt-6"><div class="card-body">
+<h2 class="card-title text-lg">Embed on another site</h2>
+<p class="text-xs opacity-50">Drop this form into an external page. The form only renders in a frame on an <strong>Allowed origin</strong> (set it above), which is also the origin permitted to submit.{embed_warn}</p>
+<textarea readonly rows="2" class="textarea textarea-bordered textarea-sm font-mono">{embed_snippet}</textarea>
+</div></div>
+<form method="post" action="/settings/forms/{id}/delete" onsubmit="return confirm('Delete this form and its submission ledger?')" class="mt-4">
+<button class="btn btn-error btn-outline btn-sm">Delete form</button></form>"##,
+        title = html_escape(&form.title), model = html_escape(&form.model),
+        slug = html_escape(&form.slug), id = id, frows = frows,
+        success = html_escape(&success_val), origins = html_escape(&origins_val),
+        notify = html_escape(&notify_val), cap = cap_val,
+        total = total, pending_badge = pending_badge,
+        quar = if form.quarantine { "checked" } else { "" },
+        checked = if active { "checked" } else { "" },
+        portal = if form.portal { "checked" } else { "" }, pf_opts = pf_opts,
+        attach = html_escape(&attach_val), max_mb = form.attach_max_mb,
+        accept = html_escape(&accept_val),
+        embed_snippet = html_escape(&embed_snippet),
+        embed_warn = if form.origins.is_empty() {
+            r#" <span class="text-warning">No allowed origins set yet — add one to enable embedding.</span>"#
+        } else { "" },
+    );
+    intake_admin_shell(&user, &form.title, &inner).into_response()
+}
+
+/// `POST /settings/forms/{id}` — persist the allow-list + settings.
+async fn intake_form_update(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<uuid::Uuid>,
+    Form(raw): Form<Vec<(String, String)>>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Intake Forms"))).into_response();
+    }
+    let Some((form, _)) = vortex_framework::intake::load_form(&db, id).await else {
+        return (StatusCode::NOT_FOUND, Html(forbidden_page("Intake Forms"))).into_response();
+    };
+    let pairs: std::collections::BTreeMap<String, String> = raw.into_iter().collect();
+
+    // Reconstruct the allow-list in the model's field order.
+    let candidates = vortex_framework::intake::exposable_fields(&db, &form.model).await;
+    let mut fields: Vec<vortex_framework::intake::FormField> = Vec::new();
+    for (name, deflabel, _ty) in &candidates {
+        if pairs.get(&format!("expose__{name}")).is_some() {
+            let label = pairs
+                .get(&format!("label__{name}"))
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| deflabel.clone());
+            let required = pairs.get(&format!("required__{name}")).is_some();
+            fields.push(vortex_framework::intake::FormField {
+                name: name.clone(),
+                label,
+                help: None,
+                required,
+            });
+        }
+    }
+
+    let success_msg = pairs.get("success_msg").map(|s| s.trim()).unwrap_or("");
+    let origins: Vec<String> = pairs
+        .get("origins")
+        .map(|s| {
+            s.split(['\n', ','])
+                .map(|o| o.trim().to_string())
+                .filter(|o| !o.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    let notify_to = pairs.get("notify_to").map(|s| s.trim()).unwrap_or("");
+    let daily_cap = pairs.get("daily_cap").and_then(|s| s.trim().parse::<i64>().ok()).unwrap_or(0);
+    let quarantine = pairs.get("quarantine").is_some();
+    let active = pairs.get("active").is_some();
+    let portal = pairs.get("portal").is_some();
+    let partner_field = pairs.get("partner_field").map(|s| s.trim()).unwrap_or("");
+
+    // Attachment fields: one per line "name | Label | required".
+    let attach_fields: Vec<vortex_framework::intake::FormField> = pairs
+        .get("attach_fields")
+        .map(|s| s.lines().filter_map(|line| {
+            let mut parts = line.split('|').map(|p| p.trim());
+            let name = parts.next().unwrap_or("").to_string();
+            if name.is_empty() { return None; }
+            let label = parts.next().filter(|s| !s.is_empty()).map(str::to_string).unwrap_or_else(|| name.clone());
+            let required = parts.next().map(|p| p.eq_ignore_ascii_case("required")).unwrap_or(false);
+            Some(vortex_framework::intake::FormField { name, label, help: None, required })
+        }).collect())
+        .unwrap_or_default();
+    let attach_max_mb = pairs.get("attach_max_mb").and_then(|s| s.trim().parse::<i64>().ok()).unwrap_or(0);
+    let attach_accept: Vec<String> = pairs.get("attach_accept")
+        .map(|s| s.split(',').map(|a| a.trim().to_string()).filter(|a| !a.is_empty()).collect())
+        .unwrap_or_default();
+
+    let settings = vortex_framework::intake::FormSettings {
+        success_msg, origins: &origins, quarantine, notify_to, daily_cap, active, portal, partner_field,
+        attach_fields: &attach_fields, attach_max_mb, attach_accept: &attach_accept,
+    };
+    if let Err(e) = vortex_framework::intake::update_form(&db, id, &fields, &settings).await {
+        return intake_admin_shell(
+            &user, "Intake Forms",
+            &format!(r#"<div class="alert alert-error">{}</div><a href="/settings/forms/{id}" class="btn btn-sm mt-4">Back</a>"#, html_escape(&e)),
+        ).into_response();
+    }
+    api_audit(
+        &state, &db_ctx.db_name, &user,
+        AuditAction::Custom("intake_form_updated".into()), AuditSeverity::Info,
+        "web_form", Some(&id.to_string()),
+        serde_json::json!({"slug": form.slug, "fields": fields.len(), "active": active, "quarantine": quarantine, "daily_cap": daily_cap}),
+    ).await;
+    Redirect::to(&format!("/settings/forms/{id}")).into_response()
+}
+
+/// `POST /settings/forms/{id}/delete` — remove a form + its submission ledger.
+async fn intake_form_delete(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<uuid::Uuid>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Intake Forms"))).into_response();
+    }
+    let _ = vortex_framework::intake::delete_form(&db, id).await;
+    api_audit(
+        &state, &db_ctx.db_name, &user,
+        AuditAction::Custom("intake_form_deleted".into()), AuditSeverity::Warning,
+        "web_form", Some(&id.to_string()), serde_json::json!({}),
+    ).await;
+    Redirect::to("/settings/forms").into_response()
+}
+
+/// `GET /settings/forms/{id}/submissions` — the triage inbox.
+async fn intake_submissions(
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Path(id): Path<uuid::Uuid>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Intake Forms"))).into_response();
+    }
+    let Some((form, _)) = vortex_framework::intake::load_form(&db, id).await else {
+        return (StatusCode::NOT_FOUND, Html(forbidden_page("Intake Forms"))).into_response();
+    };
+    let subs = vortex_framework::intake::list_submissions(&db, id, 200).await;
+
+    let mut rows = String::new();
+    for s in &subs {
+        let (badge, cls) = match s.status.as_str() {
+            "accepted" => ("accepted", "badge-success"),
+            "quarantined" => ("awaiting review", "badge-warning"),
+            "rejected" => ("rejected", "badge-error"),
+            other => (other, "badge-ghost"),
+        };
+        // Compact payload preview.
+        let mut preview = if s.payload.is_empty() {
+            "<span class='opacity-40'>—</span>".to_string()
+        } else {
+            s.payload.iter()
+                .map(|(k, v)| format!("<span class='opacity-50'>{}</span>&nbsp;{}", html_escape(k), html_escape(v)))
+                .collect::<Vec<_>>()
+                .join("<br>")
+        };
+        if s.attachments > 0 {
+            preview.push_str(&format!(
+                r#"<br><span class="badge badge-ghost badge-xs mt-1">📎 {} file(s)</span>"#,
+                s.attachments,
+            ));
+        }
+        let record = match s.record_id {
+            Some(r) => format!(r#"<a href="/form/{model}/{r}" class="link text-xs">record</a>"#, model = html_escape(&form.model), r = r),
+            None => "<span class='opacity-40 text-xs'>—</span>".to_string(),
+        };
+        let actions = if s.status == "quarantined" {
+            format!(
+                r##"<div class="flex gap-1">
+<form method="post" action="/settings/forms/{id}/submissions/{sid}/approve"><button class="btn btn-success btn-xs">Approve</button></form>
+<form method="post" action="/settings/forms/{id}/submissions/{sid}/reject"><button class="btn btn-error btn-outline btn-xs">Reject</button></form></div>"##,
+                id = id, sid = s.id,
+            )
+        } else {
+            let reviewer = s.reviewed_by.as_deref().map(html_escape).unwrap_or_default();
+            format!("<span class='text-xs opacity-50'>{reviewer}</span>")
+        };
+        rows.push_str(&format!(
+            r##"<tr><td><span class="badge {cls} badge-sm">{badge}</span></td>
+<td class="text-xs">{preview}</td><td>{record}</td>
+<td class="text-xs opacity-50">{ip}</td><td class="text-xs opacity-50">{at}</td><td>{actions}</td></tr>"##,
+            cls = cls, badge = badge, preview = preview, record = record,
+            ip = html_escape(s.source_ip.as_deref().unwrap_or("")),
+            at = s.created_at.format("%Y-%m-%d %H:%M"), actions = actions,
+        ));
+    }
+    if subs.is_empty() {
+        rows.push_str(r#"<tr><td colspan="6" class="text-center opacity-50 py-8">No submissions yet.</td></tr>"#);
+    }
+
+    let inner = format!(
+        r##"<div class="mb-4"><a href="/settings/forms/{id}" class="btn btn-ghost btn-sm">← {title}</a>
+<h1 class="text-2xl font-bold mt-2">Submissions</h1>
+<div class="text-sm opacity-60">Public URL <a href="/i/{slug}" target="_blank" class="link">/i/{slug}</a>{quar}</div></div>
+<div class="card bg-base-100 shadow"><div class="card-body">
+<table class="table table-sm"><thead><tr><th>Status</th><th>Values</th><th>Record</th><th>Source IP</th><th>Received</th><th>Action</th></tr></thead>
+<tbody>{rows}</tbody></table></div></div>"##,
+        id = id, title = html_escape(&form.title), slug = html_escape(&form.slug),
+        quar = if form.quarantine { " · <span class=\"badge badge-warning badge-xs\">quarantine on</span>" } else { "" },
+        rows = rows,
+    );
+    intake_admin_shell(&user, "Submissions", &inner).into_response()
+}
+
+/// `POST /settings/forms/{id}/submissions/{sid}/approve` — commit a held record.
+async fn intake_submission_approve(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path((id, sid)): Path<(uuid::Uuid, uuid::Uuid)>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Intake Forms"))).into_response();
+    }
+    if let Err(e) = vortex_framework::intake::approve_submission(
+        &state.audit, &db, &db_ctx.db_name, sid, user.id, &user.username,
+    ).await {
+        return intake_admin_shell(
+            &user, "Submissions",
+            &format!(r#"<div class="alert alert-error">{}</div><a href="/settings/forms/{id}/submissions" class="btn btn-sm mt-4">Back</a>"#, html_escape(&e)),
+        ).into_response();
+    }
+    Redirect::to(&format!("/settings/forms/{id}/submissions")).into_response()
+}
+
+/// `POST /settings/forms/{id}/submissions/{sid}/reject` — discard a held submission.
+async fn intake_submission_reject(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path((id, sid)): Path<(uuid::Uuid, uuid::Uuid)>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Intake Forms"))).into_response();
+    }
+    if let Err(e) = vortex_framework::intake::reject_submission(
+        &state.audit, &db, &db_ctx.db_name, sid, user.id, &user.username,
+    ).await {
+        return intake_admin_shell(
+            &user, "Submissions",
+            &format!(r#"<div class="alert alert-error">{}</div><a href="/settings/forms/{id}/submissions" class="btn btn-sm mt-4">Back</a>"#, html_escape(&e)),
+        ).into_response();
+    }
+    Redirect::to(&format!("/settings/forms/{id}/submissions")).into_response()
 }
 
 async fn portal_login_page() -> Response {
@@ -3358,6 +4324,7 @@ async fn portal_home(Db(db): Db, Extension(user): Extension<AuthUser>) -> Respon
     <li><a href="/portal/invoices" class="link">View and track your invoices</a></li>
     <li><a href="/portal/statement" class="link">See your statement of account</a></li>
     <li><a href="/portal/orders" class="link">Review your orders</a></li>
+    <li><a href="/portal/requests" class="link">Submit and track a request</a></li>
   </ul>
 </div>"#,
         name = html_escape(&name),
@@ -3680,6 +4647,209 @@ fn portal_admin_shell(user: &AuthUser, title: &str, inner: &str) -> Html<String>
         user = html_escape(&user.username),
         inner = inner,
     ))
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Vortex Intake — interactive portal (Phase 3). Signed-in partners submit
+// portal-enabled forms and track them. Reuses the governed write path; the
+// record's owner is stamped from the session partner (never the form body).
+// Portal POSTs rely on the session cookie (SameSite) for CSRF, like every
+// other authed portal action — no public nonce needed here.
+// ───────────────────────────────────────────────────────────────────────────
+
+/// `GET /portal/requests` — the partner's tracked submissions + a launcher for
+/// the available forms.
+async fn portal_requests(Db(db): Db, Extension(user): Extension<AuthUser>) -> Response {
+    use vortex_framework::ui::html_escape;
+    let partner = match portal_partner(&user) { Ok(p) => p, Err(r) => return r };
+    let name = portal_partner_name(&db, partner, &user.username).await;
+
+    let forms = vortex_framework::intake::list_portal_forms(&db).await;
+    let mut launch = String::new();
+    for f in &forms {
+        let desc = f.description.as_deref().filter(|d| !d.trim().is_empty())
+            .map(|d| format!(r#"<div class="text-sm text-base-content/60">{}</div>"#, html_escape(d)))
+            .unwrap_or_default();
+        launch.push_str(&format!(
+            r#"<a href="/portal/forms/{slug}" class="pcard p-4 block hover:border-primary">
+<div class="font-semibold">{title}</div>{desc}</a>"#,
+            slug = html_escape(&f.slug), title = html_escape(&f.title), desc = desc,
+        ));
+    }
+    let launcher = if forms.is_empty() {
+        r#"<p class="text-base-content/50 text-sm">No request forms are available right now.</p>"#.to_string()
+    } else {
+        format!(r#"<div class="grid grid-cols-1 sm:grid-cols-2 gap-3">{launch}</div>"#)
+    };
+
+    let subs = vortex_framework::intake::list_partner_submissions(&db, partner, 200).await;
+    let mut trs = String::new();
+    for s in &subs {
+        let badge = match s.status.as_str() {
+            "accepted" => r#"<span class="badge badge-success badge-sm">Received</span>"#,
+            "quarantined" => r#"<span class="badge badge-warning badge-sm">Pending review</span>"#,
+            "rejected" => r#"<span class="badge badge-error badge-sm">Declined</span>"#,
+            _ => r#"<span class="badge badge-ghost badge-sm">—</span>"#,
+        };
+        trs.push_str(&format!(
+            r#"<tr><td>{title}</td><td>{date}</td><td>{badge}</td></tr>"#,
+            title = html_escape(&s.form_title),
+            date = s.created_at.format("%Y-%m-%d %H:%M"),
+            badge = badge,
+        ));
+    }
+    if subs.is_empty() {
+        trs = r#"<tr><td colspan="3" class="text-base-content/50 text-center py-6">You have not submitted any requests yet.</td></tr>"#.to_string();
+    }
+
+    let body = format!(
+        r#"<h1 class="text-2xl font-bold mb-1">Requests</h1>
+<p class="text-base-content/60 mb-5">Submit a request and track its progress.</p>
+<div class="mb-6">{launcher}</div>
+<div class="pcard p-4"><div class="font-semibold mb-2">Your submissions</div>
+<table class="ptbl"><thead><tr><th>Form</th><th>Submitted</th><th>Status</th></tr></thead>
+<tbody>{trs}</tbody></table></div>"#,
+        launcher = launcher, trs = trs,
+    );
+    Html(portal_shell("Requests", &name, "requests", &body)).into_response()
+}
+
+/// `GET /portal/forms/{slug}` — render a portal-enabled form for the partner.
+async fn portal_form_page(
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Path(slug): Path<String>,
+) -> Response {
+    use vortex_framework::ui::html_escape;
+    let partner = match portal_partner(&user) { Ok(p) => p, Err(r) => return r };
+    let name = portal_partner_name(&db, partner, &user.username).await;
+    let Some(form) = vortex_framework::intake::fetch_portal_form(&db, &slug).await else {
+        return (StatusCode::NOT_FOUND, Html(portal_shell("Not found", &name, "requests",
+            r#"<div class="pcard p-6"><h1 class="text-xl font-bold">Form not available</h1>
+<p class="text-base-content/60 mt-1">This request form does not exist or is not open.</p>
+<a href="/portal/requests" class="link mt-3 inline-block">← Back to requests</a></div>"#))).into_response();
+    };
+
+    let mut fields_html = String::new();
+    for f in &form.fields {
+        let req = if f.required { r#" <span style="color:#e53e3e">*</span>"# } else { "" };
+        let ra = if f.required { " required" } else { "" };
+        let help = f.help.as_deref().filter(|h| !h.trim().is_empty())
+            .map(|h| format!(r#"<div class="text-xs text-base-content/50 mt-1">{}</div>"#, html_escape(h)))
+            .unwrap_or_default();
+        fields_html.push_str(&format!(
+            r#"<label class="form-control mb-3"><span class="label-text">{label}{req}</span>
+<input type="text" name="{fname}"{ra} autocomplete="off" class="input input-bordered input-sm"/>{help}</label>"#,
+            label = html_escape(&f.label), req = req, fname = html_escape(&f.name), ra = ra, help = help,
+        ));
+    }
+    // File-upload fields (Phase 4) — switch to multipart.
+    let accept_attr = if form.attach_accept.is_empty() {
+        String::new()
+    } else {
+        format!(r#" accept="{}""#, html_escape(&form.attach_accept.join(",")))
+    };
+    for f in &form.attach_fields {
+        let req = if f.required { r#" <span style="color:#e53e3e">*</span>"# } else { "" };
+        let ra = if f.required { " required" } else { "" };
+        fields_html.push_str(&format!(
+            r#"<label class="form-control mb-3"><span class="label-text">{label}{req}</span>
+<input type="file" name="{fname}"{accept}{ra} class="file-input file-input-bordered file-input-sm"/></label>"#,
+            label = html_escape(&f.label), req = req, fname = html_escape(&f.name), accept = accept_attr, ra = ra,
+        ));
+    }
+    let enctype = if form.attach_fields.is_empty() { "" } else { r#" enctype="multipart/form-data""# };
+
+    let desc = form.description.as_deref().filter(|d| !d.trim().is_empty())
+        .map(|d| format!(r#"<p class="text-base-content/60 mb-4">{}</p>"#, html_escape(d)))
+        .unwrap_or_default();
+
+    let body = format!(
+        r#"<a href="/portal/requests" class="link text-sm">← Requests</a>
+<h1 class="text-2xl font-bold mt-2 mb-1">{title}</h1>{desc}
+<form method="post" action="/portal/forms/{slug}"{enctype} class="pcard p-5 mt-3 max-w-xl">
+{fields}
+<button class="btn btn-sm mt-2" style="background:#8BC53F;border-color:#8BC53F;color:#000">Submit request</button>
+</form>"#,
+        title = html_escape(&form.title), desc = desc, slug = html_escape(&slug),
+        enctype = enctype, fields = fields_html,
+    );
+    Html(portal_shell(&form.title, &name, "requests", &body)).into_response()
+}
+
+/// `POST /portal/forms/{slug}` — governed portal submission (owner = partner).
+async fn portal_form_submit(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(slug): Path<String>,
+    request: Request,
+) -> Response {
+    use vortex_framework::intake;
+    use vortex_framework::ui::html_escape;
+    let partner = match portal_partner(&user) { Ok(p) => p, Err(r) => return r };
+    let name = portal_partner_name(&db, partner, &user.username).await;
+
+    let err_page = |name: &str, msg: &str, slug: &str| {
+        (StatusCode::BAD_REQUEST, Html(portal_shell("Requests", name, "requests", &format!(
+            r#"<div class="pcard p-6"><div class="alert alert-error text-sm mb-3">{}</div>
+<a href="/portal/forms/{}" class="link">← Back to the form</a></div>"#,
+            html_escape(msg), html_escape(slug))))).into_response()
+    };
+
+    let Some(form) = intake::fetch_portal_form(&db, &slug).await else {
+        return (StatusCode::NOT_FOUND, Html(portal_shell("Not found", &name, "requests",
+            r#"<div class="pcard p-6">This form is not available.</div>"#))).into_response();
+    };
+
+    let (submitted, raws) = match parse_intake_submission(request).await {
+        Ok(x) => x,
+        Err(e) => return err_page(&name, &e, &slug),
+    };
+    let writable = match intake::select_writable(&form.fields, &submitted) {
+        Ok(w) => w,
+        Err(e) => return err_page(&name, &e, &slug),
+    };
+    let missing = intake::missing_required(&form.fields, &writable);
+    if !missing.is_empty() {
+        return err_page(&name, &format!("Please fill in: {}.", missing.join(", ")), &slug);
+    }
+    let present_files: std::collections::HashSet<String> =
+        raws.iter().filter(|r| !r.data.is_empty()).map(|r| r.field.clone()).collect();
+    let missing_files = intake::missing_required_files(&form, &present_files);
+    if !missing_files.is_empty() {
+        return err_page(&name, &format!("Please attach: {}.", missing_files.join(", ")), &slug);
+    }
+    let uploads = match store_intake_uploads(&state, &db_ctx.db_name, &form, raws).await {
+        Ok(u) => u,
+        Err(e) => return err_page(&name, &e, &slug),
+    };
+
+    let submitter = intake::Submitter::Portal {
+        user_id: user.id,
+        partner_id: partner,
+        username: user.username.clone(),
+    };
+    let outcome = intake::submit(&state, &db, &db_ctx.db_name, &form, &writable, None, &submitter, &uploads).await;
+    let msg = match outcome {
+        Ok(intake::SubmitOutcome::Quarantined(_)) => "Thanks — your request was received and is pending review.",
+        Ok(intake::SubmitOutcome::Accepted(_)) => "Thanks — your request has been received.",
+        Ok(intake::SubmitOutcome::Capped) => {
+            return err_page(&name, "This form is not accepting more requests today. Please try again tomorrow.", &slug);
+        }
+        Err(e) => {
+            error!("portal intake submit failed for '{}': {}", slug, e);
+            return err_page(&name, &e, &slug);
+        }
+    };
+    let body = format!(
+        r#"<div class="pcard p-6 text-center"><h1 class="text-xl font-bold mb-2">{title}</h1>
+<p class="text-base-content/70">{msg}</p>
+<a href="/portal/requests" class="link mt-4 inline-block">View your requests →</a></div>"#,
+        title = html_escape(&form.title), msg = msg,
+    );
+    Html(portal_shell(&form.title, &name, "requests", &body)).into_response()
 }
 
 async fn portal_users_list(
@@ -4251,24 +5421,39 @@ async fn security_headers_middleware(
         .and_then(|v| v.to_str().ok())
         .map(|ct| ct.starts_with("text/html"))
         .unwrap_or(false);
+    // An embeddable page (a public Intake form the admin allow-listed origins
+    // for) sets its own CSP with `frame-ancestors`. Honour it: keep that CSP and
+    // do NOT slam the global `X-Frame-Options: DENY` on top, which would block
+    // framing regardless. Every other page gets the locked-down defaults.
+    let embeddable = response
+        .headers()
+        .get(header::CONTENT_SECURITY_POLICY)
+        .and_then(|v| v.to_str().ok())
+        .map(|c| c.contains("frame-ancestors"))
+        .unwrap_or(false);
+
     let headers = response.headers_mut();
     if is_html {
         headers.insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
     }
-    headers.insert("X-Frame-Options", "DENY".parse().unwrap());
+    if !embeddable {
+        headers.insert("X-Frame-Options", "DENY".parse().unwrap());
+    }
     headers.insert("X-Content-Type-Options", "nosniff".parse().unwrap());
     headers.insert("X-XSS-Protection", "1; mode=block".parse().unwrap());
     headers.insert("Referrer-Policy", "strict-origin-when-cross-origin".parse().unwrap());
     headers.insert("Permissions-Policy", "camera=(), microphone=(), geolocation=()".parse().unwrap());
-    headers.insert(
-        "Content-Security-Policy",
-        // Self-contained by policy: all CSS/JS is vendored under
-        // /static/vendor (no CDNs — air-gapped installs must render
-        // correctly). The one external allowance is OpenStreetMap
-        // tiles, which are runtime map data, not page assets; fully
-        // air-gapped sites point Leaflet at a local tile server.
-        "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data: https://*.tile.openstreetmap.org; font-src 'self'".parse().unwrap(),
-    );
+    if !embeddable {
+        headers.insert(
+            "Content-Security-Policy",
+            // Self-contained by policy: all CSS/JS is vendored under
+            // /static/vendor (no CDNs — air-gapped installs must render
+            // correctly). The one external allowance is OpenStreetMap
+            // tiles, which are runtime map data, not page assets; fully
+            // air-gapped sites point Leaflet at a local tile server.
+            "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data: https://*.tile.openstreetmap.org; font-src 'self'".parse().unwrap(),
+        );
+    }
     response
 }
 

@@ -1,0 +1,5 @@
+# Migration metadata for 149_intake_triage
+module = "core"
+description = "Vortex Intake Phase 2: quarantine/triage columns on web_form_submission (payload for deferred commit, reviewed_by/reviewed_at for the triage decision)."
+reversible = true
+dependencies = ["148_intake"]

@@ -1,0 +1,5 @@
+# Migration metadata for 150_intake_portal
+module = "core"
+description = "Vortex Intake Phase 3: partner_id + submitted_by on web_form_submission — attributable portal submissions and owner replay on approval."
+reversible = true
+dependencies = ["149_intake_triage"]

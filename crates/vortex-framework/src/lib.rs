@@ -37,6 +37,7 @@ pub mod approval;
 pub mod audit_trail;
 pub mod automation;
 pub mod blueprint;
+pub mod intake;
 pub mod chatter;
 pub mod auth;
 pub mod computed_fields;
