@@ -315,9 +315,220 @@ pub async fn submit(
     Ok(record_id)
 }
 
+// ===========================================================================
+// Admin side — create / edit / list / delete form definitions.
+// ===========================================================================
+
+/// A slug is a URL segment: `[a-z0-9](-?[a-z0-9])*`, 2–64 chars.
+pub fn valid_slug(s: &str) -> bool {
+    let n = s.len();
+    n >= 2
+        && n <= 64
+        && s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && !s.starts_with('-')
+        && !s.ends_with('-')
+        && !s.contains("--")
+}
+
+/// Row for the admin list.
+pub struct FormSummary {
+    pub id: Uuid,
+    pub slug: String,
+    pub model: String,
+    pub title: String,
+    pub active: bool,
+    pub fields: i64,
+    pub submissions: i64,
+}
+
+/// The model's exposable fields (registered, non-system) — the candidate
+/// allow-list an admin picks from. Returns `(name, label, field_type)`.
+pub async fn exposable_fields(db: &PgPool, model: &str) -> Vec<(String, String, String)> {
+    sqlx::query(
+        "SELECT f.name, f.display_name, f.field_type
+         FROM ir_model_field f JOIN ir_model m ON m.id = f.model_id
+         WHERE m.name = $1
+           AND f.name NOT IN ('id','company_id','active','created_at','updated_at','record_state','code')
+         ORDER BY f.sequence, f.name",
+    )
+    .bind(model)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default()
+    .iter()
+    .map(|r| (r.get("name"), r.get("display_name"), r.get("field_type")))
+    .collect()
+}
+
+/// Create a form. Every exposable field of the model is published by default
+/// (not required); the admin refines the allow-list on the edit page.
+pub async fn create_form(
+    db: &PgPool,
+    user_id: Uuid,
+    slug: &str,
+    model: &str,
+    title: &str,
+    description: &str,
+) -> Result<Uuid, String> {
+    if !valid_slug(slug) {
+        return Err("Slug must be 2–64 chars, lowercase letters/digits/hyphens.".into());
+    }
+    let exists: Option<Uuid> = sqlx::query_scalar("SELECT id FROM ir_model WHERE name = $1 AND is_active = true")
+        .bind(model)
+        .fetch_optional(db)
+        .await
+        .map_err(dberr)?;
+    if exists.is_none() {
+        return Err(format!("Model '{model}' not found."));
+    }
+    let dup: Option<Uuid> = sqlx::query_scalar("SELECT id FROM web_form WHERE slug = $1")
+        .bind(slug)
+        .fetch_optional(db)
+        .await
+        .map_err(dberr)?;
+    if dup.is_some() {
+        return Err(format!("A form with slug '{slug}' already exists."));
+    }
+
+    let fields: Vec<FormField> = exposable_fields(db, model)
+        .await
+        .into_iter()
+        .map(|(name, label, _)| FormField { name, label, help: None, required: false })
+        .collect();
+    let fields_json = serde_json::to_value(&fields).unwrap_or_else(|_| serde_json::json!([]));
+    // Stamp the tenant's primary company so submissions are attributable.
+    let company_id: Option<Uuid> =
+        sqlx::query_scalar("SELECT id FROM companies ORDER BY created_at LIMIT 1")
+            .fetch_optional(db)
+            .await
+            .ok()
+            .flatten();
+
+    let id: Uuid = sqlx::query_scalar(
+        "INSERT INTO web_form (slug, model, title, description, fields, company_id, created_by)
+         VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id",
+    )
+    .bind(slug)
+    .bind(model)
+    .bind(title)
+    .bind(if description.trim().is_empty() { None } else { Some(description) })
+    .bind(&fields_json)
+    .bind(company_id)
+    .bind(user_id)
+    .fetch_one(db)
+    .await
+    .map_err(dberr)?;
+    Ok(id)
+}
+
+/// List all forms with field + submission counts.
+pub async fn list_forms(db: &PgPool) -> Vec<FormSummary> {
+    sqlx::query(
+        "SELECT w.id, w.slug, w.model, w.title, w.active,
+                jsonb_array_length(w.fields) AS fields,
+                (SELECT COUNT(*) FROM web_form_submission s WHERE s.form_id = w.id) AS submissions
+         FROM web_form w ORDER BY w.created_at DESC",
+    )
+    .fetch_all(db)
+    .await
+    .unwrap_or_default()
+    .iter()
+    .map(|r| FormSummary {
+        id: r.get("id"),
+        slug: r.get("slug"),
+        model: r.get("model"),
+        title: r.get("title"),
+        active: r.get("active"),
+        fields: r.get::<Option<i32>, _>("fields").unwrap_or(0) as i64,
+        submissions: r.get("submissions"),
+    })
+    .collect()
+}
+
+/// Load a form's full definition for editing (any status, unlike `fetch_form`).
+pub async fn load_form(db: &PgPool, id: Uuid) -> Option<(WebForm, bool)> {
+    let row = sqlx::query(
+        "SELECT id, slug, model, title, description, fields, settings, company_id, active
+         FROM web_form WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()?;
+    let fields: Vec<FormField> = serde_json::from_value(row.get("fields")).unwrap_or_default();
+    let settings: serde_json::Value = row.get("settings");
+    let origins = settings
+        .get("origins")
+        .and_then(|o| o.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
+    Some((
+        WebForm {
+            id: row.get("id"),
+            slug: row.get("slug"),
+            model: row.get("model"),
+            title: row.get("title"),
+            description: row.get("description"),
+            fields,
+            company_id: row.get("company_id"),
+            success_msg: settings.get("success_msg").and_then(|v| v.as_str()).map(str::to_string),
+            origins,
+        },
+        row.get("active"),
+    ))
+}
+
+/// Update a form's allow-list + settings + active flag.
+pub async fn update_form(
+    db: &PgPool,
+    id: Uuid,
+    fields: &[FormField],
+    success_msg: &str,
+    origins: &[String],
+    active: bool,
+) -> Result<(), String> {
+    let fields_json = serde_json::to_value(fields).map_err(|e| format!("serialize fields: {e}"))?;
+    let settings = serde_json::json!({
+        "success_msg": success_msg,
+        "origins": origins,
+    });
+    sqlx::query(
+        "UPDATE web_form SET fields = $2, settings = $3, active = $4, updated_at = now() WHERE id = $1",
+    )
+    .bind(id)
+    .bind(&fields_json)
+    .bind(&settings)
+    .bind(active)
+    .execute(db)
+    .await
+    .map_err(dberr)?;
+    Ok(())
+}
+
+/// Delete a form (and its submission ledger via ON DELETE CASCADE).
+pub async fn delete_form(db: &PgPool, id: Uuid) -> Result<(), String> {
+    sqlx::query("DELETE FROM web_form WHERE id = $1")
+        .bind(id)
+        .execute(db)
+        .await
+        .map_err(dberr)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slug_rules() {
+        for ok in ["contact", "job-app", "rma-2026", "ab"] {
+            assert!(valid_slug(ok), "{ok} should be valid");
+        }
+        for bad in ["a", "-x", "x-", "x--y", "Contact", "a_b", "with space", ""] {
+            assert!(!valid_slug(bad), "{bad} should be invalid");
+        }
+    }
 
     fn f(name: &str, required: bool) -> FormField {
         FormField { name: name.into(), label: name.into(), help: None, required }
