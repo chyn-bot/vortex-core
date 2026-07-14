@@ -3151,6 +3151,25 @@ fn unix_now() -> i64 {
         .unwrap_or(0)
 }
 
+/// When a form allow-lists embedding origins, set a self-contained CSP with
+/// `frame-ancestors` so the page can be iframed by exactly those origins (the
+/// security-headers middleware then skips its global `X-Frame-Options: DENY`).
+/// With no origins, the page stays same-origin only under the default headers.
+fn with_embed_csp(mut resp: Response, origins: &[String]) -> Response {
+    if origins.is_empty() {
+        return resp;
+    }
+    let ancestors = origins.join(" ");
+    let csp = format!(
+        "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; \
+         base-uri 'none'; form-action 'self'; frame-ancestors 'self' {ancestors}"
+    );
+    if let Ok(v) = header::HeaderValue::from_str(&csp) {
+        resp.headers_mut().insert(header::CONTENT_SECURITY_POLICY, v);
+    }
+    resp
+}
+
 /// `GET /i/{slug}` — render the public form with a fresh signed nonce.
 async fn intake_form_page(
     Extension(ctx): Extension<DatabaseContext>,
@@ -3244,11 +3263,12 @@ async fn intake_form_page(
         hp_field = vortex_framework::intake::HONEYPOT_FIELD,
         fields = fields_html,
     );
-    Html(intake_page_shell(&form.title, &body)).into_response()
+    with_embed_csp(Html(intake_page_shell(&form.title, &body)).into_response(), &form.origins)
 }
 
-/// Render a public error page for a rejected submission (same chrome).
-fn intake_error_page(status: StatusCode, slug: &str, message: &str) -> Response {
+/// Render a public error page for a rejected submission (same chrome). `origins`
+/// keeps the page frameable for an embedded form (else it stays same-origin).
+fn intake_error_page(status: StatusCode, slug: &str, message: &str, origins: &[String]) -> Response {
     let body = format!(
         r#"<div class="card">
 <div class="alert alert-error">{msg}</div>
@@ -3257,7 +3277,7 @@ fn intake_error_page(status: StatusCode, slug: &str, message: &str) -> Response 
         msg = html_escape(message),
         slug = html_escape(slug),
     );
-    (status, Html(intake_page_shell("Submission error", &body))).into_response()
+    with_embed_csp((status, Html(intake_page_shell("Submission error", &body))).into_response(), origins)
 }
 
 /// Render the public success page.
@@ -3276,7 +3296,7 @@ fn intake_success_page(form: &vortex_framework::intake::WebForm) -> Response {
         title = html_escape(&form.title),
         msg = html_escape(msg),
     );
-    Html(intake_page_shell(&form.title, &body)).into_response()
+    with_embed_csp(Html(intake_page_shell(&form.title, &body)).into_response(), &form.origins)
 }
 
 /// Parse an intake submission body — urlencoded (no files) or
@@ -3379,12 +3399,12 @@ async fn intake_submit(
 
     let form = match intake::fetch_form(db, &slug).await {
         Some(f) => f,
-        None => return intake_error_page(StatusCode::NOT_FOUND, &slug, "This form is no longer available."),
+        None => return intake_error_page(StatusCode::NOT_FOUND, &slug, "This form is no longer available.", &[]),
     };
 
     let (submitted, raws) = match parse_intake_submission(request).await {
         Ok(x) => x,
-        Err(e) => return intake_error_page(StatusCode::BAD_REQUEST, &slug, &e),
+        Err(e) => return intake_error_page(StatusCode::BAD_REQUEST, &slug, &e, &form.origins),
     };
 
     // 1. Honeypot: a filled trap ⇒ bot. Respond with a success page (don't tip
@@ -3400,7 +3420,7 @@ async fn intake_submit(
         .unwrap_or(0);
     let token = submitted.get(intake::NONCE_FIELD).map(String::as_str).unwrap_or("");
     if let Err(e) = intake::verify_nonce(&slug, issued_at, token, unix_now()) {
-        return intake_error_page(StatusCode::BAD_REQUEST, &slug, &e);
+        return intake_error_page(StatusCode::BAD_REQUEST, &slug, &e, &form.origins);
     }
 
     // 3. Origin: if the form pins allowed origins, enforce them.
@@ -3414,6 +3434,7 @@ async fn intake_submit(
                 StatusCode::FORBIDDEN,
                 &slug,
                 "This form cannot be submitted from here.",
+                &form.origins,
             );
         }
     }
@@ -3421,7 +3442,7 @@ async fn intake_submit(
     // 4. Allow-list: keep only published fields; reject unknown keys loudly.
     let writable = match intake::select_writable(&form.fields, &submitted) {
         Ok(w) => w,
-        Err(e) => return intake_error_page(StatusCode::BAD_REQUEST, &slug, &e),
+        Err(e) => return intake_error_page(StatusCode::BAD_REQUEST, &slug, &e, &form.origins),
     };
 
     // 5. Required text fields + required file fields present?
@@ -3431,6 +3452,7 @@ async fn intake_submit(
             StatusCode::BAD_REQUEST,
             &slug,
             &format!("Please fill in the required field(s): {}.", missing.join(", ")),
+            &form.origins,
         );
     }
     let present_files: std::collections::HashSet<String> =
@@ -3441,13 +3463,14 @@ async fn intake_submit(
             StatusCode::BAD_REQUEST,
             &slug,
             &format!("Please attach: {}.", missing_files.join(", ")),
+            &form.origins,
         );
     }
 
     // 6. Store uploads (validated + written to FileStore, not yet linked).
     let uploads = match store_intake_uploads(&state, &ctx.db_name, &form, raws).await {
         Ok(u) => u,
-        Err(e) => return intake_error_page(StatusCode::BAD_REQUEST, &slug, &e),
+        Err(e) => return intake_error_page(StatusCode::BAD_REQUEST, &slug, &e, &form.origins),
     };
 
     // 7. Governed write (daily cap → quarantine|accept → stamp + WORM audit).
@@ -3460,10 +3483,11 @@ async fn intake_submit(
             StatusCode::TOO_MANY_REQUESTS,
             &slug,
             "This form is not accepting more responses today. Please try again tomorrow.",
+            &form.origins,
         ),
         Err(e) => {
             error!("intake submit failed for '{}': {}", slug, e);
-            intake_error_page(StatusCode::BAD_REQUEST, &slug, &e)
+            intake_error_page(StatusCode::BAD_REQUEST, &slug, &e, &form.origins)
         }
     }
 }
@@ -3605,6 +3629,7 @@ async fn intake_form_create(
 async fn intake_form_edit(
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
+    headers: HeaderMap,
     Path(id): Path<uuid::Uuid>,
 ) -> Response {
     if !user.is_admin() {
@@ -3668,6 +3693,14 @@ async fn intake_form_edit(
     .fetch_all(&db)
     .await
     .unwrap_or_default();
+    // Embed snippet — an iframe pointing at this tenant's public form URL.
+    let scheme = headers.get("x-forwarded-proto").and_then(|v| v.to_str().ok()).unwrap_or("https");
+    let host = headers.get(header::HOST).and_then(|v| v.to_str().ok()).unwrap_or("your-host");
+    let embed_snippet = format!(
+        r#"<iframe src="{scheme}://{host}/i/{slug}" width="100%" height="640" style="border:1px solid #e2e8f0;border-radius:8px" title="{title}"></iframe>"#,
+        scheme = scheme, host = host, slug = form.slug, title = form.title,
+    );
+
     // Attachment config → textarea "name | Label | required" per line.
     let attach_val = form.attach_fields.iter().map(|f| {
         let r = if f.required { " | required" } else { "" };
@@ -3734,6 +3767,11 @@ async fn intake_form_edit(
 </div></div></div>
 <div class="flex gap-2"><button class="btn btn-primary btn-sm">Save</button></div>
 </form>
+<div class="card bg-base-100 shadow mt-6"><div class="card-body">
+<h2 class="card-title text-lg">Embed on another site</h2>
+<p class="text-xs opacity-50">Drop this form into an external page. The form only renders in a frame on an <strong>Allowed origin</strong> (set it above), which is also the origin permitted to submit.{embed_warn}</p>
+<textarea readonly rows="2" class="textarea textarea-bordered textarea-sm font-mono">{embed_snippet}</textarea>
+</div></div>
 <form method="post" action="/settings/forms/{id}/delete" onsubmit="return confirm('Delete this form and its submission ledger?')" class="mt-4">
 <button class="btn btn-error btn-outline btn-sm">Delete form</button></form>"##,
         title = html_escape(&form.title), model = html_escape(&form.model),
@@ -3746,6 +3784,10 @@ async fn intake_form_edit(
         portal = if form.portal { "checked" } else { "" }, pf_opts = pf_opts,
         attach = html_escape(&attach_val), max_mb = form.attach_max_mb,
         accept = html_escape(&accept_val),
+        embed_snippet = html_escape(&embed_snippet),
+        embed_warn = if form.origins.is_empty() {
+            r#" <span class="text-warning">No allowed origins set yet — add one to enable embedding.</span>"#
+        } else { "" },
     );
     intake_admin_shell(&user, &form.title, &inner).into_response()
 }
@@ -5379,24 +5421,39 @@ async fn security_headers_middleware(
         .and_then(|v| v.to_str().ok())
         .map(|ct| ct.starts_with("text/html"))
         .unwrap_or(false);
+    // An embeddable page (a public Intake form the admin allow-listed origins
+    // for) sets its own CSP with `frame-ancestors`. Honour it: keep that CSP and
+    // do NOT slam the global `X-Frame-Options: DENY` on top, which would block
+    // framing regardless. Every other page gets the locked-down defaults.
+    let embeddable = response
+        .headers()
+        .get(header::CONTENT_SECURITY_POLICY)
+        .and_then(|v| v.to_str().ok())
+        .map(|c| c.contains("frame-ancestors"))
+        .unwrap_or(false);
+
     let headers = response.headers_mut();
     if is_html {
         headers.insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
     }
-    headers.insert("X-Frame-Options", "DENY".parse().unwrap());
+    if !embeddable {
+        headers.insert("X-Frame-Options", "DENY".parse().unwrap());
+    }
     headers.insert("X-Content-Type-Options", "nosniff".parse().unwrap());
     headers.insert("X-XSS-Protection", "1; mode=block".parse().unwrap());
     headers.insert("Referrer-Policy", "strict-origin-when-cross-origin".parse().unwrap());
     headers.insert("Permissions-Policy", "camera=(), microphone=(), geolocation=()".parse().unwrap());
-    headers.insert(
-        "Content-Security-Policy",
-        // Self-contained by policy: all CSS/JS is vendored under
-        // /static/vendor (no CDNs — air-gapped installs must render
-        // correctly). The one external allowance is OpenStreetMap
-        // tiles, which are runtime map data, not page assets; fully
-        // air-gapped sites point Leaflet at a local tile server.
-        "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data: https://*.tile.openstreetmap.org; font-src 'self'".parse().unwrap(),
-    );
+    if !embeddable {
+        headers.insert(
+            "Content-Security-Policy",
+            // Self-contained by policy: all CSS/JS is vendored under
+            // /static/vendor (no CDNs — air-gapped installs must render
+            // correctly). The one external allowance is OpenStreetMap
+            // tiles, which are runtime map data, not page assets; fully
+            // air-gapped sites point Leaflet at a local tile server.
+            "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data: https://*.tile.openstreetmap.org; font-src 'self'".parse().unwrap(),
+        );
+    }
     response
 }
 
