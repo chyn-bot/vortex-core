@@ -1,0 +1,5 @@
+# Migration metadata for 148_intake
+module = "core"
+description = "Vortex Intake: web_form (public form definitions bound to a model, with a field allow-list) and web_form_submission (triage ledger). Targets any ir_model incl. Blueprint x_ tables."
+reversible = true
+dependencies = ["122_model_registry", "145_blueprints"]
