@@ -955,13 +955,159 @@ pub async fn update_form(
 }
 
 /// Delete a form (and its submission ledger via ON DELETE CASCADE).
-pub async fn delete_form(db: &PgPool, id: Uuid) -> Result<(), String> {
+///
+/// Before the cascade drops the submission rows — which is the only place a
+/// held-but-unlinked blob key survives — this proactively deletes the blobs of
+/// every **non-`accepted`** submission. An `accepted` submission's blobs are
+/// linked to a live governed record via `ir_attachment` (the record outlives
+/// the form), so they must not be swept; the defensive reference check inside
+/// [`purge_unlinked_blobs`] is a second guard. Without this, deleting a form
+/// would strand every quarantined/rejected blob with no DB row left to find it.
+pub async fn delete_form(
+    files: &dyn crate::files::FileStore,
+    db: &PgPool,
+    db_name: &str,
+    id: Uuid,
+) -> Result<(), String> {
+    // Gather blobs from non-accepted submissions before the cascade removes them.
+    let held: Vec<Option<serde_json::Value>> = sqlx::query_scalar(
+        "SELECT attachments FROM web_form_submission \
+         WHERE form_id = $1 AND status <> 'accepted' \
+           AND attachments IS NOT NULL AND jsonb_array_length(attachments) > 0",
+    )
+    .bind(id)
+    .fetch_all(db)
+    .await
+    .map_err(dberr)?;
+    for attach in held {
+        let uploads: Vec<StoredUpload> =
+            attach.and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
+        purge_unlinked_blobs(files, db, db_name, &uploads).await;
+    }
+
     sqlx::query("DELETE FROM web_form WHERE id = $1")
         .bind(id)
         .execute(db)
         .await
         .map_err(dberr)?;
     Ok(())
+}
+
+// ===========================================================================
+// Orphaned-blob sweep — reclaim FileStore blobs no live record references.
+// ===========================================================================
+
+/// Grace period (days) a rejected submission's blobs are retained before the
+/// sweep reclaims them — a window in which an operator can still inspect what a
+/// rejected submission tried to attach. Override with
+/// `VORTEX_INTAKE_BLOB_GRACE_DAYS` (0 = sweep as soon as the next run fires).
+pub fn blob_grace_days() -> i64 {
+    std::env::var("VORTEX_INTAKE_BLOB_GRACE_DAYS")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|d| *d >= 0)
+        .unwrap_or(7)
+}
+
+/// Delete the FileStore blobs behind `uploads`, skipping any key still
+/// referenced by an `ir_attachment` row — a linked blob belongs to a live
+/// record and must never be reclaimed. Returns how many blobs were deleted.
+/// Best-effort: a failed blob delete is logged and the key is left in place
+/// (it will be retried on the next run) rather than aborting the batch.
+async fn purge_unlinked_blobs(
+    files: &dyn crate::files::FileStore,
+    db: &PgPool,
+    db_name: &str,
+    uploads: &[StoredUpload],
+) -> u64 {
+    let mut deleted = 0u64;
+    for u in uploads {
+        // Never reclaim a blob a live record still points at.
+        let referenced = sqlx::query_scalar::<_, i32>(
+            "SELECT 1 FROM ir_attachment WHERE store_fname = $1 LIMIT 1",
+        )
+        .bind(&u.key)
+        .fetch_optional(db)
+        .await
+        .ok()
+        .flatten()
+        .is_some();
+        if referenced {
+            continue;
+        }
+        match files.delete(db_name, &u.key).await {
+            Ok(()) => deleted += 1,
+            Err(e) => tracing::warn!(error = %e, key = %u.key, "intake sweep: blob delete failed"),
+        }
+    }
+    deleted
+}
+
+/// Sweep orphaned attachment blobs left behind by rejected quarantine
+/// submissions.
+///
+/// When a quarantined submission is **rejected**, no record is ever created, so
+/// the blobs stored at submit time are never linked to an `ir_attachment` and
+/// would otherwise sit in the FileStore forever. This finds rejected
+/// submissions older than `grace_days` that still carry attachment metadata,
+/// deletes each stored blob (skipping any still referenced by a live record —
+/// defensive), then clears the metadata so the row isn't reconsidered next run.
+/// The submission row itself — and its WORM-audited rejection — is preserved;
+/// only the now-dangling blob pointers are dropped. Returns the number of blobs
+/// deleted.
+///
+/// This is DB-driven: it reclaims blobs whose keys are still recorded on a
+/// submission row. Blobs stranded by a store-then-DB-failure (a key that was
+/// never persisted anywhere) are outside its reach and would need a FileStore
+/// enumeration to find — an accepted limitation, since the FileStore contract
+/// has no `list`.
+pub async fn sweep_orphaned_attachments(
+    files: &dyn crate::files::FileStore,
+    db: &PgPool,
+    db_name: &str,
+    grace_days: i64,
+) -> u64 {
+    let rows: Vec<(Uuid, Option<serde_json::Value>)> = match sqlx::query_as(
+        "SELECT id, attachments FROM web_form_submission \
+         WHERE status = 'rejected' \
+           AND attachments IS NOT NULL \
+           AND jsonb_array_length(attachments) > 0 \
+           AND reviewed_at < NOW() - make_interval(days => $1)",
+    )
+    .bind(grace_days.max(0) as i32)
+    .fetch_all(db)
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, %db_name, "intake sweep: query failed");
+            return 0;
+        }
+    };
+
+    let mut deleted = 0u64;
+    for (sub_id, attach) in rows {
+        let uploads: Vec<StoredUpload> =
+            attach.and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
+        if uploads.is_empty() {
+            continue;
+        }
+        deleted += purge_unlinked_blobs(files, db, db_name, &uploads).await;
+        // Clear the pointers so this row isn't swept again. Best-effort: if the
+        // update fails, the reference check keeps the next run from double-deleting.
+        if let Err(e) =
+            sqlx::query("UPDATE web_form_submission SET attachments = '[]'::jsonb WHERE id = $1")
+                .bind(sub_id)
+                .execute(db)
+                .await
+        {
+            tracing::warn!(error = %e, %sub_id, "intake sweep: clearing attachments failed");
+        }
+    }
+    if deleted > 0 {
+        tracing::info!(deleted, %db_name, "intake sweep removed orphaned attachment blobs");
+    }
+    deleted
 }
 
 // ===========================================================================
