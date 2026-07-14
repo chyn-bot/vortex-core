@@ -32,6 +32,7 @@
 //! would add its own binding crate alongside this one and keep
 //! `vortex-module` intact.
 
+pub mod antivirus;
 pub mod api;
 pub mod approval;
 pub mod audit_trail;

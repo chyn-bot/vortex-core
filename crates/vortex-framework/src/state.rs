@@ -116,6 +116,11 @@ pub struct AppState {
     /// filesystem path — so rows stay portable across backends. See
     /// `crate::files` for the contract.
     pub files: Arc<dyn crate::files::FileStore>,
+    /// Anti-virus scanner for uploaded content (`[antivirus]` in vortex.toml).
+    /// The default is a no-op that accepts everything; a configured `clamd`
+    /// backend screens blobs before they are stored/linked. Upload paths call
+    /// `state.av.scan(..)`. See `crate::antivirus`.
+    pub av: Arc<dyn crate::antivirus::AvScanner>,
 }
 
 /// Database context injected by the auth middleware for request-scoped
