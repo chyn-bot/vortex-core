@@ -2193,6 +2193,24 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/announcements/{id}/edit", get(announcement_edit))
         .route("/announcements/{id}", post(announcement_update))
         .route("/announcements/{id}/delete", post(announcement_delete))
+        // Blueprints — governed runtime model builder (admin-only)
+        .route("/blueprints", get(blueprints_list))
+        .route("/blueprints", post(blueprint_create))
+        .route("/blueprints/new", get(blueprint_new))
+        .route("/blueprints/import", get(blueprint_import_form))
+        .route("/blueprints/import", post(blueprint_import))
+        .route("/blueprints/{model}/export", get(blueprint_export))
+        .route("/blueprints/approvals", get(blueprint_approvals))
+        .route("/blueprints/governance", post(blueprint_governance_toggle))
+        .route("/blueprints/approvals/{id}/approve", post(blueprint_approve))
+        .route("/blueprints/approvals/{id}/reject", post(blueprint_reject))
+        .route("/blueprints/{model}", get(blueprint_designer))
+        .route("/blueprints/{model}/archive", post(blueprint_archive))
+        .route("/blueprints/{model}/history", get(blueprint_history))
+        .route("/blueprints/{model}/layout", post(blueprint_set_layout))
+        .route("/blueprints/{model}/fields", post(blueprint_add_field))
+        .route("/blueprints/{model}/fields/{name}/rename", post(blueprint_rename_field))
+        .route("/blueprints/{model}/fields/{name}/delete", post(blueprint_remove_field))
         // Shortcuts API
         .route("/api/home/shortcuts/available", get(shortcuts_available))
         .route("/api/home/shortcuts", post(shortcut_add))
@@ -5046,6 +5064,858 @@ async fn build_home_calendar(
     Html(html)
 }
 
+// -- Blueprints: governed runtime model builder (admin-only) ------------------
+//
+// Thin HTTP layer over `vortex_framework::blueprint` (which owns the policy +
+// audit + DDL). Routes are admin-gated here (defense in depth); the service
+// additionally enforces the Cedar `blueprint.*` permit.
+
+#[derive(serde::Deserialize)]
+struct BlueprintNewForm {
+    label: String,
+}
+
+#[derive(serde::Deserialize)]
+struct BlueprintFieldForm {
+    label: String,
+    field_type: String,
+    // Only meaningful for many2one / selection respectively; ignored otherwise.
+    #[serde(default)]
+    related_model: Option<String>,
+    #[serde(default)]
+    options: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct BlueprintRenameForm {
+    label: String,
+}
+
+/// The field-type vocabulary the builder offers. `selection` additionally reads
+/// the Options textarea and `many2one` the "Links to" target; every other type
+/// needs no extra configuration.
+const BLUEPRINT_FIELD_TYPES: &[(&str, &str)] = &[
+    ("string", "Text"),
+    ("text", "Long text"),
+    ("integer", "Number (integer)"),
+    ("decimal", "Decimal"),
+    ("monetary", "Money"),
+    ("boolean", "Checkbox"),
+    ("date", "Date"),
+    ("datetime", "Date & time"),
+    ("selection", "Dropdown"),
+    ("many2one", "Link to a record"),
+];
+
+fn blueprint_type_label(ft: &str) -> String {
+    BLUEPRINT_FIELD_TYPES
+        .iter()
+        .find(|(v, _)| *v == ft)
+        .map(|(_, l)| l.to_string())
+        .unwrap_or_else(|| ft.to_string())
+}
+
+fn blueprint_type_options() -> String {
+    BLUEPRINT_FIELD_TYPES
+        .iter()
+        .map(|(v, l)| format!(r#"<option value="{v}">{l}</option>"#))
+        .collect()
+}
+
+fn blueprint_shell(
+    state: &Arc<AppState>,
+    user: &AuthUser,
+    db_ctx: &DatabaseContext,
+    title: &str,
+    body: &str,
+) -> Response {
+    let display_name = user.full_name.as_deref().unwrap_or(&user.username);
+    let initials = get_initials(display_name);
+    let sidebar = build_sidebar(
+        "blueprints",
+        display_name,
+        &initials,
+        &db_ctx.installed_modules,
+        user.is_admin(),
+        &state.plugin_registry,
+        &user.roles,
+    );
+    Html(vortex_framework::render_app_shell(title, &sidebar, body)).into_response()
+}
+
+fn blueprint_forbidden() -> Response {
+    (StatusCode::FORBIDDEN, Html(forbidden_page("Blueprints"))).into_response()
+}
+
+async fn blueprints_list(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+) -> Response {
+    if !user.is_admin() {
+        return blueprint_forbidden();
+    }
+    let rows = sqlx::query(
+        "SELECT m.name, m.display_name, b.status,
+                (SELECT count(*) FROM ir_model_field f WHERE f.model_id = m.id AND f.source = 'blueprint') AS field_count
+         FROM ir_model m JOIN blueprint b ON b.model_id = m.id
+         WHERE m.source = 'blueprint'
+         ORDER BY m.display_name",
+    )
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default();
+
+    let mut table_rows = String::new();
+    for r in &rows {
+        let name: String = r.get("name");
+        let label: String = r.get("display_name");
+        let status: String = r.get("status");
+        let fields: i64 = r.get("field_count");
+        let badge = if status == "active" { "badge-success" } else { "badge-ghost" };
+        table_rows.push_str(&format!(
+            r#"<tr class="hover"><td><a class="link link-primary" href="/blueprints/{name}">{label}</a></td><td><code class="text-xs">{name}</code></td><td>{fields}</td><td><span class="badge {badge} badge-sm">{status}</span></td><td><a href="/list/{name}" class="btn btn-xs btn-ghost">Open records →</a></td></tr>"#,
+            name = html_escape(&name),
+            label = html_escape(&label),
+            fields = fields,
+            badge = badge,
+            status = html_escape(&status),
+        ));
+    }
+    if table_rows.is_empty() {
+        table_rows = r#"<tr><td colspan="5" class="text-center py-8 opacity-60">No Blueprints yet. Create one to build a model with no deploy.</td></tr>"#.to_string();
+    }
+
+    let body = format!(
+        r#"<div class="flex justify-between items-center mb-6">
+<div><h1 class="text-2xl font-bold">Blueprints</h1><p class="text-base-content/60">Build governed models at runtime — every schema change is policy-checked and written to the audit ledger.</p></div>
+<div class="flex gap-2"><a href="/blueprints/import" class="btn btn-ghost">Import</a><a href="/blueprints/approvals" class="btn btn-ghost">Approvals</a><a href="/blueprints/new" class="btn btn-primary">+ New Blueprint</a></div>
+</div>
+<div class="card bg-base-100 shadow"><div class="overflow-x-auto">
+<table class="table table-sm"><thead><tr><th>Name</th><th>Technical</th><th>Fields</th><th>Status</th><th>Records</th></tr></thead>
+<tbody>{table_rows}</tbody></table></div></div>"#,
+    );
+    blueprint_shell(&state, &user, &db_ctx, "Blueprints - Remicle", &body)
+}
+
+async fn blueprint_new(
+    State(state): State<Arc<AppState>>,
+    Db(_db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+) -> Response {
+    if !user.is_admin() {
+        return blueprint_forbidden();
+    }
+    let body = r#"<h1 class="text-2xl font-bold mb-6">New Blueprint</h1>
+<form action="/blueprints" method="POST" class="card bg-base-100 shadow p-6 max-w-xl">
+<div class="form-control mb-4"><label class="label"><span class="label-text">Name *</span></label>
+<input name="label" class="input input-bordered" placeholder="e.g. Site Visit" required/>
+<span class="label-text-alt mt-1 opacity-60">A technical name like <code>x_site_visit</code> is generated automatically.</span></div>
+<div class="flex gap-2 mt-4"><a href="/blueprints" class="btn btn-ghost">Cancel</a><button class="btn btn-primary">Create Blueprint</button></div>
+</form>"#;
+    blueprint_shell(&state, &user, &db_ctx, "New Blueprint - Remicle", body)
+}
+
+async fn blueprint_create(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Form(form): Form<BlueprintNewForm>,
+) -> Response {
+    if !user.is_admin() {
+        return blueprint_forbidden();
+    }
+    use vortex_framework::blueprint::{BlueprintOp, SubmitOutcome};
+    match vortex_framework::blueprint::submit(
+        &state,
+        &db,
+        &db_ctx.db_name,
+        &user,
+        BlueprintOp::Create { label: form.label.clone() },
+    )
+    .await
+    {
+        Ok(SubmitOutcome::Applied { model: Some(m) }) => {
+            Redirect::to(&format!("/blueprints/{m}")).into_response()
+        }
+        Ok(_) => Redirect::to("/blueprints/approvals").into_response(),
+        Err(e) => error_response(&e),
+    }
+}
+
+async fn blueprint_designer(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(model): Path<String>,
+) -> Response {
+    if !user.is_admin() {
+        return blueprint_forbidden();
+    }
+    let head = sqlx::query(
+        "SELECT m.id, m.display_name, b.status
+         FROM ir_model m JOIN blueprint b ON b.model_id = m.id
+         WHERE m.name = $1 AND m.source = 'blueprint'",
+    )
+    .bind(&model)
+    .fetch_optional(&db)
+    .await
+    .ok()
+    .flatten();
+    let Some(head) = head else {
+        return (StatusCode::NOT_FOUND, Html(forbidden_page("Blueprint not found"))).into_response();
+    };
+    let model_id: uuid::Uuid = head.get("id");
+    let label: String = head.get("display_name");
+    let status: String = head.get("status");
+
+    let fields = sqlx::query(
+        "SELECT name, display_name, field_type, sequence, is_visible, related_model
+         FROM ir_model_field
+         WHERE model_id = $1 AND source = 'blueprint' ORDER BY sequence",
+    )
+    .bind(model_id)
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default();
+
+    // Candidate many2one targets: any active model — Blueprint or compiled —
+    // whose table carries a `name` column, so the generic picker/JOIN can
+    // resolve a label. Split into two optgroups for scannability.
+    let targets = sqlx::query(
+        "SELECT m.name, m.display_name, m.source FROM ir_model m
+         WHERE m.is_active = true
+           AND EXISTS (
+               SELECT 1 FROM information_schema.columns c
+               WHERE c.table_schema = 'public' AND c.table_name = m.table_name
+                 AND c.column_name = 'name'
+           )
+         ORDER BY (m.source = 'blueprint') DESC, m.display_name",
+    )
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default();
+    let (mut bp_opts, mut core_opts) = (String::new(), String::new());
+    for t in &targets {
+        let tname: String = t.get("name");
+        let tlabel: String = t.get("display_name");
+        let tsource: String = t.get("source");
+        let opt = format!(
+            r#"<option value="{}">{}</option>"#,
+            html_escape(&tname),
+            html_escape(&tlabel),
+        );
+        if tsource == "blueprint" {
+            bp_opts.push_str(&opt);
+        } else {
+            core_opts.push_str(&opt);
+        }
+    }
+    let mut target_options = String::new();
+    if !bp_opts.is_empty() {
+        target_options.push_str(&format!(r#"<optgroup label="Blueprints">{bp_opts}</optgroup>"#));
+    }
+    if !core_opts.is_empty() {
+        target_options.push_str(&format!(r#"<optgroup label="Core records">{core_opts}</optgroup>"#));
+    }
+
+    // Layout rows: an order box + a "list column" checkbox per field, submitted
+    // as one form (order__<f> / list__<f>). Sequence drives order in both the
+    // generic form and list; is_visible drives list-column membership.
+    let mut layout_rows = String::new();
+    for (idx, f) in fields.iter().enumerate() {
+        let fname: String = f.get("name");
+        let flabel: String = f.get("display_name");
+        let in_list: bool = f.get("is_visible");
+        layout_rows.push_str(&format!(
+            r#"<tr class="hover"><td>{flabel} <code class="text-xs opacity-60">{fname}</code></td>
+<td><input type="number" name="order__{fname}" value="{ord}" class="input input-bordered input-xs w-20"/></td>
+<td class="text-center"><input type="checkbox" name="list__{fname}" class="checkbox checkbox-sm"{checked}/></td></tr>"#,
+            flabel = html_escape(&flabel),
+            fname = html_escape(&fname),
+            ord = (idx + 1) * 10,
+            checked = if in_list { " checked" } else { "" },
+        ));
+    }
+
+    let mut field_rows = String::new();
+    for f in &fields {
+        let fname: String = f.get("name");
+        let flabel: String = f.get("display_name");
+        let ftype: String = f.get("field_type");
+        let related: Option<String> = f.get("related_model");
+        // For a relation, show what it links to next to the type label.
+        let type_display = match (&ftype[..], related.as_deref()) {
+            ("many2one", Some(rel)) => format!(
+                "{} → <code class=\"text-xs\">{}</code>",
+                html_escape(&blueprint_type_label(&ftype)),
+                html_escape(rel)
+            ),
+            _ => html_escape(&blueprint_type_label(&ftype)),
+        };
+        // The Name field is the record's display field — it can't be renamed or
+        // deleted (relations resolve their label through it).
+        let is_name = fname == "name";
+        let actions = if is_name {
+            r#"<td class="opacity-50 text-xs">Display field</td><td></td>"#.to_string()
+        } else {
+            format!(
+                r#"<td><form action="/blueprints/{model}/fields/{fname}/rename" method="POST" class="join">
+<input name="label" class="input input-bordered input-xs join-item" value="{flabel}" required/>
+<button class="btn btn-xs join-item">Rename</button></form></td>
+<td><form action="/blueprints/{model}/fields/{fname}/delete" method="POST" onsubmit="return confirm('Delete field {flabel}?')"><button class="btn btn-xs btn-ghost text-error">Delete</button></form></td>"#,
+                flabel = html_escape(&flabel),
+                fname = html_escape(&fname),
+                model = html_escape(&model),
+            )
+        };
+        field_rows.push_str(&format!(
+            r#"<tr class="hover"><td>{flabel}</td><td><code class="text-xs">{fname}</code></td><td>{type_display}</td>{actions}</tr>"#,
+            flabel = html_escape(&flabel),
+            fname = html_escape(&fname),
+        ));
+    }
+    if field_rows.is_empty() {
+        field_rows = r#"<tr><td colspan="5" class="text-center py-6 opacity-60">No fields yet — add one below.</td></tr>"#.to_string();
+    }
+
+    let layout_card = if layout_rows.is_empty() {
+        String::new()
+    } else {
+        format!(
+            r#"<div class="card bg-base-100 shadow mb-6 max-w-2xl"><div class="card-body p-4">
+<h2 class="card-title text-base mb-1">Layout</h2>
+<p class="text-sm opacity-60 mb-3">Order drives both the form and the list. Untick <em>List column</em> to hide a field from the list view — it stays editable on the form.</p>
+<form action="/blueprints/{model}/layout" method="POST">
+<table class="table table-sm"><thead><tr><th>Field</th><th>Order</th><th class="text-center">List column</th></tr></thead>
+<tbody>{layout_rows}</tbody></table>
+<div class="mt-3"><button class="btn btn-primary btn-sm">Save layout</button></div>
+</form></div></div>"#,
+            model = html_escape(&model),
+            layout_rows = layout_rows,
+        )
+    };
+
+    // The "Links to" picker only appears when there's at least one valid target
+    // (a Blueprint with a Name field); otherwise a hidden empty value keeps the
+    // form well-formed and a many2one submission fails loud with guidance.
+    let target_field = if target_options.is_empty() {
+        r#"<input type="hidden" name="related_model" value=""/>"#.to_string()
+    } else {
+        format!(
+            r#"<div class="form-control"><label class="label py-1"><span class="label-text">Links to <span class="opacity-50">(Link fields)</span></span></label><select name="related_model" class="select select-bordered select-sm"><option value="">—</option>{target_options}</select></div>"#,
+            target_options = target_options,
+        )
+    };
+
+    let body = format!(
+        r#"<div class="flex justify-between items-center mb-6">
+<div><div class="flex items-center gap-2"><a href="/blueprints" class="btn btn-ghost btn-sm btn-square">←</a><h1 class="text-2xl font-bold">{label}</h1><span class="badge badge-ghost">{status}</span></div>
+<p class="text-base-content/60 mt-1">Technical name <code>{model}</code></p></div>
+<div class="flex gap-2"><a href="/list/{model}" class="btn btn-primary">Open records →</a>
+<a href="/blueprints/{model}/history" class="btn btn-ghost">History</a>
+<a href="/blueprints/{model}/export" class="btn btn-ghost">Export</a>
+<form action="/blueprints/{model}/archive" method="POST" onsubmit="return confirm('Archive this Blueprint? Its records are kept.')"><button class="btn btn-ghost text-error">Archive</button></form></div>
+</div>
+<div class="card bg-base-100 shadow mb-6"><div class="card-body p-4 overflow-x-auto">
+<h2 class="card-title text-base mb-2">Fields</h2>
+<table class="table table-sm"><thead><tr><th>Label</th><th>Name</th><th>Type</th><th>Rename</th><th></th></tr></thead>
+<tbody>{field_rows}</tbody></table>
+</div></div>
+{layout_card}
+<div class="card bg-base-100 shadow max-w-2xl"><div class="card-body p-4">
+<h2 class="card-title text-base mb-2">Add a field</h2>
+<form action="/blueprints/{model}/fields" method="POST" class="flex flex-col gap-3">
+<div class="flex flex-wrap gap-3 items-end">
+<div class="form-control"><label class="label py-1"><span class="label-text">Label</span></label><input name="label" class="input input-bordered input-sm" placeholder="e.g. Amount" required/></div>
+<div class="form-control"><label class="label py-1"><span class="label-text">Type</span></label><select name="field_type" class="select select-bordered select-sm">{type_options}</select></div>
+{target_field}
+<button class="btn btn-primary btn-sm">Add field</button>
+</div>
+<div class="form-control w-full"><label class="label py-1"><span class="label-text">Options <span class="opacity-50">(for Dropdown — one per line)</span></span></label><textarea name="options" rows="3" class="textarea textarea-bordered textarea-sm" placeholder="Open&#10;In Progress&#10;Closed"></textarea></div>
+</form></div></div>"#,
+        label = html_escape(&label),
+        status = html_escape(&status),
+        model = html_escape(&model),
+        field_rows = field_rows,
+        layout_card = layout_card,
+        type_options = blueprint_type_options(),
+        target_field = target_field,
+    );
+    blueprint_shell(
+        &state,
+        &user,
+        &db_ctx,
+        &format!("{} - Blueprints", html_escape(&label)),
+        &body,
+    )
+}
+
+async fn blueprint_add_field(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(model): Path<String>,
+    Form(form): Form<BlueprintFieldForm>,
+) -> Response {
+    if !user.is_admin() {
+        return blueprint_forbidden();
+    }
+    use vortex_framework::blueprint::{BlueprintOp, SubmitOutcome};
+    match vortex_framework::blueprint::submit(
+        &state,
+        &db,
+        &db_ctx.db_name,
+        &user,
+        BlueprintOp::AddField {
+            model: model.clone(),
+            label: form.label.clone(),
+            field_type: form.field_type.clone(),
+            related_model: form.related_model.clone(),
+            options: form.options.clone(),
+        },
+    )
+    .await
+    {
+        Ok(SubmitOutcome::Applied { .. }) => Redirect::to(&format!("/blueprints/{model}")).into_response(),
+        Ok(SubmitOutcome::Pending) => Redirect::to("/blueprints/approvals").into_response(),
+        Err(e) => error_response(&e),
+    }
+}
+
+async fn blueprint_rename_field(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path((model, name)): Path<(String, String)>,
+    Form(form): Form<BlueprintRenameForm>,
+) -> Response {
+    if !user.is_admin() {
+        return blueprint_forbidden();
+    }
+    use vortex_framework::blueprint::{BlueprintOp, SubmitOutcome};
+    match vortex_framework::blueprint::submit(
+        &state,
+        &db,
+        &db_ctx.db_name,
+        &user,
+        BlueprintOp::RenameField {
+            model: model.clone(),
+            from: name.clone(),
+            new_label: form.label.clone(),
+        },
+    )
+    .await
+    {
+        Ok(SubmitOutcome::Applied { .. }) => Redirect::to(&format!("/blueprints/{model}")).into_response(),
+        Ok(SubmitOutcome::Pending) => Redirect::to("/blueprints/approvals").into_response(),
+        Err(e) => error_response(&e),
+    }
+}
+
+async fn blueprint_remove_field(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path((model, name)): Path<(String, String)>,
+) -> Response {
+    if !user.is_admin() {
+        return blueprint_forbidden();
+    }
+    use vortex_framework::blueprint::{BlueprintOp, SubmitOutcome};
+    match vortex_framework::blueprint::submit(
+        &state,
+        &db,
+        &db_ctx.db_name,
+        &user,
+        BlueprintOp::RemoveField { model: model.clone(), name: name.clone() },
+    )
+    .await
+    {
+        Ok(SubmitOutcome::Applied { .. }) => Redirect::to(&format!("/blueprints/{model}")).into_response(),
+        Ok(SubmitOutcome::Pending) => Redirect::to("/blueprints/approvals").into_response(),
+        Err(e) => error_response(&e),
+    }
+}
+
+async fn blueprint_archive(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(model): Path<String>,
+) -> Response {
+    if !user.is_admin() {
+        return blueprint_forbidden();
+    }
+    use vortex_framework::blueprint::{BlueprintOp, SubmitOutcome};
+    match vortex_framework::blueprint::submit(
+        &state,
+        &db,
+        &db_ctx.db_name,
+        &user,
+        BlueprintOp::Archive { model: model.clone() },
+    )
+    .await
+    {
+        Ok(SubmitOutcome::Applied { .. }) => Redirect::to("/blueprints").into_response(),
+        Ok(SubmitOutcome::Pending) => Redirect::to("/blueprints/approvals").into_response(),
+        Err(e) => error_response(&e),
+    }
+}
+
+/// GET /blueprints/{model}/history — the schema-history timeline. Renders each
+/// version snapshot (who/when) with the field-level diff against the previous
+/// one, computed by `vortex_framework::blueprint::diff_definitions`. Read-only:
+/// the tamper-evident record of how a Blueprint's schema evolved — a governance
+/// capability Odoo/Frappe's no-code builders don't offer.
+async fn blueprint_history(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(model): Path<String>,
+) -> Response {
+    if !user.is_admin() {
+        return blueprint_forbidden();
+    }
+    let label: Option<String> = sqlx::query_scalar(
+        "SELECT display_name FROM ir_model WHERE name = $1 AND source = 'blueprint'",
+    )
+    .bind(&model)
+    .fetch_optional(&db)
+    .await
+    .ok()
+    .flatten();
+    let Some(label) = label else {
+        return (StatusCode::NOT_FOUND, Html(forbidden_page("Blueprint not found"))).into_response();
+    };
+
+    let versions = sqlx::query(
+        "SELECT bv.version, bv.definition, bv.applied_at, u.username AS applied_by
+         FROM blueprint_version bv
+         JOIN blueprint b ON b.id = bv.blueprint_id
+         JOIN ir_model m ON m.id = b.model_id
+         LEFT JOIN users u ON u.id = bv.applied_by
+         WHERE m.name = $1 AND m.source = 'blueprint'
+         ORDER BY bv.version ASC",
+    )
+    .bind(&model)
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default();
+
+    // Build the diff for each version against its predecessor, then render
+    // newest-first.
+    let mut entries: Vec<String> = Vec::new();
+    let mut prev_def: Option<serde_json::Value> = None;
+    for v in &versions {
+        let vnum: i32 = v.get("version");
+        let def: serde_json::Value = v.get("definition");
+        let applied_by: Option<String> = v.get("applied_by");
+        let applied_at: chrono::DateTime<chrono::Utc> = v.get("applied_at");
+        let changes = vortex_framework::blueprint::diff_definitions(prev_def.as_ref(), &def);
+
+        let change_html = if changes.is_empty() {
+            r#"<span class="opacity-60 text-sm">No field changes</span>"#.to_string()
+        } else {
+            changes
+                .iter()
+                .map(|c| {
+                    let (badge, verb) = match c.kind {
+                        "added" => ("badge-success", "Added"),
+                        "removed" => ("badge-error", "Removed"),
+                        _ => ("badge-warning", "Changed"),
+                    };
+                    let detail = if c.detail.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" <span class=\"opacity-70\">— {}</span>", html_escape(&c.detail))
+                    };
+                    format!(
+                        r#"<div class="text-sm py-0.5"><span class="badge {badge} badge-sm mr-2">{verb}</span><code class="text-xs">{field}</code>{detail}</div>"#,
+                        badge = badge,
+                        verb = verb,
+                        field = html_escape(&c.field),
+                        detail = detail,
+                    )
+                })
+                .collect::<String>()
+        };
+        entries.push(format!(
+            r#"<div class="card bg-base-100 shadow-sm border border-base-300"><div class="card-body p-4">
+<div class="flex items-center justify-between mb-2"><h3 class="font-semibold">Version {vnum}</h3>
+<span class="text-xs opacity-60">{by} · {at}</span></div>
+{changes}</div></div>"#,
+            vnum = vnum,
+            by = html_escape(applied_by.as_deref().unwrap_or("system")),
+            at = applied_at.format("%Y-%m-%d %H:%M UTC"),
+            changes = change_html,
+        ));
+        prev_def = Some(def);
+    }
+    entries.reverse();
+    let timeline = if entries.is_empty() {
+        r#"<p class="opacity-60">No versions recorded yet.</p>"#.to_string()
+    } else {
+        format!(r#"<div class="flex flex-col gap-3 max-w-2xl">{}</div>"#, entries.join(""))
+    };
+
+    let body = format!(
+        r#"<div class="flex items-center gap-2 mb-1"><a href="/blueprints/{model}" class="btn btn-ghost btn-sm btn-square">←</a><h1 class="text-2xl font-bold">{label} — History</h1></div>
+<p class="text-base-content/60 mb-6">Every schema and layout change, in order. Each version is WORM-audited; this is the human-readable timeline.</p>
+{timeline}"#,
+        model = html_escape(&model),
+        label = html_escape(&label),
+        timeline = timeline,
+    );
+    blueprint_shell(
+        &state,
+        &user,
+        &db_ctx,
+        &format!("{} History - Blueprints", html_escape(&label)),
+        &body,
+    )
+}
+
+/// GET /blueprints/{model}/export — download the Blueprint as a signed manifest.
+async fn blueprint_export(
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Path(model): Path<String>,
+) -> Response {
+    if !user.is_admin() {
+        return blueprint_forbidden();
+    }
+    match vortex_framework::blueprint::export_manifest(&db, &model).await {
+        Ok(json) => (
+            [
+                (header::CONTENT_TYPE, "application/json".to_string()),
+                (
+                    header::CONTENT_DISPOSITION,
+                    format!("attachment; filename=\"{}.blueprint.json\"", model),
+                ),
+            ],
+            json,
+        )
+            .into_response(),
+        Err(e) => error_response(&e),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ImportForm {
+    manifest: String,
+}
+
+/// GET /blueprints/import — paste-a-manifest form.
+async fn blueprint_import_form(
+    State(state): State<Arc<AppState>>,
+    Db(_db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+) -> Response {
+    if !user.is_admin() {
+        return blueprint_forbidden();
+    }
+    let body = r#"<div class="flex items-center gap-2 mb-1"><a href="/blueprints" class="btn btn-ghost btn-sm btn-square">←</a><h1 class="text-2xl font-bold">Import Blueprint</h1></div>
+<p class="text-base-content/60 mb-6">Paste a signed Blueprint manifest exported from another Vortex instance. The signature is verified before anything is created — a modified or foreign manifest is rejected.</p>
+<form action="/blueprints/import" method="POST" class="card bg-base-100 shadow p-6 max-w-2xl">
+<div class="form-control"><label class="label"><span class="label-text">Manifest JSON</span></label>
+<textarea name="manifest" rows="16" class="textarea textarea-bordered font-mono text-xs" placeholder='{ "manifest": { ... }, "signature": "..." }' required></textarea></div>
+<div class="flex gap-2 mt-4"><a href="/blueprints" class="btn btn-ghost">Cancel</a><button class="btn btn-primary">Import</button></div>
+</form>"#;
+    blueprint_shell(&state, &user, &db_ctx, "Import Blueprint - Remicle", body)
+}
+
+/// POST /blueprints/import — verify + recreate from a manifest.
+async fn blueprint_import(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Form(form): Form<ImportForm>,
+) -> Response {
+    if !user.is_admin() {
+        return blueprint_forbidden();
+    }
+    match vortex_framework::blueprint::import_manifest(&state, &db, &db_ctx.db_name, &user, &form.manifest).await {
+        Ok(model) => Redirect::to(&format!("/blueprints/{model}")).into_response(),
+        Err(e) => error_response(&e),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct GovernanceForm {
+    #[serde(default)]
+    require_approval: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct RejectForm {
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+/// GET /blueprints/approvals — the pending-change inbox + the governance toggle.
+/// Present only when approval-before-DDL matters; schema changes land here as
+/// pending requests when the tenant switch is on.
+async fn blueprint_approvals(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+) -> Response {
+    if !user.is_admin() {
+        return blueprint_forbidden();
+    }
+    let required = vortex_framework::blueprint::approval_required(&db).await;
+    let pending = vortex_framework::blueprint::pending_requests(&db).await;
+
+    let toggle = format!(
+        r#"<div class="card bg-base-100 shadow mb-6 max-w-2xl"><div class="card-body p-4">
+<form action="/blueprints/governance" method="POST" class="flex items-center gap-3">
+<input type="checkbox" name="require_approval" class="toggle toggle-primary"{checked}/>
+<div class="flex-1"><div class="font-semibold">Require approval for schema changes</div>
+<div class="text-sm opacity-60">When on, create / add / rename / delete / archive operations are queued here for a second admin to approve before any DDL runs.</div></div>
+<button class="btn btn-sm">Save</button>
+</form></div></div>"#,
+        checked = if required { " checked" } else { "" },
+    );
+
+    let mut rows = String::new();
+    for p in &pending {
+        rows.push_str(&format!(
+            r#"<tr class="hover"><td>{summary}</td><td class="text-xs opacity-70">{by} · {at}</td>
+<td class="text-right whitespace-nowrap">
+<form action="/blueprints/approvals/{id}/approve" method="POST" class="inline"><button class="btn btn-xs btn-success">Approve</button></form>
+<form action="/blueprints/approvals/{id}/reject" method="POST" class="inline ml-1" onsubmit="return confirm('Reject this change?')"><button class="btn btn-xs btn-ghost text-error">Reject</button></form>
+</td></tr>"#,
+            summary = html_escape(&p.summary),
+            by = html_escape(&p.requested_by),
+            at = p.requested_at.format("%Y-%m-%d %H:%M UTC"),
+            id = p.id,
+        ));
+    }
+    let table = if pending.is_empty() {
+        r#"<p class="opacity-60">No pending changes.</p>"#.to_string()
+    } else {
+        format!(
+            r#"<div class="card bg-base-100 shadow max-w-3xl"><div class="card-body p-4 overflow-x-auto">
+<table class="table table-sm"><thead><tr><th>Change</th><th>Requested</th><th></th></tr></thead>
+<tbody>{rows}</tbody></table></div></div>"#
+        )
+    };
+
+    let body = format!(
+        r#"<div class="flex items-center gap-2 mb-1"><a href="/blueprints" class="btn btn-ghost btn-sm btn-square">←</a><h1 class="text-2xl font-bold">Blueprint Approvals</h1></div>
+<p class="text-base-content/60 mb-6">Governed schema changes awaiting review. Approving runs the change; every decision is WORM-audited and no one can approve their own request.</p>
+{toggle}{table}"#
+    );
+    blueprint_shell(&state, &user, &db_ctx, "Blueprint Approvals - Remicle", &body)
+}
+
+async fn blueprint_governance_toggle(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Form(form): Form<GovernanceForm>,
+) -> Response {
+    if !user.is_admin() {
+        return blueprint_forbidden();
+    }
+    let on = form.require_approval.is_some();
+    match vortex_framework::blueprint::set_approval_required(&state, &db, &db_ctx.db_name, &user, on).await {
+        Ok(()) => Redirect::to("/blueprints/approvals").into_response(),
+        Err(e) => error_response(&e),
+    }
+}
+
+async fn blueprint_approve(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<uuid::Uuid>,
+) -> Response {
+    if !user.is_admin() {
+        return blueprint_forbidden();
+    }
+    match vortex_framework::blueprint::apply_request(&state, &db, &db_ctx.db_name, &user, id).await {
+        Ok(()) => Redirect::to("/blueprints/approvals").into_response(),
+        Err(e) => error_response(&e),
+    }
+}
+
+async fn blueprint_reject(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<uuid::Uuid>,
+    Form(form): Form<RejectForm>,
+) -> Response {
+    if !user.is_admin() {
+        return blueprint_forbidden();
+    }
+    let reason = form.reason.as_deref().unwrap_or("").trim().to_string();
+    match vortex_framework::blueprint::reject_request(&state, &db, &db_ctx.db_name, &user, id, &reason).await {
+        Ok(()) => Redirect::to("/blueprints/approvals").into_response(),
+        Err(e) => error_response(&e),
+    }
+}
+
+/// POST /blueprints/{model}/layout — save the field order + list-column layout.
+/// The body is flat key/value pairs (`order__<field>=<n>`, `list__<field>=on`);
+/// checkboxes only submit when checked, so an absent `list__<field>` means "not
+/// a list column". Parsed leniently here; the service validates every field name
+/// against the Blueprint's real fields before applying.
+async fn blueprint_set_layout(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(model): Path<String>,
+    Form(pairs): Form<Vec<(String, String)>>,
+) -> Response {
+    if !user.is_admin() {
+        return blueprint_forbidden();
+    }
+    let mut orders: std::collections::HashMap<String, i32> = std::collections::HashMap::new();
+    let mut list_fields: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (k, v) in &pairs {
+        if let Some(name) = k.strip_prefix("order__") {
+            if let Ok(n) = v.trim().parse::<i32>() {
+                orders.insert(name.to_string(), n);
+            }
+        } else if let Some(name) = k.strip_prefix("list__") {
+            list_fields.insert(name.to_string());
+        }
+    }
+    match vortex_framework::blueprint::set_layout(
+        &state,
+        &db,
+        &db_ctx.db_name,
+        &user,
+        &model,
+        &orders,
+        &list_fields,
+    )
+    .await
+    {
+        Ok(()) => Redirect::to(&format!("/blueprints/{model}")).into_response(),
+        Err(e) => error_response(&e),
+    }
+}
+
 // -- Announcement CRUD (admin-only) -------------------------------------------
 
 #[derive(serde::Deserialize)]
@@ -7786,7 +8656,47 @@ struct ModelField {
     badge_colors: Option<serde_json::Value>,
     widget: Option<String>,
     related_model: Option<String>,
-    related_field: Option<String>,
+}
+
+/// Resolved metadata for a many2one target model, used to build a robust JOIN
+/// (generic list) and picker query (generic form) for a relation to *any*
+/// registered model — Blueprint or compiled. It fixes two latent hazards: the
+/// generic list used the related *model name* directly as a table name (wrong
+/// whenever a compiled model's name differs from its `table_name`), and both the
+/// list and form assumed a `name` column (a name-less target errored the whole
+/// query). We resolve the real table and probe `information_schema` for the
+/// `name`/`active` columns, degrading a name-less target to its id.
+struct M2oTarget {
+    table: String,
+    has_name: bool,
+    has_active: bool,
+}
+
+async fn resolve_m2o_target(db: &PgPool, related_model: &str) -> Option<M2oTarget> {
+    let table: String = sqlx::query_scalar(
+        "SELECT table_name FROM ir_model WHERE name = $1 AND is_active = true",
+    )
+    .bind(related_model)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()?;
+    if !validate_identifier(&table) {
+        return None;
+    }
+    let cols: Vec<String> = sqlx::query_scalar(
+        "SELECT column_name FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = $1",
+    )
+    .bind(&table)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+    Some(M2oTarget {
+        has_name: cols.iter().any(|c| c == "name"),
+        has_active: cols.iter().any(|c| c == "active"),
+        table,
+    })
 }
 
 async fn generic_list_view(
@@ -7822,9 +8732,15 @@ async fn generic_list_view(
     let table_name: String = model_row.get("table_name");
 
     // Fetch field metadata
+    // Select only columns that actually exist. The attribute columns the old
+    // query also named — is_searchable / is_filterable / is_groupable /
+    // badge_colors / widget / related_field — exist in NO migration, so
+    // selecting them errored the whole query and `unwrap_or_default()` blanked
+    // every generic list (unnoticed because compiled models use bespoke lists;
+    // Blueprints are the first to depend on the generic list). Derive those
+    // attributes from the field type instead.
     let field_rows = sqlx::query(
-        "SELECT name, display_name, field_type, is_searchable, is_filterable, is_groupable,
-                selection_options, badge_colors, widget, related_model, related_field
+        "SELECT name, display_name, field_type, selection_options, related_model
          FROM ir_model_field WHERE model_id = $1 AND is_visible = true ORDER BY sequence"
     )
     .bind(model_id)
@@ -7832,18 +8748,23 @@ async fn generic_list_view(
     .await
     .unwrap_or_default();
 
-    let fields: Vec<ModelField> = field_rows.iter().map(|r| ModelField {
-        name: r.get("name"),
-        display_name: r.get("display_name"),
-        field_type: r.get("field_type"),
-        is_searchable: r.get("is_searchable"),
-        is_filterable: r.get("is_filterable"),
-        is_groupable: r.get("is_groupable"),
-        selection_options: r.get("selection_options"),
-        badge_colors: r.get("badge_colors"),
-        widget: r.get("widget"),
-        related_model: r.get("related_model"),
-        related_field: r.get("related_field"),
+    let fields: Vec<ModelField> = field_rows.iter().map(|r| {
+        let field_type: String = r.get("field_type");
+        ModelField {
+            name: r.get("name"),
+            display_name: r.get("display_name"),
+            is_searchable: matches!(field_type.as_str(), "string" | "char" | "text"),
+            is_filterable: true,
+            is_groupable: matches!(
+                field_type.as_str(),
+                "selection" | "boolean" | "date" | "datetime" | "many2one"
+            ),
+            selection_options: r.get("selection_options"),
+            badge_colors: None,
+            widget: None,
+            related_model: r.get("related_model"),
+            field_type,
+        }
     }).collect();
 
     // Build WHERE conditions
@@ -7891,14 +8812,19 @@ async fn generic_list_view(
     }
 
     // Build ORDER BY with grouping
+    // Default ordering assumed every model has a `name` column — true for
+    // compiled models, false for Blueprints (arbitrary user fields). Fall back
+    // to `id` (always present) when there is no `name` field, so the records
+    // query can't fail with "column name does not exist".
+    let default_order = if fields.iter().any(|f| f.name == "name") { "name" } else { "id" };
     let order_by = if let Some(ref group_by) = params.group_by {
         if fields.iter().any(|f| f.is_groupable && f.name == *group_by) {
-            format!("{} NULLS LAST, name", group_by)
+            format!("{} NULLS LAST, {}", group_by, default_order)
         } else {
-            "name".to_string()
+            default_order.to_string()
         }
     } else {
-        "name".to_string()
+        default_order.to_string()
     };
 
     // Build JOINs and SELECT for many2one fields
@@ -7907,15 +8833,25 @@ async fn generic_list_view(
     let mut join_idx = 0;
 
     for field in &fields {
-        if field.field_type == "many2one" {
-            if let (Some(rel_model), Some(rel_field)) = (&field.related_model, &field.related_field) {
-                let alias = format!("_rel{}", join_idx);
-                joins.push_str(&format!(
-                    " LEFT JOIN {} {} ON {}.{} = {}.id",
-                    rel_model, alias, table_name, field.name, alias
-                ));
-                select_cols.push_str(&format!(", {}.{} AS {}_display", alias, rel_field, field.name));
-                join_idx += 1;
+        if field.field_type == "many2one" && validate_identifier(&field.name) {
+            if let Some(rel_model) = &field.related_model {
+                // Resolve the target's real table (not the model name) and its
+                // display column, so a relation to a compiled model whose name
+                // differs from its table, or to a name-less target, both work.
+                if let Some(t) = resolve_m2o_target(&db, rel_model).await {
+                    let alias = format!("_rel{}", join_idx);
+                    let disp = if t.has_name {
+                        format!("{}.name", alias)
+                    } else {
+                        format!("{}.id::text", alias)
+                    };
+                    joins.push_str(&format!(
+                        " LEFT JOIN {} {} ON {}.{} = {}.id",
+                        t.table, alias, table_name, field.name, alias
+                    ));
+                    select_cols.push_str(&format!(", {} AS {}_display", disp, field.name));
+                    join_idx += 1;
+                }
             }
         }
     }
@@ -8041,7 +8977,7 @@ async fn generic_list_view(
             .collect();
 
         rows.push_str(&format!(
-            r#"<tr class="hover cursor-pointer" onclick="window.location='{}'">{}></tr>"#,
+            r#"<tr class="hover cursor-pointer" onclick="window.location='{}'">{}</tr>"#,
             vortex_framework::record_url(&model_name, &id.to_string()), cells
         ));
     }
@@ -20065,59 +21001,59 @@ async fn render_dynamic_form(
                 )
             },
             "many2one" => {
-                // Fetch related records for dropdown
-                if let Some(rel_model) = &relation_model {
-                    let rel_table: Option<String> = sqlx::query_scalar("SELECT table_name FROM ir_model WHERE name = $1")
-                        .bind(rel_model)
-                        .fetch_optional(db)
-                        .await
-                        .ok()
-                        .flatten();
+                // Fetch related records for the dropdown. The target may be a
+                // Blueprint or a compiled model; resolve its real table and
+                // probe for `name`/`active` so a name-less or active-less target
+                // degrades gracefully instead of erroring the whole picker.
+                match &relation_model {
+                    Some(rel_model) => match resolve_m2o_target(db, rel_model).await {
+                        Some(t) => {
+                            let disp = if t.has_name { "COALESCE(name, id::text)" } else { "id::text" };
+                            let active_clause = if t.has_active { "WHERE active = true" } else { "" };
+                            let rel_query = if !current_value.is_empty() {
+                                format!(
+                                    "(SELECT id, {disp} as name FROM {tbl} WHERE id::text = $1) \
+                                     UNION \
+                                     (SELECT id, {disp} as name FROM {tbl} {act} ORDER BY name LIMIT 200) \
+                                     ORDER BY name",
+                                    disp = disp, tbl = t.table, act = active_clause
+                                )
+                            } else {
+                                format!(
+                                    "SELECT id, {disp} as name FROM {tbl} {act} ORDER BY name LIMIT 200",
+                                    disp = disp, tbl = t.table, act = active_clause
+                                )
+                            };
+                            let rel_records = if !current_value.is_empty() {
+                                sqlx::query(&rel_query).bind(&current_value).fetch_all(db).await.unwrap_or_default()
+                            } else {
+                                sqlx::query(&rel_query).fetch_all(db).await.unwrap_or_default()
+                            };
 
-                    if let Some(rel_table) = rel_table {
-                        if !validate_identifier(&rel_table) {
-                            return (StatusCode::BAD_REQUEST, Html("Invalid related model")).into_response();
-                        }
-                        // Query includes current value (if any) UNION top 200 by name
-                        let rel_query = if !current_value.is_empty() {
+                            let mut options = String::from(r#"<option value="">-- Select --</option>"#);
+                            for rec in &rel_records {
+                                let rec_id: uuid::Uuid = rec.get("id");
+                                let rec_name: String = rec.get("name");
+                                let selected = if rec_id.to_string() == current_value { " selected" } else { "" };
+                                options.push_str(&format!(
+                                    r#"<option value="{}"{}>{}</option>"#,
+                                    rec_id, selected, html_escape(&rec_name)
+                                ));
+                            }
                             format!(
-                                "(SELECT id, COALESCE(name, id::text) as name FROM {} WHERE id::text = $1) \
-                                 UNION \
-                                 (SELECT id, COALESCE(name, id::text) as name FROM {} WHERE active = true ORDER BY name LIMIT 200) \
-                                 ORDER BY name",
-                                rel_table, rel_table
+                                r#"<select name="{}" class="select select-bordered w-full" {} {}>{}</select>"#,
+                                field_name, required_attr, readonly_attr, options
                             )
-                        } else {
-                            format!("SELECT id, COALESCE(name, id::text) as name FROM {} WHERE active = true ORDER BY name LIMIT 200", rel_table)
-                        };
-                        let rel_records = if !current_value.is_empty() {
-                            sqlx::query(&rel_query).bind(&current_value).fetch_all(db).await.unwrap_or_default()
-                        } else {
-                            sqlx::query(&rel_query).fetch_all(db).await.unwrap_or_default()
-                        };
-
-                        let mut options = String::from(r#"<option value="">-- Select --</option>"#);
-                        for rec in &rel_records {
-                            let rec_id: uuid::Uuid = rec.get("id");
-                            let rec_name: String = rec.get("name");
-                            let selected = if rec_id.to_string() == current_value { " selected" } else { "" };
-                            options.push_str(&format!(r#"<option value="{}"{}>{}  </option>"#, rec_id, selected, rec_name));
                         }
-                        format!(
-                            r#"<select name="{}" class="select select-bordered w-full" {} {}>{}</select>"#,
-                            field_name, required_attr, readonly_attr, options
-                        )
-                    } else {
-                        format!(
+                        None => format!(
                             r#"<input type="text" name="{}" class="input input-bordered w-full" value="{}" {} {} />"#,
-                            field_name, current_value, required_attr, readonly_attr
-                        )
-                    }
-                } else {
-                    format!(
+                            field_name, html_escape(&current_value), required_attr, readonly_attr
+                        ),
+                    },
+                    None => format!(
                         r#"<input type="text" name="{}" class="input input-bordered w-full" value="{}" {} {} />"#,
-                        field_name, current_value, required_attr, readonly_attr
-                    )
+                        field_name, html_escape(&current_value), required_attr, readonly_attr
+                    ),
                 }
             },
             "text" => {
@@ -20248,19 +21184,43 @@ async fn dynamic_form_create(
         return (StatusCode::NOT_FOUND, Html("Model not found")).into_response();
     };
 
-    // Build INSERT query dynamically
+    // Real columns + their Postgres types, straight from the catalog. This does
+    // three things a bare text-bind loop can't: (1) casts each value to the
+    // column's actual type (`$n::date` / `::numeric` / `::bool`) so date/money/
+    // bool fields don't fail — which they always did before, silently; (2)
+    // whitelists column names, ignoring any form key that isn't a real column
+    // (and closing the interpolated-identifier hole); (3) numbers placeholders
+    // by the count of *accepted* columns, fixing a bind/placeholder mismatch
+    // when any field was skipped. Trusted input: udt_name comes from the
+    // catalog, not the request.
+    let col_types: std::collections::HashMap<String, String> = sqlx::query(
+        "SELECT column_name, udt_name FROM information_schema.columns WHERE table_name = $1",
+    )
+    .bind(&table_name)
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default()
+    .iter()
+    .map(|r| (r.get::<String, _>("column_name"), r.get::<String, _>("udt_name")))
+    .collect();
+
     let mut columns = Vec::new();
     let mut placeholders = Vec::new();
     let mut values: Vec<String> = Vec::new();
 
-    for (i, (key, value)) in form_data.iter().enumerate() {
-        if key != "id" && !value.is_empty() {
-            columns.push(key.clone());
-            placeholders.push(format!("${}", i + 1));
-            // Handle checkbox values
-            let val = if value == "on" { "true".to_string() } else { value.clone() };
-            values.push(val);
+    for (key, value) in form_data.iter() {
+        if key == "id" || value.is_empty() {
+            continue;
         }
+        let Some(udt) = col_types.get(key) else {
+            continue; // not a real column — ignore
+        };
+        let n = values.len() + 1;
+        columns.push(format!("\"{}\"", key));
+        placeholders.push(format!("${}::{}", n, udt));
+        // Handle checkbox values
+        let val = if value == "on" { "true".to_string() } else { value.clone() };
+        values.push(val);
     }
 
     if columns.is_empty() {
@@ -20309,17 +21269,36 @@ async fn dynamic_form_update(
         return (StatusCode::NOT_FOUND, Html("Model not found")).into_response();
     };
 
+    // Real columns + types from the catalog — same rationale as create: cast
+    // to the true column type, whitelist column names, and number placeholders
+    // by accepted-column count (not raw enumerate index).
+    let col_types: std::collections::HashMap<String, String> = sqlx::query(
+        "SELECT column_name, udt_name FROM information_schema.columns WHERE table_name = $1",
+    )
+    .bind(&table_name)
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default()
+    .iter()
+    .map(|r| (r.get::<String, _>("column_name"), r.get::<String, _>("udt_name")))
+    .collect();
+
     // Build UPDATE query dynamically
     let mut set_clauses = Vec::new();
     let mut values: Vec<String> = Vec::new();
 
-    for (i, (key, value)) in form_data.iter().enumerate() {
-        if key != "id" {
-            set_clauses.push(format!("{} = ${}", key, i + 1));
-            // Handle checkbox values - if checkbox is unchecked, it won't be in form_data
-            let val = if value == "on" { "true".to_string() } else { value.clone() };
-            values.push(val);
+    for (key, value) in form_data.iter() {
+        if key == "id" {
+            continue;
         }
+        let Some(udt) = col_types.get(key) else {
+            continue; // not a real column — ignore
+        };
+        let n = values.len() + 1;
+        set_clauses.push(format!("\"{}\" = ${}::{}", key, n, udt));
+        // Handle checkbox values - if checkbox is unchecked, it won't be in form_data
+        let val = if value == "on" { "true".to_string() } else { value.clone() };
+        values.push(val);
     }
 
     if set_clauses.is_empty() {

@@ -173,12 +173,18 @@ async fn sync_one(pool: &PgPool, meta: &ModelMeta) -> Result<(), sqlx::Error> {
     // this, dropping or renaming a `#[derive(Model)]` field leaves a stale
     // `ir_model_field` row behind forever (the upserts above only ever add
     // or update) — the "two registries can drift" gap. We delete only rows
-    // this sync owns: `is_custom = false`. Low-code custom fields
-    // (`is_custom = true`) and every other model's rows are untouched.
+    // this sync owns: `source = 'derived'`. Low-code custom fields
+    // (`source = 'custom'`), Blueprint fields (`source = 'blueprint'`), and
+    // every other model's rows are untouched.
+    //
+    // Keying on the explicit `source` enum (migration 145) rather than
+    // `is_custom` is what makes Blueprint fields safe from this prune — a
+    // Blueprint model has no `derive(Model)` metadata, so without the
+    // `source='derived'` filter its every field would look "stale" here.
     //
     // Guarded two ways: an empty `current` set is skipped (so a
     // metadata-less model can never blank its own registry), and a DB that
-    // predates the `is_custom` column (migration 137) errors on the DELETE,
+    // predates the `source` column (migration 145) errors on the DELETE,
     // which we log and swallow — the upserts already ran, so the registry is
     // current, just not pruned.
     let current: Vec<String> = meta
@@ -191,7 +197,7 @@ async fn sync_one(pool: &PgPool, meta: &ModelMeta) -> Result<(), sqlx::Error> {
             r#"
             DELETE FROM ir_model_field
             WHERE model_id = $1
-              AND is_custom = false
+              AND source = 'derived'
               AND name <> ALL($2)
             "#,
         )
@@ -212,7 +218,7 @@ async fn sync_one(pool: &PgPool, meta: &ModelMeta) -> Result<(), sqlx::Error> {
                 tracing::warn!(
                     model = %reg_name,
                     error = %e,
-                    "registry field prune skipped (legacy DB without is_custom?)"
+                    "registry field prune skipped (legacy DB without source column?)"
                 );
             }
         }

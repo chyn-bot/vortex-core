@@ -27,6 +27,7 @@
 //! }
 //! ```
 
+pub mod blueprint;
 pub mod cache;
 pub mod commerce;
 pub mod connection;

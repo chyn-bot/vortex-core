@@ -1,0 +1,5 @@
+# Migration metadata for 147_blueprint_approval
+module = "core"
+description = "Approval-before-DDL for Blueprints: blueprint_change_request queue, single-row blueprint_governance toggle, and the Cedar permit for blueprint.approve. Deny-by-default means the approve permit is required for the review step to work."
+reversible = true
+dependencies = ["115_policy_engine", "146_blueprint_policy"]

@@ -277,6 +277,14 @@ enum ScaffoldCommands {
         #[arg(long)]
         display: Option<String>,
     },
+    /// Generate a plugin crate from an existing Blueprint (reads DATABASE_URL)
+    FromBlueprint {
+        /// Blueprint technical model name, e.g. "x_vendor_audit"
+        model: String,
+        /// Plugin crate name (default: derived from the Blueprint's display name)
+        #[arg(long)]
+        name: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -325,6 +333,9 @@ async fn main() -> Result<()> {
             match what {
                 ScaffoldCommands::Plugin { name, display } => {
                     commands::scaffold::run(&name, display)
+                }
+                ScaffoldCommands::FromBlueprint { model, name } => {
+                    commands::scaffold::run_from_blueprint(&model, name).await
                 }
             }
         }

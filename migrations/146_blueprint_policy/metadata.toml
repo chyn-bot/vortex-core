@@ -1,0 +1,5 @@
+# Migration metadata for 146_blueprint_policy
+module = "core"
+description = "Seed the Cedar permit that lets system administrators manage Blueprints. Cedar is deny-by-default, so without this every governed blueprint operation would be denied; non-admins stay denied by construction."
+reversible = true
+dependencies = ["115_policy_engine", "145_blueprints"]
