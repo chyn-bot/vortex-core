@@ -22637,6 +22637,18 @@ async fn render_dynamic_form(
     // Build sidebar
     let sidebar_menu = build_sidebar_menu(db, &user.roles, model_name).await;
 
+    // Activity stream (chatter) + History (audit trail) — same record primitives
+    // every plugin record page uses. Only meaningful for an existing record, so
+    // a brand-new form shows neither. `model_name` is the res_model/resource_type
+    // for both, matching what the generic create/update handlers audit under.
+    let (activity_panel, history_panel) = match record_id {
+        Some(rid) => (
+            vortex_framework::render_chatter_panel(model_name, rid),
+            vortex_framework::render_audit_trail(db, model_name, rid).await,
+        ),
+        None => (String::new(), String::new()),
+    };
+
     let html = format!(
         r##"<!DOCTYPE html>
 <html data-theme="dark">
@@ -22676,6 +22688,7 @@ async fn render_dynamic_form(
                 </form>
             </div>
         </div>
+        <div class="max-w-2xl mt-6 flex flex-col gap-6">{}{}</div>
     </main>
 </div>
 </body>
@@ -22687,7 +22700,9 @@ async fn render_dynamic_form(
         action_url,
         form_fields,
         model_name,
-        submit_text
+        submit_text,
+        activity_panel,
+        history_panel
     );
 
     Html(html).into_response()
@@ -22696,6 +22711,8 @@ async fn render_dynamic_form(
 async fn dynamic_form_create(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
     Path(model_name): Path<String>,
     Form(form_data): Form<std::collections::HashMap<String, String>>,
 ) -> Response {
@@ -22770,6 +22787,15 @@ async fn dynamic_form_create(
     match q.fetch_one(&db).await {
         Ok(row) => {
             let new_id: uuid::Uuid = row.get("id");
+            // Audit the create so the record's History panel is populated and the
+            // write goes through the WORM ledger (CLAUDE.md rule #5). resource_type
+            // = model_name, matching what render_audit_trail queries.
+            api_audit(
+                &state, &db_ctx.db_name, &user,
+                AuditAction::Custom("record_created".into()), AuditSeverity::Info,
+                &model_name, Some(&new_id.to_string()),
+                serde_json::json!({ "fields": columns.len() }),
+            ).await;
             Redirect::to(&format!("/form/{}/{}", model_name, new_id)).into_response()
         }
         Err(e) => {
@@ -22781,6 +22807,8 @@ async fn dynamic_form_create(
 async fn dynamic_form_update(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
     Path((model_name, record_id)): Path<(String, uuid::Uuid)>,
     Form(form_data): Form<std::collections::HashMap<String, String>>,
 ) -> Response {
@@ -22847,7 +22875,16 @@ async fn dynamic_form_update(
     q = q.bind(record_id);
 
     match q.execute(&db).await {
-        Ok(_) => Redirect::to(&format!("/form/{}/{}", model_name, record_id)).into_response(),
+        Ok(_) => {
+            // Audit the update — feeds the History panel + WORM ledger.
+            api_audit(
+                &state, &db_ctx.db_name, &user,
+                AuditAction::Custom("record_updated".into()), AuditSeverity::Info,
+                &model_name, Some(&record_id.to_string()),
+                serde_json::json!({ "fields": set_clauses.len() }),
+            ).await;
+            Redirect::to(&format!("/form/{}/{}", model_name, record_id)).into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Html(format!("Error: {}", e))).into_response(),
     }
 }
