@@ -299,6 +299,36 @@ pub fn missing_required_files(form: &WebForm, present: &HashSet<String>) -> Vec<
         .collect()
 }
 
+/// Screen every upload with the configured scanner *before* anything is stored.
+/// An infected file (or, when the scanner fails closed, an unscannable one) is
+/// rejected with a user-facing message; the offending file/signature is logged.
+pub async fn screen_uploads(
+    scanner: &dyn crate::antivirus::AvScanner,
+    raws: &[RawUpload],
+) -> Result<(), String> {
+    use crate::antivirus::AvVerdict;
+    if !scanner.is_active() {
+        return Ok(());
+    }
+    for r in raws {
+        match scanner.scan(&r.data).await {
+            Ok(AvVerdict::Clean) => {}
+            Ok(AvVerdict::Infected(sig)) => {
+                tracing::warn!(file = %r.filename, signature = %sig, "intake upload blocked by AV");
+                return Err(format!("'{}' failed a security scan and was rejected.", r.filename));
+            }
+            Err(e) => {
+                tracing::warn!(file = %r.filename, error = %e, "intake upload could not be scanned");
+                return Err(format!(
+                    "'{}' could not be security-scanned right now. Please try again later.",
+                    r.filename
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Insert `ir_attachment` rows linking already-stored blobs to a record.
 async fn link_attachments(
     db: &PgPool,
@@ -1279,6 +1309,30 @@ mod tests {
         assert_eq!(missing_required_files(&form, &present), vec!["id_doc".to_string()]);
         let both: HashSet<String> = ["id_doc".to_string(), "extra".to_string()].into_iter().collect();
         assert!(missing_required_files(&form, &both).is_empty());
+    }
+
+    struct FakeScanner(crate::antivirus::AvVerdict, bool /* err */);
+    #[async_trait::async_trait]
+    impl crate::antivirus::AvScanner for FakeScanner {
+        async fn scan(&self, _d: &[u8]) -> Result<crate::antivirus::AvVerdict, crate::antivirus::AvError> {
+            if self.1 { Err(crate::antivirus::AvError::Unreachable("down".into())) } else { Ok(self.0.clone()) }
+        }
+        fn backend_name(&self) -> &'static str { "fake" }
+    }
+
+    #[tokio::test]
+    async fn screen_uploads_blocks_infected_and_unscannable() {
+        use crate::antivirus::AvVerdict;
+        let files = vec![upload("a.pdf", "application/pdf", 10)];
+        // Clean → passes.
+        let clean = FakeScanner(AvVerdict::Clean, false);
+        assert!(screen_uploads(&clean, &files).await.is_ok());
+        // Infected → rejected.
+        let bad = FakeScanner(AvVerdict::Infected("EICAR".into()), false);
+        assert!(screen_uploads(&bad, &files).await.is_err());
+        // Scanner error (fail-closed backend surfaced Err) → rejected.
+        let err = FakeScanner(AvVerdict::Clean, true);
+        assert!(screen_uploads(&err, &files).await.is_err());
     }
 
     #[test]

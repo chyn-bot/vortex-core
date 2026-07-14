@@ -1582,6 +1582,48 @@ fn parse_files_config() -> anyhow::Result<vortex_framework::files::FilesConfig> 
     }
 }
 
+/// Parse `[antivirus]` from vortex.toml into a scanner config.
+/// Absent section (or `backend = "none"`) → no scanning (the default no-op).
+/// `backend = "clamd"` → screen uploads via a `clamd` on `address`.
+fn parse_av_config() -> vortex_framework::antivirus::AvConfig {
+    use vortex_framework::antivirus::AvConfig;
+    let config_str = std::fs::read_to_string("vortex.toml").unwrap_or_default();
+    let config: toml::Value = config_str.parse::<toml::Value>().unwrap_or(toml::Value::Table(Default::default()));
+    let section = config.get("antivirus");
+    let backend = section
+        .and_then(|s| s.get("backend"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("none");
+    match backend {
+        "none" | "" => AvConfig::Disabled,
+        "clamd" => AvConfig::Clamd {
+            address: section
+                .and_then(|s| s.get("address"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("127.0.0.1:3310")
+                .to_string(),
+            timeout: std::time::Duration::from_secs(
+                section.and_then(|s| s.get("timeout_secs")).and_then(|v| v.as_integer()).unwrap_or(30).max(1) as u64,
+            ),
+            max_bytes: section
+                .and_then(|s| s.get("max_size_mb"))
+                .and_then(|v| v.as_integer())
+                .unwrap_or(32)
+                .max(1) as usize
+                * 1024
+                * 1024,
+            fail_open: section
+                .and_then(|s| s.get("fail_open"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+        },
+        other => {
+            warn!("[antivirus] backend {other:?} not recognised — scanning disabled");
+            AvConfig::Disabled
+        }
+    }
+}
+
 /// Global connection budget from `[database] max_connections` in
 /// vortex.toml. This caps the SUM of every pool the manager opens
 /// (primary + master + one per active tenant) — keep it below the
@@ -2075,6 +2117,11 @@ pub async fn run(host: String, port: u16, _workers: Option<usize>) -> Result<()>
         .map_err(|e| anyhow::anyhow!("file storage init failed: {e}"))?;
     info!("File storage backend: {}", files.backend_name());
 
+    // Anti-virus scanner for uploaded content ([antivirus] in vortex.toml).
+    // Default is a no-op; a `clamd` backend screens uploads before storage.
+    let av = vortex_framework::antivirus::from_config(&parse_av_config());
+    info!("Upload scanning backend: {} (active: {})", av.backend_name(), av.is_active());
+
     // Create app state
     let state = Arc::new(AppState {
         db,
@@ -2095,6 +2142,7 @@ pub async fn run(host: String, port: u16, _workers: Option<usize>) -> Result<()>
         print_docs: print_docs.clone(),
         i18n,
         files,
+        av,
     });
 
     // Spawn the scheduler supervisor now that AppState exists.
@@ -3357,6 +3405,9 @@ async fn store_intake_uploads(
     raws: Vec<vortex_framework::intake::RawUpload>,
 ) -> Result<Vec<vortex_framework::intake::StoredUpload>, String> {
     use vortex_framework::intake::{self, StoredUpload};
+    // Screen every file with the configured AV scanner before anything is
+    // stored — an infected (or, fail-closed, unscannable) upload writes nothing.
+    intake::screen_uploads(state.av.as_ref(), &raws).await?;
     let mut out = Vec::new();
     for raw in raws {
         intake::validate_upload(form, &raw)?;

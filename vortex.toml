@@ -114,6 +114,19 @@ path = "uploads"
 # bucket = "vortex-files"
 # path_style = true                          # true for MinIO; false for AWS virtual-hosted
 
+[antivirus]
+# Scan uploaded content (Intake attachments, etc.) before it is stored.
+#   none  — no scanning (default; uploads are accepted as-is).
+#   clamd — screen each blob via a ClamAV `clamd` over TCP (INSTREAM).
+backend = "none"
+
+# [antivirus] settings for backend = "clamd":
+# address      = "127.0.0.1:3310"  # host:port of clamd (keep it on a private network)
+# timeout_secs = 30                # per-scan timeout
+# max_size_mb  = 32                # skip/limit larger payloads (matches upload cap)
+# fail_open    = false             # false = reject uploads clamd can't scan (fail closed);
+#                                  # true  = accept + log when clamd is unreachable
+
 [modules]
 # Auto-install core modules
 auto_install_core = true
