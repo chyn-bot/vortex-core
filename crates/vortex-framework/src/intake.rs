@@ -1157,17 +1157,126 @@ pub async fn fetch_portal_form(db: &PgPool, slug: &str) -> Option<WebForm> {
     form.portal.then_some(form)
 }
 
+/// A created record's current workflow stage, resolved for portal display so a
+/// partner sees where their request actually is (e.g. "In progress · step 2 of
+/// 4"), not just that it was accepted.
+#[derive(Debug, Clone)]
+pub struct StageInfo {
+    pub code: String,
+    pub label: String,
+    /// daisyUI colour name from `record_stages.color` (whitelisted at render).
+    pub color: String,
+    /// 1-based position among the model's active stages.
+    pub index: i32,
+    /// Number of active stages for the model (for "step {index} of {total}").
+    pub total: i32,
+}
+
 /// One of a partner's tracked submissions.
 pub struct PartnerSubmission {
     pub form_title: String,
+    /// Submission-level status: `accepted` / `quarantined` / `rejected`.
     pub status: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// The created record (present once accepted), used to resolve `stage`.
+    pub record_id: Option<Uuid>,
+    /// The target `ir_model.name`.
+    pub model: String,
+    /// The record's current workflow stage, when the model uses a status bar
+    /// and the stage is resolvable. `None` ⇒ show the submission status instead.
+    pub stage: Option<StageInfo>,
 }
 
-/// A portal partner's own submissions across all forms, newest first.
+/// Resolve the current stage of each accepted record for one model, in a single
+/// pass: load the model's ordered active-stage catalogue (for label/colour +
+/// step position), then batch-read `record_state` for `ids` from the model's
+/// table. A model with no status bar (no stages, or no `record_state` column)
+/// yields an empty map, so those submissions fall back to the plain status.
+async fn resolve_stages_for_model(
+    db: &PgPool,
+    model: &str,
+    ids: &[Uuid],
+) -> HashMap<Uuid, StageInfo> {
+    let mut out = HashMap::new();
+    if ids.is_empty() {
+        return out;
+    }
+    // Ordered active-stage catalogue → gives step index/total + label/colour.
+    let catalog: Vec<(String, String, String)> = sqlx::query(
+        "SELECT code, label, color FROM record_stages
+         WHERE model = $1 AND active = true ORDER BY sequence ASC, code ASC",
+    )
+    .bind(model)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default()
+    .iter()
+    .map(|r| (r.get("code"), r.get("label"), r.get("color")))
+    .collect();
+    if catalog.is_empty() {
+        return out;
+    }
+    let total = catalog.len() as i32;
+    let by_code: HashMap<&str, (i32, &str, &str)> = catalog
+        .iter()
+        .enumerate()
+        .map(|(i, (c, l, col))| (c.as_str(), (i as i32 + 1, l.as_str(), col.as_str())))
+        .collect();
+
+    // Target table (server-side + validated), then confirm it has record_state.
+    let table: Option<String> =
+        sqlx::query_scalar("SELECT table_name FROM ir_model WHERE name = $1 AND is_active = true")
+            .bind(model)
+            .fetch_optional(db)
+            .await
+            .ok()
+            .flatten();
+    let Some(table) = table.filter(|t| valid_ident(t)) else {
+        return out;
+    };
+    let has_state: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = $1 AND column_name = 'record_state')",
+    )
+    .bind(&table)
+    .fetch_one(db)
+    .await
+    .unwrap_or(false);
+    if !has_state {
+        return out;
+    }
+
+    // Batch-read the current stage code for every accepted record of this model.
+    let sql = format!("SELECT id, record_state FROM {table} WHERE id = ANY($1::uuid[])");
+    let rows = sqlx::query(&sql).bind(ids).fetch_all(db).await.unwrap_or_default();
+    for r in &rows {
+        let id: Uuid = r.get("id");
+        let code: Option<String> = r.try_get("record_state").ok().flatten();
+        if let Some(code) = code {
+            if let Some((idx, label, color)) = by_code.get(code.as_str()) {
+                out.insert(
+                    id,
+                    StageInfo {
+                        code: code.clone(),
+                        label: label.to_string(),
+                        color: color.to_string(),
+                        index: *idx,
+                        total,
+                    },
+                );
+            }
+        }
+    }
+    out
+}
+
+/// A portal partner's own submissions across all forms, newest first. For each
+/// accepted submission whose target model uses a status bar, the created
+/// record's current stage is resolved (batched per model) so the portal can show
+/// live progress rather than a static "Received".
 pub async fn list_partner_submissions(db: &PgPool, partner_id: Uuid, limit: i64) -> Vec<PartnerSubmission> {
-    sqlx::query(
-        "SELECT w.title AS form_title, s.status, s.created_at
+    let mut subs: Vec<PartnerSubmission> = sqlx::query(
+        "SELECT w.title AS form_title, s.status, s.created_at, s.record_id, w.model
          FROM web_form_submission s JOIN web_form w ON w.id = s.form_id
          WHERE s.partner_id = $1 ORDER BY s.created_at DESC LIMIT $2",
     )
@@ -1181,8 +1290,31 @@ pub async fn list_partner_submissions(db: &PgPool, partner_id: Uuid, limit: i64)
         form_title: r.get("form_title"),
         status: r.get("status"),
         created_at: r.get("created_at"),
+        record_id: r.try_get("record_id").ok().flatten(),
+        model: r.get("model"),
+        stage: None,
     })
-    .collect()
+    .collect();
+
+    // Group accepted records by model and resolve stages one model at a time.
+    let mut by_model: HashMap<String, Vec<Uuid>> = HashMap::new();
+    for s in &subs {
+        if s.status == "accepted" {
+            if let Some(rid) = s.record_id {
+                by_model.entry(s.model.clone()).or_default().push(rid);
+            }
+        }
+    }
+    let mut resolved: HashMap<Uuid, StageInfo> = HashMap::new();
+    for (model, ids) in &by_model {
+        resolved.extend(resolve_stages_for_model(db, model, ids).await);
+    }
+    for s in &mut subs {
+        if let Some(rid) = s.record_id {
+            s.stage = resolved.get(&rid).cloned();
+        }
+    }
+    subs
 }
 
 // ===========================================================================
