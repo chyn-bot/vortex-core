@@ -83,25 +83,41 @@ pub struct WebForm {
     pub notify_to: Option<String>,
     /// Max accepted+quarantined submissions per calendar day (0/None = no cap).
     pub daily_cap: Option<i64>,
+    /// Also offered to signed-in customer-portal users (Phase 3).
+    pub portal: bool,
+    /// Target column that receives the portal submitter's partner id (owner
+    /// stamping). Validated identifier; only stamped for portal submissions.
+    pub partner_field: Option<String>,
 }
 
-/// Parse the governance knobs out of a form's `settings` JSONB.
-fn parse_settings(settings: &serde_json::Value) -> (Option<String>, Vec<String>, bool, Option<String>, Option<i64>) {
-    let success_msg = settings.get("success_msg").and_then(|v| v.as_str()).map(str::to_string);
-    let origins = settings
-        .get("origins")
-        .and_then(|o| o.as_array())
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
-        .unwrap_or_default();
-    let quarantine = settings.get("quarantine").and_then(|v| v.as_bool()).unwrap_or(false);
-    let notify_to = settings
-        .get("notify_to")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
-    let daily_cap = settings.get("daily_cap").and_then(|v| v.as_i64()).filter(|n| *n > 0);
-    (success_msg, origins, quarantine, notify_to, daily_cap)
+/// The governance knobs parsed out of a form's `settings` JSONB.
+struct ParsedSettings {
+    success_msg: Option<String>,
+    origins: Vec<String>,
+    quarantine: bool,
+    notify_to: Option<String>,
+    daily_cap: Option<i64>,
+    portal: bool,
+    partner_field: Option<String>,
+}
+
+fn parse_settings(settings: &serde_json::Value) -> ParsedSettings {
+    let str_opt = |k: &str| {
+        settings.get(k).and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string)
+    };
+    ParsedSettings {
+        success_msg: settings.get("success_msg").and_then(|v| v.as_str()).map(str::to_string),
+        origins: settings
+            .get("origins")
+            .and_then(|o| o.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+            .unwrap_or_default(),
+        quarantine: settings.get("quarantine").and_then(|v| v.as_bool()).unwrap_or(false),
+        notify_to: str_opt("notify_to"),
+        daily_cap: settings.get("daily_cap").and_then(|v| v.as_i64()).filter(|n| *n > 0),
+        portal: settings.get("portal").and_then(|v| v.as_bool()).unwrap_or(false),
+        partner_field: str_opt("partner_field").filter(|s| valid_ident(s)),
+    }
 }
 
 /// The outcome of a public submission.
@@ -113,6 +129,54 @@ pub enum SubmitOutcome {
     Quarantined(Uuid),
     /// The form's daily cap was reached — nothing was written.
     Capped,
+}
+
+/// Who is submitting — decides owner stamping, ledger attribution, and audit
+/// identity. Public (`/i/{slug}`) is anonymous; the customer portal (Phase 3)
+/// submits as the signed-in partner.
+pub enum Submitter {
+    /// Logged-out public visitor: no owner, `created_by` NULL, anon audit.
+    Anonymous,
+    /// Signed-in portal user: owner = their partner, real attribution.
+    Portal { user_id: Uuid, partner_id: Uuid, username: String },
+}
+
+impl Submitter {
+    fn partner_id(&self) -> Option<Uuid> {
+        match self {
+            Submitter::Portal { partner_id, .. } => Some(*partner_id),
+            Submitter::Anonymous => None,
+        }
+    }
+    fn user_id(&self) -> Option<Uuid> {
+        match self {
+            Submitter::Portal { user_id, .. } => Some(*user_id),
+            Submitter::Anonymous => None,
+        }
+    }
+}
+
+/// Server-side owner stamps applied to the target record — never client-supplied.
+/// `created_by`/`partner_field` are only set for an attributable (portal)
+/// submission or its later approval.
+#[derive(Default)]
+struct OwnerStamp {
+    created_by: Option<Uuid>,
+    /// `(column, value)` — the form's `partner_field` set to the partner id.
+    partner: Option<(String, Uuid)>,
+}
+
+impl OwnerStamp {
+    /// Derive the stamps for a submitter against a form's `partner_field`.
+    fn for_submitter(sub: &Submitter, form: &WebForm) -> Self {
+        match sub {
+            Submitter::Anonymous => OwnerStamp::default(),
+            Submitter::Portal { user_id, partner_id, .. } => OwnerStamp {
+                created_by: Some(*user_id),
+                partner: form.partner_field.clone().map(|f| (f, *partner_id)),
+            },
+        }
+    }
 }
 
 /// Sign a form nonce: `HMAC(master_key, "<slug>|<issued_at>")`. Stateless — the
@@ -197,8 +261,13 @@ pub async fn fetch_form(db: &PgPool, slug: &str) -> Option<WebForm> {
     let fields: Vec<FormField> =
         serde_json::from_value(row.get("fields")).unwrap_or_default();
     let settings: serde_json::Value = row.get("settings");
-    let (success_msg, origins, quarantine, notify_to, daily_cap) = parse_settings(&settings);
-    Some(WebForm {
+    Some(web_form_from_row(&row, fields, parse_settings(&settings)))
+}
+
+/// Build a `WebForm` from a `web_form` row + its parsed settings. The row must
+/// carry `id, slug, model, title, description, company_id`.
+fn web_form_from_row(row: &sqlx::postgres::PgRow, fields: Vec<FormField>, s: ParsedSettings) -> WebForm {
+    WebForm {
         id: row.get("id"),
         slug: row.get("slug"),
         model: row.get("model"),
@@ -206,12 +275,14 @@ pub async fn fetch_form(db: &PgPool, slug: &str) -> Option<WebForm> {
         description: row.get("description"),
         fields,
         company_id: row.get("company_id"),
-        success_msg,
-        origins,
-        quarantine,
-        notify_to,
-        daily_cap,
-    })
+        success_msg: s.success_msg,
+        origins: s.origins,
+        quarantine: s.quarantine,
+        notify_to: s.notify_to,
+        daily_cap: s.daily_cap,
+        portal: s.portal,
+        partner_field: s.partner_field,
+    }
 }
 
 /// The model's first status stage (lowest sequence), used to default
@@ -241,6 +312,7 @@ async fn insert_target_record(
     db: &PgPool,
     form: &WebForm,
     writable: &BTreeMap<String, String>,
+    stamp: &OwnerStamp,
 ) -> Result<Uuid, String> {
     // Resolve the target table (server-side, from the form's model — the client
     // never names it).
@@ -307,6 +379,28 @@ async fn insert_target_record(
             i += 1;
         }
     }
+    // Owner stamps (portal submissions / their approvals). `created_by` and the
+    // configured partner column are set from the trusted actor, never the body.
+    if let Some(uid) = stamp.created_by {
+        if cols.contains_key("created_by") && !names.iter().any(|n| n == "created_by") {
+            names.push("created_by".into());
+            placeholders.push(format!("${i}::uuid"));
+            values.push(uid.to_string());
+            i += 1;
+        }
+    }
+    if let Some((col, pid)) = &stamp.partner {
+        // `partner_field` was validated as an identifier at parse time; only
+        // stamp it if it is a real column not already written by the allow-list.
+        if let Some(udt) = cols.get(col) {
+            if valid_ident(col) && !names.iter().any(|n| n == col) {
+                names.push(col.clone());
+                placeholders.push(format!("${i}::{udt}"));
+                values.push(pid.to_string());
+                i += 1;
+            }
+        }
+    }
 
     let sql = format!(
         "INSERT INTO {table} ({}) VALUES ({}) RETURNING id",
@@ -349,7 +443,7 @@ async fn notify_submission(state: &AppState, db_name: &str, form: &WebForm, held
         ""
     };
     let body = format!(
-        "A new submission was received on the public form \"{}\" (/i/{}).{}",
+        "A new submission was received on the form \"{}\" (/i/{}).{}",
         form.title, form.slug, review
     );
     let job = crate::jobs::NewJob::new(
@@ -363,11 +457,11 @@ async fn notify_submission(state: &AppState, db_name: &str, form: &WebForm, held
     }
 }
 
-/// Handle a validated public submission. Enforces the daily cap, then either
-/// writes the record immediately (`Accepted`) or holds it for review
-/// (`Quarantined`) per the form's setting. Records the submission ledger row, a
-/// WORM audit entry, and a best-effort notification. `writable` must already be
-/// allow-listed + required-checked.
+/// Handle a validated submission from `submitter`. Enforces the daily cap, then
+/// either writes the record immediately (`Accepted`) or holds it for review
+/// (`Quarantined`) per the form's setting. Records the ledger row (with actor
+/// attribution), a WORM audit entry, and a best-effort notification. `writable`
+/// must already be allow-listed + required-checked.
 pub async fn submit(
     state: &AppState,
     db: &PgPool,
@@ -375,6 +469,7 @@ pub async fn submit(
     form: &WebForm,
     writable: &BTreeMap<String, String>,
     source_ip: Option<String>,
+    submitter: &Submitter,
 ) -> Result<SubmitOutcome, String> {
     // Daily cap — counts today's accepted + quarantined submissions.
     if let Some(cap) = form.daily_cap {
@@ -384,22 +479,27 @@ pub async fn submit(
     }
 
     let payload = serde_json::to_value(writable).unwrap_or_else(|_| serde_json::json!({}));
+    let partner_id = submitter.partner_id();
+    let submitted_by = submitter.user_id();
 
     if form.quarantine {
-        // Hold for review: capture the payload, write NO record yet.
+        // Hold for review: capture the payload + actor, write NO record yet.
         let sub_id: Uuid = sqlx::query_scalar(
-            "INSERT INTO web_form_submission (form_id, record_id, status, source_ip, payload)
-             VALUES ($1, NULL, 'quarantined', $2::inet, $3) RETURNING id",
+            "INSERT INTO web_form_submission
+                 (form_id, record_id, status, source_ip, payload, partner_id, submitted_by)
+             VALUES ($1, NULL, 'quarantined', $2::inet, $3, $4, $5) RETURNING id",
         )
         .bind(form.id)
         .bind(&source_ip)
         .bind(&payload)
+        .bind(partner_id)
+        .bind(submitted_by)
         .fetch_one(db)
         .await
         .map_err(dberr)?;
 
-        audit_anon(
-            state, db_name, "intake_quarantined", AuditSeverity::Info,
+        audit_submit(
+            state, db_name, submitter, "intake_quarantined", AuditSeverity::Info,
             "web_form_submission", &sub_id.to_string(),
             serde_json::json!({ "form": form.slug, "model": form.model, "source_ip": source_ip }),
         ).await;
@@ -407,22 +507,26 @@ pub async fn submit(
         return Ok(SubmitOutcome::Quarantined(sub_id));
     }
 
-    // Immediate write.
-    let record_id = insert_target_record(db, form, writable).await?;
+    // Immediate write, with owner stamping for portal submissions.
+    let stamp = OwnerStamp::for_submitter(submitter, form);
+    let record_id = insert_target_record(db, form, writable, &stamp).await?;
     sqlx::query(
-        "INSERT INTO web_form_submission (form_id, record_id, status, source_ip, payload)
-         VALUES ($1, $2, 'accepted', $3::inet, $4)",
+        "INSERT INTO web_form_submission
+             (form_id, record_id, status, source_ip, payload, partner_id, submitted_by)
+         VALUES ($1, $2, 'accepted', $3::inet, $4, $5, $6)",
     )
     .bind(form.id)
     .bind(record_id)
     .bind(&source_ip)
     .bind(&payload)
+    .bind(partner_id)
+    .bind(submitted_by)
     .execute(db)
     .await
     .map_err(dberr)?;
 
-    audit_anon(
-        state, db_name, "intake_submitted", AuditSeverity::Info,
+    audit_submit(
+        state, db_name, submitter, "intake_submitted", AuditSeverity::Info,
         &form.model, &record_id.to_string(),
         serde_json::json!({ "form": form.slug, "source_ip": source_ip }),
     ).await;
@@ -430,21 +534,28 @@ pub async fn submit(
     Ok(SubmitOutcome::Accepted(record_id))
 }
 
-/// Anonymous WORM audit helper: no user_id (nullable FK), denormalized username.
-async fn audit_anon(
+/// WORM audit for a submission, attributed to the actor: anonymous for public
+/// (no user, denormalized username), the real portal user otherwise.
+async fn audit_submit(
     state: &AppState,
     db_name: &str,
+    submitter: &Submitter,
     code: &str,
     severity: AuditSeverity,
     resource_type: &str,
     resource_id: &str,
     details: serde_json::Value,
 ) {
-    let entry = AuditEntry::new(AuditAction::Custom(code.into()), severity)
+    let mut entry = AuditEntry::new(AuditAction::Custom(code.into()), severity)
         .with_database(db_name)
-        .with_username("anonymous-intake")
         .with_resource(resource_type, resource_id)
         .with_details(details);
+    entry = match submitter {
+        Submitter::Anonymous => entry.with_username("anonymous-intake"),
+        Submitter::Portal { user_id, username, .. } => {
+            entry.with_user(vortex_common::UserId(*user_id)).with_username(username)
+        }
+    };
     if let Err(e) = state.audit.log(entry).await {
         tracing::error!(code, error = %e, "intake audit write failed");
     }
@@ -593,24 +704,8 @@ pub async fn load_form(db: &PgPool, id: Uuid) -> Option<(WebForm, bool)> {
     .flatten()?;
     let fields: Vec<FormField> = serde_json::from_value(row.get("fields")).unwrap_or_default();
     let settings: serde_json::Value = row.get("settings");
-    let (success_msg, origins, quarantine, notify_to, daily_cap) = parse_settings(&settings);
-    Some((
-        WebForm {
-            id: row.get("id"),
-            slug: row.get("slug"),
-            model: row.get("model"),
-            title: row.get("title"),
-            description: row.get("description"),
-            fields,
-            company_id: row.get("company_id"),
-            success_msg,
-            origins,
-            quarantine,
-            notify_to,
-            daily_cap,
-        },
-        row.get("active"),
-    ))
+    let active: bool = row.get("active");
+    Some((web_form_from_row(&row, fields, parse_settings(&settings)), active))
 }
 
 /// Settings an admin edits on the form page (the governance knobs).
@@ -621,6 +716,10 @@ pub struct FormSettings<'a> {
     pub notify_to: &'a str,
     pub daily_cap: i64,
     pub active: bool,
+    /// Offer this form to signed-in customer-portal users (Phase 3).
+    pub portal: bool,
+    /// Target column stamped with the portal submitter's partner id ("" = none).
+    pub partner_field: &'a str,
 }
 
 /// Update a form's allow-list + settings + active flag.
@@ -631,12 +730,18 @@ pub async fn update_form(
     s: &FormSettings<'_>,
 ) -> Result<(), String> {
     let fields_json = serde_json::to_value(fields).map_err(|e| format!("serialize fields: {e}"))?;
+    let partner_field = s.partner_field.trim();
+    if !partner_field.is_empty() && !valid_ident(partner_field) {
+        return Err("Partner field must be a valid column identifier.".into());
+    }
     let settings = serde_json::json!({
         "success_msg": s.success_msg,
         "origins": s.origins,
         "quarantine": s.quarantine,
         "notify_to": s.notify_to.trim(),
         "daily_cap": s.daily_cap.max(0),
+        "portal": s.portal,
+        "partner_field": partner_field,
     });
     sqlx::query(
         "UPDATE web_form SET fields = $2, settings = $3, active = $4, updated_at = now() WHERE id = $1",
@@ -659,6 +764,71 @@ pub async fn delete_form(db: &PgPool, id: Uuid) -> Result<(), String> {
         .await
         .map_err(dberr)?;
     Ok(())
+}
+
+// ===========================================================================
+// Customer portal (Phase 3) — signed-in partners submit + track requests.
+// ===========================================================================
+
+/// A portal-available form, for the "Submit a request" list.
+pub struct PortalForm {
+    pub slug: String,
+    pub title: String,
+    pub description: Option<String>,
+}
+
+/// Active forms flagged `portal` in settings.
+pub async fn list_portal_forms(db: &PgPool) -> Vec<PortalForm> {
+    sqlx::query(
+        "SELECT slug, title, description FROM web_form
+         WHERE active = true AND (settings->>'portal')::boolean = true
+         ORDER BY title",
+    )
+    .fetch_all(db)
+    .await
+    .unwrap_or_default()
+    .iter()
+    .map(|r| PortalForm {
+        slug: r.get("slug"),
+        title: r.get("title"),
+        description: r.try_get("description").ok().flatten(),
+    })
+    .collect()
+}
+
+/// Load an active portal-enabled form by slug (else `None` — a form not flagged
+/// `portal` is not reachable from the portal even if it's public).
+pub async fn fetch_portal_form(db: &PgPool, slug: &str) -> Option<WebForm> {
+    let form = fetch_form(db, slug).await?;
+    form.portal.then_some(form)
+}
+
+/// One of a partner's tracked submissions.
+pub struct PartnerSubmission {
+    pub form_title: String,
+    pub status: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// A portal partner's own submissions across all forms, newest first.
+pub async fn list_partner_submissions(db: &PgPool, partner_id: Uuid, limit: i64) -> Vec<PartnerSubmission> {
+    sqlx::query(
+        "SELECT w.title AS form_title, s.status, s.created_at
+         FROM web_form_submission s JOIN web_form w ON w.id = s.form_id
+         WHERE s.partner_id = $1 ORDER BY s.created_at DESC LIMIT $2",
+    )
+    .bind(partner_id)
+    .bind(limit)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default()
+    .iter()
+    .map(|r| PartnerSubmission {
+        form_title: r.get("form_title"),
+        status: r.get("status"),
+        created_at: r.get("created_at"),
+    })
+    .collect()
 }
 
 // ===========================================================================
@@ -724,7 +894,8 @@ pub async fn approve_submission(
     reviewer_name: &str,
 ) -> Result<Uuid, String> {
     let row = sqlx::query(
-        "SELECT form_id, status, payload FROM web_form_submission WHERE id = $1",
+        "SELECT form_id, status, payload, partner_id, submitted_by
+         FROM web_form_submission WHERE id = $1",
     )
     .bind(submission_id)
     .fetch_optional(db)
@@ -742,6 +913,10 @@ pub async fn approve_submission(
         .flatten()
         .and_then(|v| serde_json::from_value(v).ok())
         .unwrap_or_default();
+    // The original submitter, captured at hold time — so the approved record
+    // carries the same owner it would have had on an immediate write.
+    let partner_id: Option<Uuid> = row.try_get("partner_id").ok().flatten();
+    let submitted_by: Option<Uuid> = row.try_get("submitted_by").ok().flatten();
 
     let (form, _active) = load_form(db, form_id).await.ok_or("Form no longer exists.")?;
     // Re-validate against the current allow-list (the form may have changed
@@ -751,7 +926,11 @@ pub async fn approve_submission(
     if !missing.is_empty() {
         return Err(format!("Cannot approve — required now-missing: {}.", missing.join(", ")));
     }
-    let record_id = insert_target_record(db, &form, &writable).await?;
+    let stamp = OwnerStamp {
+        created_by: submitted_by,
+        partner: form.partner_field.clone().zip(partner_id),
+    };
+    let record_id = insert_target_record(db, &form, &writable, &stamp).await?;
 
     sqlx::query(
         "UPDATE web_form_submission
@@ -868,5 +1047,35 @@ mod tests {
         let allow = vec![f("name", true), f("email", true), f("note", false)];
         let miss = missing_required(&allow, &map(&[("name", "A"), ("email", "  ")]));
         assert_eq!(miss, vec!["email".to_string()]); // blank required; note not required
+    }
+
+    fn form_with_partner(partner_field: Option<&str>) -> WebForm {
+        WebForm {
+            id: Uuid::nil(), slug: "s".into(), model: "x_m".into(), title: "T".into(),
+            description: None, fields: vec![], company_id: None, success_msg: None,
+            origins: vec![], quarantine: false, notify_to: None, daily_cap: None,
+            portal: true, partner_field: partner_field.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn owner_stamp_maps_actor_to_stamps() {
+        // Anonymous: no owner stamps at all.
+        let anon = OwnerStamp::for_submitter(&Submitter::Anonymous, &form_with_partner(Some("partner_id")));
+        assert!(anon.created_by.is_none() && anon.partner.is_none());
+
+        let user = Uuid::from_u128(7);
+        let partner = Uuid::from_u128(9);
+        let portal = Submitter::Portal { user_id: user, partner_id: partner, username: "p".into() };
+
+        // Portal + partner_field configured: created_by + partner column stamped.
+        let s = OwnerStamp::for_submitter(&portal, &form_with_partner(Some("partner_id")));
+        assert_eq!(s.created_by, Some(user));
+        assert_eq!(s.partner, Some(("partner_id".to_string(), partner)));
+
+        // Portal but no partner_field: still attributes created_by, no partner column.
+        let s2 = OwnerStamp::for_submitter(&portal, &form_with_partner(None));
+        assert_eq!(s2.created_by, Some(user));
+        assert!(s2.partner.is_none());
     }
 }

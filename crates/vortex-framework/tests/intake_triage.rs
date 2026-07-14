@@ -53,6 +53,8 @@ async fn setup() -> Option<Harness> {
         "CREATE TABLE {TARGET_TABLE} (
              id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
              company_id UUID,
+             partner_id UUID,
+             created_by UUID,
              name VARCHAR(255),
              active BOOLEAN NOT NULL DEFAULT true,
              created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -81,7 +83,8 @@ async fn setup() -> Option<Harness> {
     .bind(MODEL)
     .bind("Triage Test")
     .bind(serde_json::json!([{"name":"name","label":"Name","required":true}]))
-    .bind(serde_json::json!({"quarantine": true}))
+    // partner_field set so approval also exercises portal owner stamping.
+    .bind(serde_json::json!({"quarantine": true, "partner_field": "partner_id"}))
     .execute(&pool)
     .await
     .expect("insert web_form");
@@ -108,17 +111,24 @@ async fn form_id(pool: &PgPool) -> Uuid {
         .unwrap()
 }
 
-/// Insert a quarantined submission carrying `payload`, return its id.
-async fn quarantined(pool: &PgPool, name: &str) -> Uuid {
+/// Insert a quarantined submission carrying `payload` + optional actor, return its id.
+async fn quarantined(
+    pool: &PgPool,
+    name: &str,
+    partner_id: Option<Uuid>,
+    submitted_by: Option<Uuid>,
+) -> Uuid {
     let fid = form_id(pool).await;
     let mut payload = BTreeMap::new();
     payload.insert("name".to_string(), name.to_string());
     sqlx::query_scalar(
-        "INSERT INTO web_form_submission (form_id, status, payload)
-         VALUES ($1, 'quarantined', $2) RETURNING id",
+        "INSERT INTO web_form_submission (form_id, status, payload, partner_id, submitted_by)
+         VALUES ($1, 'quarantined', $2, $3, $4) RETURNING id",
     )
     .bind(fid)
     .bind(serde_json::to_value(&payload).unwrap())
+    .bind(partner_id)
+    .bind(submitted_by)
     .fetch_one(pool)
     .await
     .unwrap()
@@ -127,7 +137,10 @@ async fn quarantined(pool: &PgPool, name: &str) -> Uuid {
 #[tokio::test]
 async fn approve_writes_the_held_record_and_settles_the_ledger() {
     let Some(h) = setup().await else { return };
-    let sub = quarantined(&h.pool, "Approved Row").await;
+    // A portal-origin held submission: it carries the partner + submitter, which
+    // approval must stamp onto the replayed record (owner stamping).
+    let partner = Uuid::from_u128(0xA0);
+    let sub = quarantined(&h.pool, "Approved Row", Some(partner), Some(h.reviewer)).await;
 
     let rec = vortex_framework::intake::approve_submission(
         &h.audit, &h.pool, "intake_test", sub, h.reviewer, "tester",
@@ -135,13 +148,18 @@ async fn approve_writes_the_held_record_and_settles_the_ledger() {
     .await
     .expect("approve should succeed");
 
-    // The record now exists in the target table with the captured value.
-    let name: String = sqlx::query_scalar(&format!("SELECT name FROM {TARGET_TABLE} WHERE id = $1"))
-        .bind(rec)
-        .fetch_one(&h.pool)
-        .await
-        .expect("record written");
-    assert_eq!(name, "Approved Row");
+    // The record now exists in the target table with the captured value AND the
+    // owner stamps replayed from the held submission.
+    let rrow = sqlx::query(&format!(
+        "SELECT name, partner_id, created_by FROM {TARGET_TABLE} WHERE id = $1"
+    ))
+    .bind(rec)
+    .fetch_one(&h.pool)
+    .await
+    .expect("record written");
+    assert_eq!(rrow.get::<String, _>("name"), "Approved Row");
+    assert_eq!(rrow.get::<Option<Uuid>, _>("partner_id"), Some(partner), "partner_field stamped");
+    assert_eq!(rrow.get::<Option<Uuid>, _>("created_by"), Some(h.reviewer), "created_by stamped");
 
     // The ledger row is settled: accepted, record linked, reviewer stamped.
     let row = sqlx::query(
@@ -167,7 +185,7 @@ async fn approve_writes_the_held_record_and_settles_the_ledger() {
 #[tokio::test]
 async fn reject_writes_no_record() {
     let Some(h) = setup().await else { return };
-    let sub = quarantined(&h.pool, "Rejected Row").await;
+    let sub = quarantined(&h.pool, "Rejected Row", None, None).await;
 
     let before: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {TARGET_TABLE}"))
         .fetch_one(&h.pool)

@@ -2558,6 +2558,8 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/portal/invoices/{id}", get(portal_invoice_detail))
         .route("/portal/orders", get(portal_orders))
         .route("/portal/statement", get(portal_statement))
+        .route("/portal/requests", get(portal_requests))
+        .route("/portal/forms/{slug}", get(portal_form_page).post(portal_form_submit))
         .route("/portal/logout", post(portal_logout))
         .route_layer(middleware::from_fn_with_state(state.clone(), portal_auth_middleware));
 
@@ -3030,7 +3032,7 @@ table.ptbl td.num, table.ptbl th.num {{ text-align: right; font-variant-numeric:
 <nav class="pbar px-4 py-3 flex items-center justify-between gap-4">
   <a href="/portal" class="text-lg font-bold"><span style="color:#8BC53F">re</span><span class="text-base-content/60">micle</span> <span class="font-normal text-sm text-base-content/50">Portal</span></a>
   <div class="flex items-center gap-4 text-sm overflow-x-auto">
-    {home}{invoices}{orders}{statement}
+    {home}{invoices}{orders}{statement}{requests}
     <span class="text-base-content/40 hidden sm:inline">|</span>
     <span class="text-base-content/70 hidden sm:inline">{who}</span>
     <form method="post" action="/portal/logout" class="inline"><button class="text-error hover:underline">Sign out</button></form>
@@ -3044,6 +3046,7 @@ table.ptbl td.num, table.ptbl th.num {{ text-align: right; font-variant-numeric:
         invoices = nav("/portal/invoices", "invoices", "Invoices"),
         orders = nav("/portal/orders", "orders", "Orders"),
         statement = nav("/portal/statement", "statement", "Statement"),
+        requests = nav("/portal/requests", "requests", "Requests"),
         body = body,
     )
 }
@@ -3320,7 +3323,7 @@ async fn intake_submit(
 
     // 6. Governed write (daily cap → quarantine|accept → stamp + WORM audit).
     let (client_ip, _ua) = request_fingerprint(&headers);
-    match intake::submit(&state, db, &ctx.db_name, &form, &writable, client_ip).await {
+    match intake::submit(&state, db, &ctx.db_name, &form, &writable, client_ip, &intake::Submitter::Anonymous).await {
         Ok(intake::SubmitOutcome::Accepted(_)) | Ok(intake::SubmitOutcome::Quarantined(_)) => {
             intake_success_page(&form)
         }
@@ -3523,6 +3526,30 @@ async fn intake_form_edit(
         String::new()
     };
 
+    // Candidate partner columns: the target model's UUID-typed columns (a
+    // many2one to the portal partner), minus system columns.
+    let uuid_cols: Vec<String> = sqlx::query_scalar(
+        "SELECT c.column_name FROM information_schema.columns c
+         JOIN ir_model m ON m.table_name = c.table_name
+         WHERE m.name = $1 AND c.udt_name = 'uuid'
+           AND c.column_name NOT IN ('id','company_id','created_by')
+         ORDER BY c.column_name",
+    )
+    .bind(&form.model)
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default();
+    let cur_pf = form.partner_field.clone().unwrap_or_default();
+    let mut pf_opts = String::from(r#"<option value="">— none —</option>"#);
+    for c in &uuid_cols {
+        let sel = if *c == cur_pf { " selected" } else { "" };
+        pf_opts.push_str(&format!(r#"<option value="{c}"{sel}>{c}</option>"#, c = html_escape(c), sel = sel));
+    }
+    // A partner_field configured but no longer a real column — keep it visible.
+    if !cur_pf.is_empty() && !uuid_cols.iter().any(|c| *c == cur_pf) {
+        pf_opts.push_str(&format!(r#"<option value="{c}" selected>{c} (missing)</option>"#, c = html_escape(&cur_pf)));
+    }
+
     let inner = format!(
         r##"<div class="mb-4"><a href="/settings/forms" class="btn btn-ghost btn-sm">← Intake Forms</a>
 <h1 class="text-2xl font-bold mt-2">{title}</h1>
@@ -3551,6 +3578,13 @@ async fn intake_form_edit(
 <label class="label cursor-pointer gap-2 justify-start mt-2"><input type="checkbox" name="quarantine" value="1" {quar} class="checkbox checkbox-sm"/><span class="label-text">Hold submissions for review (quarantine) — no record is written until approved</span></label>
 <label class="label cursor-pointer gap-2 justify-start"><input type="checkbox" name="active" value="1" {checked} class="checkbox checkbox-sm"/><span class="label-text">Published (accepting responses)</span></label>
 </div></div>
+<div class="card bg-base-100 shadow mb-6"><div class="card-body">
+<h2 class="card-title text-lg">Customer portal</h2>
+<p class="text-xs opacity-50">Offer this form to signed-in portal users too. Their submission is owned by their partner — the partner field below is stamped server-side (never from the form).</p>
+<label class="label cursor-pointer gap-2 justify-start"><input type="checkbox" name="portal" value="1" {portal} class="checkbox checkbox-sm"/><span class="label-text">Available in the customer portal (/portal/forms)</span></label>
+<label class="form-control"><span class="label-text">Partner field (stamped with the portal submitter)</span>
+<select name="partner_field" class="select select-bordered select-sm">{pf_opts}</select></label>
+</div></div>
 <div class="flex gap-2"><button class="btn btn-primary btn-sm">Save</button></div>
 </form>
 <form method="post" action="/settings/forms/{id}/delete" onsubmit="return confirm('Delete this form and its submission ledger?')" class="mt-4">
@@ -3562,6 +3596,7 @@ async fn intake_form_edit(
         total = total, pending_badge = pending_badge,
         quar = if form.quarantine { "checked" } else { "" },
         checked = if active { "checked" } else { "" },
+        portal = if form.portal { "checked" } else { "" }, pf_opts = pf_opts,
     );
     intake_admin_shell(&user, &form.title, &inner).into_response()
 }
@@ -3618,9 +3653,11 @@ async fn intake_form_update(
     let daily_cap = pairs.get("daily_cap").and_then(|s| s.trim().parse::<i64>().ok()).unwrap_or(0);
     let quarantine = pairs.get("quarantine").is_some();
     let active = pairs.get("active").is_some();
+    let portal = pairs.get("portal").is_some();
+    let partner_field = pairs.get("partner_field").map(|s| s.trim()).unwrap_or("");
 
     let settings = vortex_framework::intake::FormSettings {
-        success_msg, origins: &origins, quarantine, notify_to, daily_cap, active,
+        success_msg, origins: &origins, quarantine, notify_to, daily_cap, active, portal, partner_field,
     };
     if let Err(e) = vortex_framework::intake::update_form(&db, id, &fields, &settings).await {
         return intake_admin_shell(
@@ -4072,6 +4109,7 @@ async fn portal_home(Db(db): Db, Extension(user): Extension<AuthUser>) -> Respon
     <li><a href="/portal/invoices" class="link">View and track your invoices</a></li>
     <li><a href="/portal/statement" class="link">See your statement of account</a></li>
     <li><a href="/portal/orders" class="link">Review your orders</a></li>
+    <li><a href="/portal/requests" class="link">Submit and track a request</a></li>
   </ul>
 </div>"#,
         name = html_escape(&name),
@@ -4394,6 +4432,178 @@ fn portal_admin_shell(user: &AuthUser, title: &str, inner: &str) -> Html<String>
         user = html_escape(&user.username),
         inner = inner,
     ))
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Vortex Intake — interactive portal (Phase 3). Signed-in partners submit
+// portal-enabled forms and track them. Reuses the governed write path; the
+// record's owner is stamped from the session partner (never the form body).
+// Portal POSTs rely on the session cookie (SameSite) for CSRF, like every
+// other authed portal action — no public nonce needed here.
+// ───────────────────────────────────────────────────────────────────────────
+
+/// `GET /portal/requests` — the partner's tracked submissions + a launcher for
+/// the available forms.
+async fn portal_requests(Db(db): Db, Extension(user): Extension<AuthUser>) -> Response {
+    use vortex_framework::ui::html_escape;
+    let partner = match portal_partner(&user) { Ok(p) => p, Err(r) => return r };
+    let name = portal_partner_name(&db, partner, &user.username).await;
+
+    let forms = vortex_framework::intake::list_portal_forms(&db).await;
+    let mut launch = String::new();
+    for f in &forms {
+        let desc = f.description.as_deref().filter(|d| !d.trim().is_empty())
+            .map(|d| format!(r#"<div class="text-sm text-base-content/60">{}</div>"#, html_escape(d)))
+            .unwrap_or_default();
+        launch.push_str(&format!(
+            r#"<a href="/portal/forms/{slug}" class="pcard p-4 block hover:border-primary">
+<div class="font-semibold">{title}</div>{desc}</a>"#,
+            slug = html_escape(&f.slug), title = html_escape(&f.title), desc = desc,
+        ));
+    }
+    let launcher = if forms.is_empty() {
+        r#"<p class="text-base-content/50 text-sm">No request forms are available right now.</p>"#.to_string()
+    } else {
+        format!(r#"<div class="grid grid-cols-1 sm:grid-cols-2 gap-3">{launch}</div>"#)
+    };
+
+    let subs = vortex_framework::intake::list_partner_submissions(&db, partner, 200).await;
+    let mut trs = String::new();
+    for s in &subs {
+        let badge = match s.status.as_str() {
+            "accepted" => r#"<span class="badge badge-success badge-sm">Received</span>"#,
+            "quarantined" => r#"<span class="badge badge-warning badge-sm">Pending review</span>"#,
+            "rejected" => r#"<span class="badge badge-error badge-sm">Declined</span>"#,
+            _ => r#"<span class="badge badge-ghost badge-sm">—</span>"#,
+        };
+        trs.push_str(&format!(
+            r#"<tr><td>{title}</td><td>{date}</td><td>{badge}</td></tr>"#,
+            title = html_escape(&s.form_title),
+            date = s.created_at.format("%Y-%m-%d %H:%M"),
+            badge = badge,
+        ));
+    }
+    if subs.is_empty() {
+        trs = r#"<tr><td colspan="3" class="text-base-content/50 text-center py-6">You have not submitted any requests yet.</td></tr>"#.to_string();
+    }
+
+    let body = format!(
+        r#"<h1 class="text-2xl font-bold mb-1">Requests</h1>
+<p class="text-base-content/60 mb-5">Submit a request and track its progress.</p>
+<div class="mb-6">{launcher}</div>
+<div class="pcard p-4"><div class="font-semibold mb-2">Your submissions</div>
+<table class="ptbl"><thead><tr><th>Form</th><th>Submitted</th><th>Status</th></tr></thead>
+<tbody>{trs}</tbody></table></div>"#,
+        launcher = launcher, trs = trs,
+    );
+    Html(portal_shell("Requests", &name, "requests", &body)).into_response()
+}
+
+/// `GET /portal/forms/{slug}` — render a portal-enabled form for the partner.
+async fn portal_form_page(
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Path(slug): Path<String>,
+) -> Response {
+    use vortex_framework::ui::html_escape;
+    let partner = match portal_partner(&user) { Ok(p) => p, Err(r) => return r };
+    let name = portal_partner_name(&db, partner, &user.username).await;
+    let Some(form) = vortex_framework::intake::fetch_portal_form(&db, &slug).await else {
+        return (StatusCode::NOT_FOUND, Html(portal_shell("Not found", &name, "requests",
+            r#"<div class="pcard p-6"><h1 class="text-xl font-bold">Form not available</h1>
+<p class="text-base-content/60 mt-1">This request form does not exist or is not open.</p>
+<a href="/portal/requests" class="link mt-3 inline-block">← Back to requests</a></div>"#))).into_response();
+    };
+
+    let mut fields_html = String::new();
+    for f in &form.fields {
+        let req = if f.required { r#" <span style="color:#e53e3e">*</span>"# } else { "" };
+        let ra = if f.required { " required" } else { "" };
+        let help = f.help.as_deref().filter(|h| !h.trim().is_empty())
+            .map(|h| format!(r#"<div class="text-xs text-base-content/50 mt-1">{}</div>"#, html_escape(h)))
+            .unwrap_or_default();
+        fields_html.push_str(&format!(
+            r#"<label class="form-control mb-3"><span class="label-text">{label}{req}</span>
+<input type="text" name="{fname}"{ra} autocomplete="off" class="input input-bordered input-sm"/>{help}</label>"#,
+            label = html_escape(&f.label), req = req, fname = html_escape(&f.name), ra = ra, help = help,
+        ));
+    }
+    let desc = form.description.as_deref().filter(|d| !d.trim().is_empty())
+        .map(|d| format!(r#"<p class="text-base-content/60 mb-4">{}</p>"#, html_escape(d)))
+        .unwrap_or_default();
+
+    let body = format!(
+        r#"<a href="/portal/requests" class="link text-sm">← Requests</a>
+<h1 class="text-2xl font-bold mt-2 mb-1">{title}</h1>{desc}
+<form method="post" action="/portal/forms/{slug}" class="pcard p-5 mt-3 max-w-xl">
+{fields}
+<button class="btn btn-sm mt-2" style="background:#8BC53F;border-color:#8BC53F;color:#000">Submit request</button>
+</form>"#,
+        title = html_escape(&form.title), desc = desc, slug = html_escape(&slug), fields = fields_html,
+    );
+    Html(portal_shell(&form.title, &name, "requests", &body)).into_response()
+}
+
+/// `POST /portal/forms/{slug}` — governed portal submission (owner = partner).
+async fn portal_form_submit(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(slug): Path<String>,
+    Form(raw): Form<Vec<(String, String)>>,
+) -> Response {
+    use vortex_framework::intake;
+    use vortex_framework::ui::html_escape;
+    let partner = match portal_partner(&user) { Ok(p) => p, Err(r) => return r };
+    let name = portal_partner_name(&db, partner, &user.username).await;
+
+    let err_page = |name: &str, msg: &str, slug: &str| {
+        (StatusCode::BAD_REQUEST, Html(portal_shell("Requests", name, "requests", &format!(
+            r#"<div class="pcard p-6"><div class="alert alert-error text-sm mb-3">{}</div>
+<a href="/portal/forms/{}" class="link">← Back to the form</a></div>"#,
+            html_escape(msg), html_escape(slug))))).into_response()
+    };
+
+    let Some(form) = intake::fetch_portal_form(&db, &slug).await else {
+        return (StatusCode::NOT_FOUND, Html(portal_shell("Not found", &name, "requests",
+            r#"<div class="pcard p-6">This form is not available.</div>"#))).into_response();
+    };
+
+    let submitted: std::collections::BTreeMap<String, String> = raw.into_iter().collect();
+    let writable = match intake::select_writable(&form.fields, &submitted) {
+        Ok(w) => w,
+        Err(e) => return err_page(&name, &e, &slug),
+    };
+    let missing = intake::missing_required(&form.fields, &writable);
+    if !missing.is_empty() {
+        return err_page(&name, &format!("Please fill in: {}.", missing.join(", ")), &slug);
+    }
+
+    let submitter = intake::Submitter::Portal {
+        user_id: user.id,
+        partner_id: partner,
+        username: user.username.clone(),
+    };
+    let outcome = intake::submit(&state, &db, &db_ctx.db_name, &form, &writable, None, &submitter).await;
+    let msg = match outcome {
+        Ok(intake::SubmitOutcome::Quarantined(_)) => "Thanks — your request was received and is pending review.",
+        Ok(intake::SubmitOutcome::Accepted(_)) => "Thanks — your request has been received.",
+        Ok(intake::SubmitOutcome::Capped) => {
+            return err_page(&name, "This form is not accepting more requests today. Please try again tomorrow.", &slug);
+        }
+        Err(e) => {
+            error!("portal intake submit failed for '{}': {}", slug, e);
+            return err_page(&name, &e, &slug);
+        }
+    };
+    let body = format!(
+        r#"<div class="pcard p-6 text-center"><h1 class="text-xl font-bold mb-2">{title}</h1>
+<p class="text-base-content/70">{msg}</p>
+<a href="/portal/requests" class="link mt-4 inline-block">View your requests →</a></div>"#,
+        title = html_escape(&form.title), msg = msg,
+    );
+    Html(portal_shell(&form.title, &name, "requests", &body)).into_response()
 }
 
 async fn portal_users_list(
