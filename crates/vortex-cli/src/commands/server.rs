@@ -4889,21 +4889,50 @@ async fn portal_requests(Db(db): Db, Extension(user): Extension<AuthUser>) -> Re
     let subs = vortex_framework::intake::list_partner_submissions(&db, partner, 200).await;
     let mut trs = String::new();
     for s in &subs {
-        let badge = match s.status.as_str() {
-            "accepted" => r#"<span class="badge badge-success badge-sm">Received</span>"#,
-            "quarantined" => r#"<span class="badge badge-warning badge-sm">Pending review</span>"#,
-            "rejected" => r#"<span class="badge badge-error badge-sm">Declined</span>"#,
-            _ => r#"<span class="badge badge-ghost badge-sm">—</span>"#,
+        // Once accepted, prefer the created record's live workflow stage over the
+        // static "Received" — the partner sees where their request actually is.
+        let (status_cell, progress_cell) = match (s.status.as_str(), s.stage.as_ref()) {
+            ("accepted", Some(st)) => {
+                use vortex_framework::status::StageColor;
+                let color = StageColor::parse(&st.color).suffix();
+                let bar = if st.total > 1 {
+                    let pct = (st.index as f64 / st.total as f64 * 100.0).round() as i64;
+                    format!(
+                        r#"<div class="flex items-center gap-2"><progress class="progress progress-{color} w-24" value="{idx}" max="{total}"></progress><span class="text-xs opacity-50">Step {idx} of {total}</span></div>"#,
+                        color = color, idx = st.index, total = st.total,
+                    )
+                } else {
+                    String::new()
+                };
+                (
+                    format!(
+                        r#"<span class="badge badge-{color} badge-sm">{label}</span>"#,
+                        color = color, label = html_escape(&st.label),
+                    ),
+                    bar,
+                )
+            }
+            ("accepted", None) => {
+                (r#"<span class="badge badge-success badge-sm">Received</span>"#.to_string(), String::new())
+            }
+            ("quarantined", _) => {
+                (r#"<span class="badge badge-warning badge-sm">Pending review</span>"#.to_string(), String::new())
+            }
+            ("rejected", _) => {
+                (r#"<span class="badge badge-error badge-sm">Declined</span>"#.to_string(), String::new())
+            }
+            _ => (r#"<span class="badge badge-ghost badge-sm">—</span>"#.to_string(), String::new()),
         };
         trs.push_str(&format!(
-            r#"<tr><td>{title}</td><td>{date}</td><td>{badge}</td></tr>"#,
+            r#"<tr><td>{title}</td><td>{date}</td><td>{status}</td><td>{progress}</td></tr>"#,
             title = html_escape(&s.form_title),
             date = s.created_at.format("%Y-%m-%d %H:%M"),
-            badge = badge,
+            status = status_cell,
+            progress = progress_cell,
         ));
     }
     if subs.is_empty() {
-        trs = r#"<tr><td colspan="3" class="text-base-content/50 text-center py-6">You have not submitted any requests yet.</td></tr>"#.to_string();
+        trs = r#"<tr><td colspan="4" class="text-base-content/50 text-center py-6">You have not submitted any requests yet.</td></tr>"#.to_string();
     }
 
     let body = format!(
@@ -4911,7 +4940,7 @@ async fn portal_requests(Db(db): Db, Extension(user): Extension<AuthUser>) -> Re
 <p class="text-base-content/60 mb-5">Submit a request and track its progress.</p>
 <div class="mb-6">{launcher}</div>
 <div class="pcard p-4"><div class="font-semibold mb-2">Your submissions</div>
-<table class="ptbl"><thead><tr><th>Form</th><th>Submitted</th><th>Status</th></tr></thead>
+<table class="ptbl"><thead><tr><th>Form</th><th>Submitted</th><th>Status</th><th>Progress</th></tr></thead>
 <tbody>{trs}</tbody></table></div>"#,
         launcher = launcher, trs = trs,
     );

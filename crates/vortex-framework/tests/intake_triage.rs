@@ -362,6 +362,93 @@ async fn sweep_reclaims_rejected_blobs_and_spares_linked_ones() {
 }
 
 #[tokio::test]
+async fn portal_tracking_resolves_record_stage() {
+    let Some(h) = setup().await else { return };
+    const PMODEL: &str = "x_intake_portal_stage_test";
+    const PTABLE: &str = "intake_portal_stage_target";
+    const PSLUG: &str = "intake-portal-stage-test";
+
+    // Clean any prior run.
+    sqlx::query("DELETE FROM web_form WHERE slug = $1").bind(PSLUG).execute(&h.pool).await.ok();
+    sqlx::query("DELETE FROM record_stages WHERE model = $1").bind(PMODEL).execute(&h.pool).await.ok();
+    sqlx::query("DELETE FROM ir_model WHERE name = $1").bind(PMODEL).execute(&h.pool).await.ok();
+    sqlx::query(&format!("DROP TABLE IF EXISTS {PTABLE}")).execute(&h.pool).await.ok();
+
+    // A status-bar model: its table carries a `record_state` column.
+    sqlx::query(&format!(
+        "CREATE TABLE {PTABLE} (
+             id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+             company_id UUID, partner_id UUID, created_by UUID,
+             name VARCHAR(255), record_state VARCHAR(50),
+             active BOOLEAN NOT NULL DEFAULT true,
+             created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+             updated_at TIMESTAMPTZ NOT NULL DEFAULT now())"
+    ))
+    .execute(&h.pool)
+    .await
+    .expect("create stage target table");
+    sqlx::query("INSERT INTO ir_model (name, display_name, table_name, is_active) VALUES ($1,$2,$3,true)")
+        .bind(PMODEL).bind("Portal Stage Test").bind(PTABLE)
+        .execute(&h.pool).await.expect("ir_model");
+    for (seq, code, label, color) in [
+        (10, "new", "New", "neutral"),
+        (20, "in_progress", "In Progress", "info"),
+        (30, "done", "Done", "success"),
+    ] {
+        sqlx::query("INSERT INTO record_stages (model, code, label, color, sequence) VALUES ($1,$2,$3,$4,$5)")
+            .bind(PMODEL).bind(code).bind(label).bind(color).bind(seq)
+            .execute(&h.pool).await.expect("stage");
+    }
+    let fid: Uuid = sqlx::query_scalar(
+        "INSERT INTO web_form (slug, model, title, fields, settings, active)
+         VALUES ($1, $2, 'Portal Stage', $3, '{\"portal\": true}'::jsonb, true) RETURNING id",
+    )
+    .bind(PSLUG)
+    .bind(PMODEL)
+    .bind(serde_json::json!([{"name":"name","label":"Name","required":true}]))
+    .fetch_one(&h.pool)
+    .await
+    .expect("web_form");
+
+    let partner = Uuid::from_u128(0xC0FFEE);
+    // Two accepted records: one mid-pipeline (stage 2), one with no stage set.
+    let rec_mid: Uuid = sqlx::query_scalar(&format!(
+        "INSERT INTO {PTABLE} (name, record_state, partner_id) VALUES ('Mid','in_progress',$1) RETURNING id"
+    ))
+    .bind(partner).fetch_one(&h.pool).await.expect("mid record");
+    let rec_nostate: Uuid = sqlx::query_scalar(&format!(
+        "INSERT INTO {PTABLE} (name, record_state, partner_id) VALUES ('Blank', NULL, $1) RETURNING id"
+    ))
+    .bind(partner).fetch_one(&h.pool).await.expect("blank record");
+    for rec in [rec_mid, rec_nostate] {
+        sqlx::query(
+            "INSERT INTO web_form_submission (form_id, record_id, status, partner_id, payload)
+             VALUES ($1, $2, 'accepted', $3, '{}'::jsonb)",
+        )
+        .bind(fid).bind(rec).bind(partner).execute(&h.pool).await.expect("submission");
+    }
+
+    let subs = vortex_framework::intake::list_partner_submissions(&h.pool, partner, 50).await;
+    let mid = subs.iter().find(|s| s.record_id == Some(rec_mid)).expect("mid submission listed");
+    let st = mid.stage.as_ref().expect("stage resolved for accepted status-bar record");
+    assert_eq!(st.code, "in_progress");
+    assert_eq!(st.label, "In Progress");
+    assert_eq!(st.index, 2, "second of three ordered stages");
+    assert_eq!(st.total, 3);
+    assert_eq!(st.color, "info");
+
+    // A record with no stage set falls back to no StageInfo (portal shows "Received").
+    let blank = subs.iter().find(|s| s.record_id == Some(rec_nostate)).expect("blank submission listed");
+    assert!(blank.stage.is_none(), "unset record_state yields no stage");
+
+    // Cleanup.
+    sqlx::query("DELETE FROM web_form WHERE slug = $1").bind(PSLUG).execute(&h.pool).await.ok();
+    sqlx::query("DELETE FROM record_stages WHERE model = $1").bind(PMODEL).execute(&h.pool).await.ok();
+    sqlx::query("DELETE FROM ir_model WHERE name = $1").bind(PMODEL).execute(&h.pool).await.ok();
+    sqlx::query(&format!("DROP TABLE IF EXISTS {PTABLE}")).execute(&h.pool).await.ok();
+}
+
+#[tokio::test]
 async fn delete_form_purges_held_quarantine_blobs() {
     let Some(h) = setup().await else { return };
     use vortex_framework::files::{FileStore, LocalDirStore};
