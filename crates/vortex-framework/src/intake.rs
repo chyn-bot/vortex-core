@@ -97,6 +97,9 @@ pub struct WebForm {
     /// Accepted upload types: lowercase extensions (".pdf") and/or MIME globs
     /// ("image/*", "application/pdf"). Empty = a safe built-in default set.
     pub attach_accept: Vec<String>,
+    /// Require a solved CAPTCHA challenge on the public path. Only enforced when
+    /// a provider is configured globally (`[captcha]`); otherwise inert.
+    pub captcha: bool,
 }
 
 /// Default per-file upload ceiling when a form doesn't set one.
@@ -114,6 +117,7 @@ struct ParsedSettings {
     attach_fields: Vec<FormField>,
     attach_max_mb: i64,
     attach_accept: Vec<String>,
+    captcha: bool,
 }
 
 fn parse_settings(settings: &serde_json::Value) -> ParsedSettings {
@@ -150,6 +154,7 @@ fn parse_settings(settings: &serde_json::Value) -> ParsedSettings {
         attach_accept,
         portal: settings.get("portal").and_then(|v| v.as_bool()).unwrap_or(false),
         partner_field: str_opt("partner_field").filter(|s| valid_ident(s)),
+        captcha: settings.get("captcha").and_then(|v| v.as_bool()).unwrap_or(false),
     }
 }
 
@@ -464,6 +469,7 @@ fn web_form_from_row(row: &sqlx::postgres::PgRow, fields: Vec<FormField>, s: Par
         attach_fields: s.attach_fields,
         attach_max_mb: s.attach_max_mb,
         attach_accept: s.attach_accept,
+        captcha: s.captcha,
     }
 }
 
@@ -913,6 +919,9 @@ pub struct FormSettings<'a> {
     pub attach_fields: &'a [FormField],
     pub attach_max_mb: i64,
     pub attach_accept: &'a [String],
+    /// Require a solved CAPTCHA on the public path (only enforced when a
+    /// provider is configured globally).
+    pub captcha: bool,
 }
 
 /// Update a form's allow-list + settings + active flag.
@@ -935,6 +944,7 @@ pub async fn update_form(
         "daily_cap": s.daily_cap.max(0),
         "portal": s.portal,
         "partner_field": partner_field,
+        "captcha": s.captcha,
         "attachments": {
             "fields": s.attach_fields,
             "max_mb": s.attach_max_mb.max(0),
@@ -1412,6 +1422,7 @@ mod tests {
             origins: vec![], quarantine: false, notify_to: None, daily_cap: None,
             portal: true, partner_field: partner_field.map(str::to_string),
             attach_fields: vec![], attach_max_mb: DEFAULT_MAX_UPLOAD_MB, attach_accept: vec![],
+            captcha: false,
         }
     }
 

@@ -34,6 +34,7 @@
 
 pub mod antivirus;
 pub mod api;
+pub mod captcha;
 pub mod approval;
 pub mod audit_trail;
 pub mod automation;

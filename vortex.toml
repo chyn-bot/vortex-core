@@ -127,6 +127,23 @@ backend = "none"
 # fail_open    = false             # false = reject uploads clamd can't scan (fail closed);
 #                                  # true  = accept + log when clamd is unreachable
 
+[captcha]
+# Human-verification challenge for public Intake forms. Global here; each form
+# opts in via its "Require CAPTCHA" toggle. The signed nonce + honeypot +
+# fill-time gate already block dumb bots — this is the escalation layer.
+#   none      — no CAPTCHA (default).
+#   turnstile — Cloudflare Turnstile (single host, privacy-friendly).
+#   hcaptcha  — hCaptcha.
+#   recaptcha — Google reCAPTCHA v2 ("I'm not a robot" checkbox).
+provider = "none"
+
+# [captcha] settings when a provider is set (sitekey + secret are required):
+# sitekey    = "0x..."             # public site key (ships in the page HTML)
+# secret     = "0x..."             # private secret (server-side siteverify only)
+# verify_url = ""                  # override the provider's siteverify endpoint (blank = default)
+# fail_open  = false               # false = reject when the provider is unreachable (fail closed);
+#                                  # true  = accept + log when siteverify can't be reached
+
 [modules]
 # Auto-install core modules
 auto_install_core = true
