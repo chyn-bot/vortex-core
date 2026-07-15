@@ -67,11 +67,13 @@ async fn public_context_middleware(
     .into_iter()
     .collect();
 
+    let custom_apps_html = custom_apps_nav(pool.pool(), "").await;
     request.extensions_mut().insert(pool.clone());
     request.extensions_mut().insert(DatabaseContext {
         db_name,
         pool,
         installed_modules,
+        custom_apps_html,
     });
     next.run(request).await
 }
@@ -276,6 +278,7 @@ async fn auth_middleware(
             .collect();
 
             // Inject Arc<ConnectionPool> for plugin handlers (Extension-based extraction)
+            let custom_apps_html = custom_apps_nav(pool.pool(), "").await;
             request.extensions_mut().insert(pool.clone());
 
             // Inject DatabaseContext for downstream extractors (Db, InstalledModules)
@@ -283,6 +286,7 @@ async fn auth_middleware(
                 db_name,
                 pool,
                 installed_modules: db_installed_modules,
+                custom_apps_html,
             });
 
             next.run(request).await
@@ -449,6 +453,8 @@ async fn api_auth_middleware(
         db_name,
         pool,
         installed_modules,
+        // Bearer/API requests don't render the admin sidebar — skip the query.
+        custom_apps_html: String::new(),
     });
 
     next.run(request).await
@@ -592,6 +598,7 @@ async fn resolve_bearer(
         db_name,
         pool: pool.clone(),
         installed_modules,
+        custom_apps_html: custom_apps_nav(pool.pool(), "").await,
     };
     Some((auth_user, pool, db_ctx, tok))
 }
@@ -4471,6 +4478,8 @@ async fn portal_auth_middleware(
         db_name,
         pool,
         installed_modules: db_installed_modules,
+        // Portal (customer-facing) uses its own chrome, not build_sidebar.
+        custom_apps_html: String::new(),
     });
     next.run(request).await
 }
