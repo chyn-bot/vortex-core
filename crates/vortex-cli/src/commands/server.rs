@@ -2758,12 +2758,11 @@ async fn login_page(State(state): State<Arc<AppState>>, headers: HeaderMap) -> H
         let options: String = databases.iter().map(|db| {
             format!(r#"<option value="{0}">{0}</option>"#, html_escape(db))
         }).collect();
-        format!(r#"
-                    <div class="form-control mb-4">
+        format!(r#"<div class="form-control mb-4">
                         <label class="label">
                             <span class="label-text">Database</span>
                         </label>
-                        <select name="database" class="select select-bordered">
+                        <select name="database" class="select select-bordered login-input w-full">
                             {options}
                         </select>
                     </div>"#)
@@ -2772,16 +2771,10 @@ async fn login_page(State(state): State<Arc<AppState>>, headers: HeaderMap) -> H
     };
 
     let template = include_str!("../../templates/login_standalone.html");
-    // Inject database selector before the username field
-    let html = template.replace(
-        r#"<div class="form-control mb-4">
-                        <label class="label">
-                            <span class="label-text">Username</span>"#,
-        &format!(r#"{db_selector_html}
-                    <div class="form-control mb-4">
-                        <label class="label">
-                            <span class="label-text">Username</span>"#),
-    );
+    // Inject the database selector at the `<!-- DB_SELECTOR -->` placeholder in
+    // the form (above the username field). A plain string swap keeps the
+    // template free to be restyled without touching this handler.
+    let html = template.replace("<!-- DB_SELECTOR -->", &db_selector_html);
     Html(html)
 }
 
