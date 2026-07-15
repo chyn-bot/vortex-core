@@ -214,8 +214,15 @@ async fn resolve(db: &PgPool, model: &str) -> Result<(Uuid, Uuid, String), Strin
 
 /// Snapshot the current blueprint fields as JSON for a version record.
 async fn snapshot(tx: &mut Transaction<'_, Postgres>, model_id: Uuid) -> Result<serde_json::Value, String> {
+    // Full field definition so a version can be faithfully restored — relation
+    // target, dropdown options, validation flags, computed formula, and layout,
+    // not just name/type. Older snapshots predate these keys; the restore path
+    // treats each as optional.
     let rows = sqlx::query(
-        "SELECT name, display_name, field_type, sequence, is_visible FROM ir_model_field
+        "SELECT name, display_name, field_type, sequence, is_visible, related_model,
+                selection_options, is_required, is_unique, is_computed,
+                compute_kind, compute_expr, col_span, section
+         FROM ir_model_field
          WHERE model_id = $1 AND source = 'blueprint' ORDER BY sequence",
     )
     .bind(model_id)
@@ -231,6 +238,15 @@ async fn snapshot(tx: &mut Transaction<'_, Postgres>, model_id: Uuid) -> Result<
                 "type": r.get::<String, _>("field_type"),
                 "sequence": r.get::<i32, _>("sequence"),
                 "in_list": r.get::<bool, _>("is_visible"),
+                "related_model": r.try_get::<Option<String>, _>("related_model").unwrap_or(None),
+                "options": r.try_get::<Option<serde_json::Value>, _>("selection_options").unwrap_or(None),
+                "required": r.try_get::<bool, _>("is_required").unwrap_or(false),
+                "unique": r.try_get::<bool, _>("is_unique").unwrap_or(false),
+                "computed": r.try_get::<bool, _>("is_computed").unwrap_or(false),
+                "compute_kind": r.try_get::<Option<String>, _>("compute_kind").unwrap_or(None),
+                "compute_expr": r.try_get::<Option<String>, _>("compute_expr").unwrap_or(None),
+                "col_span": r.try_get::<i16, _>("col_span").unwrap_or(2),
+                "section": r.try_get::<Option<String>, _>("section").unwrap_or(None),
             })
         })
         .collect();
@@ -625,6 +641,190 @@ pub async fn remove_field(
     Ok(())
 }
 
+/// Re-create a single Blueprint field inside an open transaction from a snapshot
+/// field JSON (see [`snapshot`]). Used by [`restore_version`] to add back a
+/// field that a prior version had. Returns `Ok(false)` (skipped, not an error)
+/// when the snapshot lacks enough to rebuild it faithfully — e.g. an old
+/// snapshot of a relation field with no recorded target.
+async fn recreate_field_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    db: &PgPool,
+    model_id: Uuid,
+    blueprint_id: Uuid,
+    table: &str,
+    f: &serde_json::Value,
+) -> Result<bool, String> {
+    let name = f.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    if name.is_empty() {
+        return Ok(false);
+    }
+    ddl::validate_identifier(name).map_err(|e| format!("invalid field name '{name}': {e}"))?;
+    let label = f.get("label").and_then(|v| v.as_str()).unwrap_or(name);
+    let ftype = f.get("type").and_then(|v| v.as_str()).unwrap_or("string");
+    let seq = f.get("sequence").and_then(|v| v.as_i64()).unwrap_or(10) as i32;
+    let in_list = f.get("in_list").and_then(|v| v.as_bool()).unwrap_or(true);
+    let is_required = f.get("required").and_then(|v| v.as_bool()).unwrap_or(false);
+    let is_unique = f.get("unique").and_then(|v| v.as_bool()).unwrap_or(false);
+    let is_computed = f.get("computed").and_then(|v| v.as_bool()).unwrap_or(false);
+    let col_span = f.get("col_span").and_then(|v| v.as_i64()).unwrap_or(2) as i16;
+    let section = f.get("section").and_then(|v| v.as_str());
+
+    // Computed fields are virtual (no physical column) — restore the registry
+    // row only. A computed field without its formula can't be rebuilt.
+    if is_computed {
+        let kind = f.get("compute_kind").and_then(|v| v.as_str());
+        let expr = f.get("compute_expr").and_then(|v| v.as_str());
+        let (Some(kind), Some(expr)) = (kind, expr) else { return Ok(false) };
+        sqlx::query(
+            "INSERT INTO ir_model_field
+                (model_id, name, display_name, field_type, sequence, source, is_custom,
+                 is_visible, is_computed, compute_kind, compute_expr, col_span, section)
+             VALUES ($1,$2,$3,$4,$5,'blueprint',false,$6,true,$7,$8,$9,$10)",
+        )
+        .bind(model_id).bind(name).bind(label).bind(ftype).bind(seq).bind(in_list)
+        .bind(kind).bind(expr).bind(col_span).bind(section)
+        .execute(&mut **tx).await.map_err(dberr)?;
+        return Ok(true);
+    }
+
+    // Physical column: relation → FK, else a scalar column.
+    if ftype == "many2one" {
+        let Some(target) = f.get("related_model").and_then(|v| v.as_str()).filter(|s| !s.is_empty())
+        else {
+            return Ok(false); // old snapshot with no target — can't rebuild the FK
+        };
+        let target_table = resolve_relation_target(db, target).await?;
+        ddl::add_reference_column(tx, table, name, &target_table, blueprint_id)
+            .await
+            .map_err(|e| format!("restore relation column '{name}' failed: {e}"))?;
+    } else {
+        ddl::add_column(tx, table, name, ftype, blueprint_id)
+            .await
+            .map_err(|e| format!("restore column '{name}' failed: {e}"))?;
+    }
+    if is_unique {
+        ddl::add_unique_index(tx, table, name, blueprint_id)
+            .await
+            .map_err(|e| format!("restore unique index for '{name}' failed: {e}"))?;
+    }
+
+    let related = f.get("related_model").and_then(|v| v.as_str());
+    let options = f.get("options").filter(|v| !v.is_null()).cloned();
+    sqlx::query(
+        "INSERT INTO ir_model_field
+            (model_id, name, display_name, field_type, sequence, source, is_custom, is_visible,
+             related_model, selection_options, is_required, is_unique, col_span, section)
+         VALUES ($1,$2,$3,$4,$5,'blueprint',false,$6,$7,$8,$9,$10,$11,$12)",
+    )
+    .bind(model_id).bind(name).bind(label).bind(ftype).bind(seq).bind(in_list)
+    .bind(related).bind(options).bind(is_required).bind(is_unique).bind(col_span).bind(section)
+    .execute(&mut **tx).await.map_err(dberr)?;
+    Ok(true)
+}
+
+/// Restore a Blueprint's fields to those captured in version `target_version`:
+/// fields present now but not in that version are **dropped** (their column and
+/// data are destroyed — the UI confirms this), and fields in that version but
+/// missing now are re-created. Fields present in both are left untouched (a
+/// field's type never changes, so same-name means same definition). Records and
+/// their values in surviving columns are preserved. The restore is itself
+/// recorded as a new version, so history only moves forward.
+pub async fn restore_version(
+    state: &AppState,
+    db: &PgPool,
+    db_name: &str,
+    user: &AuthUser,
+    model: &str,
+    target_version: i32,
+) -> Result<(), String> {
+    gate(state, user, "blueprint.alter", model).await?;
+    let (model_id, blueprint_id, table) = resolve(db, model).await?;
+
+    let def: Option<serde_json::Value> = sqlx::query_scalar(
+        "SELECT definition FROM blueprint_version WHERE blueprint_id = $1 AND version = $2",
+    )
+    .bind(blueprint_id)
+    .bind(target_version)
+    .fetch_optional(db)
+    .await
+    .map_err(dberr)?;
+    let Some(def) = def else {
+        return Err(format!("Version {target_version} not found for this Blueprint."));
+    };
+    let target_fields = def.get("fields").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    let target_names: std::collections::HashSet<String> = target_fields
+        .iter()
+        .filter_map(|f| f.get("name").and_then(|v| v.as_str()).map(str::to_string))
+        .collect();
+
+    let current = sqlx::query(
+        "SELECT name, is_computed FROM ir_model_field WHERE model_id = $1 AND source = 'blueprint'",
+    )
+    .bind(model_id)
+    .fetch_all(db)
+    .await
+    .map_err(dberr)?;
+    let current_names: std::collections::HashSet<String> =
+        current.iter().map(|r| r.get::<String, _>("name")).collect();
+
+    let mut tx = db.begin().await.map_err(dberr)?;
+    let mut dropped: Vec<String> = Vec::new();
+    let mut added: Vec<String> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
+
+    // Drop fields not in the target version. The display `name` field is never
+    // dropped (it's the record's identity).
+    for row in &current {
+        let n: String = row.get("name");
+        if n == "name" || target_names.contains(&n) {
+            continue;
+        }
+        let computed: bool = row.try_get("is_computed").unwrap_or(false);
+        if !computed {
+            ddl::drop_column(&mut tx, &table, &n, blueprint_id)
+                .await
+                .map_err(|e| format!("drop column '{n}' failed: {e}"))?;
+        }
+        sqlx::query("DELETE FROM ir_model_field WHERE model_id = $1 AND name = $2 AND source = 'blueprint'")
+            .bind(model_id).bind(&n)
+            .execute(&mut *tx).await.map_err(dberr)?;
+        dropped.push(n);
+    }
+
+    // Re-add fields the target version had but that are gone now.
+    for f in &target_fields {
+        let n = f.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        if n.is_empty() || n == "name" || current_names.contains(n) {
+            continue;
+        }
+        if recreate_field_in_tx(&mut tx, db, model_id, blueprint_id, &table, f).await? {
+            added.push(n.to_string());
+        } else {
+            skipped.push(n.to_string());
+        }
+    }
+
+    record_version(&mut tx, blueprint_id, model_id, user).await?;
+    tx.commit().await.map_err(dberr)?;
+
+    audit(
+        state,
+        db_name,
+        user,
+        "blueprint_restored",
+        AuditSeverity::Warning,
+        model,
+        serde_json::json!({
+            "restored_to_version": target_version,
+            "dropped": dropped,
+            "added": added,
+            "skipped": skipped,
+        }),
+    )
+    .await;
+    Ok(())
+}
+
 /// Compute the normalized layout to apply. `existing` is the blueprint's field
 /// names in their current order; `orders` maps a field name to a desired ordinal
 /// (lower = earlier); `list_fields` is the set of fields to keep as generic-list
@@ -930,6 +1130,7 @@ pub enum BlueprintOp {
     },
     RenameField { model: String, from: String, new_label: String },
     RemoveField { model: String, name: String },
+    Restore { model: String, version: i32 },
     Archive { model: String },
 }
 
@@ -940,7 +1141,8 @@ impl BlueprintOp {
             BlueprintOp::Create { .. } => "blueprint.create",
             BlueprintOp::AddField { .. }
             | BlueprintOp::RenameField { .. }
-            | BlueprintOp::RemoveField { .. } => "blueprint.alter",
+            | BlueprintOp::RemoveField { .. }
+            | BlueprintOp::Restore { .. } => "blueprint.alter",
             BlueprintOp::Archive { .. } => "blueprint.delete",
         }
     }
@@ -953,6 +1155,7 @@ impl BlueprintOp {
             BlueprintOp::AddField { model, .. }
             | BlueprintOp::RenameField { model, .. }
             | BlueprintOp::RemoveField { model, .. }
+            | BlueprintOp::Restore { model, .. }
             | BlueprintOp::Archive { model } => model.clone(),
         }
     }
@@ -963,6 +1166,7 @@ impl BlueprintOp {
             BlueprintOp::AddField { .. } => "add_field",
             BlueprintOp::RenameField { .. } => "rename_field",
             BlueprintOp::RemoveField { .. } => "remove_field",
+            BlueprintOp::Restore { .. } => "restore",
             BlueprintOp::Archive { .. } => "archive",
         }
     }
@@ -978,6 +1182,7 @@ impl BlueprintOp {
                 format!("Rename “{from}” → “{new_label}” on {model}")
             }
             BlueprintOp::RemoveField { model, name } => format!("Delete field “{name}” from {model}"),
+            BlueprintOp::Restore { model, version } => format!("Restore {model} to version {version}"),
             BlueprintOp::Archive { model } => format!("Archive {model}"),
         }
     }
@@ -1061,6 +1266,9 @@ async fn execute_op(
         }
         BlueprintOp::RemoveField { model, name } => {
             remove_field(state, db, db_name, user, model, name).await.map(|_| None)
+        }
+        BlueprintOp::Restore { model, version } => {
+            restore_version(state, db, db_name, user, model, *version).await.map(|_| None)
         }
         BlueprintOp::Archive { model } => {
             archive(state, db, db_name, user, model).await.map(|_| None)

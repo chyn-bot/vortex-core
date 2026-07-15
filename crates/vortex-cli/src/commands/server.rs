@@ -2303,6 +2303,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/blueprints/{model}/menu", post(blueprint_toggle_menu))
         .route("/blueprints/{model}/enable-stages", post(blueprint_enable_stages))
         .route("/blueprints/{model}/history", get(blueprint_history))
+        .route("/blueprints/{model}/restore", post(blueprint_restore))
         .route("/blueprints/{model}/layout", post(blueprint_set_layout))
         .route("/blueprints/{model}/fields", post(blueprint_add_field))
         .route("/blueprints/{model}/fields/{name}/rename", post(blueprint_rename_field))
@@ -6992,6 +6993,42 @@ async fn blueprint_add_field(
     }
 }
 
+#[derive(serde::Deserialize)]
+struct BlueprintRestoreForm {
+    version: i32,
+}
+
+/// POST /blueprints/{model}/restore — restore the field set to an earlier
+/// version (governed; may drop columns, so the history UI confirms data loss).
+async fn blueprint_restore(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(model): Path<String>,
+    Form(form): Form<BlueprintRestoreForm>,
+) -> Response {
+    if !user.is_admin() {
+        return blueprint_forbidden();
+    }
+    use vortex_framework::blueprint::{BlueprintOp, SubmitOutcome};
+    match vortex_framework::blueprint::submit(
+        &state,
+        &db,
+        &db_ctx.db_name,
+        &user,
+        BlueprintOp::Restore { model: model.clone(), version: form.version },
+    )
+    .await
+    {
+        Ok(SubmitOutcome::Applied { .. }) => {
+            Redirect::to(&format!("/blueprints/{model}/history")).into_response()
+        }
+        Ok(SubmitOutcome::Pending) => Redirect::to("/blueprints/approvals").into_response(),
+        Err(e) => error_response(&e),
+    }
+}
+
 async fn blueprint_rename_field(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
@@ -7265,7 +7302,9 @@ async fn blueprint_history(
     .unwrap_or_default();
 
     // Build the diff for each version against its predecessor, then render
-    // newest-first.
+    // newest-first. The highest version is the current state — every earlier one
+    // gets a "Restore" control.
+    let latest_version: i32 = versions.iter().map(|v| v.get::<i32, _>("version")).max().unwrap_or(0);
     let mut entries: Vec<String> = Vec::new();
     let mut prev_def: Option<serde_json::Value> = None;
     for v in &versions {
@@ -7301,14 +7340,28 @@ async fn blueprint_history(
                 })
                 .collect::<String>()
         };
+        // Current version = no restore; earlier versions get a data-loss-warned
+        // Restore button that reconciles the field set back to that snapshot.
+        let restore_btn = if vnum == latest_version {
+            r#"<span class="badge badge-ghost badge-sm">current</span>"#.to_string()
+        } else {
+            format!(
+                r#"<form method="POST" action="/blueprints/{model}/restore" onsubmit="return confirm('Restore to version {vnum}? Fields added since then will be DROPPED and their data permanently lost. This is recorded as a new version.');">
+<input type="hidden" name="version" value="{vnum}"/>
+<button class="btn btn-ghost btn-xs text-warning" title="Restore the field set to this version">↩ Restore</button></form>"#,
+                model = html_escape(&model),
+                vnum = vnum,
+            )
+        };
         entries.push(format!(
             r#"<div class="card bg-base-100 shadow-sm border border-base-300"><div class="card-body p-4">
 <div class="flex items-center justify-between mb-2"><h3 class="font-semibold">Version {vnum}</h3>
-<span class="text-xs opacity-60">{by} · {at}</span></div>
+<div class="flex items-center gap-2"><span class="text-xs opacity-60">{by} · {at}</span>{restore_btn}</div></div>
 {changes}</div></div>"#,
             vnum = vnum,
             by = html_escape(applied_by.as_deref().unwrap_or("system")),
             at = applied_at.format("%Y-%m-%d %H:%M UTC"),
+            restore_btn = restore_btn,
             changes = change_html,
         ));
         prev_def = Some(def);
