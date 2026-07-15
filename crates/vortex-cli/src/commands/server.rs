@@ -22603,21 +22603,12 @@ async fn render_dynamic_form(
     let single_section = section_order.len() <= 1;
     for section in &section_order {
         // With only one section, the section heading is redundant with the form
-        // title, so suppress it and just lay the fields out.
-        let heading = if single_section {
-            String::new()
-        } else {
-            format!(
-                r#"<h2 class="text-xs font-semibold uppercase tracking-wider text-base-content/50 border-b border-base-300 pb-2 mb-4">{}</h2>"#,
-                html_escape(section)
-            )
-        };
-        sections_html.push_str(&format!(
-            r#"<section class="break-inside-avoid mb-8">{heading}
-<div class="grid grid-cols-1 md:grid-cols-2 gap-x-6">{fields}</div>
-</section>"#,
-            heading = heading,
-            fields = section_bodies.get(section).map(String::as_str).unwrap_or(""),
+        // title, so suppress it. `form_section` is the shared sheet primitive so
+        // the generic form and core forms render identical field groups.
+        let heading = if single_section { "" } else { section.as_str() };
+        sections_html.push_str(&vortex_framework::form::form_section(
+            heading,
+            section_bodies.get(section).map(String::as_str).unwrap_or(""),
         ));
     }
 
@@ -22688,35 +22679,33 @@ async fn render_dynamic_form(
         None => (String::new(), String::new()),
     };
 
-    let body = format!(
-        r##"<div class="max-w-5xl mx-auto">
-<div class="mb-3">
-    <a href="/list/{model}" class="btn btn-ghost btn-sm">← Back to List</a>
-</div>
-{stagebar}
-<form method="post" action="{action}">
-    <div class="bg-base-100 rounded-lg shadow-sm border border-base-300 p-6 md:p-8">
-        <h1 class="text-2xl font-bold mb-6">{title}</h1>
-        <div class="columns-1 lg:columns-2 gap-x-10">
-        {fields}
-        </div>
-    </div>
-    <div class="flex justify-end gap-2 mt-4">
-        <a href="/list/{model}" class="btn btn-ghost">Cancel</a>
-        <button type="submit" class="btn btn-primary">{submit}</button>
-    </div>
-</form>
-<div class="mt-8 flex flex-col gap-6">{activity}{history}</div>
-</div>"##,
-        model = model_name,
-        title = title,
-        stagebar = stage_bar,
-        action = action_url,
-        fields = sections_html,
-        submit = submit_text,
-        activity = activity_panel,
-        history = history_panel,
+    // Compose the canonical record-form sheet (shared with core forms via the
+    // vortex_framework::form primitive). Sections lay out two-up as a masonry so
+    // a short section next to a tall one packs tightly; the sheet itself is
+    // wider than the old max-w-5xl so it fills the main column instead of
+    // stranding a large gutter on wide screens.
+    let list_href = format!("/list/{}", model_name);
+    let inner = format!(
+        r#"<div class="columns-1 lg:columns-2 gap-x-10">{}</div>"#,
+        sections_html
     );
+    let footer = format!(
+        r#"<a href="{cancel}" class="btn btn-ghost">Cancel</a><button type="submit" class="btn btn-primary">{submit}</button>"#,
+        cancel = list_href,
+        submit = submit_text,
+    );
+    let form_attrs = format!(r#"method="post" action="{}""#, action_url);
+    let below = format!("{}{}", activity_panel, history_panel);
+    let body = vortex_framework::form::render_form_sheet(&vortex_framework::form::FormSheet {
+        max_width: vortex_framework::form::SHEET_WIDTH,
+        back_href: &list_href,
+        control_row: &stage_bar,
+        form_attrs: &form_attrs,
+        title: &title,
+        inner: &inner,
+        footer: &footer,
+        below: &below,
+    });
 
     Html(vortex_framework::render_app_shell(&title, &sidebar, &body)).into_response()
 }
