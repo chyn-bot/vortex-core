@@ -305,6 +305,16 @@ mod tests {
         assert!(html.contains("Details"));
         assert!(html.contains("action=\"/items/create\""));
         assert!(html.contains("Name is required"));
+        // Contract: the config-driven form engine — which every scaffolded
+        // plugin routes its create/edit forms through — MUST emit the canonical
+        // centered sheet. If this breaks, new plugins silently drift off the
+        // core form UI, so pin the sheet's structural markers here.
+        assert!(html.contains(crate::form::SHEET_WIDTH), "render_form must use the sheet width");
+        assert!(
+            html.contains("bg-base-100 rounded-lg shadow-sm border border-base-300"),
+            "render_form must wrap fields in the sheet container"
+        );
+        assert!(!html.contains("card bg-base-100 shadow"), "render_form must not use floating cards");
 
         let html = render_form(
             &pool, &c, FormMode::Edit, Some("abc-123"),
