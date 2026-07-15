@@ -711,6 +711,133 @@ pub async fn set_layout(
     Ok(())
 }
 
+/// Enable the stage workflow (status bar) for a Blueprint: add the
+/// `record_state` column to its table if missing and, the first time only, seed
+/// a starter Draft → In Progress → Done set of stages plus the two transition
+/// buttons that move between them — so the bar works immediately. Admins then
+/// refine stages/buttons from Settings → Stages (both are generic per-model
+/// catalogs). Idempotent; presentation-level metadata + a column add, so it
+/// applies directly with no approval gate (like the menu toggle).
+pub async fn enable_stages(
+    state: &AppState,
+    db: &PgPool,
+    db_name: &str,
+    user: &AuthUser,
+    model: &str,
+) -> Result<(), String> {
+    gate(state, user, "blueprint.alter", model).await?;
+    let (model_id, blueprint_id, table) = resolve(db, model).await?;
+    if table.is_empty() || !table.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Err("Invalid table name".to_string());
+    }
+    let mut tx = db.begin().await.map_err(dberr)?;
+
+    // 1. record_state column (idempotent — safe to click twice).
+    sqlx::query(&format!(
+        "ALTER TABLE {table} ADD COLUMN IF NOT EXISTS record_state VARCHAR(64)"
+    ))
+    .execute(&mut *tx)
+    .await
+    .map_err(dberr)?;
+
+    // 2. Seed a working starter workflow the first time only. If the admin has
+    //    already defined stages for this model, leave them untouched.
+    let have: i64 = sqlx::query_scalar("SELECT count(*) FROM record_stages WHERE model = $1")
+        .bind(model)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(dberr)?;
+    if have == 0 {
+        for (i, (code, label, color)) in [
+            ("draft", "Draft", "neutral"),
+            ("in_progress", "In Progress", "info"),
+            ("done", "Done", "success"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            sqlx::query(
+                "INSERT INTO record_stages (model, code, label, color, sequence, always_visible, locked, active) \
+                 VALUES ($1, $2, $3, $4, $5, true, false, true)",
+            )
+            .bind(model)
+            .bind(code)
+            .bind(label)
+            .bind(color)
+            .bind((i as i32 + 1) * 10)
+            .execute(&mut *tx)
+            .await
+            .map_err(dberr)?;
+        }
+        for (i, (label, from, to, color)) in [
+            ("Start", "draft", "in_progress", "info"),
+            ("Mark Done", "in_progress", "done", "success"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            sqlx::query(
+                "INSERT INTO record_stage_actions (model, label, target_stage, from_stage, color, sequence, active) \
+                 VALUES ($1, $2, $3, $4, $5, $6, true)",
+            )
+            .bind(model)
+            .bind(label)
+            .bind(to)
+            .bind(from)
+            .bind(color)
+            .bind((i as i32 + 1) * 10)
+            .execute(&mut *tx)
+            .await
+            .map_err(dberr)?;
+        }
+    }
+
+    // 3. Give every existing row the first stage so the bar always has a value.
+    sqlx::query(&format!(
+        "UPDATE {table} SET record_state = 'draft' WHERE record_state IS NULL"
+    ))
+    .execute(&mut *tx)
+    .await
+    .map_err(dberr)?;
+
+    record_version(&mut tx, blueprint_id, model_id, user).await?;
+    tx.commit().await.map_err(dberr)?;
+
+    audit(
+        state,
+        db_name,
+        user,
+        "blueprint_stages_enabled",
+        AuditSeverity::Info,
+        model,
+        serde_json::json!({ "seeded_starter_workflow": have == 0 }),
+    )
+    .await;
+    Ok(())
+}
+
+/// Does this Blueprint's table have the `record_state` column (i.e. are stages
+/// enabled)? Best-effort — a false is also returned on any query error.
+pub async fn stages_enabled(db: &PgPool, model: &str) -> bool {
+    let table: Option<String> =
+        sqlx::query_scalar("SELECT table_name FROM ir_model WHERE name = $1 AND source = 'blueprint'")
+            .bind(model)
+            .fetch_optional(db)
+            .await
+            .ok()
+            .flatten();
+    let Some(table) = table else { return false };
+    sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM information_schema.columns \
+         WHERE table_schema = 'public' AND table_name = $1 AND column_name = 'record_state'",
+    )
+    .bind(&table)
+    .fetch_one(db)
+    .await
+    .map(|n| n > 0)
+    .unwrap_or(false)
+}
+
 /// Archive a Blueprint: soft-delete (status='archived', model inactive). The
 /// generated table and its data are preserved — a hard drop is a separate,
 /// deliberate admin path (Phase 1b/later).

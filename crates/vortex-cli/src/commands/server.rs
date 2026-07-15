@@ -2301,6 +2301,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/blueprints/{model}", get(blueprint_designer))
         .route("/blueprints/{model}/archive", post(blueprint_archive))
         .route("/blueprints/{model}/menu", post(blueprint_toggle_menu))
+        .route("/blueprints/{model}/enable-stages", post(blueprint_enable_stages))
         .route("/blueprints/{model}/history", get(blueprint_history))
         .route("/blueprints/{model}/layout", post(blueprint_set_layout))
         .route("/blueprints/{model}/fields", post(blueprint_add_field))
@@ -2511,6 +2512,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/form/{model}", post(dynamic_form_create))
         .route("/form/{model}/{id}", get(dynamic_form_edit))
         .route("/form/{model}/{id}", post(dynamic_form_update))
+        .route("/form/{model}/{id}/stage/{target}", post(dynamic_form_stage))
         // API endpoints
         .route("/api/notifications", get(api_notifications))
         .route("/api/countries", get(api_countries))
@@ -6866,12 +6868,17 @@ async fn blueprint_designer(
         )
     };
 
+    // Whether this Blueprint's table already has a record_state column (stages
+    // enabled) — drives the header's "Enable stages" vs "Stages" control.
+    let stages_on = vortex_framework::blueprint::stages_enabled(&db, &model).await;
+
     let body = format!(
         r#"<div class="flex justify-between items-center mb-6">
 <div><div class="flex items-center gap-2"><a href="/blueprints" class="btn btn-ghost btn-sm btn-square">←</a><h1 class="text-2xl font-bold">{label}</h1><span class="badge badge-ghost">{status}</span></div>
 <p class="text-base-content/60 mt-1">Technical name <code>{model}</code></p></div>
 <div class="flex gap-2"><a href="/list/{model}" class="btn btn-primary">Open records →</a>
 {menu_btn}
+{stages_btn}
 <a href="/blueprints/{model}/history" class="btn btn-ghost">History</a>
 <a href="/blueprints/{model}/export" class="btn btn-ghost">Export</a>
 <form action="/blueprints/{model}/archive" method="POST" onsubmit="return confirm('Archive this Blueprint? Its records are kept.')"><button class="btn btn-ghost text-error">Archive</button></form></div>
@@ -6904,6 +6911,11 @@ async fn blueprint_designer(
             format!(r#"<form action="/blueprints/{m}/menu" method="POST"><input type="hidden" name="show" value="0"><button class="btn btn-ghost" title="Remove this app from the sidebar">✓ In menu — remove</button></form>"#, m = html_escape(&model))
         } else {
             format!(r#"<form action="/blueprints/{m}/menu" method="POST"><input type="hidden" name="show" value="1"><button class="btn btn-ghost" title="Add this app to the sidebar navigation">+ Add to menu</button></form>"#, m = html_escape(&model))
+        },
+        stages_btn = if stages_on {
+            r#"<a href="/settings/stages" class="btn btn-ghost" title="Edit this app's stages and transition buttons">Stages ⚙</a>"#.to_string()
+        } else {
+            format!(r#"<form action="/blueprints/{m}/enable-stages" method="POST" onsubmit="return confirm('Enable a stage workflow (status bar) for this app? This adds a status column and a starter Draft → In Progress → Done flow you can then customise in Settings → Stages.')"><button class="btn btn-ghost" title="Add a status-bar workflow to this app">+ Enable stages</button></form>"#, m = html_escape(&model))
         },
     );
     blueprint_shell(
@@ -7077,6 +7089,106 @@ async fn blueprint_toggle_menu(
     )
     .await;
     Redirect::to(&format!("/blueprints/{model}")).into_response()
+}
+
+/// POST /blueprints/{model}/enable-stages — turn on the stage workflow (status
+/// bar) for a Blueprint: adds a `record_state` column and, the first time,
+/// seeds a starter Draft → In Progress → Done workflow with transition buttons.
+/// Admin-only; the service audits + versions. No approval gate (it's a column
+/// add + presentation metadata, like the menu toggle).
+async fn blueprint_enable_stages(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(model): Path<String>,
+) -> Response {
+    if !user.is_admin() {
+        return blueprint_forbidden();
+    }
+    match vortex_framework::blueprint::enable_stages(&state, &db, &db_ctx.db_name, &user, &model)
+        .await
+    {
+        Ok(()) => Redirect::to(&format!("/blueprints/{model}")).into_response(),
+        Err(e) => error_response(&e),
+    }
+}
+
+/// POST /form/{model}/{id}/stage/{target} — move a record to a new stage from
+/// the generic form's status bar. Gated by exactly the rules the buttons render
+/// with (`StageActions::can_transition`), so a hand-crafted POST can't reach a
+/// transition the user wouldn't be shown.
+async fn dynamic_form_stage(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path((model, id, target)): Path<(String, uuid::Uuid, String)>,
+) -> Response {
+    let table: Option<String> =
+        sqlx::query_scalar("SELECT table_name FROM ir_model WHERE name = $1 AND is_active = true")
+            .bind(&model)
+            .fetch_optional(&db)
+            .await
+            .ok()
+            .flatten();
+    let Some(table) = table else {
+        return (StatusCode::NOT_FOUND, Html("Model not found")).into_response();
+    };
+    if !validate_identifier(&table) {
+        return (StatusCode::BAD_REQUEST, Html("Invalid model")).into_response();
+    }
+
+    let current: String = sqlx::query_scalar::<_, Option<String>>(&format!(
+        "SELECT record_state FROM {table} WHERE id = $1"
+    ))
+    .bind(id)
+    .fetch_optional(&db)
+    .await
+    .ok()
+    .flatten()
+    .flatten()
+    .unwrap_or_default();
+
+    // Both gates mirror what the bar/buttons would render: the target must be a
+    // real stage, and the current→target move must be one this user may make.
+    let bar = vortex_framework::StatusBar::from_db(&db, &model, &table, "record_state").await;
+    if !bar.is_valid(&target) {
+        return error_response("Unknown stage.");
+    }
+    let actions = vortex_framework::StageActions::from_db(&db, &model).await;
+    if !actions.can_transition(&current, &target, &user.roles) {
+        return (
+            StatusCode::FORBIDDEN,
+            Html(forbidden_page("You cannot make that stage change.")),
+        )
+            .into_response();
+    }
+
+    if let Err(e) = sqlx::query(&format!(
+        "UPDATE {table} SET record_state = $1, updated_at = now() WHERE id = $2"
+    ))
+    .bind(&target)
+    .bind(id)
+    .execute(&db)
+    .await
+    {
+        return error_response(&format!("Could not change stage: {e}"));
+    }
+
+    api_audit(
+        &state,
+        &db_ctx.db_name,
+        &user,
+        AuditAction::Custom("record_stage_changed".into()),
+        AuditSeverity::Info,
+        &model,
+        Some(&id.to_string()),
+        serde_json::json!({ "from": current, "to": target }),
+    )
+    .await;
+
+    Redirect::to(&format!("/form/{model}/{id}")).into_response()
 }
 
 /// GET /blueprints/{model}/history — the schema-history timeline. Renders each
@@ -22446,6 +22558,35 @@ async fn render_dynamic_form(
         &apps,
     );
 
+    // Stage status bar — for a saved record whose Blueprint has stages enabled
+    // (a `record_state` column, present here as a key in `record_data`, plus
+    // stages defined in `record_stages`). Reuses the core StatusBar/StageActions
+    // widgets; the role-gated transition buttons POST to the gated
+    // /form/{model}/{id}/stage/{target} endpoint. New (unsaved) records show no
+    // bar — there's nothing to transition yet.
+    let stage_bar = match record_id {
+        Some(rid) => {
+            let state_val = record_data.get("record_state").cloned().unwrap_or_default();
+            if state_val.is_empty() {
+                String::new()
+            } else {
+                let bar = vortex_framework::StatusBar::from_db(db, model_name, &table_name, "record_state").await;
+                if bar.has_stages() {
+                    let actions = vortex_framework::StageActions::from_db(db, model_name).await;
+                    let base = format!("/form/{}/{}/stage", model_name, rid);
+                    format!(
+                        r#"<div class="mb-4 flex flex-wrap items-center justify-between gap-3"><div>{}</div><div>{}</div></div>"#,
+                        bar.render(&state_val, &base),
+                        actions.render(&state_val, &user.roles, &base),
+                    )
+                } else {
+                    String::new()
+                }
+            }
+        }
+        None => String::new(),
+    };
+
     // Activity stream (chatter) + History (audit trail) — same record primitives
     // every plugin record page uses. Only meaningful for an existing record, so
     // a brand-new form shows neither. `model_name` is the res_model/resource_type
@@ -22465,6 +22606,7 @@ async fn render_dynamic_form(
 
 <div class="card bg-base-100 shadow max-w-4xl">
     <div class="card-body">
+        {stagebar}
         <h2 class="card-title">{title}</h2>
 
         <form method="post" action="{action}">
@@ -22481,6 +22623,7 @@ async fn render_dynamic_form(
 <div class="max-w-4xl mt-6 flex flex-col gap-6">{activity}{history}</div>"##,
         model = model_name,
         title = title,
+        stagebar = stage_bar,
         action = action_url,
         fields = form_fields,
         submit = submit_text,

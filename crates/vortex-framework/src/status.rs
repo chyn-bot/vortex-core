@@ -279,6 +279,12 @@ impl StatusBar {
         self.stages.iter().any(|s| s.value == value)
     }
 
+    /// Does this model have any stages defined? Lets a caller skip rendering an
+    /// empty bar for a model that hasn't configured a workflow.
+    pub fn has_stages(&self) -> bool {
+        !self.stages.is_empty()
+    }
+
     fn label_of(&self, value: &str) -> String {
         self.stages
             .iter()
