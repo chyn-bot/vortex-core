@@ -6773,25 +6773,48 @@ async fn blueprint_designer(
     })
     .unwrap_or_default();
 
-    // Layout rows: an order box, a form-width picker, and a "list column"
-    // checkbox per field, submitted as one form (order__<f> / width__<f> /
-    // list__<f>). Sequence drives order in both the generic form and list;
-    // col_span lays the form out in two columns; is_visible drives list-column
-    // membership.
+    // Per-field section (card grouping), read best-effort like col_span — a DB
+    // predating migration 154 has no `section` column, so these default empty.
+    let section_map: std::collections::HashMap<String, String> = sqlx::query(
+        "SELECT name, section FROM ir_model_field WHERE model_id = $1 AND source = 'blueprint'",
+    )
+    .bind(model_id)
+    .fetch_all(&db)
+    .await
+    .map(|rows| {
+        rows.iter()
+            .filter_map(|r| {
+                r.try_get::<Option<String>, _>("section")
+                    .ok()
+                    .flatten()
+                    .map(|s| (r.get::<String, _>("name"), s))
+            })
+            .collect()
+    })
+    .unwrap_or_default();
+
+    // Layout rows: an order box, a form-width picker, a section name, and a
+    // "list column" checkbox per field, submitted as one form (order__<f> /
+    // width__<f> / section__<f> / list__<f>). Sequence drives order in both the
+    // generic form and list; col_span + section lay the form out in section
+    // cards / two columns; is_visible drives list-column membership.
     let mut layout_rows = String::new();
     for (idx, f) in fields.iter().enumerate() {
         let fname: String = f.get("name");
         let flabel: String = f.get("display_name");
         let in_list: bool = f.get("is_visible");
         let span = width_map.get(&fname).copied().unwrap_or(2);
+        let section = section_map.get(&fname).cloned().unwrap_or_default();
         layout_rows.push_str(&format!(
             r#"<tr class="hover"><td>{flabel} <code class="text-xs opacity-60">{fname}</code></td>
 <td><input type="number" name="order__{fname}" value="{ord}" class="input input-bordered input-xs w-20"/></td>
+<td><input type="text" name="section__{fname}" value="{section}" placeholder="General" class="input input-bordered input-xs w-32"/></td>
 <td><select name="width__{fname}" class="select select-bordered select-xs"><option value="2"{full}>Full</option><option value="1"{half}>Half</option></select></td>
 <td class="text-center"><input type="checkbox" name="list__{fname}" class="checkbox checkbox-sm"{checked}/></td></tr>"#,
             flabel = html_escape(&flabel),
             fname = html_escape(&fname),
             ord = (idx + 1) * 10,
+            section = html_escape(&section),
             full = if span >= 2 { " selected" } else { "" },
             half = if span <= 1 { " selected" } else { "" },
             checked = if in_list { " checked" } else { "" },
@@ -6845,9 +6868,9 @@ async fn blueprint_designer(
         format!(
             r#"<div class="card bg-base-100 shadow mb-6 max-w-2xl"><div class="card-body p-4">
 <h2 class="card-title text-base mb-1">Layout</h2>
-<p class="text-sm opacity-60 mb-3">Order drives both the form and the list. Set a field to <em>Half</em> width to place it beside the next Half field (two per row on wide screens). Untick <em>List column</em> to hide a field from the list view — it stays editable on the form.</p>
+<p class="text-sm opacity-60 mb-3">Order drives both the form and the list. <em>Section</em> groups fields into cards (blank = General); sections lay out two-up across the full width like the Contacts form. Set a field to <em>Half</em> width to place it beside the next Half field in its section. Untick <em>List column</em> to hide a field from the list view — it stays editable on the form.</p>
 <form action="/blueprints/{model}/layout" method="POST">
-<table class="table table-sm"><thead><tr><th>Field</th><th>Order</th><th>Form width</th><th class="text-center">List column</th></tr></thead>
+<table class="table table-sm"><thead><tr><th>Field</th><th>Order</th><th>Section</th><th>Form width</th><th class="text-center">List column</th></tr></thead>
 <tbody>{layout_rows}</tbody></table>
 <div class="mt-3"><button class="btn btn-primary btn-sm">Save layout</button></div>
 </form></div></div>"#,
@@ -7512,6 +7535,7 @@ async fn blueprint_set_layout(
     let mut orders: std::collections::HashMap<String, i32> = std::collections::HashMap::new();
     let mut list_fields: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut widths: std::collections::HashMap<String, i16> = std::collections::HashMap::new();
+    let mut sections: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for (k, v) in &pairs {
         if let Some(name) = k.strip_prefix("order__") {
             if let Ok(n) = v.trim().parse::<i32>() {
@@ -7523,6 +7547,8 @@ async fn blueprint_set_layout(
             if let Ok(n) = v.trim().parse::<i16>() {
                 widths.insert(name.to_string(), n);
             }
+        } else if let Some(name) = k.strip_prefix("section__") {
+            sections.insert(name.to_string(), v.clone());
         }
     }
     match vortex_framework::blueprint::set_layout(
@@ -7534,6 +7560,7 @@ async fn blueprint_set_layout(
         &orders,
         &list_fields,
         &widths,
+        &sections,
     )
     .await
     {
@@ -22340,6 +22367,27 @@ async fn render_dynamic_form(
     })
     .unwrap_or_default();
 
+    // Per-field section (card grouping), read best-effort like col_span so a DB
+    // predating migration 154 still renders (every field falls into "General").
+    let section_map: std::collections::HashMap<String, String> = sqlx::query(
+        "SELECT name, section FROM ir_model_field WHERE model_id = $1",
+    )
+    .bind(model_id)
+    .fetch_all(db)
+    .await
+    .map(|rows| {
+        rows.iter()
+            .filter_map(|r| {
+                r.try_get::<Option<String>, _>("section")
+                    .ok()
+                    .flatten()
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|s| (r.get::<String, _>("name"), s))
+            })
+            .collect()
+    })
+    .unwrap_or_default();
+
     // Fetch existing record if editing
     let record_data: std::collections::HashMap<String, String> = if let Some(rid) = record_id {
         let query = format!("SELECT * FROM {} WHERE id = $1", table_name);
@@ -22382,8 +22430,12 @@ async fn render_dynamic_form(
             .collect()
     };
 
-    // Build form fields HTML
-    let mut form_fields = String::new();
+    // Build form fields HTML, grouped into sections (cards). Section order is
+    // first-appearance in field order; a field with no section lands in
+    // "General". Each section's fields are accumulated as a string of field
+    // divs, later wrapped in a card + inner 2-col grid.
+    let mut section_order: Vec<String> = Vec::new();
+    let mut section_bodies: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for field in &fields {
         let field_name: String = field.get("name");
         let display_name: String = field.get("display_name");
@@ -22523,12 +22575,49 @@ async fn render_dynamic_form(
 
         let required_badge = "";  // Can add required indicator later based on field metadata
 
-        form_fields.push_str(&format!(
+        let field_html = format!(
             r#"<div class="form-control mb-4 {}">
                 <label class="label"><span class="label-text">{} {}</span></label>
                 {}
             </div>"#,
             span_class, display_name, required_badge, input_html
+        );
+
+        let section = section_map
+            .get(&field_name)
+            .cloned()
+            .unwrap_or_else(|| "General".to_string());
+        if !section_bodies.contains_key(&section) {
+            section_order.push(section.clone());
+        }
+        section_bodies.entry(section).or_default().push_str(&field_html);
+    }
+
+    // Wrap each section's fields in a card (title + inner 2-col field grid). The
+    // cards flow into a 2-column masonry in the body, so the form uses the full
+    // width like the Contacts form instead of one narrow column.
+    // Sections render as flat labeled groups (an uppercase heading + a rule),
+    // NOT elevated cards — so inside the single form "sheet" they read as one
+    // tidy document (Odoo-style) instead of cards floating on the background.
+    let mut sections_html = String::new();
+    let single_section = section_order.len() <= 1;
+    for section in &section_order {
+        // With only one section, the section heading is redundant with the form
+        // title, so suppress it and just lay the fields out.
+        let heading = if single_section {
+            String::new()
+        } else {
+            format!(
+                r#"<h2 class="text-xs font-semibold uppercase tracking-wider text-base-content/50 border-b border-base-300 pb-2 mb-4">{}</h2>"#,
+                html_escape(section)
+            )
+        };
+        sections_html.push_str(&format!(
+            r#"<section class="break-inside-avoid mb-8">{heading}
+<div class="grid grid-cols-1 md:grid-cols-2 gap-x-6">{fields}</div>
+</section>"#,
+            heading = heading,
+            fields = section_bodies.get(section).map(String::as_str).unwrap_or(""),
         ));
     }
 
@@ -22600,32 +22689,30 @@ async fn render_dynamic_form(
     };
 
     let body = format!(
-        r##"<div class="mb-6">
+        r##"<div class="max-w-5xl mx-auto">
+<div class="mb-3">
     <a href="/list/{model}" class="btn btn-ghost btn-sm">← Back to List</a>
 </div>
-
-<div class="card bg-base-100 shadow max-w-4xl">
-    <div class="card-body">
-        {stagebar}
-        <h2 class="card-title">{title}</h2>
-
-        <form method="post" action="{action}">
-            <div class="grid grid-cols-1 md:grid-cols-2 gap-x-6">
-            {fields}
-            </div>
-            <div class="card-actions justify-end mt-6">
-                <a href="/list/{model}" class="btn btn-ghost">Cancel</a>
-                <button type="submit" class="btn btn-primary">{submit}</button>
-            </div>
-        </form>
+{stagebar}
+<form method="post" action="{action}">
+    <div class="bg-base-100 rounded-lg shadow-sm border border-base-300 p-6 md:p-8">
+        <h1 class="text-2xl font-bold mb-6">{title}</h1>
+        <div class="columns-1 lg:columns-2 gap-x-10">
+        {fields}
+        </div>
     </div>
-</div>
-<div class="max-w-4xl mt-6 flex flex-col gap-6">{activity}{history}</div>"##,
+    <div class="flex justify-end gap-2 mt-4">
+        <a href="/list/{model}" class="btn btn-ghost">Cancel</a>
+        <button type="submit" class="btn btn-primary">{submit}</button>
+    </div>
+</form>
+<div class="mt-8 flex flex-col gap-6">{activity}{history}</div>
+</div>"##,
         model = model_name,
         title = title,
         stagebar = stage_bar,
         action = action_url,
-        fields = form_fields,
+        fields = sections_html,
         submit = submit_text,
         activity = activity_panel,
         history = history_panel,
