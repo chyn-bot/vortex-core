@@ -408,6 +408,7 @@ async fn resolve_relation_target(db: &PgPool, target_model: &str) -> Result<Stri
 /// stores its options; `many2one` adds a real UUID FK to another Blueprint and
 /// stores the target's model name in `related_model` (which the generic layer
 /// uses to render the picker and resolve labels).
+#[allow(clippy::too_many_arguments)]
 pub async fn add_field(
     state: &AppState,
     db: &PgPool,
@@ -418,6 +419,8 @@ pub async fn add_field(
     field_type: &str,
     related_model: Option<&str>,
     options_raw: Option<&str>,
+    is_required: bool,
+    is_unique: bool,
 ) -> Result<(), String> {
     let col = slugify(label);
     ddl::validate_identifier(&col).map_err(|e| format!("invalid field name: {e}"))?;
@@ -476,6 +479,14 @@ pub async fn add_field(
             .map_err(|e| format!("add column failed: {e}"))?,
     }
 
+    // Uniqueness is enforced by a real partial index on the fresh column; on a
+    // brand-new field every value is NULL, so this never conflicts at creation.
+    if is_unique {
+        ddl::add_unique_index(&mut tx, &table, &col, blueprint_id)
+            .await
+            .map_err(|e| format!("add unique constraint failed: {e}"))?;
+    }
+
     let seq: i32 =
         sqlx::query_scalar("SELECT COALESCE(MAX(sequence), 0) + 10 FROM ir_model_field WHERE model_id = $1")
             .bind(model_id)
@@ -486,8 +497,8 @@ pub async fn add_field(
     sqlx::query(
         "INSERT INTO ir_model_field
             (model_id, name, display_name, field_type, sequence, source, is_custom, is_visible,
-             related_model, selection_options)
-         VALUES ($1, $2, $3, $4, $5, 'blueprint', false, true, $6, $7)",
+             related_model, selection_options, is_required, is_unique)
+         VALUES ($1, $2, $3, $4, $5, 'blueprint', false, true, $6, $7, $8, $9)",
     )
     .bind(model_id)
     .bind(&col)
@@ -496,6 +507,8 @@ pub async fn add_field(
     .bind(seq)
     .bind(&related)
     .bind(&selection_options)
+    .bind(is_required)
+    .bind(is_unique)
     .execute(&mut *tx)
     .await
     .map_err(dberr)?;
@@ -910,6 +923,10 @@ pub enum BlueprintOp {
         field_type: String,
         related_model: Option<String>,
         options: Option<String>,
+        #[serde(default)]
+        required: bool,
+        #[serde(default)]
+        unique: bool,
     },
     RenameField { model: String, from: String, new_label: String },
     RemoveField { model: String, name: String },
@@ -1031,9 +1048,11 @@ async fn execute_op(
         BlueprintOp::Create { label } => {
             create(state, db, db_name, user, label).await.map(Some)
         }
-        BlueprintOp::AddField { model, label, field_type, related_model, options } => add_field(
+        BlueprintOp::AddField {
+            model, label, field_type, related_model, options, required, unique,
+        } => add_field(
             state, db, db_name, user, model, label, field_type,
-            related_model.as_deref(), options.as_deref(),
+            related_model.as_deref(), options.as_deref(), *required, *unique,
         )
         .await
         .map(|_| None),
@@ -1562,6 +1581,8 @@ mod tests {
             field_type: "monetary".into(),
             related_model: None,
             options: None,
+            required: false,
+            unique: false,
         };
         // Payload survives a JSON round-trip (how it's stored + replayed).
         let json = serde_json::to_value(&op).unwrap();

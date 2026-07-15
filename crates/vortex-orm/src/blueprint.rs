@@ -211,6 +211,59 @@ pub async fn add_reference_column(
     Ok(())
 }
 
+/// Deterministic name for a Blueprint column's uniqueness index. Postgres
+/// truncates identifiers at 63 bytes; `x_`-prefixed tables plus a column name
+/// are comfortably short, but truncate defensively so two long fields can't
+/// collide on a silently-shortened index name.
+fn unique_index_name(table: &str, column: &str) -> String {
+    let raw = format!("uq_{table}_{column}");
+    if raw.len() > 63 {
+        raw[..63].to_string()
+    } else {
+        raw
+    }
+}
+
+/// Enforce uniqueness on a Blueprint column with a partial UNIQUE index over
+/// active rows only, so a soft-deleted (`active = false`) record never blocks
+/// reuse of its value. NULLs are exempt from UNIQUE in Postgres, so a
+/// not-yet-filled optional field allows many blank rows. Fails loudly (23505 or
+/// a duplicate-data error) if existing rows already violate the constraint —
+/// the caller surfaces that to the user.
+pub async fn add_unique_index(
+    tx: &mut Transaction<'_, Postgres>,
+    table: &str,
+    column: &str,
+    blueprint_id: Uuid,
+) -> Result<(), BlueprintError> {
+    validate_table(table)?;
+    validate_column(column)?;
+    let index = unique_index_name(table, column);
+    validate_identifier(&index)?;
+    let stmt = format!("CREATE UNIQUE INDEX {index} ON {table} ({column}) WHERE active");
+    sqlx::query(&stmt).execute(&mut **tx).await?;
+    log_ddl(tx, blueprint_id, &stmt).await?;
+    Ok(())
+}
+
+/// Drop a Blueprint column's uniqueness index (idempotent). Used when a field is
+/// removed or its uniqueness is turned off.
+pub async fn drop_unique_index(
+    tx: &mut Transaction<'_, Postgres>,
+    table: &str,
+    column: &str,
+    blueprint_id: Uuid,
+) -> Result<(), BlueprintError> {
+    validate_table(table)?;
+    validate_column(column)?;
+    let index = unique_index_name(table, column);
+    validate_identifier(&index)?;
+    let stmt = format!("DROP INDEX IF EXISTS {index}");
+    sqlx::query(&stmt).execute(&mut **tx).await?;
+    log_ddl(tx, blueprint_id, &stmt).await?;
+    Ok(())
+}
+
 /// Drop a user column from a Blueprint's table. System columns are refused.
 pub async fn drop_column(
     tx: &mut Transaction<'_, Postgres>,

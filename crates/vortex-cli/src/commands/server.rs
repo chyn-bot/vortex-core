@@ -6508,6 +6508,16 @@ struct BlueprintFieldForm {
     related_model: Option<String>,
     #[serde(default)]
     options: Option<String>,
+    // Checkboxes — present ("on"/"1") only when ticked.
+    #[serde(default)]
+    required: Option<String>,
+    #[serde(default)]
+    unique: Option<String>,
+}
+
+/// A checkbox is "on" when the browser submits it (unticked boxes are absent).
+fn checkbox_on(v: &Option<String>) -> bool {
+    matches!(v.as_deref(), Some("on") | Some("1") | Some("true"))
 }
 
 #[derive(serde::Deserialize)]
@@ -6912,6 +6922,8 @@ async fn blueprint_designer(
 <div class="form-control"><label class="label py-1"><span class="label-text">Label</span></label><input name="label" class="input input-bordered input-sm" placeholder="e.g. Amount" required/></div>
 <div class="form-control"><label class="label py-1"><span class="label-text">Type</span></label><select name="field_type" class="select select-bordered select-sm">{type_options}</select></div>
 {target_field}
+<label class="label cursor-pointer gap-2 py-1" title="Users must fill this field in before saving"><input type="checkbox" name="required" class="checkbox checkbox-sm"/><span class="label-text">Required</span></label>
+<label class="label cursor-pointer gap-2 py-1" title="No two records may share this value"><input type="checkbox" name="unique" class="checkbox checkbox-sm"/><span class="label-text">Unique</span></label>
 <button class="btn btn-primary btn-sm">Add field</button>
 </div>
 <div class="form-control w-full"><label class="label py-1"><span class="label-text">Options <span class="opacity-50">(for Dropdown — one per line)</span></span></label><textarea name="options" rows="3" class="textarea textarea-bordered textarea-sm" placeholder="Open&#10;In Progress&#10;Closed"></textarea></div>
@@ -6966,6 +6978,8 @@ async fn blueprint_add_field(
             field_type: form.field_type.clone(),
             related_model: form.related_model.clone(),
             options: form.options.clone(),
+            required: checkbox_on(&form.required),
+            unique: checkbox_on(&form.unique),
         },
     )
     .await
@@ -22381,6 +22395,22 @@ async fn render_dynamic_form(
     })
     .unwrap_or_default();
 
+    // Per-field "required" flag, read best-effort like col_span/section so a DB
+    // predating migration 155 (no is_required column) simply treats every field
+    // as optional rather than blanking the form.
+    let required_map: std::collections::HashMap<String, bool> = sqlx::query(
+        "SELECT name, is_required FROM ir_model_field WHERE model_id = $1",
+    )
+    .bind(model_id)
+    .fetch_all(db)
+    .await
+    .map(|rows| {
+        rows.iter()
+            .map(|r| (r.get::<String, _>("name"), r.try_get::<bool, _>("is_required").unwrap_or(false)))
+            .collect()
+    })
+    .unwrap_or_default();
+
     // Fetch existing record if editing
     let record_data: std::collections::HashMap<String, String> = if let Some(rid) = record_id {
         let query = format!("SELECT * FROM {} WHERE id = $1", table_name);
@@ -22446,7 +22476,8 @@ async fn render_dynamic_form(
         };
 
         let current_value = record_data.get(&field_name).cloned().unwrap_or_default();
-        let required_attr = "";  // Can add required logic later based on field metadata
+        let is_required = required_map.get(&field_name).copied().unwrap_or(false);
+        let required_attr = if is_required { "required" } else { "" };
         let readonly_attr = "";
 
         let input_html = match field_type.as_str() {
@@ -22566,7 +22597,11 @@ async fn render_dynamic_form(
             }
         };
 
-        let required_badge = "";  // Can add required indicator later based on field metadata
+        let required_badge = if is_required {
+            r#"<span class="text-error" title="Required">*</span>"#
+        } else {
+            ""
+        };
 
         let field_html = format!(
             r#"<div class="form-control mb-4 {}">
@@ -22703,6 +22738,45 @@ async fn render_dynamic_form(
     Html(vortex_framework::render_app_shell(&title, &sidebar, &body)).into_response()
 }
 
+/// Display names of `is_required` Blueprint fields left blank in `form_data`.
+/// Best-effort: on a DB predating migration 155 the query errors and no field is
+/// treated as required (matching the drift-safe render path).
+async fn blueprint_required_missing(
+    db: &sqlx::PgPool,
+    model_name: &str,
+    form_data: &std::collections::HashMap<String, String>,
+) -> Vec<String> {
+    let rows = sqlx::query(
+        "SELECT f.name, f.display_name FROM ir_model_field f \
+         JOIN ir_model m ON m.id = f.model_id \
+         WHERE m.name = $1 AND f.is_required = true",
+    )
+    .bind(model_name)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+    rows.iter()
+        .filter_map(|r| {
+            let name: String = r.get("name");
+            let filled = form_data.get(&name).map(|v| !v.trim().is_empty()).unwrap_or(false);
+            if filled { None } else { Some(r.get::<String, _>("display_name")) }
+        })
+        .collect()
+}
+
+/// Turn a write error into a user-facing message — a unique-index violation
+/// (SQLSTATE 23505, from a Blueprint "Unique" field) reads as a plain
+/// duplicate-value message instead of a raw Postgres error.
+fn friendly_write_error(e: &sqlx::Error) -> String {
+    if let sqlx::Error::Database(dbe) = e {
+        if dbe.code().as_deref() == Some("23505") {
+            return "That value is already used by another record — this field must be unique."
+                .to_string();
+        }
+    }
+    format!("Error: {e}")
+}
+
 async fn dynamic_form_create(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
@@ -22722,6 +22796,13 @@ async fn dynamic_form_create(
     let Some(table_name) = table_name else {
         return (StatusCode::NOT_FOUND, Html("Model not found")).into_response();
     };
+
+    // Enforce required fields server-side (the `required` input attribute is the
+    // first line; this catches API/no-JS submits).
+    let missing = blueprint_required_missing(&db, &model_name, &form_data).await;
+    if !missing.is_empty() {
+        return error_response(&format!("Please fill in the required field(s): {}.", missing.join(", ")));
+    }
 
     // Real columns + their Postgres types, straight from the catalog. This does
     // three things a bare text-bind loop can't: (1) casts each value to the
@@ -22793,9 +22874,7 @@ async fn dynamic_form_create(
             ).await;
             Redirect::to(&format!("/form/{}/{}", model_name, new_id)).into_response()
         }
-        Err(e) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, Html(format!("Error: {}", e))).into_response()
-        }
+        Err(e) => error_response(&friendly_write_error(&e)),
     }
 }
 
@@ -22818,6 +22897,12 @@ async fn dynamic_form_update(
     let Some(table_name) = table_name else {
         return (StatusCode::NOT_FOUND, Html("Model not found")).into_response();
     };
+
+    // Enforce required fields server-side, same as create.
+    let missing = blueprint_required_missing(&db, &model_name, &form_data).await;
+    if !missing.is_empty() {
+        return error_response(&format!("Please fill in the required field(s): {}.", missing.join(", ")));
+    }
 
     // Real columns + types from the catalog — same rationale as create: cast
     // to the true column type, whitelist column names, and number placeholders
@@ -22880,7 +22965,7 @@ async fn dynamic_form_update(
             ).await;
             Redirect::to(&format!("/form/{}/{}", model_name, record_id)).into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Html(format!("Error: {}", e))).into_response(),
+        Err(e) => error_response(&friendly_write_error(&e)),
     }
 }
 
