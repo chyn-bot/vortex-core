@@ -113,6 +113,7 @@ pub use record_panel::{
     HOST_FORM_ID,
 };
 pub use scheduler::{Schedule, ScheduledAction, ScheduledActionDef, Scheduler};
+pub use form::{form_section, form_section_raw, render_form_sheet, FormSheet, SHEET_WIDTH};
 pub use shell::{render_app_shell, render_app_shell_with};
 pub use sidebar::{build_sidebar, build_sidebar_nav};
 pub use state::{AppState, DatabaseContext};

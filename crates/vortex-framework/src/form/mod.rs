@@ -44,7 +44,7 @@ mod sheet;
 pub use config::{FieldKind, FormConfig, FormField, FormSection};
 pub use lookup::{typeahead_widget, LookupSource};
 pub use render::{render_form, FormMode};
-pub use sheet::{form_section, render_form_sheet, FormSheet, SHEET_WIDTH};
+pub use sheet::{form_section, form_section_raw, render_form_sheet, FormSheet, SHEET_WIDTH};
 pub use save::{execute_form_save, load_record, FieldError, FormValues, SaveOutcome};
 
 /// Postgres-safe identifier: lowercase alnum + underscore, ≤ 63 chars.

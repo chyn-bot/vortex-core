@@ -31,6 +31,21 @@ pub const SHEET_WIDTH: &str = "max-w-6xl";
 /// emitted verbatim (the caller has already escaped its field labels/values);
 /// `heading` is HTML-escaped here.
 pub fn form_section(heading: &str, fields_html: &str) -> String {
+    form_section_raw(
+        heading,
+        &format!(
+            r#"<div class="grid grid-cols-1 md:grid-cols-2 gap-x-6">{}</div>"#,
+            fields_html
+        ),
+    )
+}
+
+/// Like [`form_section`] but emits `inner_html` verbatim with no imposed field
+/// grid — for bespoke forms that manage their own internal field layout (nested
+/// grids, multi-input address blocks, inline scripts) and only want the flat
+/// sheet-section chrome (heading + rule) instead of a floating card. Only the
+/// `heading` is HTML-escaped.
+pub fn form_section_raw(heading: &str, inner_html: &str) -> String {
     let head = if heading.is_empty() {
         String::new()
     } else {
@@ -40,9 +55,9 @@ pub fn form_section(heading: &str, fields_html: &str) -> String {
         )
     };
     format!(
-        r#"<section class="break-inside-avoid mb-8 last:mb-0">{head}<div class="grid grid-cols-1 md:grid-cols-2 gap-x-6">{fields}</div></section>"#,
+        r#"<section class="break-inside-avoid mb-8 last:mb-0">{head}{inner}</section>"#,
         head = head,
-        fields = fields_html,
+        inner = inner_html,
     )
 }
 

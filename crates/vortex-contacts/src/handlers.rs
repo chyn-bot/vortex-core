@@ -291,18 +291,11 @@ async fn new_contact_form(
     // field added in Settings ▸ Custom Fields shows here without a code change.
     let cc = contact_custom(&db, None).await;
 
-    let content = format!(
-        r#"<a href="/contacts" class="btn btn-ghost btn-sm mb-2">← Back to Contacts</a>
-<h1 class="text-2xl font-bold mb-6">New Contact</h1>
-
-<form method="POST" action="/contacts/create">
-<div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
-
-<!-- Left column -->
-<div class="card bg-base-100 shadow">
-<div class="card-body">
-<h2 class="card-title text-lg mb-4">General</h2>
-<div class="form-control mb-3">
+    // Field groups — identical field markup to before, now wrapped as flat
+    // sheet sections (see vortex_plugin_sdk::framework::form_section_raw) instead
+    // of floating cards, so the whole form reads as one Odoo-style sheet.
+    let general = format!(
+        r#"<div class="form-control mb-3">
 <label class="label"><span class="label-text">Name *</span></label>
 <input name="name" class="input input-bordered input-sm" required/>
 </div>
@@ -338,16 +331,15 @@ async fn new_contact_form(
 <input type="checkbox" name="active" class="checkbox checkbox-sm" checked/>
 <span class="label-text">Active</span>
 </label>
-</div>
-</div>
-</div>
+</div>"#,
+        cf_name = cc.name,
+        cf_ctype = cc.contact_type,
+        cf_vat = cc.vat_number,
+        cf_credit = cc.credit_limit,
+    );
 
-<!-- Right column -->
-<div class="space-y-6">
-<div class="card bg-base-100 shadow">
-<div class="card-body">
-<h2 class="card-title text-lg mb-4">Contact Info</h2>
-<div class="form-control mb-3">
+    let contact_info = format!(
+        r#"<div class="form-control mb-3">
 <label class="label"><span class="label-text">Email</span></label>
 <input name="email" type="email" autocomplete="email" class="input input-bordered input-sm"/>
 </div>
@@ -361,14 +353,14 @@ async fn new_contact_form(
 <label class="label"><span class="label-text">Mobile</span></label>
 <input name="mobile" type="tel" inputmode="tel" class="input input-bordered input-sm"/>
 </div>
-{cf_mobile}
-</div>
-</div>
+{cf_mobile}"#,
+        cf_email = cc.email,
+        cf_phone = cc.phone,
+        cf_mobile = cc.mobile,
+    );
 
-<div class="card bg-base-100 shadow">
-<div class="card-body">
-<h2 class="card-title text-lg mb-4">Address</h2>
-<div class="form-control mb-3">
+    let address = format!(
+        r#"<div class="form-control mb-3">
 <label class="label"><span class="label-text">Street</span></label>
 <input name="street" autocomplete="address-line1" class="input input-bordered input-sm" placeholder="Address line 1"/>
 <input name="street2" autocomplete="address-line2" class="input input-bordered input-sm mt-1" placeholder="Address line 2"/>
@@ -426,34 +418,40 @@ async function loadStates(countryId) {{
     sel.innerHTML = '<option value="">Error: ' + e.message + '</option>';
   }}
 }}
-</script>
-</div>
-</div>
-</div>
-</div>
+</script>"#,
+    );
 
-<div class="form-control mt-4">
+    let notes = format!(
+        r#"<div class="form-control">
 <label class="label"><span class="label-text">Notes</span></label>
 <textarea name="notes" class="textarea textarea-bordered" rows="3"></textarea>
 </div>
-{cf_notes}
-{bottom}
-<div class="mt-6 flex gap-2">
-<button type="submit" class="btn btn-primary btn-sm">Create</button>
-<a href="/contacts" class="btn btn-ghost btn-sm">Cancel</a>
-</div>
-</form>"#,
-        country_options = country_options,
-        cf_name = cc.name,
-        cf_ctype = cc.contact_type,
-        cf_vat = cc.vat_number,
-        cf_credit = cc.credit_limit,
-        cf_email = cc.email,
-        cf_phone = cc.phone,
-        cf_mobile = cc.mobile,
+{cf_notes}"#,
         cf_notes = cc.notes,
+    );
+
+    // Two columns of flat sections inside one sheet (masonry-ish via the
+    // existing 2-col grid), then full-width Notes + any bottom-anchored custom
+    // fields, all in a single centered container.
+    let inner = format!(
+        r#"<div class="grid grid-cols-1 lg:grid-cols-2 gap-6 gap-x-10">{general}<div class="space-y-6">{contact_info}{address}</div></div>{notes}{bottom}"#,
+        general = vortex_plugin_sdk::framework::form_section_raw("General", &general),
+        contact_info = vortex_plugin_sdk::framework::form_section_raw("Contact Info", &contact_info),
+        address = vortex_plugin_sdk::framework::form_section_raw("Address", &address),
+        notes = vortex_plugin_sdk::framework::form_section_raw("Notes", &notes),
         bottom = cc.bottom,
     );
+
+    let content = vortex_plugin_sdk::framework::render_form_sheet(&vortex_plugin_sdk::framework::FormSheet {
+        max_width: vortex_plugin_sdk::framework::SHEET_WIDTH,
+        back_href: "/contacts",
+        control_row: "",
+        form_attrs: r#"method="POST" action="/contacts/create""#,
+        title: "New Contact",
+        inner: &inner,
+        footer: r#"<a href="/contacts" class="btn btn-ghost">Cancel</a><button type="submit" class="btn btn-primary">Create</button>"#,
+        below: "",
+    });
 
     Html(page_shell(&sidebar, "New Contact", &content)).into_response()
 }
@@ -787,32 +785,10 @@ async fn edit_contact(
     let ids = id.to_string();
     let cc = contact_custom(&db, Some(&ids)).await;
 
-    let content = format!(
-        r#"<div class="flex items-center justify-between mb-6">
-<div>
-<a href="/contacts" class="btn btn-ghost btn-sm mb-2">← Back to Contacts</a>
-<h1 class="text-2xl font-bold">{name} <span class="text-base-content/40 font-mono text-sm">{code}</span></h1>
-</div>
-<div class="flex items-center gap-2">
-{portal_button}
-{duplicate_button}
-{archive_button}
-</div>
-</div>
-
-{status_bar}
-
-{approval_panel}
-
-<form method="POST" action="/contacts/{id}" id="record-form">
-<fieldset class="contents"{form_disabled}>
-<div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
-
-<!-- Left column -->
-<div class="card bg-base-100 shadow">
-<div class="card-body">
-<h2 class="card-title text-lg mb-4">General</h2>
-<div class="form-control mb-3">
+    // Field groups — identical field markup (values preserved) to before, now
+    // flat sheet sections instead of floating cards.
+    let general = format!(
+        r#"<div class="form-control mb-3">
 <label class="label"><span class="label-text">Name *</span></label>
 <input name="name" class="input input-bordered input-sm" value="{name_val}" required/>
 </div>
@@ -848,16 +824,24 @@ async fn edit_contact(
 <input type="checkbox" name="active" class="checkbox checkbox-sm" {active_checked}/>
 <span class="label-text">Active</span>
 </label>
-</div>
-</div>
-</div>
+</div>"#,
+        name_val = esc(&name),
+        vat = esc(vat_number.as_deref().unwrap_or("")),
+        credit = credit_limit.map(|c| format!("{:.2}", c)).unwrap_or_default(),
+        cf_name = cc.name,
+        cf_ctype = cc.contact_type,
+        cf_vat = cc.vat_number,
+        cf_credit = cc.credit_limit,
+        sel_cust = sel(&contact_type, "customer"),
+        sel_supp = sel(&contact_type, "supplier"),
+        sel_both = sel(&contact_type, "both"),
+        sel_other = sel(&contact_type, "other"),
+        is_company_checked = if is_company { "checked" } else { "" },
+        active_checked = if active { "checked" } else { "" },
+    );
 
-<!-- Right column -->
-<div class="space-y-6">
-<div class="card bg-base-100 shadow">
-<div class="card-body">
-<h2 class="card-title text-lg mb-4">Contact Info</h2>
-<div class="form-control mb-3">
+    let contact_info = format!(
+        r#"<div class="form-control mb-3">
 <label class="label"><span class="label-text">Email</span></label>
 <input name="email" type="email" autocomplete="email" class="input input-bordered input-sm" value="{email_val}"/>
 </div>
@@ -871,14 +855,17 @@ async fn edit_contact(
 <label class="label"><span class="label-text">Mobile</span></label>
 <input name="mobile" type="tel" inputmode="tel" class="input input-bordered input-sm" value="{mobile_val}"/>
 </div>
-{cf_mobile}
-</div>
-</div>
+{cf_mobile}"#,
+        email_val = esc(email.as_deref().unwrap_or("")),
+        phone_val = esc(phone.as_deref().unwrap_or("")),
+        mobile_val = esc(mobile.as_deref().unwrap_or("")),
+        cf_email = cc.email,
+        cf_phone = cc.phone,
+        cf_mobile = cc.mobile,
+    );
 
-<div class="card bg-base-100 shadow">
-<div class="card-body">
-<h2 class="card-title text-lg mb-4">Address</h2>
-<div class="form-control mb-3">
+    let address = format!(
+        r#"<div class="form-control mb-3">
 <label class="label"><span class="label-text">Street</span></label>
 <input name="street" autocomplete="address-line1" class="input input-bordered input-sm" value="{street_val}" placeholder="Address line 1"/>
 <input name="street2" autocomplete="address-line2" class="input input-bordered input-sm mt-1" value="{street2_val}" placeholder="Address line 2"/>
@@ -936,25 +923,68 @@ async function loadStates(countryId) {{
     sel.innerHTML = '<option value="">Error: ' + e.message + '</option>';
   }}
 }}
-</script>
-</div>
-</div>
-<div class="lg:col-span-2">{record_panels}</div>
-</div>
-</div>
+</script>"#,
+        street_val = esc(street.as_deref().unwrap_or("")),
+        street2_val = esc(street2.as_deref().unwrap_or("")),
+        street3_val = esc(street3.as_deref().unwrap_or("")),
+        zip_val = esc(zip.as_deref().unwrap_or("")),
+        city_val = esc(city.as_deref().unwrap_or("")),
+        state_options = state_options,
+        country_options = country_options,
+    );
 
-<div class="form-control mt-4">
+    let notes = format!(
+        r#"<div class="form-control">
 <label class="label"><span class="label-text">Notes</span></label>
 <textarea name="notes" class="textarea textarea-bordered" rows="3">{notes_val}</textarea>
 </div>
-{cf_notes}
+{cf_notes}"#,
+        notes_val = esc(notes.as_deref().unwrap_or("")),
+        cf_notes = cc.notes,
+    );
+
+    // Header (back link, name, action buttons), status bar, and approval panel
+    // stay above the sheet; the field area is wrapped as one Odoo-style sheet
+    // inside the record form. The <fieldset class="contents"> disable-wrapper
+    // encloses both the sheet and its footer so a locked record is fully
+    // read-only, so this form builds the sheet inline rather than via
+    // render_form_sheet (which owns its own <form>). Chatter/history sit below.
+    let content = format!(
+        r#"<div class="max-w-6xl mx-auto">
+<div class="flex items-center justify-between mb-6">
+<div>
+<a href="/contacts" class="btn btn-ghost btn-sm mb-2">← Back to Contacts</a>
+<h1 class="text-2xl font-bold">{name} <span class="text-base-content/40 font-mono text-sm">{code}</span></h1>
+</div>
+<div class="flex items-center gap-2">
+{portal_button}
+{duplicate_button}
+{archive_button}
+</div>
+</div>
+
+{status_bar}
+
+{approval_panel}
+
+<form method="POST" action="/contacts/{id}" id="record-form">
+<fieldset class="contents"{form_disabled}>
+<div class="bg-base-100 rounded-lg shadow-sm border border-base-300 p-6 md:p-8">
+<div class="grid grid-cols-1 lg:grid-cols-2 gap-6 gap-x-10">
+{general}
+<div class="space-y-6">{contact_info}{address}</div>
+<div class="lg:col-span-2">{record_panels}</div>
+</div>
+{notes}
 {bottom}
-<div class="mt-6 flex gap-2">
-<button type="submit" class="btn btn-primary btn-sm">Save</button>
-<a href="/contacts" class="btn btn-ghost btn-sm">Cancel</a>
+</div>
+<div class="flex justify-end gap-2 mt-4">
+<a href="/contacts" class="btn btn-ghost">Cancel</a>
+<button type="submit" class="btn btn-primary">Save</button>
 </div>
 </fieldset>
 </form>
+</div>
 
 {activity_panel}
 
@@ -963,35 +993,12 @@ async function loadStates(countryId) {{
         activity_panel = activity_panel,
         name = esc(&name),
         code = esc(code.as_deref().unwrap_or("")),
-        name_val = esc(&name),
-        email_val = esc(email.as_deref().unwrap_or("")),
-        phone_val = esc(phone.as_deref().unwrap_or("")),
-        mobile_val = esc(mobile.as_deref().unwrap_or("")),
-        street_val = esc(street.as_deref().unwrap_or("")),
-        street2_val = esc(street2.as_deref().unwrap_or("")),
-        street3_val = esc(street3.as_deref().unwrap_or("")),
-        city_val = esc(city.as_deref().unwrap_or("")),
-        zip_val = esc(zip.as_deref().unwrap_or("")),
-        country_options = country_options,
-        state_options = state_options,
-        vat = esc(vat_number.as_deref().unwrap_or("")),
-        credit = credit_limit.map(|c| format!("{:.2}", c)).unwrap_or_default(),
-        notes_val = esc(notes.as_deref().unwrap_or("")),
-        cf_name = cc.name,
-        cf_ctype = cc.contact_type,
-        cf_vat = cc.vat_number,
-        cf_credit = cc.credit_limit,
-        cf_email = cc.email,
-        cf_phone = cc.phone,
-        cf_mobile = cc.mobile,
-        cf_notes = cc.notes,
+        general = vortex_plugin_sdk::framework::form_section_raw("General", &general),
+        contact_info = vortex_plugin_sdk::framework::form_section_raw("Contact Info", &contact_info),
+        address = vortex_plugin_sdk::framework::form_section_raw("Address", &address),
+        notes = vortex_plugin_sdk::framework::form_section_raw("Notes", &notes),
+        record_panels = record_panels,
         bottom = cc.bottom,
-        sel_cust = sel(&contact_type, "customer"),
-        sel_supp = sel(&contact_type, "supplier"),
-        sel_both = sel(&contact_type, "both"),
-        sel_other = sel(&contact_type, "other"),
-        is_company_checked = if is_company { "checked" } else { "" },
-        active_checked = if active { "checked" } else { "" },
         history_panel = history_panel,
         status_bar = status_bar,
         approval_panel = approval_panel,
