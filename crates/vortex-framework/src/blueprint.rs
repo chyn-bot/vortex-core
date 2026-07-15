@@ -420,6 +420,32 @@ async fn resolve_relation_target(db: &PgPool, target_model: &str) -> Result<Stri
     .ok_or_else(|| format!("'{target_model}' is not a valid relation target"))
 }
 
+/// Find the one many2one field on `child_model` that links back to `owner_model`
+/// — the inverse of a one2many. Exactly one is required: zero means the child
+/// has no link back (add one first); more than one is ambiguous.
+async fn find_inverse_m2o(db: &PgPool, child_model: &str, owner_model: &str) -> Result<String, String> {
+    let names: Vec<String> = sqlx::query_scalar(
+        "SELECT f.name FROM ir_model_field f
+         JOIN ir_model m ON m.id = f.model_id
+         WHERE m.name = $1 AND f.field_type = 'many2one' AND f.related_model = $2
+         ORDER BY f.name",
+    )
+    .bind(child_model)
+    .bind(owner_model)
+    .fetch_all(db)
+    .await
+    .map_err(dberr)?;
+    match names.len() {
+        0 => Err(format!(
+            "'{child_model}' has no field linking back here. Add a \"Link to a record\" field on '{child_model}' that points to this record type first."
+        )),
+        1 => Ok(names.into_iter().next().unwrap()),
+        _ => Err(format!(
+            "'{child_model}' links back more than once, so the child list is ambiguous. (Choosing among multiple inverse links isn't supported yet.)"
+        )),
+    }
+}
+
 /// Add a field to a Blueprint. Scalars add a typed column; `selection` also
 /// stores its options; `many2one` adds a real UUID FK to another Blueprint and
 /// stores the target's model name in `related_model` (which the generic layer
@@ -440,28 +466,52 @@ pub async fn add_field(
 ) -> Result<(), String> {
     let col = slugify(label);
     ddl::validate_identifier(&col).map_err(|e| format!("invalid field name: {e}"))?;
-    // Validate the type against the physical-column vocabulary up front.
-    ddl::column_type(field_type).map_err(|e| format!("unsupported field type: {e}"))?;
+    // Physical-column types are validated against the column vocabulary; the
+    // relational types (many2many = link table, one2many = virtual inverse) are
+    // not columns, so they skip that check.
+    let is_m2m = field_type == "many2many";
+    let is_o2m = field_type == "one2many";
+    if !is_m2m && !is_o2m {
+        ddl::column_type(field_type).map_err(|e| format!("unsupported field type: {e}"))?;
+    }
     gate(state, user, "blueprint.alter", model).await?;
 
+    let (model_id, blueprint_id, table) = resolve(db, model).await?;
+
     // Type-specific inputs, validated before opening the transaction.
-    let selection_options: Option<serde_json::Value> = if field_type == "selection" {
+    let mut selection_options: Option<serde_json::Value> = if field_type == "selection" {
         Some(parse_selection_options(options_raw.unwrap_or(""))?)
     } else {
         None
     };
-    let (related, target_table): (Option<String>, Option<String>) = if field_type == "many2one" {
-        let target = related_model
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .ok_or("Pick a record type this field links to")?;
-        let table = resolve_relation_target(db, target).await?;
-        (Some(target.to_string()), Some(table))
-    } else {
-        (None, None)
+    // Relation target/child model resolution.
+    let (related, target_table): (Option<String>, Option<String>) = match field_type {
+        "many2one" | "many2many" => {
+            let target = related_model
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or("Pick a record type this field links to")?;
+            let table = resolve_relation_target(db, target).await?;
+            (Some(target.to_string()), Some(table))
+        }
+        "one2many" => {
+            let child = related_model
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or("Pick the child record type this list shows")?;
+            let child_table = resolve_relation_target(db, child).await?;
+            // Auto-detect the child's many2one field that points back at us, so
+            // the builder doesn't have to name the inverse. Exactly one is
+            // required (no ambiguity).
+            let inverse = find_inverse_m2o(db, child, model).await?;
+            selection_options = Some(serde_json::json!({
+                "inverse_field": inverse,
+                "child_table": child_table,
+            }));
+            (Some(child.to_string()), None)
+        }
+        _ => (None, None),
     };
-
-    let (model_id, blueprint_id, table) = resolve(db, model).await?;
 
     let fcount: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM ir_model_field WHERE model_id = $1 AND source = 'blueprint'")
@@ -486,18 +536,21 @@ pub async fn add_field(
         return Err(format!("A field named '{col}' already exists"));
     }
 
-    match &target_table {
-        Some(tt) => ddl::add_reference_column(&mut tx, &table, &col, tt, blueprint_id)
+    match field_type {
+        "many2one" => ddl::add_reference_column(&mut tx, &table, &col, target_table.as_deref().unwrap(), blueprint_id)
             .await
             .map_err(|e| format!("add relation column failed: {e}"))?,
-        None => ddl::add_column(&mut tx, &table, &col, field_type, blueprint_id)
+        "many2many" => ddl::create_m2m_junction(&mut tx, &table, &col, target_table.as_deref().unwrap(), blueprint_id)
+            .await
+            .map_err(|e| format!("create link table failed: {e}"))?,
+        "one2many" => { /* virtual inverse — no schema change on this table */ }
+        _ => ddl::add_column(&mut tx, &table, &col, field_type, blueprint_id)
             .await
             .map_err(|e| format!("add column failed: {e}"))?,
     }
 
-    // Uniqueness is enforced by a real partial index on the fresh column; on a
-    // brand-new field every value is NULL, so this never conflicts at creation.
-    if is_unique {
+    // Uniqueness applies only to real scalar/relation columns.
+    if is_unique && !is_m2m && !is_o2m {
         ddl::add_unique_index(&mut tx, &table, &col, blueprint_id)
             .await
             .map_err(|e| format!("add unique constraint failed: {e}"))?;
@@ -563,6 +616,20 @@ pub async fn rename_field(
     gate(state, user, "blueprint.alter", model).await?;
 
     let (model_id, blueprint_id, table) = resolve(db, model).await?;
+
+    // A relation field's link table / inverse is derived from its name, so a
+    // rename would orphan it. Disallow for now (delete + re-add instead).
+    let ftype: Option<String> = sqlx::query_scalar(
+        "SELECT field_type FROM ir_model_field WHERE model_id = $1 AND name = $2 AND source = 'blueprint'",
+    )
+    .bind(model_id)
+    .bind(from)
+    .fetch_optional(db)
+    .await
+    .map_err(dberr)?;
+    if matches!(ftype.as_deref(), Some("many2many") | Some("one2many")) {
+        return Err("Relation fields can't be renamed yet — delete and re-add instead.".to_string());
+    }
     let mut tx = db.begin().await.map_err(dberr)?;
 
     ddl::rename_column(&mut tx, &table, from, &to, blueprint_id)
@@ -612,11 +679,29 @@ pub async fn remove_field(
     gate(state, user, "blueprint.alter", model).await?;
 
     let (model_id, blueprint_id, table) = resolve(db, model).await?;
+
+    // Branch the physical cleanup on the field kind: a link table for m2m, no
+    // schema change for a virtual o2m, a plain column drop otherwise.
+    let field_type: Option<String> = sqlx::query_scalar(
+        "SELECT field_type FROM ir_model_field WHERE model_id = $1 AND name = $2 AND source = 'blueprint'",
+    )
+    .bind(model_id)
+    .bind(name)
+    .fetch_optional(db)
+    .await
+    .map_err(dberr)?;
+
     let mut tx = db.begin().await.map_err(dberr)?;
 
-    ddl::drop_column(&mut tx, &table, name, blueprint_id)
-        .await
-        .map_err(|e| format!("drop column failed: {e}"))?;
+    match field_type.as_deref() {
+        Some("many2many") => ddl::drop_m2m_junction(&mut tx, &table, name, blueprint_id)
+            .await
+            .map_err(|e| format!("drop link table failed: {e}"))?,
+        Some("one2many") => { /* virtual — no schema to drop */ }
+        _ => ddl::drop_column(&mut tx, &table, name, blueprint_id)
+            .await
+            .map_err(|e| format!("drop column failed: {e}"))?,
+    }
 
     sqlx::query("DELETE FROM ir_model_field WHERE model_id = $1 AND name = $2 AND source = 'blueprint'")
         .bind(model_id)
@@ -687,22 +772,36 @@ async fn recreate_field_in_tx(
         return Ok(true);
     }
 
-    // Physical column: relation → FK, else a scalar column.
-    if ftype == "many2one" {
-        let Some(target) = f.get("related_model").and_then(|v| v.as_str()).filter(|s| !s.is_empty())
-        else {
-            return Ok(false); // old snapshot with no target — can't rebuild the FK
-        };
-        let target_table = resolve_relation_target(db, target).await?;
-        ddl::add_reference_column(tx, table, name, &target_table, blueprint_id)
-            .await
-            .map_err(|e| format!("restore relation column '{name}' failed: {e}"))?;
-    } else {
-        ddl::add_column(tx, table, name, ftype, blueprint_id)
-            .await
-            .map_err(|e| format!("restore column '{name}' failed: {e}"))?;
+    // Physical / relational schema per kind.
+    match ftype {
+        "many2one" => {
+            let Some(target) = f.get("related_model").and_then(|v| v.as_str()).filter(|s| !s.is_empty())
+            else {
+                return Ok(false); // old snapshot with no target — can't rebuild the FK
+            };
+            let target_table = resolve_relation_target(db, target).await?;
+            ddl::add_reference_column(tx, table, name, &target_table, blueprint_id)
+                .await
+                .map_err(|e| format!("restore relation column '{name}' failed: {e}"))?;
+        }
+        "many2many" => {
+            let Some(target) = f.get("related_model").and_then(|v| v.as_str()).filter(|s| !s.is_empty())
+            else {
+                return Ok(false); // can't rebuild the link table without a target
+            };
+            let target_table = resolve_relation_target(db, target).await?;
+            ddl::create_m2m_junction(tx, table, name, &target_table, blueprint_id)
+                .await
+                .map_err(|e| format!("restore link table '{name}' failed: {e}"))?;
+        }
+        "one2many" => { /* virtual — metadata only (options carries the inverse) */ }
+        _ => {
+            ddl::add_column(tx, table, name, ftype, blueprint_id)
+                .await
+                .map_err(|e| format!("restore column '{name}' failed: {e}"))?;
+        }
     }
-    if is_unique {
+    if is_unique && ftype != "many2many" && ftype != "one2many" {
         ddl::add_unique_index(tx, table, name, blueprint_id)
             .await
             .map_err(|e| format!("restore unique index for '{name}' failed: {e}"))?;

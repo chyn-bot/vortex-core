@@ -6540,6 +6540,8 @@ const BLUEPRINT_FIELD_TYPES: &[(&str, &str)] = &[
     ("datetime", "Date & time"),
     ("selection", "Dropdown"),
     ("many2one", "Link to a record"),
+    ("many2many", "Link to many records"),
+    ("one2many", "Related records list"),
 ];
 
 fn blueprint_type_label(ft: &str) -> String {
@@ -10406,7 +10408,10 @@ async fn generic_list_view(
     // attributes from the field type instead.
     let field_rows = sqlx::query(
         "SELECT name, display_name, field_type, selection_options, related_model
-         FROM ir_model_field WHERE model_id = $1 AND is_visible = true ORDER BY sequence"
+         FROM ir_model_field WHERE model_id = $1 AND is_visible = true
+           AND field_type NOT IN ('many2many', 'one2many')
+           AND COALESCE(is_computed, false) = false
+         ORDER BY sequence"
     )
     .bind(model_id)
     .fetch_all(&db)
@@ -22657,6 +22662,80 @@ async fn render_dynamic_form(
                     field_name, current_value.replace(" ", "T"), required_attr, readonly_attr
                 )
             },
+            "many2many" => {
+                // Multi-link: a real multi-select for choosing plus a hidden
+                // comma-joined input that carries the selection on submit (the
+                // Form<HashMap> extractor keeps one value per name, so the CSV
+                // hidden field is what the save path reads and syncs to the link
+                // table). Current links come from the junction.
+                match &relation_model {
+                    Some(rel_model) => match resolve_m2o_target(db, rel_model).await {
+                        Some(t) => {
+                            let jt = vortex_orm::blueprint::m2m_junction_name(&table_name, &field_name);
+                            let current_ids: Vec<String> = if let Some(rid) = record_id {
+                                sqlx::query_scalar::<_, uuid::Uuid>(&format!("SELECT target_id FROM {} WHERE owner_id = $1", jt))
+                                    .bind(rid).fetch_all(db).await.unwrap_or_default()
+                                    .iter().map(|u| u.to_string()).collect()
+                            } else { Vec::new() };
+                            let disp = if t.has_name { "COALESCE(name, id::text)" } else { "id::text" };
+                            let act = if t.has_active { "WHERE active = true" } else { "" };
+                            let recs = sqlx::query(&format!("SELECT id, {} as name FROM {} {} ORDER BY name LIMIT 500", disp, t.table, act))
+                                .fetch_all(db).await.unwrap_or_default();
+                            let mut opts = String::new();
+                            for rec in &recs {
+                                let rid: uuid::Uuid = rec.get("id");
+                                let rname: String = rec.get("name");
+                                let sel = if current_ids.contains(&rid.to_string()) { " selected" } else { "" };
+                                opts.push_str(&format!(r#"<option value="{}"{}>{}</option>"#, rid, sel, html_escape(&rname)));
+                            }
+                            format!(
+                                r#"<select multiple size="6" class="select select-bordered w-full h-auto" onchange="(function(s){{var a=[];for(var i=0;i<s.options.length;i++){{if(s.options[i].selected)a.push(s.options[i].value);}}document.getElementById('m2m_{f}').value=a.join(',');}})(this)">{opts}</select><input type="hidden" id="m2m_{f}" name="{f}" value="{cur}"/><div class="text-xs opacity-50 mt-1">Hold Ctrl / Cmd to select more than one.</div>"#,
+                                f = field_name, opts = opts, cur = current_ids.join(",")
+                            )
+                        }
+                        None => format!(r#"<div class="text-sm opacity-60">Link target unavailable.</div><input type="hidden" name="{}" value=""/>"#, field_name),
+                    },
+                    None => format!(r#"<input type="hidden" name="{}" value=""/>"#, field_name),
+                }
+            },
+            "one2many" => {
+                // Read-only list of child records that link back here via the
+                // auto-detected inverse many2one. Not an input — nothing to save.
+                match record_id {
+                    Some(rid) => {
+                        let meta = selection_options.as_ref().and_then(|o| {
+                            let ct = o.get("child_table").and_then(|v| v.as_str())?.to_string();
+                            let inv = o.get("inverse_field").and_then(|v| v.as_str())?.to_string();
+                            Some((ct, inv))
+                        });
+                        match meta {
+                            Some((child_table, inverse)) if validate_identifier(&child_table) && validate_identifier(&inverse) => {
+                                let child_model = relation_model.clone().unwrap_or_default();
+                                let rows = sqlx::query(&format!(
+                                    "SELECT id, COALESCE(name, id::text) as name FROM {} WHERE {} = $1 ORDER BY name LIMIT 200",
+                                    child_table, inverse
+                                )).bind(rid).fetch_all(db).await.unwrap_or_default();
+                                if rows.is_empty() {
+                                    r#"<div class="text-sm opacity-60 border border-base-300 rounded-lg p-3">No related records yet.</div>"#.to_string()
+                                } else {
+                                    let mut items = String::new();
+                                    for r in &rows {
+                                        let cid: uuid::Uuid = r.get("id");
+                                        let cnm: String = r.get("name");
+                                        items.push_str(&format!(
+                                            r#"<a href="/form/{m}/{id}" class="flex items-center justify-between px-3 py-2 hover:bg-base-200 border-b border-base-200 last:border-0"><span>{nm}</span><span class="opacity-40">→</span></a>"#,
+                                            m = html_escape(&child_model), id = cid, nm = html_escape(&cnm)
+                                        ));
+                                    }
+                                    format!(r#"<div class="border border-base-300 rounded-lg overflow-hidden">{}</div>"#, items)
+                                }
+                            }
+                            _ => r#"<div class="text-sm opacity-60">This related list isn't configured correctly.</div>"#.to_string(),
+                        }
+                    }
+                    None => r#"<div class="text-sm opacity-60 border border-base-300 rounded-lg p-3">Save this record first to see and add related records.</div>"#.to_string(),
+                }
+            },
             _ => {
                 // Default to text input
                 format!(
@@ -22843,6 +22922,52 @@ async fn blueprint_required_missing(
         .collect()
 }
 
+/// Sync a Blueprint record's many2many link tables from the submitted form. Each
+/// m2m field arrives as a comma-joined list of target ids in a hidden input; we
+/// replace that record's rows in the field's junction table. Best-effort per
+/// field — a bad id is dropped rather than failing the whole save.
+async fn sync_blueprint_m2m(
+    db: &sqlx::PgPool,
+    table_name: &str,
+    model_name: &str,
+    record_id: uuid::Uuid,
+    form_data: &std::collections::HashMap<String, String>,
+) {
+    let rows = sqlx::query(
+        "SELECT f.name FROM ir_model_field f JOIN ir_model m ON m.id = f.model_id \
+         WHERE m.name = $1 AND f.field_type = 'many2many'",
+    )
+    .bind(model_name)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+    for r in &rows {
+        let field: String = r.get("name");
+        if !validate_identifier(&field) {
+            continue;
+        }
+        let jt = vortex_orm::blueprint::m2m_junction_name(table_name, &field);
+        let ids: Vec<uuid::Uuid> = form_data
+            .get(&field)
+            .map(|csv| csv.split(',').filter_map(|s| s.trim().parse().ok()).collect())
+            .unwrap_or_default();
+        let _ = sqlx::query(&format!("DELETE FROM {} WHERE owner_id = $1", jt))
+            .bind(record_id)
+            .execute(db)
+            .await;
+        for tid in ids {
+            let _ = sqlx::query(&format!(
+                "INSERT INTO {} (owner_id, target_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                jt
+            ))
+            .bind(record_id)
+            .bind(tid)
+            .execute(db)
+            .await;
+        }
+    }
+}
+
 /// Turn a write error into a user-facing message — a unique-index violation
 /// (SQLSTATE 23505, from a Blueprint "Unique" field) reads as a plain
 /// duplicate-value message instead of a raw Postgres error.
@@ -22956,6 +23081,8 @@ async fn dynamic_form_create(
             if let Err(e) = vortex_framework::computed_fields::store_values(&db, &model_name, new_id).await {
                 tracing::warn!(model = %model_name, error = %e, "computed field store after create failed");
             }
+            // Sync many2many links (hidden CSV inputs — not physical columns).
+            sync_blueprint_m2m(&db, &table_name, &model_name, new_id, &form_data).await;
             Redirect::to(&format!("/form/{}/{}", model_name, new_id)).into_response()
         }
         Err(e) => error_response(&friendly_write_error(&e)),
@@ -23021,6 +23148,8 @@ async fn dynamic_form_update(
     }
 
     if set_clauses.is_empty() {
+        // No scalar columns changed, but many2many links still may have.
+        sync_blueprint_m2m(&db, &table_name, &model_name, record_id, &form_data).await;
         return Redirect::to(&format!("/form/{}/{}", model_name, record_id)).into_response();
     }
 
@@ -23051,6 +23180,7 @@ async fn dynamic_form_update(
             if let Err(e) = vortex_framework::computed_fields::store_values(&db, &model_name, record_id).await {
                 tracing::warn!(model = %model_name, error = %e, "computed field store after update failed");
             }
+            sync_blueprint_m2m(&db, &table_name, &model_name, record_id, &form_data).await;
             Redirect::to(&format!("/form/{}/{}", model_name, record_id)).into_response()
         }
         Err(e) => error_response(&friendly_write_error(&e)),

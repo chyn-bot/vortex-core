@@ -246,6 +246,62 @@ pub async fn add_unique_index(
     Ok(())
 }
 
+/// Junction-table name for a many2many field: `<owner_table>_<field>_rel`,
+/// length-capped like [`unique_index_name`].
+pub fn m2m_junction_name(owner_table: &str, field: &str) -> String {
+    let raw = format!("{owner_table}_{field}_rel");
+    if raw.len() > 63 {
+        raw[..63].to_string()
+    } else {
+        raw
+    }
+}
+
+/// Create the link table for a many2many field: `(owner_id, target_id)` with a
+/// composite primary key and cascade deletes on both sides, so removing either
+/// record cleans up its links. `target_table` may be a compiled (non-`x_`)
+/// table, so it is validated as a plain identifier — the caller must confirm it
+/// names a real model first.
+pub async fn create_m2m_junction(
+    tx: &mut Transaction<'_, Postgres>,
+    owner_table: &str,
+    field: &str,
+    target_table: &str,
+    blueprint_id: Uuid,
+) -> Result<(), BlueprintError> {
+    validate_table(owner_table)?;
+    validate_column(field)?;
+    validate_identifier(target_table)?;
+    let jt = m2m_junction_name(owner_table, field);
+    validate_identifier(&jt)?;
+    let stmt = format!(
+        "CREATE TABLE {jt} (\
+         owner_id UUID NOT NULL REFERENCES {owner_table}(id) ON DELETE CASCADE, \
+         target_id UUID NOT NULL REFERENCES {target_table}(id) ON DELETE CASCADE, \
+         PRIMARY KEY (owner_id, target_id))"
+    );
+    sqlx::query(&stmt).execute(&mut **tx).await?;
+    log_ddl(tx, blueprint_id, &stmt).await?;
+    Ok(())
+}
+
+/// Drop a many2many field's link table (idempotent).
+pub async fn drop_m2m_junction(
+    tx: &mut Transaction<'_, Postgres>,
+    owner_table: &str,
+    field: &str,
+    blueprint_id: Uuid,
+) -> Result<(), BlueprintError> {
+    validate_table(owner_table)?;
+    validate_column(field)?;
+    let jt = m2m_junction_name(owner_table, field);
+    validate_identifier(&jt)?;
+    let stmt = format!("DROP TABLE IF EXISTS {jt}");
+    sqlx::query(&stmt).execute(&mut **tx).await?;
+    log_ddl(tx, blueprint_id, &stmt).await?;
+    Ok(())
+}
+
 /// Drop a Blueprint column's uniqueness index (idempotent). Used when a field is
 /// removed or its uniqueness is turned off.
 pub async fn drop_unique_index(
