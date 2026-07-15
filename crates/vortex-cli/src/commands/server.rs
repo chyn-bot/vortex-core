@@ -9992,10 +9992,11 @@ async fn module_upgrade(
 // ============================================================================
 
 /// Sidebar `<li>` items for the generic model views (list/kanban/graph/
-/// calendar/pivot). These reuse the same aggregated plugin-registry menu as
-/// every plugin page — via [`vortex_framework::build_sidebar_nav`] — instead
-/// of the sparse `ir_ui_menu` fallback in [`build_sidebar_menu`], so the
-/// left-hand menu no longer vanishes when switching into a non-list view.
+/// calendar/pivot) AND the generic record form. These reuse the same
+/// aggregated plugin-registry menu as every plugin page — via
+/// [`vortex_framework::build_sidebar_nav`] — plus the "Custom Apps" Blueprint
+/// group, instead of the old sparse `ir_ui_menu` renderer, so the left-hand
+/// menu no longer vanishes when switching into a non-list view.
 async fn generic_view_sidebar(
     state: &AppState,
     user: &AuthUser,
@@ -10048,105 +10049,6 @@ async fn custom_apps_nav(db: &sqlx::PgPool, active_model: &str) -> String {
             label = vortex_framework::html_escape(&label),
         ));
     }
-    html
-}
-
-async fn build_sidebar_menu(db: &PgPool, user_roles: &[String], current_model: &str) -> String {
-    // Fetch menu items
-    let menus = sqlx::query(
-        r#"SELECT id, name, parent_id, sequence, icon, action_type, action_model, action_view_type, action_url, groups
-           FROM ir_ui_menu WHERE active = true ORDER BY sequence, name"#
-    )
-    .fetch_all(db)
-    .await
-    .unwrap_or_default();
-
-    // Icon mapping
-    let get_icon = |icon: &str| -> &str {
-        match icon {
-            "dashboard" => r#"<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2V6zM14 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2v-2zM14 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2z"/></svg>"#,
-            "users" => r#"<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197m9 5.197v-1"/></svg>"#,
-            "building" => r#"<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5M9 7h1m-1 4h1m4-4h1m-1 4h1m-5 10v-5a1 1 0 011-1h2a1 1 0 011 1v5m-4 0h4"/></svg>"#,
-            "shield" => r#"<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"/></svg>"#,
-            "lock" => r#"<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/></svg>"#,
-            "cog" | "settings" => r#"<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/></svg>"#,
-            "puzzle" | "apps" => r#"<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 4a2 2 0 114 0v1a1 1 0 001 1h3a1 1 0 011 1v3a1 1 0 01-1 1h-1a2 2 0 100 4h1a1 1 0 011 1v3a1 1 0 01-1 1h-3a1 1 0 01-1-1v-1a2 2 0 10-4 0v1a1 1 0 01-1 1H7a1 1 0 01-1-1v-3a1 1 0 00-1-1H4a2 2 0 110-4h1a1 1 0 001-1V7a1 1 0 011-1h3a1 1 0 001-1V4z"/></svg>"#,
-            "folder" => r#"<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"/></svg>"#,
-            "user" => r#"<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"/></svg>"#,
-            _ => r#"<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10" stroke-width="2"/></svg>"#,
-        }
-    };
-
-    // Build hierarchical menu
-    let mut html = String::new();
-
-    // Get top-level menus (no parent)
-    for menu in menus.iter().filter(|m| m.try_get::<Option<uuid::Uuid>, _>("parent_id").ok().flatten().is_none()) {
-        let name: String = menu.get("name");
-        let icon: Option<String> = menu.get("icon");
-        let action_type: Option<String> = menu.get("action_type");
-        let groups: Option<String> = menu.get("groups");
-
-        // Check group permissions
-        if let Some(ref g) = groups {
-            if let Ok(allowed_groups) = serde_json::from_str::<Vec<String>>(g) {
-                if !allowed_groups.is_empty() && !user_roles.iter().any(|r| allowed_groups.contains(r)) {
-                    continue;
-                }
-            }
-        }
-
-        let menu_id: uuid::Uuid = menu.get("id");
-        let icon_html = icon.as_deref().map(get_icon).unwrap_or("");
-
-        // Check if this is a section header (no action) or a link
-        if action_type.is_none() {
-            // It's a section header - find children
-            let children: Vec<_> = menus.iter()
-                .filter(|m| m.try_get::<Option<uuid::Uuid>, _>("parent_id").ok().flatten() == Some(menu_id))
-                .collect();
-
-            if !children.is_empty() {
-                html.push_str(&format!(r#"<li class="menu-title mt-4"><span>{}</span></li>"#, name));
-
-                for child in children {
-                    let child_name: String = child.get("name");
-                    let child_icon: Option<String> = child.get("icon");
-                    let child_action_type: Option<String> = child.get("action_type");
-                    let child_action_model: Option<String> = child.get("action_model");
-                    let child_action_url: Option<String> = child.get("action_url");
-                    let child_view_type: String = child.try_get("action_view_type").unwrap_or_else(|_| "list".to_string());
-
-                    let child_icon_html = child_icon.as_deref().map(get_icon).unwrap_or("");
-
-                    let href = match child_action_type.as_deref() {
-                        Some("model") => {
-                            let model = child_action_model.unwrap_or_default();
-                            let is_active = model == current_model;
-                            let active_class = if is_active { " active" } else { "" };
-                            format!(r#"<li><a href="/{}/{}" class="nav-item{}">{}<span class="sidebar-text">{}</span></a></li>"#,
-                                child_view_type, model, active_class, child_icon_html, child_name)
-                        }
-                        Some("url") => {
-                            let url = child_action_url.unwrap_or_default();
-                            format!(r#"<li><a href="{}" class="nav-item">{}<span class="sidebar-text">{}</span></a></li>"#,
-                                url, child_icon_html, child_name)
-                        }
-                        _ => format!(r#"<li><a class="nav-item">{}<span class="sidebar-text">{}</span></a></li>"#,
-                            child_icon_html, child_name),
-                    };
-                    html.push_str(&href);
-                }
-            }
-        } else {
-            // It's a direct link (like Dashboard)
-            let action_url: Option<String> = menu.get("action_url");
-            let href = action_url.unwrap_or_else(|| "/home".to_string());
-            html.push_str(&format!(r#"<li><a href="{}" class="nav-item">{}<span class="sidebar-text">{}</span></a></li>"#,
-                href, icon_html, name));
-        }
-    }
-
     html
 }
 
@@ -22365,24 +22267,26 @@ async fn dynamic_form_new(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
     Path(model_name): Path<String>,
     Query(prefill): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
-    let _ = &state;
-    render_dynamic_form(&db, &user, &model_name, None, &prefill).await
+    render_dynamic_form(&state, &db_ctx, &db, &user, &model_name, None, &prefill).await
 }
 
 async fn dynamic_form_edit(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
     Path((model_name, record_id)): Path<(String, uuid::Uuid)>,
 ) -> Response {
-    let _ = &state;
-    render_dynamic_form(&db, &user, &model_name, Some(record_id), &std::collections::HashMap::new()).await
+    render_dynamic_form(&state, &db_ctx, &db, &user, &model_name, Some(record_id), &std::collections::HashMap::new()).await
 }
 
 async fn render_dynamic_form(
+    state: &AppState,
+    db_ctx: &DatabaseContext,
     db: &PgPool,
     user: &AuthUser,
     model_name: &str,
@@ -22634,8 +22538,12 @@ async fn render_dynamic_form(
         (format!("/form/{}", model_name), "Create", format!("New {}", model_display_name))
     };
 
-    // Build sidebar
-    let sidebar_menu = build_sidebar_menu(db, &user.roles, model_name).await;
+    // Build sidebar — use the SAME aggregated nav as every other generic view
+    // (plugins + core + the "Custom Apps" Blueprint group) instead of the sparse
+    // `build_sidebar_menu` (ir_ui_menu) source, which dropped plugin entries and
+    // the Custom Apps group on this page. Closes the last "two sidebar renderers"
+    // holdout.
+    let sidebar_menu = generic_view_sidebar(state, user, db_ctx, model_name).await;
 
     // Activity stream (chatter) + History (audit trail) — same record primitives
     // every plugin record page uses. Only meaningful for an existing record, so
