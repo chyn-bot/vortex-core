@@ -67,11 +67,13 @@ async fn public_context_middleware(
     .into_iter()
     .collect();
 
+    let custom_apps_html = custom_apps_nav(pool.pool(), "").await;
     request.extensions_mut().insert(pool.clone());
     request.extensions_mut().insert(DatabaseContext {
         db_name,
         pool,
         installed_modules,
+        custom_apps_html,
     });
     next.run(request).await
 }
@@ -276,6 +278,7 @@ async fn auth_middleware(
             .collect();
 
             // Inject Arc<ConnectionPool> for plugin handlers (Extension-based extraction)
+            let custom_apps_html = custom_apps_nav(pool.pool(), "").await;
             request.extensions_mut().insert(pool.clone());
 
             // Inject DatabaseContext for downstream extractors (Db, InstalledModules)
@@ -283,6 +286,7 @@ async fn auth_middleware(
                 db_name,
                 pool,
                 installed_modules: db_installed_modules,
+                custom_apps_html,
             });
 
             next.run(request).await
@@ -449,6 +453,8 @@ async fn api_auth_middleware(
         db_name,
         pool,
         installed_modules,
+        // Bearer/API requests don't render the admin sidebar — skip the query.
+        custom_apps_html: String::new(),
     });
 
     next.run(request).await
@@ -592,6 +598,7 @@ async fn resolve_bearer(
         db_name,
         pool: pool.clone(),
         installed_modules,
+        custom_apps_html: custom_apps_nav(pool.pool(), "").await,
     };
     Some((auth_user, pool, db_ctx, tok))
 }
@@ -4471,6 +4478,8 @@ async fn portal_auth_middleware(
         db_name,
         pool,
         installed_modules: db_installed_modules,
+        // Portal (customer-facing) uses its own chrome, not build_sidebar.
+        custom_apps_html: String::new(),
     });
     next.run(request).await
 }
@@ -9991,20 +10000,26 @@ async fn module_upgrade(
 // Dynamic Sidebar Menu Helper
 // ============================================================================
 
-/// Sidebar `<li>` items for the generic model views (list/kanban/graph/
-/// calendar/pivot). These reuse the same aggregated plugin-registry menu as
-/// every plugin page — via [`vortex_framework::build_sidebar_nav`] — instead
-/// of the sparse `ir_ui_menu` fallback in [`build_sidebar_menu`], so the
-/// left-hand menu no longer vanishes when switching into a non-list view.
-async fn generic_view_sidebar(
+/// Full canonical `<aside>` sidebar (nav + user footer via `build_sidebar`) for
+/// the generic model views (list/kanban/graph/calendar/pivot) AND the generic
+/// record form. Returns the complete sidebar — the same aggregated
+/// plugin-registry menu as every plugin page plus the "Custom Apps" Blueprint
+/// group and the user footer — so those pages render through `render_app_shell`
+/// identically to the rest of the system, instead of a bespoke top-navbar +
+/// sparse `ir_ui_menu` menu that made the left-hand chrome inconsistent.
+async fn generic_view_shell_sidebar(
     state: &AppState,
     user: &AuthUser,
     db_ctx: &DatabaseContext,
     active: &str,
 ) -> String {
     let apps = custom_apps_nav(db_ctx.pool.pool(), active).await;
-    vortex_framework::build_sidebar_nav(
+    let display_name = user.full_name.as_deref().unwrap_or(&user.username);
+    let initials = get_initials(display_name);
+    vortex_framework::build_sidebar(
         active,
+        display_name,
+        &initials,
         &db_ctx.installed_modules,
         user.is_admin(),
         &state.plugin_registry,
@@ -10048,105 +10063,6 @@ async fn custom_apps_nav(db: &sqlx::PgPool, active_model: &str) -> String {
             label = vortex_framework::html_escape(&label),
         ));
     }
-    html
-}
-
-async fn build_sidebar_menu(db: &PgPool, user_roles: &[String], current_model: &str) -> String {
-    // Fetch menu items
-    let menus = sqlx::query(
-        r#"SELECT id, name, parent_id, sequence, icon, action_type, action_model, action_view_type, action_url, groups
-           FROM ir_ui_menu WHERE active = true ORDER BY sequence, name"#
-    )
-    .fetch_all(db)
-    .await
-    .unwrap_or_default();
-
-    // Icon mapping
-    let get_icon = |icon: &str| -> &str {
-        match icon {
-            "dashboard" => r#"<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2V6zM14 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2v-2zM14 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2z"/></svg>"#,
-            "users" => r#"<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197m9 5.197v-1"/></svg>"#,
-            "building" => r#"<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5M9 7h1m-1 4h1m4-4h1m-1 4h1m-5 10v-5a1 1 0 011-1h2a1 1 0 011 1v5m-4 0h4"/></svg>"#,
-            "shield" => r#"<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"/></svg>"#,
-            "lock" => r#"<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/></svg>"#,
-            "cog" | "settings" => r#"<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/></svg>"#,
-            "puzzle" | "apps" => r#"<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 4a2 2 0 114 0v1a1 1 0 001 1h3a1 1 0 011 1v3a1 1 0 01-1 1h-1a2 2 0 100 4h1a1 1 0 011 1v3a1 1 0 01-1 1h-3a1 1 0 01-1-1v-1a2 2 0 10-4 0v1a1 1 0 01-1 1H7a1 1 0 01-1-1v-3a1 1 0 00-1-1H4a2 2 0 110-4h1a1 1 0 001-1V7a1 1 0 011-1h3a1 1 0 001-1V4z"/></svg>"#,
-            "folder" => r#"<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"/></svg>"#,
-            "user" => r#"<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"/></svg>"#,
-            _ => r#"<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10" stroke-width="2"/></svg>"#,
-        }
-    };
-
-    // Build hierarchical menu
-    let mut html = String::new();
-
-    // Get top-level menus (no parent)
-    for menu in menus.iter().filter(|m| m.try_get::<Option<uuid::Uuid>, _>("parent_id").ok().flatten().is_none()) {
-        let name: String = menu.get("name");
-        let icon: Option<String> = menu.get("icon");
-        let action_type: Option<String> = menu.get("action_type");
-        let groups: Option<String> = menu.get("groups");
-
-        // Check group permissions
-        if let Some(ref g) = groups {
-            if let Ok(allowed_groups) = serde_json::from_str::<Vec<String>>(g) {
-                if !allowed_groups.is_empty() && !user_roles.iter().any(|r| allowed_groups.contains(r)) {
-                    continue;
-                }
-            }
-        }
-
-        let menu_id: uuid::Uuid = menu.get("id");
-        let icon_html = icon.as_deref().map(get_icon).unwrap_or("");
-
-        // Check if this is a section header (no action) or a link
-        if action_type.is_none() {
-            // It's a section header - find children
-            let children: Vec<_> = menus.iter()
-                .filter(|m| m.try_get::<Option<uuid::Uuid>, _>("parent_id").ok().flatten() == Some(menu_id))
-                .collect();
-
-            if !children.is_empty() {
-                html.push_str(&format!(r#"<li class="menu-title mt-4"><span>{}</span></li>"#, name));
-
-                for child in children {
-                    let child_name: String = child.get("name");
-                    let child_icon: Option<String> = child.get("icon");
-                    let child_action_type: Option<String> = child.get("action_type");
-                    let child_action_model: Option<String> = child.get("action_model");
-                    let child_action_url: Option<String> = child.get("action_url");
-                    let child_view_type: String = child.try_get("action_view_type").unwrap_or_else(|_| "list".to_string());
-
-                    let child_icon_html = child_icon.as_deref().map(get_icon).unwrap_or("");
-
-                    let href = match child_action_type.as_deref() {
-                        Some("model") => {
-                            let model = child_action_model.unwrap_or_default();
-                            let is_active = model == current_model;
-                            let active_class = if is_active { " active" } else { "" };
-                            format!(r#"<li><a href="/{}/{}" class="nav-item{}">{}<span class="sidebar-text">{}</span></a></li>"#,
-                                child_view_type, model, active_class, child_icon_html, child_name)
-                        }
-                        Some("url") => {
-                            let url = child_action_url.unwrap_or_default();
-                            format!(r#"<li><a href="{}" class="nav-item">{}<span class="sidebar-text">{}</span></a></li>"#,
-                                url, child_icon_html, child_name)
-                        }
-                        _ => format!(r#"<li><a class="nav-item">{}<span class="sidebar-text">{}</span></a></li>"#,
-                            child_icon_html, child_name),
-                    };
-                    html.push_str(&href);
-                }
-            }
-        } else {
-            // It's a direct link (like Dashboard)
-            let action_url: Option<String> = menu.get("action_url");
-            let href = action_url.unwrap_or_else(|| "/home".to_string());
-            html.push_str(&format!(r#"<li><a href="{}" class="nav-item">{}<span class="sidebar-text">{}</span></a></li>"#,
-                href, icon_html, name));
-        }
-    }
-
     html
 }
 
@@ -10597,7 +10513,7 @@ async fn generic_list_view(
     }
 
     // Build dynamic sidebar
-    let sidebar_menu = generic_view_sidebar(&state, &user, &db_ctx, &model_name).await;
+    let sidebar = generic_view_shell_sidebar(&state, &user, &db_ctx, &model_name).await;
 
     // Fetch saved filters for this model
     let saved_filters = sqlx::query(
@@ -10615,57 +10531,9 @@ async fn generic_list_view(
         format!(r#"<option value="{}">{}</option>"#, id, name)
     }).collect();
 
-    // Build full page
-    Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style><title>{}</title>
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=18" rel="stylesheet"/>
-<script src="/static/vortex.js?v=18" defer></script>
-<script src="/static/vendor/tailwind.js"></script>
-<style>
-body {{ background: oklch(var(--b2)); color: oklch(var(--bc)); }}
-.top-navbar {{ background: oklch(var(--b1)); border-bottom: 1px solid oklch(var(--b3)); position: sticky; top: 0; z-index: 50; }}
-.sidebar {{ background: oklch(var(--b1)); border-right: 1px solid oklch(var(--b3)); }}
-.card {{ background: oklch(var(--b1)); border: 1px solid oklch(var(--b3)); }}
-.table {{ color: oklch(var(--bc)); }}
-.table th {{ color: #8BC53F; font-weight: 600; background: oklch(var(--b1)); }}
-.table tr:hover {{ background: oklch(var(--b3)); }}
-.menu a {{ color: oklch(var(--bc)/0.7); }}
-.menu a:hover, .menu a.active {{ background: oklch(var(--b3)); color: oklch(var(--bc)); }}
-.text-muted {{ color: oklch(var(--bc)/0.6); }}
-.btn-primary {{ background: #8BC53F; border-color: #8BC53F; color: #000; }}
-.btn-primary:hover {{ background: #6BA32E; border-color: #6BA32E; }}
-.user-badge {{ background: #8BC53F; color: #000; font-weight: 600; }}
-@media (max-width: 768px) {{
-    .sidebar {{ display: none; }}
-    .main-content {{ padding: 1rem; }}
-    .table {{ font-size: 0.85rem; }}
-    h1 {{ font-size: 1.5rem; }}
-}}
-</style>
-</head><body class="min-h-screen">
-<nav class="top-navbar px-4 py-3 flex items-center justify-between">
-    <div class="flex items-center gap-2"><button class="btn btn-ghost btn-sm btn-square md:hidden" onclick="var s=document.querySelector('.sidebar');s.classList.toggle('hidden');s.classList.toggle('md:block')"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="text-xl font-bold"><span style="color:#8BC53F">re</span><span class="text-muted">micle</span></a></div>
-    <div class="flex items-center gap-2 md:gap-3">
-        <a href="/home" class="text-base-content text-sm hover:underline hidden md:inline">Home</a>
-        <a href="/settings" class="text-base-content text-sm hover:underline hidden md:inline">Settings</a>
-        <a href="/notifications" class="btn btn-ghost btn-circle btn-sm relative" title="Notifications">
-            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9"/></svg>
-            <span class="absolute top-0 right-0 w-2 h-2 bg-red-500 rounded-full"></span>
-        </a>
-        <button onclick="(function(){{var h=document.documentElement,c=h.getAttribute('data-theme')==='dark'?'corporate':'dark';h.setAttribute('data-theme',c);localStorage.setItem('theme',c);document.querySelectorAll('.theme-icon-sun,.theme-icon-moon').forEach(function(e){{e.classList.toggle('hidden')}})}})();" class="btn btn-ghost btn-circle btn-sm" title="Toggle theme"><svg class="theme-icon-sun w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5" stroke-width="2"/><path stroke-linecap="round" stroke-width="2" d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg><svg class="theme-icon-moon w-5 h-5 hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg></button>
-        <div class="user-badge px-3 py-1 rounded-full text-sm">@{}</div>
-    </div>
-</nav>
-<div class="flex">
-<aside class="sidebar w-64 min-h-screen p-4 hidden md:block">
-<ul class="menu mt-2">
-{}
-</ul>
-</aside>
-<main class="flex-1 p-4 md:p-6 main-content">
-<div class="flex flex-col md:flex-row justify-between items-start md:items-center mb-6 gap-4">
-<div><h1 class="text-xl md:text-2xl font-bold">{}</h1><p class="text-muted">Manage {}</p></div>
+    // Build page body (canonical chrome via render_app_shell + build_sidebar).
+    let body = format!(r#"<div class="flex flex-col md:flex-row justify-between items-start md:items-center mb-6 gap-4">
+<div><h1 class="text-xl md:text-2xl font-bold">{}</h1><p class="opacity-60">Manage {}</p></div>
 <div class="flex gap-2 flex-wrap">
     <div class="btn-group">
         <a href="/list/{}" class="btn btn-sm btn-active" title="List View">
@@ -10684,11 +10552,11 @@ body {{ background: oklch(var(--b2)); color: oklch(var(--bc)); }}
     <a href="{}" class="btn btn-primary btn-sm">+ New</a>
 </div>
 </div>
-<div class="card mb-4">
+<div class="card bg-base-100 shadow mb-4">
 <div class="card-body p-3 md:p-4">
 <form method="GET" action="/list/{}" class="flex flex-wrap gap-3 items-end">
     <div class="form-control">
-        <label class="label py-0"><span class="label-text text-xs text-muted">Saved Filters</span></label>
+        <label class="label py-0"><span class="label-text text-xs opacity-60">Saved Filters</span></label>
         <select class="select select-bordered select-sm bg-transparent" onchange="if(this.value) window.location='?saved_filter='+this.value">
             <option value="">-- Select --</option>
             {}
@@ -10701,19 +10569,13 @@ body {{ background: oklch(var(--b2)); color: oklch(var(--bc)); }}
 </form>
 </div>
 </div>
-<div class="card overflow-x-auto">
+<div class="card bg-base-100 shadow overflow-x-auto">
 <table class="table">
 <thead><tr>{}</tr></thead>
 <tbody>{}</tbody>
 </table>
 {}
-</div>
-</main>
-</div>
-</body></html>"#,
-        model_display_name,
-        user.username,
-        sidebar_menu,
+</div>"#,
         model_display_name, model_display_name.to_lowercase(),
         model_name, model_name, model_name, model_name,
         vortex_framework::new_record_url(&model_name), model_name,
@@ -10747,7 +10609,9 @@ body {{ background: oklch(var(--b2)); color: oklch(var(--bc)); }}
             };
             build_pagination_html(page, per_page, total, &base_url)
         }
-    )).into_response()
+    );
+
+    Html(vortex_framework::render_app_shell(&model_display_name, &sidebar, &body)).into_response()
 }
 
 // ============================================================================
@@ -11011,7 +10875,7 @@ async fn generic_kanban_view(
     let agg = pick("agg").filter(|a| ["count", "sum", "avg", "min", "max"].contains(&a.as_str())).unwrap_or_else(|| "sum".to_string());
     let drag_enabled = pick("drag").as_deref() != Some("0");
 
-    let sidebar_menu = generic_view_sidebar(&state, &user, &db_ctx, &model_name).await;
+    let sidebar = generic_view_shell_sidebar(&state, &user, &db_ctx, &model_name).await;
     let mut current_cfg = std::collections::BTreeMap::new();
     if !group_by.is_empty() { current_cfg.insert("group_by".to_string(), group_by.clone()); }
     let view_bar = vortex_framework::saved_views::render_view_bar(
@@ -11215,10 +11079,8 @@ async fn generic_kanban_view(
         board.push_str(r#"<div class="kb-empty">No groupable field to build a board. Pick a Group-by field.</div>"#);
     }
 
-    let html = KANBAN_SHELL
+    let body = KANBAN_BODY
         .replace("__TITLE__", &html_escape(&model_display_name))
-        .replace("__USER__", &html_escape(&user.username))
-        .replace("__SIDEBAR__", &sidebar_menu)
         .replace("__LISTURL__", &html_escape(&list_view_url))
         .replace("__FIELDS__", &html_escape(&fields_json))
         .replace("__CONFIG__", &html_escape(&config_json))
@@ -11226,45 +11088,19 @@ async fn generic_kanban_view(
         .replace("__DRAG__", if drag_enabled { "1" } else { "0" })
         .replace("__BOARD__", &board)
         .replace("__MODEL__", &html_escape(&model_name))
-        .replace("__NEWURL__", &html_escape(&vortex_framework::new_record_url(&model_name)));
-    Html(html.replace("<!--VIEW_BAR-->", &view_bar)).into_response()
+        .replace("__NEWURL__", &html_escape(&vortex_framework::new_record_url(&model_name)))
+        .replace("<!--VIEW_BAR-->", &view_bar);
+    Html(vortex_framework::render_app_shell_with(
+        &format!("{} - Kanban", model_display_name),
+        &sidebar,
+        &body,
+        r#"<link href="/static/kanban.css?v=1" rel="stylesheet"/>"#,
+        r#"<div id="kb-toast" class="kb-toast"></div><script src="/static/kanban.js?v=1"></script>"#,
+    )).into_response()
 }
 
-const KANBAN_SHELL: &str = r#"<!DOCTYPE html><html data-theme="dark"><head>
-<script>(function(){var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)})()</script>
-<style>[data-theme="corporate"] .theme-icon-sun{display:none !important}[data-theme="corporate"] .theme-icon-moon{display:inline-block !important}</style>
-<title>__TITLE__ - Kanban</title>
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=18" rel="stylesheet"/>
-<link href="/static/kanban.css?v=1" rel="stylesheet"/>
-<script src="/static/vortex.js?v=18" defer></script>
-<script src="/static/vendor/tailwind.js"></script>
-<style>
-body { background: oklch(var(--b2)); color: oklch(var(--bc)); }
-.top-navbar { background: oklch(var(--b1)); border-bottom: 1px solid oklch(var(--b3)); position: sticky; top: 0; z-index: 50; }
-.sidebar { background: oklch(var(--b1)); border-right: 1px solid oklch(var(--b3)); }
-.text-muted { color: oklch(var(--bc)/0.6); }
-.user-badge { background: #8BC53F; color: #000; font-weight: 600; }
-</style>
-</head><body class="min-h-screen">
-<nav class="top-navbar px-4 py-3 flex items-center justify-between">
-  <div class="flex items-center gap-2">
-    <button class="btn btn-ghost btn-sm btn-square md:hidden" onclick="var s=document.querySelector('.sidebar');s.classList.toggle('hidden');s.classList.toggle('md:block')"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button>
-    <a href="/home" class="text-xl font-bold"><span style="color:#8BC53F">re</span><span class="text-muted">micle</span></a>
-  </div>
-  <div class="flex items-center gap-2 md:gap-3">
-    <a href="/home" class="text-base-content text-sm hover:underline hidden md:inline">Home</a>
-    <a href="/settings" class="text-base-content text-sm hover:underline hidden md:inline">Settings</a>
-    <button onclick="(function(){var h=document.documentElement,c=h.getAttribute('data-theme')==='dark'?'corporate':'dark';h.setAttribute('data-theme',c);localStorage.setItem('theme',c);document.querySelectorAll('.theme-icon-sun,.theme-icon-moon').forEach(function(e){e.classList.toggle('hidden')})})();" class="btn btn-ghost btn-circle btn-sm" title="Toggle theme"><svg class="theme-icon-sun w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5" stroke-width="2"/><path stroke-linecap="round" stroke-width="2" d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg><svg class="theme-icon-moon w-5 h-5 hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg></button>
-    <div class="user-badge px-3 py-1 rounded-full text-sm">@__USER__</div>
-  </div>
-</nav>
-<div class="flex">
-<aside class="sidebar w-64 min-h-screen p-4 hidden md:block"><ul class="menu mt-2">__SIDEBAR__</ul></aside>
-<main class="flex-1 p-4 md:p-6 min-w-0">
-<div class="flex flex-col md:flex-row justify-between items-start md:items-center mb-4 gap-4">
-  <div><h1 class="text-xl md:text-2xl font-bold">__TITLE__</h1><p class="text-muted">Kanban — drag cards between columns to change stage</p></div>
+const KANBAN_BODY: &str = r#"<div class="flex flex-col md:flex-row justify-between items-start md:items-center mb-4 gap-4">
+  <div><h1 class="text-xl md:text-2xl font-bold">__TITLE__</h1><p class="opacity-60">Kanban — drag cards between columns to change stage</p></div>
   <div class="flex gap-2 flex-wrap">
     <div class="btn-group">
       <a href="__LISTURL__" class="btn btn-sm" title="List View"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 10h16M4 14h16M4 18h16"/></svg></a>
@@ -11273,16 +11109,11 @@ body { background: oklch(var(--b2)); color: oklch(var(--bc)); }
       <a href="/pivot/__MODEL__" class="btn btn-sm" title="Pivot View"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 10h18M3 14h18m-9-4v8m-7 0h14a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg></a>
     </div>
     <!--VIEW_BAR-->
-    <a href="__NEWURL__" class="btn btn-sm" style="background:#8BC53F;border-color:#8BC53F;color:#000">+ New</a>
+    <a href="__NEWURL__" class="btn btn-primary btn-sm">+ New</a>
   </div>
 </div>
 <div id="kb-config" class="kb-config"></div>
-<div id="kanban-root" class="kb-board" data-model="__MODEL__" data-group="__GROUP__" data-drag="__DRAG__" data-fields="__FIELDS__" data-config="__CONFIG__">__BOARD__</div>
-</main>
-</div>
-<div id="kb-toast" class="kb-toast"></div>
-<script src="/static/kanban.js?v=1"></script>
-</body></html>"#;
+<div id="kanban-root" class="kb-board" data-model="__MODEL__" data-group="__GROUP__" data-drag="__DRAG__" data-fields="__FIELDS__" data-config="__CONFIG__">__BOARD__</div>"#;
 
 // ============================================================================
 // Generic Graph View
@@ -11401,56 +11232,27 @@ async fn generic_graph_view(
     )
     .await;
 
-    let sidebar_menu = generic_view_sidebar(&state, &user, &db_ctx, &model_name).await;
+    let sidebar = generic_view_shell_sidebar(&state, &user, &db_ctx, &model_name).await;
 
-    let html = GRAPH_SHELL
+    let body = GRAPH_BODY
         .replace("__TITLE__", &html_escape(&model_display_name))
-        .replace("__USER__", &html_escape(&user.username))
-        .replace("__SIDEBAR__", &sidebar_menu)
         .replace("__LISTURL__", &html_escape(&list_view_url))
         .replace("__FIELDS__", &html_escape(&fields_json))
         .replace("__CONFIG__", &html_escape(&config_json))
         .replace("__MODEL__", &html_escape(&model_name))
-        .replace("__NEWURL__", &html_escape(&vortex_framework::new_record_url(&model_name)));
-    Html(html.replace("<!--VIEW_BAR-->", &view_bar)).into_response()
+        .replace("__NEWURL__", &html_escape(&vortex_framework::new_record_url(&model_name)))
+        .replace("<!--VIEW_BAR-->", &view_bar);
+    Html(vortex_framework::render_app_shell_with(
+        &format!("{} - Graph", model_display_name),
+        &sidebar,
+        &body,
+        r#"<link href="/static/pivot.css?v=25" rel="stylesheet"/><link href="/static/graph.css?v=2" rel="stylesheet"/>"#,
+        r#"<script src="/static/vendor/chart.umd.js"></script><script src="/static/graph.js?v=2"></script>"#,
+    )).into_response()
 }
 
-const GRAPH_SHELL: &str = r#"<!DOCTYPE html><html data-theme="dark"><head>
-<script>(function(){var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)})()</script>
-<style>[data-theme="corporate"] .theme-icon-sun{display:none !important}[data-theme="corporate"] .theme-icon-moon{display:inline-block !important}</style>
-<title>__TITLE__ - Graph</title>
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=18" rel="stylesheet"/>
-<link href="/static/pivot.css?v=25" rel="stylesheet"/>
-<link href="/static/graph.css?v=2" rel="stylesheet"/>
-<script src="/static/vortex.js?v=18" defer></script>
-<script src="/static/vendor/tailwind.js"></script>
-<style>
-body { background: oklch(var(--b2)); color: oklch(var(--bc)); }
-.top-navbar { background: oklch(var(--b1)); border-bottom: 1px solid oklch(var(--b3)); position: sticky; top: 0; z-index: 50; }
-.sidebar { background: oklch(var(--b1)); border-right: 1px solid oklch(var(--b3)); }
-.text-muted { color: oklch(var(--bc)/0.6); }
-.user-badge { background: #8BC53F; color: #000; font-weight: 600; }
-</style>
-</head><body class="min-h-screen">
-<nav class="top-navbar px-4 py-3 flex items-center justify-between">
-  <div class="flex items-center gap-2">
-    <button class="btn btn-ghost btn-sm btn-square md:hidden" onclick="var s=document.querySelector('.sidebar');s.classList.toggle('hidden');s.classList.toggle('md:block')"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button>
-    <a href="/home" class="text-xl font-bold"><span style="color:#8BC53F">re</span><span class="text-muted">micle</span></a>
-  </div>
-  <div class="flex items-center gap-2 md:gap-3">
-    <a href="/home" class="text-base-content text-sm hover:underline hidden md:inline">Home</a>
-    <a href="/settings" class="text-base-content text-sm hover:underline hidden md:inline">Settings</a>
-    <button onclick="(function(){var h=document.documentElement,c=h.getAttribute('data-theme')==='dark'?'corporate':'dark';h.setAttribute('data-theme',c);localStorage.setItem('theme',c);document.querySelectorAll('.theme-icon-sun,.theme-icon-moon').forEach(function(e){e.classList.toggle('hidden')})})();" class="btn btn-ghost btn-circle btn-sm" title="Toggle theme"><svg class="theme-icon-sun w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5" stroke-width="2"/><path stroke-linecap="round" stroke-width="2" d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg><svg class="theme-icon-moon w-5 h-5 hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg></button>
-    <div class="user-badge px-3 py-1 rounded-full text-sm">@__USER__</div>
-  </div>
-</nav>
-<div class="flex">
-<aside class="sidebar w-64 min-h-screen p-4 hidden md:block"><ul class="menu mt-2">__SIDEBAR__</ul></aside>
-<main class="flex-1 p-4 md:p-6 min-w-0">
-<div class="flex flex-col md:flex-row justify-between items-start md:items-center mb-4 gap-4">
-  <div><h1 class="text-xl md:text-2xl font-bold">__TITLE__</h1><p class="text-muted">Graph — drag fields into X-axis, Series and Measures</p></div>
+const GRAPH_BODY: &str = r#"<div class="flex flex-col md:flex-row justify-between items-start md:items-center mb-4 gap-4">
+  <div><h1 class="text-xl md:text-2xl font-bold">__TITLE__</h1><p class="opacity-60">Graph — drag fields into X-axis, Series and Measures</p></div>
   <div class="flex gap-2 flex-wrap">
     <div class="btn-group">
       <a href="__LISTURL__" class="btn btn-sm" title="List View"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 10h16M4 14h16M4 18h16"/></svg></a>
@@ -11467,7 +11269,7 @@ body { background: oklch(var(--b2)); color: oklch(var(--bc)); }
         <li><a id="g-export-pdf">PDF document</a></li>
       </ul>
     </div>
-    <a href="__NEWURL__" class="btn btn-sm" style="background:#8BC53F;border-color:#8BC53F;color:#000">+ New</a>
+    <a href="__NEWURL__" class="btn btn-primary btn-sm">+ New</a>
   </div>
 </div>
 <div class="g-wrap">
@@ -11486,11 +11288,7 @@ body { background: oklch(var(--b2)); color: oklch(var(--bc)); }
     </div>
   </div>
 </div>
-<div id="graph-root" data-model="__MODEL__" data-data-url="/pivot/__MODEL__/data" data-fields="__FIELDS__" data-config="__CONFIG__"></div>
-<script src="/static/vendor/chart.umd.js"></script>
-<script src="/static/graph.js?v=2"></script>
-</main>
-</div></body></html>"#;
+<div id="graph-root" data-model="__MODEL__" data-data-url="/pivot/__MODEL__/data" data-fields="__FIELDS__" data-config="__CONFIG__"></div>"#;
 
 // ============================================================================
 // Calendar View
@@ -11634,18 +11432,23 @@ async fn generic_calendar_view(
     })
     .to_string();
 
-    let sidebar_menu = generic_view_sidebar(&state, &user, &db_ctx, &model_name).await;
+    let sidebar = generic_view_shell_sidebar(&state, &user, &db_ctx, &model_name).await;
 
-    let html = CALENDAR_SHELL
+    let body = CALENDAR_BODY
         .replace("__TITLE__", &html_escape(&model_display_name))
-        .replace("__USER__", &html_escape(&user.username))
-        .replace("__SIDEBAR__", &sidebar_menu)
         .replace("__LISTURL__", &html_escape(&list_view_url))
         .replace("__FIELDS__", &html_escape(&fields_json))
         .replace("__CONFIG__", &html_escape(&config_json))
         .replace("__MODEL__", &html_escape(&model_name))
-        .replace("__NEWURL__", &html_escape(&vortex_framework::new_record_url(&model_name)));
-    Html(html.replace("<!--VIEW_BAR-->", &view_bar)).into_response()
+        .replace("__NEWURL__", &html_escape(&vortex_framework::new_record_url(&model_name)))
+        .replace("<!--VIEW_BAR-->", &view_bar);
+    Html(vortex_framework::render_app_shell_with(
+        &format!("{} - Calendar", model_display_name),
+        &sidebar,
+        &body,
+        r#"<link href="/static/calendar.css?v=1" rel="stylesheet"/>"#,
+        r#"<script src="/static/calendar.js?v=2"></script>"#,
+    )).into_response()
 }
 
 /// GET /calendar/{model}/data — events overlapping the `[start,end]` range as
@@ -11878,41 +11681,8 @@ async fn generic_calendar_data(
     .into_response()
 }
 
-const CALENDAR_SHELL: &str = r#"<!DOCTYPE html><html data-theme="dark"><head>
-<script>(function(){var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)})()</script>
-<style>[data-theme="corporate"] .theme-icon-sun{display:none !important}[data-theme="corporate"] .theme-icon-moon{display:inline-block !important}</style>
-<title>__TITLE__ - Calendar</title>
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=18" rel="stylesheet"/>
-<link href="/static/calendar.css?v=1" rel="stylesheet"/>
-<script src="/static/vortex.js?v=18" defer></script>
-<script src="/static/vendor/tailwind.js"></script>
-<style>
-body { background: oklch(var(--b2)); color: oklch(var(--bc)); }
-.top-navbar { background: oklch(var(--b1)); border-bottom: 1px solid oklch(var(--b3)); position: sticky; top: 0; z-index: 50; }
-.sidebar { background: oklch(var(--b1)); border-right: 1px solid oklch(var(--b3)); }
-.text-muted { color: oklch(var(--bc)/0.6); }
-.user-badge { background: #8BC53F; color: #000; font-weight: 600; }
-</style>
-</head><body class="min-h-screen">
-<nav class="top-navbar px-4 py-3 flex items-center justify-between">
-  <div class="flex items-center gap-2">
-    <button class="btn btn-ghost btn-sm btn-square md:hidden" onclick="var s=document.querySelector('.sidebar');s.classList.toggle('hidden');s.classList.toggle('md:block')"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button>
-    <a href="/home" class="text-xl font-bold"><span style="color:#8BC53F">re</span><span class="text-muted">micle</span></a>
-  </div>
-  <div class="flex items-center gap-2 md:gap-3">
-    <a href="/home" class="text-base-content text-sm hover:underline hidden md:inline">Home</a>
-    <a href="/settings" class="text-base-content text-sm hover:underline hidden md:inline">Settings</a>
-    <button onclick="(function(){var h=document.documentElement,c=h.getAttribute('data-theme')==='dark'?'corporate':'dark';h.setAttribute('data-theme',c);localStorage.setItem('theme',c);document.querySelectorAll('.theme-icon-sun,.theme-icon-moon').forEach(function(e){e.classList.toggle('hidden')})})();" class="btn btn-ghost btn-circle btn-sm" title="Toggle theme"><svg class="theme-icon-sun w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5" stroke-width="2"/><path stroke-linecap="round" stroke-width="2" d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg><svg class="theme-icon-moon w-5 h-5 hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg></button>
-    <div class="user-badge px-3 py-1 rounded-full text-sm">@__USER__</div>
-  </div>
-</nav>
-<div class="flex">
-<aside class="sidebar w-64 min-h-screen p-4 hidden md:block"><ul class="menu mt-2">__SIDEBAR__</ul></aside>
-<main class="flex-1 p-4 md:p-6 min-w-0">
-<div class="flex flex-col md:flex-row justify-between items-start md:items-center mb-4 gap-4">
-  <div><h1 class="text-xl md:text-2xl font-bold">__TITLE__</h1><p class="text-muted">Calendar — click a day to add, drag fields to reconfigure</p></div>
+const CALENDAR_BODY: &str = r#"<div class="flex flex-col md:flex-row justify-between items-start md:items-center mb-4 gap-4">
+  <div><h1 class="text-xl md:text-2xl font-bold">__TITLE__</h1><p class="opacity-60">Calendar — click a day to add, drag fields to reconfigure</p></div>
   <div class="flex gap-2 flex-wrap">
     <div class="btn-group">
       <a href="__LISTURL__" class="btn btn-sm" title="List View"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 10h16M4 14h16M4 18h16"/></svg></a>
@@ -11922,7 +11692,7 @@ body { background: oklch(var(--b2)); color: oklch(var(--bc)); }
       <a href="/pivot/__MODEL__" class="btn btn-sm" title="Pivot View"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 10h18M3 14h18m-9-4v8m-7 0h14a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg></a>
     </div>
     <!--VIEW_BAR-->
-    <a href="__NEWURL__" class="btn btn-sm" style="background:#8BC53F;border-color:#8BC53F;color:#000">+ New</a>
+    <a href="__NEWURL__" class="btn btn-primary btn-sm">+ New</a>
   </div>
 </div>
 <div id="cal-config" class="cal-config"></div>
@@ -11930,11 +11700,7 @@ body { background: oklch(var(--b2)); color: oklch(var(--bc)); }
 <div id="cal-legend" class="cal-legend" style="display:none"></div>
 <div id="cal-body" class="cal-body">
   <div id="calendar-root" data-model="__MODEL__" data-fields="__FIELDS__" data-config="__CONFIG__"></div>
-</div>
-<script src="/static/calendar.js?v=2"></script>
-</main>
-</div>
-</body></html>"#;
+</div>"#;
 
 // ============================================================================
 // Generic Pivot View (Excel-style, client-rendered)
@@ -12049,58 +11815,30 @@ async fn generic_pivot_view(
     )
     .await;
 
-    let sidebar_menu = generic_view_sidebar(&state, &user, &db_ctx, &model_name).await;
+    let sidebar = generic_view_shell_sidebar(&state, &user, &db_ctx, &model_name).await;
 
     // Shell built by token replacement (not format!) so the inline navbar JS
     // keeps its braces without escaping. Dynamic JSON goes into HTML-escaped
     // double-quoted data-* attributes.
-    let html = PIVOT_SHELL
+    let body = PIVOT_BODY
         .replace("__TITLE__", &html_escape(&model_display_name))
-        .replace("__USER__", &html_escape(&user.username))
-        .replace("__SIDEBAR__", &sidebar_menu)
         .replace("__LISTURL__", &html_escape(&list_view_url))
         .replace("__FIELDS__", &html_escape(&fields_json))
         .replace("__CONFIG__", &html_escape(&config_json))
         .replace("__MODEL__", &html_escape(&model_name))
-        .replace("__NEWURL__", &html_escape(&vortex_framework::new_record_url(&model_name)));
-    Html(html.replace("<!--VIEW_BAR-->", &view_bar)).into_response()
+        .replace("__NEWURL__", &html_escape(&vortex_framework::new_record_url(&model_name)))
+        .replace("<!--VIEW_BAR-->", &view_bar);
+    Html(vortex_framework::render_app_shell_with(
+        &format!("{} - Pivot", model_display_name),
+        &sidebar,
+        &body,
+        r#"<link href="/static/pivot.css?v=25" rel="stylesheet"/>"#,
+        r#"<script src="/static/pivot.js?v=25"></script>"#,
+    )).into_response()
 }
 
-const PIVOT_SHELL: &str = r#"<!DOCTYPE html><html data-theme="dark"><head>
-<script>(function(){var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)})()</script>
-<style>[data-theme="corporate"] .theme-icon-sun{display:none !important}[data-theme="corporate"] .theme-icon-moon{display:inline-block !important}</style>
-<title>__TITLE__ - Pivot</title>
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=18" rel="stylesheet"/>
-<link href="/static/pivot.css?v=25" rel="stylesheet"/>
-<script src="/static/vortex.js?v=18" defer></script>
-<script src="/static/vendor/tailwind.js"></script>
-<style>
-body { background: oklch(var(--b2)); color: oklch(var(--bc)); }
-.top-navbar { background: oklch(var(--b1)); border-bottom: 1px solid oklch(var(--b3)); position: sticky; top: 0; z-index: 50; }
-.sidebar { background: oklch(var(--b1)); border-right: 1px solid oklch(var(--b3)); }
-.text-muted { color: oklch(var(--bc)/0.6); }
-.user-badge { background: #8BC53F; color: #000; font-weight: 600; }
-</style>
-</head><body class="min-h-screen">
-<nav class="top-navbar px-4 py-3 flex items-center justify-between">
-  <div class="flex items-center gap-2">
-    <button class="btn btn-ghost btn-sm btn-square md:hidden" onclick="var s=document.querySelector('.sidebar');s.classList.toggle('hidden');s.classList.toggle('md:block')"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button>
-    <a href="/home" class="text-xl font-bold"><span style="color:#8BC53F">re</span><span class="text-muted">micle</span></a>
-  </div>
-  <div class="flex items-center gap-2 md:gap-3">
-    <a href="/home" class="text-base-content text-sm hover:underline hidden md:inline">Home</a>
-    <a href="/settings" class="text-base-content text-sm hover:underline hidden md:inline">Settings</a>
-    <button onclick="(function(){var h=document.documentElement,c=h.getAttribute('data-theme')==='dark'?'corporate':'dark';h.setAttribute('data-theme',c);localStorage.setItem('theme',c);document.querySelectorAll('.theme-icon-sun,.theme-icon-moon').forEach(function(e){e.classList.toggle('hidden')})})();" class="btn btn-ghost btn-circle btn-sm" title="Toggle theme"><svg class="theme-icon-sun w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5" stroke-width="2"/><path stroke-linecap="round" stroke-width="2" d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg><svg class="theme-icon-moon w-5 h-5 hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg></button>
-    <div class="user-badge px-3 py-1 rounded-full text-sm">@__USER__</div>
-  </div>
-</nav>
-<div class="flex">
-<aside class="sidebar w-64 min-h-screen p-4 hidden md:block"><ul class="menu mt-2">__SIDEBAR__</ul></aside>
-<main class="flex-1 p-4 md:p-6 min-w-0">
-<div class="flex flex-col md:flex-row justify-between items-start md:items-center mb-4 gap-4">
-  <div><h1 class="text-xl md:text-2xl font-bold">__TITLE__</h1><p class="text-muted">Pivot table — drag fields into Rows, Columns and Values</p></div>
+const PIVOT_BODY: &str = r#"<div class="flex flex-col md:flex-row justify-between items-start md:items-center mb-4 gap-4">
+  <div><h1 class="text-xl md:text-2xl font-bold">__TITLE__</h1><p class="opacity-60">Pivot table — drag fields into Rows, Columns and Values</p></div>
   <div class="flex gap-2 flex-wrap">
     <div class="btn-group">
       <a href="__LISTURL__" class="btn btn-sm" title="List View"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 10h16M4 14h16M4 18h16"/></svg></a>
@@ -12111,7 +11849,7 @@ body { background: oklch(var(--b2)); color: oklch(var(--bc)); }
     </div>
     <!--VIEW_BAR-->
     <button id="pv-export" class="btn btn-sm gap-1" title="Export to Excel (CSV)"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v2a2 2 0 002 2h12a2 2 0 002-2v-2M7 10l5 5 5-5M12 15V3"/></svg>Excel</button>
-    <a href="__NEWURL__" class="btn btn-sm" style="background:#8BC53F;border-color:#8BC53F;color:#000">+ New</a>
+    <a href="__NEWURL__" class="btn btn-primary btn-sm">+ New</a>
   </div>
 </div>
 <div class="pv-wrap">
@@ -12127,10 +11865,7 @@ body { background: oklch(var(--b2)); color: oklch(var(--bc)); }
     </div>
   </div>
 </div>
-<div id="pivot-root" data-model="__MODEL__" data-data-url="/pivot/__MODEL__/data" data-fields="__FIELDS__" data-config="__CONFIG__"></div>
-<script src="/static/pivot.js?v=25"></script>
-</main>
-</div></body></html>"#;
+<div id="pivot-root" data-model="__MODEL__" data-data-url="/pivot/__MODEL__/data" data-fields="__FIELDS__" data-config="__CONFIG__"></div>"#;
 
 /// GET /pivot/{model}/data — aggregated pivot matrix as JSON. Every field name
 /// is allow-listed against the model registry; subtotals and grand totals are
@@ -22365,24 +22100,26 @@ async fn dynamic_form_new(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
     Path(model_name): Path<String>,
     Query(prefill): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
-    let _ = &state;
-    render_dynamic_form(&db, &user, &model_name, None, &prefill).await
+    render_dynamic_form(&state, &db_ctx, &db, &user, &model_name, None, &prefill).await
 }
 
 async fn dynamic_form_edit(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
     Path((model_name, record_id)): Path<(String, uuid::Uuid)>,
 ) -> Response {
-    let _ = &state;
-    render_dynamic_form(&db, &user, &model_name, Some(record_id), &std::collections::HashMap::new()).await
+    render_dynamic_form(&state, &db_ctx, &db, &user, &model_name, Some(record_id), &std::collections::HashMap::new()).await
 }
 
 async fn render_dynamic_form(
+    state: &AppState,
+    db_ctx: &DatabaseContext,
     db: &PgPool,
     user: &AuthUser,
     model_name: &str,
@@ -22634,8 +22371,25 @@ async fn render_dynamic_form(
         (format!("/form/{}", model_name), "Create", format!("New {}", model_display_name))
     };
 
-    // Build sidebar
-    let sidebar_menu = build_sidebar_menu(db, &user.roles, model_name).await;
+    // Full app-shell chrome — the SAME header, sidebar, and user footer
+    // (avatar/name/theme-toggle/logout) as every other page, via build_sidebar +
+    // render_app_shell. The generic record form is no longer a bespoke inline
+    // layout, so navigating into a Custom App looks identical to the rest of the
+    // system. The Custom Apps group + current-model active highlight come from
+    // custom_apps_nav(model_name).
+    let display_name = user.full_name.as_deref().unwrap_or(&user.username);
+    let initials = get_initials(display_name);
+    let apps = custom_apps_nav(db_ctx.pool.pool(), model_name).await;
+    let sidebar = build_sidebar(
+        model_name,
+        display_name,
+        &initials,
+        &db_ctx.installed_modules,
+        user.is_admin(),
+        &state.plugin_registry,
+        &user.roles,
+        &apps,
+    );
 
     // Activity stream (chatter) + History (audit trail) — same record primitives
     // every plugin record page uses. Only meaningful for an existing record, so
@@ -22649,63 +22403,35 @@ async fn render_dynamic_form(
         None => (String::new(), String::new()),
     };
 
-    let html = format!(
-        r##"<!DOCTYPE html>
-<html data-theme="dark">
-<head>
-    <script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{}</title>
-    <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=18" rel="stylesheet"/>
-<script src="/static/vortex.js?v=18" defer></script>
-    <script src="/static/vendor/tailwind.js"></script>
-</head>
-<body class="min-h-screen bg-base-200">
-<div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar-inline').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay-inline').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a><button onclick="(function(){{var h=document.documentElement,c=h.getAttribute('data-theme')==='dark'?'corporate':'dark';h.setAttribute('data-theme',c);localStorage.setItem('theme',c);document.querySelectorAll('.theme-icon-sun,.theme-icon-moon').forEach(function(e){{e.classList.toggle('hidden')}})}})();" class="btn btn-ghost btn-sm btn-square ml-auto"><svg class="theme-icon-sun w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5" stroke-width="2"/><path stroke-linecap="round" stroke-width="2" d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg><svg class="theme-icon-moon w-5 h-5 hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg></button></div>
-<div id="sidebar-overlay-inline" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar-inline').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
-<div class="flex">
-    <aside id="sidebar-inline" class="w-64 bg-base-100 shadow-lg min-h-screen p-4 fixed lg:static top-0 left-0 z-40 h-full -translate-x-full lg:translate-x-0 transition-transform duration-200">
-        <div class="text-xl font-bold mb-6"><span class="text-success">re</span><span class="opacity-60">micle</span></div>
-        <ul class="menu">{}</ul>
-    </aside>
-    <main class="flex-1 p-4 lg:p-6 min-w-0">
-        <div class="mb-6">
-            <a href="/list/{}" class="btn btn-ghost btn-sm">← Back to List</a>
-        </div>
-
-        <div class="card bg-base-100 shadow max-w-2xl">
-            <div class="card-body">
-                <h2 class="card-title">{}</h2>
-
-                <form method="post" action="{}">
-                    {}
-                    <div class="card-actions justify-end mt-6">
-                        <a href="/list/{}" class="btn btn-ghost">Cancel</a>
-                        <button type="submit" class="btn btn-primary">{}</button>
-                    </div>
-                </form>
-            </div>
-        </div>
-        <div class="max-w-2xl mt-6 flex flex-col gap-6">{}{}</div>
-    </main>
+    let body = format!(
+        r##"<div class="mb-6">
+    <a href="/list/{model}" class="btn btn-ghost btn-sm">← Back to List</a>
 </div>
-</body>
-</html>"##,
-        title,
-        sidebar_menu,
-        model_name,
-        title,
-        action_url,
-        form_fields,
-        model_name,
-        submit_text,
-        activity_panel,
-        history_panel
+
+<div class="card bg-base-100 shadow max-w-2xl">
+    <div class="card-body">
+        <h2 class="card-title">{title}</h2>
+
+        <form method="post" action="{action}">
+            {fields}
+            <div class="card-actions justify-end mt-6">
+                <a href="/list/{model}" class="btn btn-ghost">Cancel</a>
+                <button type="submit" class="btn btn-primary">{submit}</button>
+            </div>
+        </form>
+    </div>
+</div>
+<div class="max-w-2xl mt-6 flex flex-col gap-6">{activity}{history}</div>"##,
+        model = model_name,
+        title = title,
+        action = action_url,
+        fields = form_fields,
+        submit = submit_text,
+        activity = activity_panel,
+        history = history_panel,
     );
 
-    Html(html).into_response()
+    Html(vortex_framework::render_app_shell(&title, &sidebar, &body)).into_response()
 }
 
 async fn dynamic_form_create(

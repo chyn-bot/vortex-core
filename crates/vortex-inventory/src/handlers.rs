@@ -124,7 +124,7 @@ fn render_sidebar_active(state: &AppState, user: &AuthUser, db_ctx: &DatabaseCon
         user.is_admin(),
         &state.plugin_registry,
         &user.roles,
-        "",
+        &db_ctx.custom_apps_html,
     )
 }
 
