@@ -4425,31 +4425,36 @@ fn note_template_form_body(action: &str, title: &str, name: &str, body: &str, ac
     let active_box = if is_new { String::new() } else {
         format!(r#"<div class="form-control mb-3"><label class="cursor-pointer label justify-start gap-3"><input type="checkbox" name="active" class="checkbox checkbox-sm" {}/><span class="label-text">Active (offered in the quote editor)</span></label></div>"#, if active { "checked" } else { "" })
     };
-    format!(
-        r##"<div class="max-w-3xl">
-{rt_head}
-<a href="/sales/note-templates" class="btn btn-ghost btn-sm mb-3">← Back to Templates</a>
-<h1 class="text-2xl font-bold mb-3">{title}</h1>
-{rt_toolbar}
-<form method="POST" action="{action}" id="tpl-form">
-<div class="card bg-base-100 shadow"><div class="card-body">
-<div class="form-control mb-3"><label class="label"><span class="label-text">Name *</span></label>
+    // Standard record entry form → canonical Odoo-style sheet. The rich-text
+    // <style> head and the sticky editing toolbar stay above the form (they act
+    // on the contenteditable body inside the sheet), so they ride in the sheet's
+    // control row; the editor + submit-sync scripts follow the sheet verbatim.
+    let fields = format!(
+        r##"<div class="form-control mb-3"><label class="label"><span class="label-text">Name *</span></label>
 <input name="name" class="input input-bordered input-sm" value="{name}" required placeholder="e.g. Standard payment terms"/></div>
 <div class="form-control mb-3"><label class="label"><span class="label-text">Body</span></label>
 <div id="tpl-body" contenteditable="true" data-ph="Type the terms… use the toolbar above for bold / colour / tables" class="rt-field textarea textarea-bordered leading-snug" style="min-height:12rem">{body}</div>
 <input type="hidden" name="body"/></div>
-{active_box}
-<div class="flex gap-2"><button class="btn btn-primary btn-sm">Save</button>
-<a href="/sales/note-templates" class="btn btn-ghost btn-sm">Cancel</a></div>
-</div></div></form>
+{active_box}"##,
+        name = name, body = body, active_box = active_box,
+    );
+    let sheet = vortex_plugin_sdk::framework::render_form_sheet(&vortex_plugin_sdk::framework::FormSheet {
+        max_width: vortex_plugin_sdk::framework::SHEET_WIDTH,
+        back_href: "/sales/note-templates",
+        control_row: &format!("{rt_head}{rt_toolbar}", rt_head = RICH_TEXT_HEAD, rt_toolbar = RICH_TOOLBAR_HTML),
+        form_attrs: &format!(r#"method="POST" action="{action}" id="tpl-form""#, action = action),
+        title,
+        inner: &vortex_plugin_sdk::framework::form_section_raw("", &fields),
+        footer: r#"<a href="/sales/note-templates" class="btn btn-ghost btn-sm">Cancel</a><button class="btn btn-primary btn-sm">Save</button>"#,
+        below: "",
+    });
+    format!(
+        r#"{sheet}
 <script>{rt_js}</script>
-<script>{sync_js}</script>
-</div>"##,
-        rt_head = RICH_TEXT_HEAD,
-        rt_toolbar = RICH_TOOLBAR_HTML,
+<script>{sync_js}</script>"#,
+        sheet = sheet,
         rt_js = RICH_TEXT_JS,
         sync_js = TPL_SUBMIT_JS,
-        action = action, title = title, name = name, body = body, active_box = active_box,
     )
 }
 
@@ -4515,8 +4520,10 @@ async fn edit_note_template(
     let active: bool = row.try_get("active").unwrap_or(true);
     // Re-sanitize on the way out (defense in depth) before raw-embedding.
     let body_safe = crate::richtext::sanitize_rich(&body);
+    // Title is HTML-escaped by render_form_sheet, so pass the raw name here
+    // (the name field value below is still escaped for its raw-embedded input).
     let content = note_template_form_body(
-        &format!("/sales/note-templates/{id}"), &format!("Edit {}", esc(&name)),
+        &format!("/sales/note-templates/{id}"), &format!("Edit {}", name),
         &esc(&name), &body_safe, active, false,
     );
     Html(page_shell(&sidebar, "Edit Terms Template", &content)).into_response()

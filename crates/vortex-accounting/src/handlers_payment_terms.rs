@@ -105,11 +105,13 @@ async fn list_payment_terms(
 #[allow(clippy::too_many_arguments)]
 fn payment_term_form(
     action: &str,
+    title: &str,
     name: &str,
     due_days: &str,
     note: &str,
     active: bool,
     is_new: bool,
+    below: &str,
 ) -> String {
     let esc = vortex_plugin_sdk::framework::html_escape;
     let active_row = if is_new {
@@ -122,10 +124,8 @@ fn payment_term_form(
             checked = if active { " checked" } else { "" },
         )
     };
-    format!(
-        r#"<form method="POST" action="{action}">
-<div class="card bg-base-100 shadow"><div class="card-body">
-<div class="form-control mb-3">
+    let fields = format!(
+        r#"<div class="form-control mb-3">
 <label class="label"><span class="label-text">Name *</span></label>
 <input name="name" value="{name}" class="input input-bordered input-sm" required maxlength="120" placeholder="e.g. Net 30"/>
 </div>
@@ -138,16 +138,23 @@ fn payment_term_form(
 <label class="label"><span class="label-text">Note</span></label>
 <textarea name="note" class="textarea textarea-bordered textarea-sm" rows="2" maxlength="500" placeholder="Optional wording printed on documents">{note}</textarea>
 </div>
-{active_row}
-<button type="submit" class="btn btn-primary btn-sm">Save</button>
-</div></div>
-</form>"#,
-        action = action,
+{active_row}"#,
         name = esc(name),
         due_days = esc(due_days),
         note = esc(note),
         active_row = active_row,
-    )
+    );
+    let inner = vortex_plugin_sdk::framework::form_section_raw("", &fields);
+    vortex_plugin_sdk::framework::render_form_sheet(&vortex_plugin_sdk::framework::FormSheet {
+        max_width: vortex_plugin_sdk::framework::SHEET_WIDTH,
+        back_href: "/accounting/payment-terms",
+        control_row: "",
+        form_attrs: &format!(r#"method="POST" action="{action}""#, action = action),
+        title,
+        inner: &inner,
+        footer: r#"<a href="/accounting/payment-terms" class="btn btn-ghost">Cancel</a><button type="submit" class="btn btn-primary">Save</button>"#,
+        below,
+    })
 }
 
 async fn new_payment_term_form(
@@ -157,13 +164,15 @@ async fn new_payment_term_form(
     Extension(db_ctx): Extension<DatabaseContext>,
 ) -> Response {
     let sidebar = render_sidebar(&state, &user, &db_ctx);
-    let content = format!(
-        r#"<div class="max-w-xl">
-<a href="/accounting/payment-terms" class="btn btn-ghost btn-sm mb-4">← Back to Payment Terms</a>
-<h1 class="text-2xl font-bold mb-6">New Payment Term</h1>
-{form}
-</div>"#,
-        form = payment_term_form("/accounting/payment-terms/create", "", "30", "", true, true),
+    let content = payment_term_form(
+        "/accounting/payment-terms/create",
+        "New Payment Term",
+        "",
+        "30",
+        "",
+        true,
+        true,
+        "",
     );
     Html(page_shell(&sidebar, "New Payment Term", &content)).into_response()
 }
@@ -239,22 +248,15 @@ async fn edit_payment_term(
     let note: String = row.get("note");
     let active: bool = row.get("active");
     let activity_panel = vortex_plugin_sdk::framework::render_chatter_panel("payment_term", id);
-    let content = format!(
-        r#"<div class="max-w-xl">
-<a href="/accounting/payment-terms" class="btn btn-ghost btn-sm mb-4">← Back to Payment Terms</a>
-<h1 class="text-2xl font-bold mb-6">{name}</h1>
-{form}
-<div class="mt-6">{activity_panel}</div>
-</div>"#,
-        name = vortex_plugin_sdk::framework::html_escape(&name),
-        form = payment_term_form(
-            &format!("/accounting/payment-terms/{id}"),
-            &name,
-            &due_days.to_string(),
-            &note,
-            active,
-            false,
-        ),
+    let content = payment_term_form(
+        &format!("/accounting/payment-terms/{id}"),
+        &name,
+        &name,
+        &due_days.to_string(),
+        &note,
+        active,
+        false,
+        &activity_panel,
     );
     Html(page_shell(&sidebar, "Edit Payment Term", &content)).into_response()
 }

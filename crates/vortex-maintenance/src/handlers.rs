@@ -282,22 +282,28 @@ fn category_form_body(action: &str, title: &str, name: &str, parents: &str, acti
     let active_box = if is_new { String::new() } else {
         format!(r#"<div class="form-control mb-3"><label class="cursor-pointer label justify-start gap-3"><input type="checkbox" name="active" class="checkbox checkbox-sm" {}/><span class="label-text">Active</span></label></div>"#, if active { "checked" } else { "" })
     };
-    format!(
-        r#"<div class="max-w-xl">
-<a href="/maintenance/asset-categories" class="btn btn-ghost btn-sm mb-4">← Back to Categories</a>
-<h1 class="text-2xl font-bold mb-6">{title}</h1>
-<form method="POST" action="{action}">
-<div class="card bg-base-100 shadow"><div class="card-body">
-<div class="form-control mb-3"><label class="label"><span class="label-text">Name *</span></label>
+    // Flat sheet section (see vortex_plugin_sdk::framework::form_section_raw)
+    // instead of a floating card — the whole form reads as one Odoo-style sheet.
+    let fields = format!(
+        r#"<div class="form-control mb-3"><label class="label"><span class="label-text">Name *</span></label>
 <input name="name" class="input input-bordered input-sm" value="{name}" required/></div>
 <div class="form-control mb-3"><label class="label"><span class="label-text">Parent Category</span></label>
 <select name="parent_id" class="select select-bordered select-sm">{parents}</select></div>
-{active_box}
-<div class="flex gap-2"><button class="btn btn-primary btn-sm">Save</button>
-<a href="/maintenance/asset-categories" class="btn btn-ghost btn-sm">Cancel</a></div>
-</div></div></form></div>"#,
-        title = title, action = action, name = name, parents = parents, active_box = active_box,
-    )
+{active_box}"#,
+        name = name, parents = parents, active_box = active_box,
+    );
+    let form_attrs = format!(r#"method="POST" action="{action}""#);
+    let inner = vortex_plugin_sdk::framework::form_section_raw("", &fields);
+    vortex_plugin_sdk::framework::render_form_sheet(&vortex_plugin_sdk::framework::FormSheet {
+        max_width: vortex_plugin_sdk::framework::SHEET_WIDTH,
+        back_href: "/maintenance/asset-categories",
+        control_row: "",
+        form_attrs: &form_attrs,
+        title,
+        inner: &inner,
+        footer: r#"<a href="/maintenance/asset-categories" class="btn btn-ghost btn-sm">Cancel</a><button type="submit" class="btn btn-primary btn-sm">Save</button>"#,
+        below: "",
+    })
 }
 
 async fn new_category_form(
@@ -476,20 +482,23 @@ async fn new_asset_form(
     let vendors = vendor_options(&db, None).await;
     let parents = asset_options(&db, None).await;
     let fields = asset_fields("medium", "operational", "", "", "", "", "", "0", "", &categories, &vendors, &parents);
-    let content = format!(
-        r#"<div class="max-w-3xl">
-<a href="/maintenance/assets" class="btn btn-ghost btn-sm mb-4">← Back to Assets</a>
-<h1 class="text-2xl font-bold mb-6">New Asset</h1>
-<form method="POST" action="/maintenance/assets/create">
-<div class="card bg-base-100 shadow"><div class="card-body">
-<div class="form-control mb-3"><label class="label"><span class="label-text">Name *</span></label>
+    let section = format!(
+        r#"<div class="form-control mb-3"><label class="label"><span class="label-text">Name *</span></label>
 <input name="name" class="input input-bordered input-sm" required/></div>
-{fields}
-<div class="flex gap-2 mt-4"><button class="btn btn-primary btn-sm">Create</button>
-<a href="/maintenance/assets" class="btn btn-ghost btn-sm">Cancel</a></div>
-</div></div></form></div>"#,
+{fields}"#,
         fields = fields,
     );
+    let inner = vortex_plugin_sdk::framework::form_section_raw("", &section);
+    let content = vortex_plugin_sdk::framework::render_form_sheet(&vortex_plugin_sdk::framework::FormSheet {
+        max_width: vortex_plugin_sdk::framework::SHEET_WIDTH,
+        back_href: "/maintenance/assets",
+        control_row: "",
+        form_attrs: r#"method="POST" action="/maintenance/assets/create""#,
+        title: "New Asset",
+        inner: &inner,
+        footer: r#"<a href="/maintenance/assets" class="btn btn-ghost btn-sm">Cancel</a><button type="submit" class="btn btn-primary btn-sm">Create</button>"#,
+        below: "",
+    });
     Html(page_shell(&sidebar, "New Asset", &content)).into_response()
 }
 
@@ -623,15 +632,18 @@ async fn edit_asset(
 
 <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
 <div class="lg:col-span-2"><form method="POST" action="/maintenance/assets/{id}">
-<div class="card bg-base-100 shadow"><div class="card-body">
-<h2 class="card-title text-lg mb-3">Details</h2>
+<div class="bg-base-100 rounded-lg shadow-sm border border-base-300 p-6 md:p-8">
+<section class="break-inside-avoid mb-8 last:mb-0">
+<h2 class="text-xs font-semibold uppercase tracking-wider text-base-content/50 border-b border-base-300 pb-2 mb-4">Details</h2>
 <div class="form-control mb-3"><label class="label"><span class="label-text">Name *</span></label>
 <input name="name" class="input input-bordered input-sm" value="{name_val}" required/></div>
 {fields}
 <div class="form-control mt-3"><label class="cursor-pointer label justify-start gap-3">
 <input type="checkbox" name="active" class="checkbox checkbox-sm" {active_checked}/><span class="label-text">Active</span></label></div>
-<div class="mt-4"><button class="btn btn-primary btn-sm">Save</button></div>
-</div></div></form></div>
+</section>
+</div>
+<div class="flex justify-end gap-2 mt-4"><button class="btn btn-primary btn-sm">Save</button></div>
+</form></div>
 
 <div class="space-y-6">
 <div class="card bg-base-100 shadow"><div class="card-body">
@@ -764,13 +776,8 @@ async fn new_work_order_form(
     let assets = asset_options(&db, preselect).await;
     let users = user_options(&db, None).await;
     let locations = location_options(&db, None).await;
-    let content = format!(
-        r#"<div class="max-w-2xl">
-<a href="/maintenance" class="btn btn-ghost btn-sm mb-4">← Back to Work Orders</a>
-<h1 class="text-2xl font-bold mb-6">New Work Order</h1>
-<form method="POST" action="/maintenance/work-orders/create">
-<div class="card bg-base-100 shadow"><div class="card-body">
-<div class="form-control mb-3"><label class="label"><span class="label-text">Asset</span></label>
+    let section = format!(
+        r#"<div class="form-control mb-3"><label class="label"><span class="label-text">Asset</span></label>
 <select name="asset_id" class="select select-bordered select-sm">{assets}</select></div>
 <div class="grid grid-cols-2 gap-3">
 <div class="form-control mb-3"><label class="label"><span class="label-text">Type</span></label>
@@ -789,12 +796,20 @@ async fn new_work_order_form(
 <div class="form-control mb-3"><label class="label"><span class="label-text">Parts Source Location</span></label>
 <select name="consume_location_id" class="select select-bordered select-sm">{locations}</select></div>
 <div class="form-control mb-4"><label class="label"><span class="label-text">Description</span></label>
-<textarea name="description" class="textarea textarea-bordered" rows="3"></textarea></div>
-<div class="flex gap-2"><button class="btn btn-primary btn-sm">Create</button>
-<a href="/maintenance" class="btn btn-ghost btn-sm">Cancel</a></div>
-</div></div></form></div>"#,
+<textarea name="description" class="textarea textarea-bordered" rows="3"></textarea></div>"#,
         assets = assets, users = users, locations = locations,
     );
+    let inner = vortex_plugin_sdk::framework::form_section_raw("", &section);
+    let content = vortex_plugin_sdk::framework::render_form_sheet(&vortex_plugin_sdk::framework::FormSheet {
+        max_width: vortex_plugin_sdk::framework::SHEET_WIDTH,
+        back_href: "/maintenance",
+        control_row: "",
+        form_attrs: r#"method="POST" action="/maintenance/work-orders/create""#,
+        title: "New Work Order",
+        inner: &inner,
+        footer: r#"<a href="/maintenance" class="btn btn-ghost btn-sm">Cancel</a><button type="submit" class="btn btn-primary btn-sm">Create</button>"#,
+        below: "",
+    });
     Html(page_shell(&sidebar, "New Work Order", &content)).into_response()
 }
 
@@ -922,6 +937,9 @@ async fn edit_work_order(
         format!(
             r#"<form method="POST" action="/maintenance/work-orders/{id}">
 <fieldset{dis}>
+<div class="bg-base-100 rounded-lg shadow-sm border border-base-300 p-6 md:p-8">
+<section class="break-inside-avoid mb-8 last:mb-0">
+<h2 class="text-xs font-semibold uppercase tracking-wider text-base-content/50 border-b border-base-300 pb-2 mb-4">Details</h2>
 <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
 <div class="form-control"><label class="label"><span class="label-text">Asset</span></label>
 <select name="asset_id" class="select select-bordered select-sm">{assets}</select></div>
@@ -946,7 +964,9 @@ async fn edit_work_order(
 <div class="form-control"><label class="label"><span class="label-text">Downtime (hours)</span></label>
 <input name="downtime_hours" type="number" step="0.01" value="{downtime}" class="input input-bordered input-sm"/></div>
 </div>
-{save_btn}
+</section>
+</div>
+{footer}
 </fieldset>
 </form>"#,
             id = id, dis = dis, assets = assets, users = users, locations = locations,
@@ -956,7 +976,7 @@ async fn edit_work_order(
             downtime = money(downtime),
             t_c = sel(&wo_type, "corrective"), t_p = sel(&wo_type, "preventive"), t_i = sel(&wo_type, "inspection"),
             p_l = sel(&priority, "low"), p_n = sel(&priority, "normal"), p_h = sel(&priority, "high"), p_u = sel(&priority, "urgent"),
-            save_btn = if editable { r#"<div class="mt-3"><button class="btn btn-primary btn-sm">Save</button></div>"# } else { "" },
+            footer = if editable { r#"<div class="flex justify-end gap-2 mt-4"><button class="btn btn-primary btn-sm">Save</button></div>"# } else { "" },
         )
     };
 
@@ -990,10 +1010,7 @@ async fn edit_work_order(
 <h1 class="text-2xl font-bold">{number} {badge}</h1></div>
 <div>{actions}</div></div>
 
-<div class="card bg-base-100 shadow mb-6"><div class="card-body">
-<h2 class="card-title text-lg mb-3">Details</h2>
-{header}
-</div></div>
+<div class="mb-6">{header}</div>
 
 <div class="card bg-base-100 shadow"><div class="card-body">
 <h2 class="card-title text-lg mb-2">Parts</h2>
@@ -1369,17 +1386,17 @@ async fn new_plan_form(
     let users = user_options(&db, None).await;
     let locations = location_options(&db, None).await;
     let fields = plan_form_fields("preventive", "normal", "1", "month", "", "0", "active", "", &assets, &users, &locations, true);
-    let content = format!(
-        r#"<div class="max-w-3xl">
-<a href="/maintenance/plans" class="btn btn-ghost btn-sm mb-4">← Back to Plans</a>
-<h1 class="text-2xl font-bold mb-6">New Maintenance Plan</h1>
-<form method="POST" action="/maintenance/plans/create">
-<div class="card bg-base-100 shadow"><div class="card-body">{fields}
-<div class="flex gap-2 mt-4"><button class="btn btn-primary btn-sm">Create</button>
-<a href="/maintenance/plans" class="btn btn-ghost btn-sm">Cancel</a></div>
-</div></div></form></div>"#,
-        fields = fields,
-    );
+    let inner = vortex_plugin_sdk::framework::form_section_raw("", &fields);
+    let content = vortex_plugin_sdk::framework::render_form_sheet(&vortex_plugin_sdk::framework::FormSheet {
+        max_width: vortex_plugin_sdk::framework::SHEET_WIDTH,
+        back_href: "/maintenance/plans",
+        control_row: "",
+        form_attrs: r#"method="POST" action="/maintenance/plans/create""#,
+        title: "New Maintenance Plan",
+        inner: &inner,
+        footer: r#"<a href="/maintenance/plans" class="btn btn-ghost btn-sm">Cancel</a><button type="submit" class="btn btn-primary btn-sm">Create</button>"#,
+        below: "",
+    });
     Html(page_shell(&sidebar, "New Plan", &content)).into_response()
 }
 
@@ -1456,18 +1473,21 @@ async fn edit_plan(
 
     let activity_panel = vortex_plugin_sdk::framework::render_chatter_panel("maint_plan", id);
     let content = format!(
-        r#"<div class="max-w-3xl">
+        r#"<div class="max-w-6xl mx-auto">
 <a href="/maintenance/plans" class="btn btn-ghost btn-sm mb-4">← Back to Plans</a>
 <div class="flex items-center justify-between mb-6">
 <h1 class="text-2xl font-bold">Edit Plan</h1>
 <div>{dup}</div></div>
 <form method="POST" action="/maintenance/plans/{id}">
-<div class="card bg-base-100 shadow"><div class="card-body">{fields}
-<div class="flex gap-2 mt-4"><button class="btn btn-primary btn-sm">Save</button>
-<a href="/maintenance/plans" class="btn btn-ghost btn-sm">Cancel</a></div>
-</div></div></form>
-<div class="mt-6">{activity_panel}</div></div>"#,
-        id = id, fields = fields,
+<div class="bg-base-100 rounded-lg shadow-sm border border-base-300 p-6 md:p-8">
+<section class="break-inside-avoid mb-8 last:mb-0">{fields}</section>
+</div>
+<div class="flex justify-end gap-2 mt-4">
+<a href="/maintenance/plans" class="btn btn-ghost btn-sm">Cancel</a>
+<button class="btn btn-primary btn-sm">Save</button></div>
+</form>
+<div class="mt-8 flex flex-col gap-6">{activity_panel}</div></div>"#,
+        id = id, fields = fields, activity_panel = activity_panel,
         dup = duplicate_button(&format!("/maintenance/plans/{id}/duplicate")),
     );
     Html(page_shell(&sidebar, &format!("Plan {}", name), &content)).into_response()

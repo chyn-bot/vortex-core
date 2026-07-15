@@ -390,13 +390,11 @@ async fn new_order_form(
     let locations = location_options(&db, None).await;
     let currencies = currency_options(&db, None).await;
 
-    let content = format!(
-        r#"<div class="max-w-2xl">
-<a href="/purchase/rfqs" class="btn btn-ghost btn-sm mb-4">← Back to RFQs</a>
-<h1 class="text-2xl font-bold mb-6">New RFQ</h1>
-<p class="text-base-content/60 text-sm mb-4">Every purchase starts as a request for quotation — it gets its PO number when confirmed.</p>
-<form method="POST" action="/purchase/orders/create">
-<div class="card bg-base-100 shadow"><div class="card-body">
+    // Field groups — identical field markup to before, now composed as one flat
+    // Odoo-style sheet section (see vortex_plugin_sdk::framework::form_section_raw)
+    // instead of a floating card. The submit/cancel buttons move to the sheet footer.
+    let fields = format!(
+        r#"<p class="text-base-content/60 text-sm mb-4">Every purchase starts as a request for quotation — it gets its PO number when confirmed.</p>
 <div class="form-control mb-3">
 <label class="label"><span class="label-text">Vendor *</span></label>
 <select name="vendor_id" class="select select-bordered select-sm" required>{vendors}</select>
@@ -430,18 +428,24 @@ async fn new_order_form(
 <div class="form-control mb-4">
 <label class="label"><span class="label-text">Note</span></label>
 <textarea name="note" class="textarea textarea-bordered" rows="2"></textarea>
-</div>
-<div class="flex gap-2">
-<button type="submit" class="btn btn-primary btn-sm">Create</button>
-<a href="/purchase" class="btn btn-ghost btn-sm">Cancel</a>
-</div>
-</div></div>
-</form>
 </div>"#,
         vendors = vendors,
         locations = locations,
         currencies = currencies,
     );
+
+    let inner = vortex_plugin_sdk::framework::form_section_raw("", &fields);
+
+    let content = vortex_plugin_sdk::framework::render_form_sheet(&vortex_plugin_sdk::framework::FormSheet {
+        max_width: vortex_plugin_sdk::framework::SHEET_WIDTH,
+        back_href: "/purchase/rfqs",
+        control_row: "",
+        form_attrs: r#"method="POST" action="/purchase/orders/create""#,
+        title: "New RFQ",
+        inner: &inner,
+        footer: r#"<a href="/purchase" class="btn btn-ghost btn-sm">Cancel</a><button type="submit" class="btn btn-primary btn-sm">Create</button>"#,
+        below: "",
+    });
 
     Html(page_shell(&sidebar, "New RFQ", &content)).into_response()
 }
@@ -1583,28 +1587,33 @@ async fn receive_form(
         ));
     }
 
-    let content = format!(
-        r#"<div class="max-w-3xl">
-<a href="/purchase/orders/{id}" class="btn btn-ghost btn-sm mb-4">← Back to {number}</a>
-<h1 class="text-2xl font-bold mb-2">Receive Goods — {number}</h1>
-<p class="text-base-content/60 mb-6">Enter the quantity received per line. Lot/serial-tracked products require a number. Receiving posts validated stock moves from the Vendors location into the receiving location.</p>
-<form method="POST" action="/purchase/orders/{id}/receive">
-<div class="card bg-base-100 shadow"><div class="card-body">
+    // Receipt entry table — identical markup to before, now composed as one flat
+    // Odoo-style sheet section instead of a floating card; buttons move to the footer.
+    let fields = format!(
+        r#"<p class="text-base-content/60 mb-6">Enter the quantity received per line. Lot/serial-tracked products require a number. Receiving posts validated stock moves from the Vendors location into the receiving location.</p>
 <div class="overflow-x-auto">
 <table class="table table-sm">
 <thead><tr><th>Code</th><th>Product</th><th class="text-right">Outstanding</th><th>Receive Qty</th><th>Lot / Serial</th></tr></thead>
 <tbody>{rows}</tbody>
 </table>
-</div>
-<div class="flex gap-2 mt-4">
-<button type="submit" class="btn btn-success btn-sm">Post Receipt</button>
-<a href="/purchase/orders/{id}" class="btn btn-ghost btn-sm">Cancel</a>
-</div>
-</div></div>
-</form>
 </div>"#,
-        id = id, number = esc(&number), rows = rows,
+        rows = rows,
     );
+
+    let inner = vortex_plugin_sdk::framework::form_section_raw("", &fields);
+
+    let content = vortex_plugin_sdk::framework::render_form_sheet(&vortex_plugin_sdk::framework::FormSheet {
+        max_width: vortex_plugin_sdk::framework::SHEET_WIDTH,
+        back_href: &format!("/purchase/orders/{id}"),
+        control_row: "",
+        form_attrs: &format!(r#"method="POST" action="/purchase/orders/{id}/receive""#),
+        title: &format!("Receive Goods — {}", number),
+        inner: &inner,
+        footer: &format!(
+            r#"<a href="/purchase/orders/{id}" class="btn btn-ghost btn-sm">Cancel</a><button type="submit" class="btn btn-success btn-sm">Post Receipt</button>"#
+        ),
+        below: "",
+    });
 
     Html(page_shell(&sidebar, &format!("Receive {}", number), &content)).into_response()
 }

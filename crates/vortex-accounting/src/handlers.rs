@@ -1051,14 +1051,14 @@ async fn list_accounts(
     Html(page_shell(&sidebar, "Chart of Accounts", &list_html)).into_response()
 }
 
-fn account_form(action: &str, values: Option<(&str, &str, &str, bool, bool)>) -> String {
+/// The account (chart-of-accounts) field body, rendered as a flat sheet section.
+/// Callers wrap it in the canonical [`FormSheet`] chrome (form + footer).
+fn account_form(values: Option<(&str, &str, &str, bool, bool)>) -> String {
     let (code, name, account_type, reconcile, active) =
         values.unwrap_or(("", "", "", false, true));
     let esc = vortex_plugin_sdk::framework::html_escape;
-    format!(
-        r#"<form method="POST" action="{action}">
-<div class="card bg-base-100 shadow"><div class="card-body">
-<div class="grid grid-cols-2 gap-3">
+    let fields = format!(
+        r#"<div class="grid grid-cols-2 gap-3">
 <div class="form-control mb-3">
 <label class="label"><span class="label-text">Code *</span></label>
 <input name="code" value="{code}" class="input input-bordered input-sm font-mono" required maxlength="16"/>
@@ -1079,11 +1079,7 @@ fn account_form(action: &str, values: Option<(&str, &str, &str, bool, bool)>) ->
 <div class="form-control mb-3">
 <label class="label cursor-pointer justify-start gap-2"><input type="checkbox" name="active" value="1" class="checkbox checkbox-sm"{active_checked}/><span class="label-text">Active</span></label>
 </div>
-</div>
-<button type="submit" class="btn btn-primary btn-sm">Save</button>
-</div></div>
-</form>"#,
-        action = action,
+</div>"#,
         code = esc(code),
         name = esc(name),
         type_options = account_type_options(if account_type.is_empty() {
@@ -1093,7 +1089,8 @@ fn account_form(action: &str, values: Option<(&str, &str, &str, bool, bool)>) ->
         }),
         reconcile_checked = if reconcile { " checked" } else { "" },
         active_checked = if active { " checked" } else { "" },
-    )
+    );
+    vortex_plugin_sdk::framework::form_section_raw("", &fields)
 }
 
 async fn new_account_form(
@@ -1103,14 +1100,16 @@ async fn new_account_form(
     Extension(db_ctx): Extension<DatabaseContext>,
 ) -> Response {
     let sidebar = render_sidebar(&state, &user, &db_ctx);
-    let content = format!(
-        r#"<div class="max-w-xl">
-<a href="/accounting/accounts" class="btn btn-ghost btn-sm mb-4">← Back to Chart of Accounts</a>
-<h1 class="text-2xl font-bold mb-6">New Account</h1>
-{form}
-</div>"#,
-        form = account_form("/accounting/accounts/create", None),
-    );
+    let content = vortex_plugin_sdk::framework::render_form_sheet(&vortex_plugin_sdk::framework::FormSheet {
+        max_width: vortex_plugin_sdk::framework::SHEET_WIDTH,
+        back_href: "/accounting/accounts",
+        control_row: "",
+        form_attrs: r#"method="POST" action="/accounting/accounts/create""#,
+        title: "New Account",
+        inner: &account_form(None),
+        footer: r#"<a href="/accounting/accounts" class="btn btn-ghost">Cancel</a><button type="submit" class="btn btn-primary">Save</button>"#,
+        below: "",
+    });
     Html(page_shell(&sidebar, "New Account", &content)).into_response()
 }
 
@@ -1188,20 +1187,29 @@ async fn edit_account(
 
     let activity_panel = vortex_plugin_sdk::framework::render_chatter_panel("acc_account", id);
 
+    // Rich header h1 (code — name + type badge) lives inside the sheet, so this
+    // form builds the canonical sheet inline rather than via render_form_sheet
+    // (whose title is HTML-escaped). Chatter/history sit below.
     let content = format!(
-        r#"<div class="max-w-xl">
-<a href="/accounting/accounts" class="btn btn-ghost btn-sm mb-4">← Back to Chart of Accounts</a>
+        r#"<div class="max-w-6xl mx-auto">
+<div class="mb-3"><a href="/accounting/accounts" class="btn btn-ghost btn-sm">← Back to Chart of Accounts</a></div>
+<form method="POST" action="/accounting/accounts/{id}">
+<div class="bg-base-100 rounded-lg shadow-sm border border-base-300 p-6 md:p-8">
 <h1 class="text-2xl font-bold mb-6">{code} — {name} <span class="badge badge-ghost">{type_label}</span></h1>
 {form}
-<div class="mt-6">{activity_panel}</div>
+</div>
+<div class="flex justify-end gap-2 mt-4">
+<a href="/accounting/accounts" class="btn btn-ghost">Cancel</a>
+<button type="submit" class="btn btn-primary">Save</button>
+</div>
+</form>
+<div class="mt-8 flex flex-col gap-6">{activity_panel}</div>
 </div>"#,
+        id = id,
         code = vortex_plugin_sdk::framework::html_escape(&code),
         name = vortex_plugin_sdk::framework::html_escape(&name),
         type_label = account_type_label(&account_type),
-        form = account_form(
-            &format!("/accounting/accounts/{id}"),
-            Some((&code, &name, &account_type, reconcile, active)),
-        ),
+        form = account_form(Some((&code, &name, &account_type, reconcile, active))),
     );
     Html(page_shell(&sidebar, "Edit Account", &content)).into_response()
 }
@@ -1324,13 +1332,11 @@ async fn edit_journal(
 
     let activity_panel = vortex_plugin_sdk::framework::render_chatter_panel("acc_journal", id);
 
-    let content = format!(
-        r#"<div class="max-w-xl">
-<a href="/accounting/journals" class="btn btn-ghost btn-sm mb-4">← Back to Journals</a>
-<h1 class="text-2xl font-bold mb-6">{code} — {name} <span class="badge badge-ghost">{jtype}</span></h1>
-<form method="POST" action="/accounting/journals/{id}">
-<div class="card bg-base-100 shadow"><div class="card-body">
-<div class="form-control mb-3">
+    // Rich header h1 (code — name + type badge) lives inside the sheet, so this
+    // form builds the canonical sheet inline rather than via render_form_sheet
+    // (whose title is HTML-escaped). Chatter/history sit below.
+    let fields = format!(
+        r#"<div class="form-control mb-3">
 <label class="label"><span class="label-text">Name *</span></label>
 <input name="name" value="{name}" class="input input-bordered input-sm" required maxlength="120"/>
 </div>
@@ -1341,18 +1347,31 @@ async fn edit_journal(
 <div class="form-control mb-4">
 <label class="label"><span class="label-text">Note</span></label>
 <textarea name="note" class="textarea textarea-bordered textarea-sm" rows="2">{note}</textarea>
+</div>"#,
+        name = esc(&name),
+        accounts = accounts,
+        note = esc(note.as_deref().unwrap_or("")),
+    );
+    let content = format!(
+        r#"<div class="max-w-6xl mx-auto">
+<div class="mb-3"><a href="/accounting/journals" class="btn btn-ghost btn-sm">← Back to Journals</a></div>
+<form method="POST" action="/accounting/journals/{id}">
+<div class="bg-base-100 rounded-lg shadow-sm border border-base-300 p-6 md:p-8">
+<h1 class="text-2xl font-bold mb-6">{code} — {name} <span class="badge badge-ghost">{jtype}</span></h1>
+{section}
 </div>
-<button type="submit" class="btn btn-primary btn-sm">Save</button>
-</div></div>
+<div class="flex justify-end gap-2 mt-4">
+<a href="/accounting/journals" class="btn btn-ghost">Cancel</a>
+<button type="submit" class="btn btn-primary">Save</button>
+</div>
 </form>
-<div class="mt-6">{activity_panel}</div>
+<div class="mt-8 flex flex-col gap-6">{activity_panel}</div>
 </div>"#,
         id = id,
         code = esc(&code),
         name = esc(&name),
         jtype = esc(&journal_type),
-        accounts = accounts,
-        note = esc(note.as_deref().unwrap_or("")),
+        section = vortex_plugin_sdk::framework::form_section_raw("", &fields),
     );
     Html(page_shell(&sidebar, "Edit Journal", &content)).into_response()
 }
