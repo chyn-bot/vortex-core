@@ -656,6 +656,7 @@ pub async fn set_layout(
     model: &str,
     orders: &HashMap<String, i32>,
     list_fields: &HashSet<String>,
+    widths: &HashMap<String, i16>,
 ) -> Result<(), String> {
     gate(state, user, "blueprint.alter", model).await?;
 
@@ -677,14 +678,18 @@ pub async fn set_layout(
 
     let plan = plan_layout(&existing, orders, list_fields)?;
     for (name, seq, in_list) in &plan {
+        // Form width: 1 = half column, 2 = full row. Anything else clamps to a
+        // full row so a malformed submission can't hide a field. Absent = full.
+        let span: i16 = widths.get(name).copied().unwrap_or(2).clamp(1, 2);
         sqlx::query(
-            "UPDATE ir_model_field SET sequence = $3, is_visible = $4
+            "UPDATE ir_model_field SET sequence = $3, is_visible = $4, col_span = $5
              WHERE model_id = $1 AND name = $2 AND source = 'blueprint'",
         )
         .bind(model_id)
         .bind(name)
         .bind(*seq)
         .bind(*in_list)
+        .bind(span)
         .execute(&mut *tx)
         .await
         .map_err(dberr)?;

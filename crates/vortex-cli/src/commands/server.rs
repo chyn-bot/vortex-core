@@ -6755,21 +6755,43 @@ async fn blueprint_designer(
         target_options.push_str(&format!(r#"<optgroup label="Core records">{core_opts}</optgroup>"#));
     }
 
-    // Layout rows: an order box + a "list column" checkbox per field, submitted
-    // as one form (order__<f> / list__<f>). Sequence drives order in both the
-    // generic form and list; is_visible drives list-column membership.
+    // Per-field form width (col_span). Read best-effort in its own query so a
+    // tenant DB that predates migration 153 still renders the designer — the
+    // widths just default to Full.
+    let width_map: std::collections::HashMap<String, i16> = sqlx::query(
+        "SELECT name, col_span FROM ir_model_field WHERE model_id = $1 AND source = 'blueprint'",
+    )
+    .bind(model_id)
+    .fetch_all(&db)
+    .await
+    .map(|rows| {
+        rows.iter()
+            .map(|r| (r.get::<String, _>("name"), r.try_get::<i16, _>("col_span").unwrap_or(2)))
+            .collect()
+    })
+    .unwrap_or_default();
+
+    // Layout rows: an order box, a form-width picker, and a "list column"
+    // checkbox per field, submitted as one form (order__<f> / width__<f> /
+    // list__<f>). Sequence drives order in both the generic form and list;
+    // col_span lays the form out in two columns; is_visible drives list-column
+    // membership.
     let mut layout_rows = String::new();
     for (idx, f) in fields.iter().enumerate() {
         let fname: String = f.get("name");
         let flabel: String = f.get("display_name");
         let in_list: bool = f.get("is_visible");
+        let span = width_map.get(&fname).copied().unwrap_or(2);
         layout_rows.push_str(&format!(
             r#"<tr class="hover"><td>{flabel} <code class="text-xs opacity-60">{fname}</code></td>
 <td><input type="number" name="order__{fname}" value="{ord}" class="input input-bordered input-xs w-20"/></td>
+<td><select name="width__{fname}" class="select select-bordered select-xs"><option value="2"{full}>Full</option><option value="1"{half}>Half</option></select></td>
 <td class="text-center"><input type="checkbox" name="list__{fname}" class="checkbox checkbox-sm"{checked}/></td></tr>"#,
             flabel = html_escape(&flabel),
             fname = html_escape(&fname),
             ord = (idx + 1) * 10,
+            full = if span >= 2 { " selected" } else { "" },
+            half = if span <= 1 { " selected" } else { "" },
             checked = if in_list { " checked" } else { "" },
         ));
     }
@@ -6821,9 +6843,9 @@ async fn blueprint_designer(
         format!(
             r#"<div class="card bg-base-100 shadow mb-6 max-w-2xl"><div class="card-body p-4">
 <h2 class="card-title text-base mb-1">Layout</h2>
-<p class="text-sm opacity-60 mb-3">Order drives both the form and the list. Untick <em>List column</em> to hide a field from the list view — it stays editable on the form.</p>
+<p class="text-sm opacity-60 mb-3">Order drives both the form and the list. Set a field to <em>Half</em> width to place it beside the next Half field (two per row on wide screens). Untick <em>List column</em> to hide a field from the list view — it stays editable on the form.</p>
 <form action="/blueprints/{model}/layout" method="POST">
-<table class="table table-sm"><thead><tr><th>Field</th><th>Order</th><th class="text-center">List column</th></tr></thead>
+<table class="table table-sm"><thead><tr><th>Field</th><th>Order</th><th>Form width</th><th class="text-center">List column</th></tr></thead>
 <tbody>{layout_rows}</tbody></table>
 <div class="mt-3"><button class="btn btn-primary btn-sm">Save layout</button></div>
 </form></div></div>"#,
@@ -7377,6 +7399,7 @@ async fn blueprint_set_layout(
     }
     let mut orders: std::collections::HashMap<String, i32> = std::collections::HashMap::new();
     let mut list_fields: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut widths: std::collections::HashMap<String, i16> = std::collections::HashMap::new();
     for (k, v) in &pairs {
         if let Some(name) = k.strip_prefix("order__") {
             if let Ok(n) = v.trim().parse::<i32>() {
@@ -7384,6 +7407,10 @@ async fn blueprint_set_layout(
             }
         } else if let Some(name) = k.strip_prefix("list__") {
             list_fields.insert(name.to_string());
+        } else if let Some(name) = k.strip_prefix("width__") {
+            if let Ok(n) = v.trim().parse::<i16>() {
+                widths.insert(name.to_string(), n);
+            }
         }
     }
     match vortex_framework::blueprint::set_layout(
@@ -7394,6 +7421,7 @@ async fn blueprint_set_layout(
         &model,
         &orders,
         &list_fields,
+        &widths,
     )
     .await
     {
@@ -22182,6 +22210,24 @@ async fn render_dynamic_form(
         ));
     }
 
+    // Per-field form width (col_span: 1 = half, 2 = full row), read best-effort
+    // in its own query — a tenant DB that predates migration 153 has no col_span
+    // column, so the query fails and every field defaults to full width (the old
+    // one-field-per-row behaviour). Kept out of the fail-loud field query above
+    // so drift can't blank the whole form.
+    let width_map: std::collections::HashMap<String, i16> = sqlx::query(
+        "SELECT name, col_span FROM ir_model_field WHERE model_id = $1",
+    )
+    .bind(model_id)
+    .fetch_all(db)
+    .await
+    .map(|rows| {
+        rows.iter()
+            .map(|r| (r.get::<String, _>("name"), r.try_get::<i16, _>("col_span").unwrap_or(2)))
+            .collect()
+    })
+    .unwrap_or_default();
+
     // Fetch existing record if editing
     let record_data: std::collections::HashMap<String, String> = if let Some(rid) = record_id {
         let query = format!("SELECT * FROM {} WHERE id = $1", table_name);
@@ -22232,6 +22278,15 @@ async fn render_dynamic_form(
         let field_type: String = field.get("field_type");
         let selection_options: Option<serde_json::Value> = field.get("selection_options");
         let relation_model: Option<String> = field.get("related_model");
+
+        // Half-width fields (col_span=1) take one column of the 2-col grid so two
+        // sit side by side; full-width (default) span the row. On mobile the grid
+        // is single-column, so everything stacks regardless.
+        let span_class = if width_map.get(&field_name).copied().unwrap_or(2) <= 1 {
+            "md:col-span-1"
+        } else {
+            "md:col-span-2"
+        };
 
         let current_value = record_data.get(&field_name).cloned().unwrap_or_default();
         let required_attr = "";  // Can add required logic later based on field metadata
@@ -22357,11 +22412,11 @@ async fn render_dynamic_form(
         let required_badge = "";  // Can add required indicator later based on field metadata
 
         form_fields.push_str(&format!(
-            r#"<div class="form-control mb-4">
+            r#"<div class="form-control mb-4 {}">
                 <label class="label"><span class="label-text">{} {}</span></label>
                 {}
             </div>"#,
-            display_name, required_badge, input_html
+            span_class, display_name, required_badge, input_html
         ));
     }
 
@@ -22408,12 +22463,14 @@ async fn render_dynamic_form(
     <a href="/list/{model}" class="btn btn-ghost btn-sm">← Back to List</a>
 </div>
 
-<div class="card bg-base-100 shadow max-w-2xl">
+<div class="card bg-base-100 shadow max-w-4xl">
     <div class="card-body">
         <h2 class="card-title">{title}</h2>
 
         <form method="post" action="{action}">
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-x-6">
             {fields}
+            </div>
             <div class="card-actions justify-end mt-6">
                 <a href="/list/{model}" class="btn btn-ghost">Cancel</a>
                 <button type="submit" class="btn btn-primary">{submit}</button>
@@ -22421,7 +22478,7 @@ async fn render_dynamic_form(
         </form>
     </div>
 </div>
-<div class="max-w-2xl mt-6 flex flex-col gap-6">{activity}{history}</div>"##,
+<div class="max-w-4xl mt-6 flex flex-col gap-6">{activity}{history}</div>"##,
         model = model_name,
         title = title,
         action = action_url,
