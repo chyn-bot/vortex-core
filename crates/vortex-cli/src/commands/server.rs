@@ -6927,7 +6927,9 @@ async fn blueprint_designer(
 <button class="btn btn-primary btn-sm">Add field</button>
 </div>
 <div class="form-control w-full"><label class="label py-1"><span class="label-text">Options <span class="opacity-50">(for Dropdown — one per line)</span></span></label><textarea name="options" rows="3" class="textarea textarea-bordered textarea-sm" placeholder="Open&#10;In Progress&#10;Closed"></textarea></div>
-</form></div></div>"#,
+</form>
+<div class="text-sm text-base-content/60 mt-3 pt-3 border-t border-base-300">Need a field that derives its value automatically (a total, or a value pulled from a linked record)? Add a <a href="/settings/computed-fields?model={model}" class="link link-primary">computed field</a> — it shows read-only on the record.</div>
+</div></div>"#,
         label = html_escape(&label),
         status = html_escape(&status),
         model = html_escape(&model),
@@ -16011,7 +16013,12 @@ struct ComputedFieldForm {
     help: Option<String>,
 }
 
-async fn render_computed_fields_page(db: &sqlx::PgPool, username: &str, error: Option<&str>) -> String {
+async fn render_computed_fields_page(
+    db: &sqlx::PgPool,
+    username: &str,
+    error: Option<&str>,
+    prefill_model: Option<&str>,
+) -> String {
     use vortex_framework::ui::html_escape;
 
     let models = sqlx::query("SELECT name, display_name FROM ir_model WHERE is_active = true ORDER BY display_name")
@@ -16020,9 +16027,13 @@ async fn render_computed_fields_page(db: &sqlx::PgPool, username: &str, error: O
     for m in &models {
         let name: String = m.get("name");
         let label: String = m.get("display_name");
-        model_options.push_str(&format!(r#"<option value="{}">{} ({})</option>"#,
-            html_escape(&name), html_escape(&label), html_escape(&name)));
+        let selected = if prefill_model == Some(name.as_str()) { " selected" } else { "" };
+        model_options.push_str(&format!(r#"<option value="{}"{}>{} ({})</option>"#,
+            html_escape(&name), selected, html_escape(&label), html_escape(&name)));
     }
+    // Deep-linked from a Blueprint designer (?model=…): open the create dialog
+    // straight away with that model preselected.
+    let modal_open = if prefill_model.is_some() { " open" } else { "" };
     let mut kind_options = String::new();
     for (code, label) in vortex_framework::computed_fields::COMPUTE_KINDS {
         kind_options.push_str(&format!(r#"<option value="{code}">{label}</option>"#));
@@ -16083,7 +16094,7 @@ async fn render_computed_fields_page(db: &sqlx::PgPool, username: &str, error: O
         </div></div>
         <div class="mt-4"><a href="/settings" class="btn btn-ghost btn-sm">← Back to Settings</a></div>
     </div>
-    <dialog id="create-modal" class="modal"><div class="modal-box max-w-2xl">
+    <dialog id="create-modal" class="modal"{modal_open}><div class="modal-box max-w-2xl">
         <h3 class="font-bold text-lg mb-4">New Computed Field</h3>
         <form method="post" action="/settings/computed-fields">
             <div class="form-control mb-3"><label class="label"><span class="label-text">Model</span></label>
@@ -16115,11 +16126,15 @@ async fn computed_fields_list(
     State(_state): State<Arc<AppState>>,
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     if !user.is_system_admin() && !user.has_role("Administrator") {
         return Redirect::to("/settings").into_response();
     }
-    Html(render_computed_fields_page(&db, &user.username, None).await).into_response()
+    // ?model=x_foo (from a Blueprint designer link) preselects that model and
+    // opens the create dialog.
+    let prefill = q.get("model").map(String::as_str).filter(|s| !s.is_empty());
+    Html(render_computed_fields_page(&db, &user.username, None, prefill).await).into_response()
 }
 
 async fn computed_field_create(
@@ -16147,7 +16162,7 @@ async fn computed_field_create(
             let _ = state.audit.log(audit).await;
             Redirect::to("/settings/computed-fields").into_response()
         }
-        Err(e) => Html(render_computed_fields_page(&db, &user.username, Some(&e)).await).into_response(),
+        Err(e) => Html(render_computed_fields_page(&db, &user.username, Some(&e), Some(form.model.trim())).await).into_response(),
     }
 }
 
@@ -16162,7 +16177,7 @@ async fn computed_field_delete(
         return Redirect::to("/settings").into_response();
     }
     if let Err(e) = vortex_framework::computed_fields::delete(&db, form.model.trim(), form.name.trim()).await {
-        return Html(render_computed_fields_page(&db, &user.username, Some(&e)).await).into_response();
+        return Html(render_computed_fields_page(&db, &user.username, Some(&e), None).await).into_response();
     }
     let audit = AuditEntry::new(AuditAction::ConfigChanged, AuditSeverity::Info)
         .with_user(vortex_common::UserId(user.id))
@@ -22334,6 +22349,7 @@ async fn render_dynamic_form(
         "SELECT name, display_name, field_type, selection_options, related_model
          FROM ir_model_field
          WHERE model_id = $1 AND name NOT IN ('id', 'created_at', 'updated_at', 'active')
+           AND COALESCE(is_computed, false) = false
          ORDER BY sequence, display_name"
     )
     .bind(model_id)
@@ -22713,9 +22729,19 @@ async fn render_dynamic_form(
     // wider than the old max-w-5xl so it fills the main column instead of
     // stranding a large gutter on wide screens.
     let list_href = format!("/list/{}", model_name);
+    // Computed fields (related lookups + safe arithmetic) render read-only below
+    // the editable fields, evaluated live for an existing record. The engine
+    // returns an empty string when the model has none, so this is inert for
+    // plain Blueprints.
+    let computed_html = vortex_framework::computed_fields::render_for_form(
+        db,
+        model_name,
+        record_id.map(|r| r.to_string()).as_deref(),
+    )
+    .await;
     let inner = format!(
-        r#"<div class="columns-1 lg:columns-2 gap-x-10">{}</div>"#,
-        sections_html
+        r#"<div class="columns-1 lg:columns-2 gap-x-10">{}</div>{}"#,
+        sections_html, computed_html
     );
     let footer = format!(
         r#"<a href="{cancel}" class="btn btn-ghost">Cancel</a><button type="submit" class="btn btn-primary">{submit}</button>"#,
@@ -22872,6 +22898,11 @@ async fn dynamic_form_create(
                 &model_name, Some(&new_id.to_string()),
                 serde_json::json!({ "fields": columns.len() }),
             ).await;
+            // Recompute any computed fields for the new record so they display
+            // immediately. Best-effort — a formula problem shouldn't fail the save.
+            if let Err(e) = vortex_framework::computed_fields::store_values(&db, &model_name, new_id).await {
+                tracing::warn!(model = %model_name, error = %e, "computed field store after create failed");
+            }
             Redirect::to(&format!("/form/{}/{}", model_name, new_id)).into_response()
         }
         Err(e) => error_response(&friendly_write_error(&e)),
@@ -22963,6 +22994,10 @@ async fn dynamic_form_update(
                 &model_name, Some(&record_id.to_string()),
                 serde_json::json!({ "fields": set_clauses.len() }),
             ).await;
+            // Recompute computed fields against the updated row.
+            if let Err(e) = vortex_framework::computed_fields::store_values(&db, &model_name, record_id).await {
+                tracing::warn!(model = %model_name, error = %e, "computed field store after update failed");
+            }
             Redirect::to(&format!("/form/{}/{}", model_name, record_id)).into_response()
         }
         Err(e) => error_response(&friendly_write_error(&e)),
