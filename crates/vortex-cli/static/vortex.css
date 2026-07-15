@@ -46,6 +46,121 @@ input[type="number"],
   letter-spacing: -0.01em;
 }
 
+/* 3b ▸ Buttons: softer, rounder, pastel.
+       The default DaisyUI theme gives filled buttons a solid, saturated fill
+       (e.g. a strong blue `btn-primary`) with dark `-content` text — legible in
+       theory but heavy, and the primary's black-on-blue reads poorly. Restyle
+       every filled semantic button as a *soft* button: a pale same-hue tint for
+       the background and a strong, darkened same-hue tint for the label, so the
+       text always contrasts against its own tint. Colours are mixed from the
+       theme's own tokens (`--p`, `--s`, …) against the page surface (`--b1`),
+       so this follows the active theme instead of hard-coding hexes.
+       Ghost / outline / link buttons keep their treatment — only their radius
+       is rounded. */
+:root {
+  --rounded-btn: 0.7rem; /* DaisyUI reads this for every .btn corner */
+}
+.btn {
+  border-radius: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+
+/* Soft filled variants. Scoped to filled buttons only (not ghost/outline/link),
+   and !important so they win over DaisyUI's equal-specificity colour rules. */
+.btn-primary:not(.btn-ghost):not(.btn-outline):not(.btn-link),
+.btn-secondary:not(.btn-ghost):not(.btn-outline):not(.btn-link),
+.btn-accent:not(.btn-ghost):not(.btn-outline):not(.btn-link),
+.btn-info:not(.btn-ghost):not(.btn-outline):not(.btn-link),
+.btn-success:not(.btn-ghost):not(.btn-outline):not(.btn-link),
+.btn-warning:not(.btn-ghost):not(.btn-outline):not(.btn-link),
+.btn-error:not(.btn-ghost):not(.btn-outline):not(.btn-link) {
+  border-width: 1px;
+  box-shadow: 0 1px 2px rgb(0 0 0 / 0.05);
+}
+
+.btn-primary:not(.btn-ghost):not(.btn-outline):not(.btn-link) {
+  background-color: color-mix(in oklab, oklch(var(--p)) 15%, oklch(var(--b1))) !important;
+  border-color: color-mix(in oklab, oklch(var(--p)) 26%, oklch(var(--b1))) !important;
+  color: color-mix(in oklab, oklch(var(--p)) 72%, black) !important;
+}
+.btn-primary:not(.btn-ghost):not(.btn-outline):not(.btn-link):hover {
+  background-color: color-mix(in oklab, oklch(var(--p)) 26%, oklch(var(--b1))) !important;
+  border-color: color-mix(in oklab, oklch(var(--p)) 38%, oklch(var(--b1))) !important;
+}
+
+.btn-secondary:not(.btn-ghost):not(.btn-outline):not(.btn-link) {
+  background-color: color-mix(in oklab, oklch(var(--s)) 15%, oklch(var(--b1))) !important;
+  border-color: color-mix(in oklab, oklch(var(--s)) 26%, oklch(var(--b1))) !important;
+  color: color-mix(in oklab, oklch(var(--s)) 72%, black) !important;
+}
+.btn-secondary:not(.btn-ghost):not(.btn-outline):not(.btn-link):hover {
+  background-color: color-mix(in oklab, oklch(var(--s)) 26%, oklch(var(--b1))) !important;
+  border-color: color-mix(in oklab, oklch(var(--s)) 38%, oklch(var(--b1))) !important;
+}
+
+.btn-accent:not(.btn-ghost):not(.btn-outline):not(.btn-link) {
+  background-color: color-mix(in oklab, oklch(var(--a)) 15%, oklch(var(--b1))) !important;
+  border-color: color-mix(in oklab, oklch(var(--a)) 26%, oklch(var(--b1))) !important;
+  color: color-mix(in oklab, oklch(var(--a)) 72%, black) !important;
+}
+.btn-accent:not(.btn-ghost):not(.btn-outline):not(.btn-link):hover {
+  background-color: color-mix(in oklab, oklch(var(--a)) 26%, oklch(var(--b1))) !important;
+  border-color: color-mix(in oklab, oklch(var(--a)) 38%, oklch(var(--b1))) !important;
+}
+
+.btn-info:not(.btn-ghost):not(.btn-outline):not(.btn-link) {
+  background-color: color-mix(in oklab, oklch(var(--in)) 15%, oklch(var(--b1))) !important;
+  border-color: color-mix(in oklab, oklch(var(--in)) 26%, oklch(var(--b1))) !important;
+  color: color-mix(in oklab, oklch(var(--in)) 70%, black) !important;
+}
+.btn-info:not(.btn-ghost):not(.btn-outline):not(.btn-link):hover {
+  background-color: color-mix(in oklab, oklch(var(--in)) 26%, oklch(var(--b1))) !important;
+  border-color: color-mix(in oklab, oklch(var(--in)) 38%, oklch(var(--b1))) !important;
+}
+
+.btn-success:not(.btn-ghost):not(.btn-outline):not(.btn-link) {
+  background-color: color-mix(in oklab, oklch(var(--su)) 16%, oklch(var(--b1))) !important;
+  border-color: color-mix(in oklab, oklch(var(--su)) 28%, oklch(var(--b1))) !important;
+  color: color-mix(in oklab, oklch(var(--su)) 74%, black) !important;
+}
+.btn-success:not(.btn-ghost):not(.btn-outline):not(.btn-link):hover {
+  background-color: color-mix(in oklab, oklch(var(--su)) 27%, oklch(var(--b1))) !important;
+  border-color: color-mix(in oklab, oklch(var(--su)) 40%, oklch(var(--b1))) !important;
+}
+
+.btn-warning:not(.btn-ghost):not(.btn-outline):not(.btn-link) {
+  background-color: color-mix(in oklab, oklch(var(--wa)) 18%, oklch(var(--b1))) !important;
+  border-color: color-mix(in oklab, oklch(var(--wa)) 30%, oklch(var(--b1))) !important;
+  color: color-mix(in oklab, oklch(var(--wa)) 76%, black) !important;
+}
+.btn-warning:not(.btn-ghost):not(.btn-outline):not(.btn-link):hover {
+  background-color: color-mix(in oklab, oklch(var(--wa)) 29%, oklch(var(--b1))) !important;
+  border-color: color-mix(in oklab, oklch(var(--wa)) 42%, oklch(var(--b1))) !important;
+}
+
+.btn-error:not(.btn-ghost):not(.btn-outline):not(.btn-link) {
+  background-color: color-mix(in oklab, oklch(var(--er)) 15%, oklch(var(--b1))) !important;
+  border-color: color-mix(in oklab, oklch(var(--er)) 26%, oklch(var(--b1))) !important;
+  color: color-mix(in oklab, oklch(var(--er)) 72%, black) !important;
+}
+.btn-error:not(.btn-ghost):not(.btn-outline):not(.btn-link):hover {
+  background-color: color-mix(in oklab, oklch(var(--er)) 26%, oklch(var(--b1))) !important;
+  border-color: color-mix(in oklab, oklch(var(--er)) 38%, oklch(var(--b1))) !important;
+}
+
+/* Neutral / un-coloured .btn: a soft gray chip rather than a hard fill. */
+.btn:not([class*="btn-"]),
+.btn-neutral:not(.btn-ghost):not(.btn-outline):not(.btn-link) {
+  background-color: color-mix(in oklab, oklch(var(--bc)) 8%, oklch(var(--b1))) !important;
+  border-color: color-mix(in oklab, oklch(var(--bc)) 16%, oklch(var(--b1))) !important;
+  color: color-mix(in oklab, oklch(var(--bc)) 82%, transparent) !important;
+}
+.btn:not([class*="btn-"]):hover,
+.btn-neutral:not(.btn-ghost):not(.btn-outline):not(.btn-link):hover {
+  background-color: color-mix(in oklab, oklch(var(--bc)) 15%, oklch(var(--b1))) !important;
+}
+
 /* 4 ▸ Tables: quieter headers, clearer hover, comfortable density. */
 .table thead th {
   font-size: 0.68rem;
