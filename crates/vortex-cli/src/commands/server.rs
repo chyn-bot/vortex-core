@@ -22360,8 +22360,11 @@ async fn dynamic_form_edit(
     Extension(user): Extension<AuthUser>,
     Extension(db_ctx): Extension<DatabaseContext>,
     Path((model_name, record_id)): Path<(String, uuid::Uuid)>,
+    // Query carries `_return` when a line was opened from a parent's list; it is
+    // not used to seed fields on an existing record (that's gated on new).
+    Query(query): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
-    render_dynamic_form(&state, &db_ctx, &db, &user, &model_name, Some(record_id), &std::collections::HashMap::new()).await
+    render_dynamic_form(&state, &db_ctx, &db, &user, &model_name, Some(record_id), &query).await
 }
 
 async fn render_dynamic_form(
@@ -22715,20 +22718,34 @@ async fn render_dynamic_form(
                                     "SELECT id, COALESCE(name, id::text) as name FROM {} WHERE {} = $1 ORDER BY name LIMIT 200",
                                     child_table, inverse
                                 )).bind(rid).fetch_all(db).await.unwrap_or_default();
-                                if rows.is_empty() {
-                                    r#"<div class="text-sm opacity-60 border border-base-300 rounded-lg p-3">No related records yet.</div>"#.to_string()
+                                let list_html = if rows.is_empty() {
+                                    r#"<div class="text-sm opacity-60 px-3 py-3">No lines yet — use “+ Add” to create one.</div>"#.to_string()
                                 } else {
                                     let mut items = String::new();
                                     for r in &rows {
                                         let cid: uuid::Uuid = r.get("id");
                                         let cnm: String = r.get("name");
                                         items.push_str(&format!(
-                                            r#"<a href="/form/{m}/{id}" class="flex items-center justify-between px-3 py-2 hover:bg-base-200 border-b border-base-200 last:border-0"><span>{nm}</span><span class="opacity-40">→</span></a>"#,
-                                            m = html_escape(&child_model), id = cid, nm = html_escape(&cnm)
+                                            r#"<a href="/form/{m}/{id}?_return=/form/{owner}/{pid}" class="flex items-center justify-between px-3 py-2 hover:bg-base-200 border-b border-base-200 last:border-0"><span>{nm}</span><span class="opacity-40">→</span></a>"#,
+                                            m = html_escape(&child_model), id = cid,
+                                            owner = html_escape(model_name), pid = rid,
+                                            nm = html_escape(&cnm)
                                         ));
                                     }
-                                    format!(r#"<div class="border border-base-300 rounded-lg overflow-hidden">{}</div>"#, items)
-                                }
+                                    items
+                                };
+                                // "+ Add" deep-links to the child form with the
+                                // inverse link pre-filled and a return path back
+                                // to this record, so adding lines loops home.
+                                let add_url = format!(
+                                    "/form/{child}/new?{inv}={pid}&_return=/form/{owner}/{pid}",
+                                    child = html_escape(&child_model), inv = html_escape(&inverse),
+                                    pid = rid, owner = html_escape(model_name),
+                                );
+                                format!(
+                                    r#"<div class="border border-base-300 rounded-lg overflow-hidden">{list}</div><a href="{add}" class="btn btn-sm btn-ghost mt-2">+ Add</a>"#,
+                                    list = list_html, add = add_url,
+                                )
                             }
                             _ => r#"<div class="text-sm opacity-60">This related list isn't configured correctly.</div>"#.to_string(),
                         }
@@ -22860,7 +22877,19 @@ async fn render_dynamic_form(
     // a short section next to a tall one packs tightly; the sheet itself is
     // wider than the old max-w-5xl so it fills the main column instead of
     // stranding a large gutter on wide screens.
-    let list_href = format!("/list/{}", model_name);
+    // A `_return` query param (set by the one2many "+ Add" deep-link) sends the
+    // user back to the parent record after saving/cancelling this child, so
+    // header→line entry loops home. Same-origin paths only (guards open-redirect).
+    let return_url = prefill
+        .get("_return")
+        .filter(|r| r.starts_with('/') && !r.starts_with("//"))
+        .cloned();
+    let back_href = return_url.clone().unwrap_or_else(|| format!("/list/{}", model_name));
+    // Carry `_return` through the form submit so create/update can honour it.
+    let return_hidden = return_url
+        .as_deref()
+        .map(|r| format!(r#"<input type="hidden" name="_return" value="{}"/>"#, html_escape(r)))
+        .unwrap_or_default();
     // Computed fields (related lookups + safe arithmetic) render read-only below
     // the editable fields, evaluated live for an existing record. The engine
     // returns an empty string when the model has none, so this is inert for
@@ -22872,19 +22901,21 @@ async fn render_dynamic_form(
     )
     .await;
     let inner = format!(
-        r#"<div class="columns-1 lg:columns-2 gap-x-10">{}</div>{}"#,
-        sections_html, computed_html
+        r#"{return_hidden}<div class="columns-1 lg:columns-2 gap-x-10">{fields}</div>{computed}"#,
+        return_hidden = return_hidden,
+        fields = sections_html,
+        computed = computed_html,
     );
     let footer = format!(
         r#"<a href="{cancel}" class="btn btn-ghost">Cancel</a><button type="submit" class="btn btn-primary">{submit}</button>"#,
-        cancel = list_href,
+        cancel = back_href,
         submit = submit_text,
     );
     let form_attrs = format!(r#"method="post" action="{}""#, action_url);
     let below = format!("{}{}", activity_panel, history_panel);
     let body = vortex_framework::form::render_form_sheet(&vortex_framework::form::FormSheet {
         max_width: vortex_framework::form::SHEET_WIDTH,
-        back_href: &list_href,
+        back_href: &back_href,
         control_row: &stage_bar,
         form_attrs: &form_attrs,
         title: &title,
@@ -23083,7 +23114,13 @@ async fn dynamic_form_create(
             }
             // Sync many2many links (hidden CSV inputs — not physical columns).
             sync_blueprint_m2m(&db, &table_name, &model_name, new_id, &form_data).await;
-            Redirect::to(&format!("/form/{}/{}", model_name, new_id)).into_response()
+            // Return to the parent record when this was a one2many "+ Add" line.
+            let dest = form_data
+                .get("_return")
+                .filter(|r| r.starts_with('/') && !r.starts_with("//"))
+                .cloned()
+                .unwrap_or_else(|| format!("/form/{}/{}", model_name, new_id));
+            Redirect::to(&dest).into_response()
         }
         Err(e) => error_response(&friendly_write_error(&e)),
     }
@@ -23181,7 +23218,12 @@ async fn dynamic_form_update(
                 tracing::warn!(model = %model_name, error = %e, "computed field store after update failed");
             }
             sync_blueprint_m2m(&db, &table_name, &model_name, record_id, &form_data).await;
-            Redirect::to(&format!("/form/{}/{}", model_name, record_id)).into_response()
+            let dest = form_data
+                .get("_return")
+                .filter(|r| r.starts_with('/') && !r.starts_with("//"))
+                .cloned()
+                .unwrap_or_else(|| format!("/form/{}/{}", model_name, record_id));
+            Redirect::to(&dest).into_response()
         }
         Err(e) => error_response(&friendly_write_error(&e)),
     }
