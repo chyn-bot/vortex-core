@@ -4,59 +4,116 @@
     <script>(function(){var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)})()</script>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Login - Remicle</title>
+    <title>Sign in - Remicle</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-    <link href="/static/vortex.css?v=18" rel="stylesheet">
-    <script src="/static/vortex.js?v=18" defer></script>
-    <script src="/static/vendor/tailwind.js"></script>
+    <link href="/static/vortex.css?v=19" rel="stylesheet">
+    <script src="/static/vortex.js?v=19" defer></script>
+    <link href="/static/tailwind.css?v=21" rel="stylesheet"/>
     <script src="/static/vendor/htmx.min.js"></script>
-    <script>
-        tailwind.config = {
-            theme: {
-                extend: {
-                    colors: {
-                        'remicle': {
-                            'green': '#8BC53F',
-                            'green-dark': '#6BA32E',
-                            'gray': '#6D6E71',
-                            'gray-light': '#9D9FA2',
-                        }
-                    }
-                }
-            }
-        }
-    </script>
     <style>
         .htmx-request .htmx-indicator { display: inline-flex !important; }
         .htmx-indicator { display: none; }
+        /* Hero canvas — a deep, green-tinted near-black with a soft brand glow.
+           Kept as explicit values so the panel reads identically regardless of
+           the active DaisyUI theme. */
+        .login-hero {
+            background:
+                radial-gradient(60rem 60rem at 15% 10%, rgba(139,197,63,0.16), transparent 55%),
+                radial-gradient(50rem 50rem at 90% 100%, rgba(107,163,46,0.14), transparent 50%),
+                linear-gradient(135deg, #0b0f0a 0%, #10231a 55%, #0b0f0a 100%);
+            color: #e8f0e0;
+        }
+        .login-hero::before {
+            /* faint dotted grid, evokes a structured ledger without shouting */
+            content: "";
+            position: absolute; inset: 0;
+            background-image: radial-gradient(rgba(232,240,224,0.06) 1px, transparent 1px);
+            background-size: 22px 22px;
+            mask-image: linear-gradient(180deg, transparent, #000 30%, #000 70%, transparent);
+            pointer-events: none;
+        }
+        .login-check { color: #8BC53F; flex: none; }
+        /* Brand CTA — a confident brand-green with dark text: high contrast and
+           on-brand for the hero, overriding the app's soft button treatment
+           just for this one primary action. */
+        .login-cta {
+            background: #8BC53F !important;
+            border-color: #8BC53F !important;
+            color: #0b1207 !important;
+            font-weight: 700;
+        }
+        .login-cta:hover { background: #7ab331 !important; border-color: #7ab331 !important; }
+        .login-input:focus { outline: none; border-color: #8BC53F; box-shadow: 0 0 0 2px rgba(139,197,63,0.25); }
     </style>
 </head>
-<body class="min-h-screen bg-base-200 flex items-center justify-center p-4">
-    <div class="w-full max-w-md">
-        <div class="card bg-base-100 shadow-2xl">
-            <div class="card-body">
-                <!-- Logo -->
-                <div class="text-center mb-6">
-                    <div class="flex justify-center mb-4">
-                        <img src="/static/images/remiclelogo.png" alt="Remicle" class="h-12">
-                    </div>
-                    <p class="text-base-content/60 text-sm">Zero-Trust Enterprise Core</p>
+<body class="min-h-screen bg-base-200">
+    <div class="min-h-screen grid lg:grid-cols-2">
+
+        <!-- ── Hero panel (large screens) ─────────────────────────── -->
+        <section class="login-hero relative hidden lg:flex flex-col justify-between p-12 xl:p-16 overflow-hidden">
+            <div class="relative z-10">
+                <img src="/static/images/remiclelogo.png" alt="Remicle" class="h-10">
+            </div>
+
+            <div class="relative z-10 max-w-lg">
+                <p class="text-xs font-semibold uppercase tracking-[0.2em]" style="color:#8BC53F">Zero-Trust Enterprise Core</p>
+                <h1 class="mt-4 text-4xl xl:text-5xl font-bold leading-[1.1]" style="text-wrap:balance">
+                    One hardened kernel.<br>Every capability, governed.
+                </h1>
+                <p class="mt-5 text-base leading-relaxed" style="color:#a7c48f">
+                    Persistence, identity, audit, policy, and workflow live in the core.
+                    Everything domain-specific ships as a plugin — nothing bypasses the ledger or the gate.
+                </p>
+                <ul class="mt-8 space-y-3 text-sm" style="color:#cfe0bf">
+                    <li class="flex items-center gap-3">
+                        <svg class="login-check w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg>
+                        WORM audit ledger — cryptographically chained, tamper-evident
+                    </li>
+                    <li class="flex items-center gap-3">
+                        <svg class="login-check w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg>
+                        Cedar policy engine — every action gated by ABAC rules
+                    </li>
+                    <li class="flex items-center gap-3">
+                        <svg class="login-check w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg>
+                        LDAP federation &amp; signed sessions
+                    </li>
+                </ul>
+            </div>
+
+            <div class="relative z-10 text-xs" style="color:#6d7c62">
+                &copy; Remicle · All access is logged for audit
+            </div>
+        </section>
+
+        <!-- ── Sign-in panel ──────────────────────────────────────── -->
+        <section class="flex items-center justify-center p-6 sm:p-10">
+            <div class="w-full max-w-sm">
+                <!-- Compact brand mark on small screens (hero is hidden there) -->
+                <div class="lg:hidden mb-8 text-center">
+                    <img src="/static/images/remiclelogo.png" alt="Remicle" class="h-11 mx-auto">
+                    <p class="mt-2 text-xs uppercase tracking-[0.2em]" style="color:#6BA32E">Zero-Trust Enterprise Core</p>
                 </div>
 
-                <!-- Error message -->
+                <!-- NOTICE -->
+                <h2 class="text-2xl font-bold">Sign in</h2>
+                <p class="mt-1 mb-6 text-sm text-base-content/60">Welcome back — access your workspace.</p>
+
+                <!-- Error / validation message target -->
                 <div id="login-error"></div>
 
-                <!-- Login Form -->
                 <form hx-post="/auth/login"
                       hx-target="#login-error"
-                      hx-swap="innerHTML">
+                      hx-swap="innerHTML"
+                      class="mt-2">
+
+                    <!-- DB_SELECTOR -->
 
                     <div class="form-control mb-4">
                         <label class="label">
                             <span class="label-text">Username</span>
                         </label>
                         <input type="text" name="username" placeholder="Username"
-                               class="input input-bordered" required autofocus>
+                               class="input input-bordered login-input w-full" required autofocus>
                     </div>
 
                     <div class="form-control mb-6">
@@ -64,22 +121,21 @@
                             <span class="label-text">Password</span>
                         </label>
                         <input type="password" name="password" placeholder="Password"
-                               class="input input-bordered" required>
+                               class="input input-bordered login-input w-full" required>
                     </div>
 
-                    <button type="submit" class="btn btn-primary w-full">
+                    <button type="submit" class="btn login-cta w-full">
                         <span class="htmx-indicator loading loading-spinner loading-sm"></span>
                         Sign In
                     </button>
                 </form>
 
-                <!-- Footer -->
-                <div class="mt-4 text-center text-xs text-base-content/50">
-                    <p>Session timeout: 30 minutes</p>
-                    <p>All access is logged for audit</p>
+                <div class="mt-6 pt-5 border-t border-base-300 text-center text-xs text-base-content/50">
+                    <p>Sessions expire after 30 minutes of inactivity.</p>
+                    <p class="mt-1">All access is recorded in the audit ledger.</p>
                 </div>
             </div>
-        </div>
+        </section>
     </div>
 </body>
 </html>

@@ -81,22 +81,22 @@ pub fn contacts_routes() -> Router<Arc<AppState>> {
 fn page_shell(sidebar: &str, title: &str, content: &str) -> String {
     format!(
         r##"<!DOCTYPE html><html data-theme="dark"><head>
-<script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script>
+<script src="/static/theme-init.js?v=20"></script>
 <title>{title} - Vortex</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=18" rel="stylesheet"/>
-<script src="/static/vortex.js?v=18" defer></script>
-<script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script>
+<link href="/static/tailwind.css?v=21" rel="stylesheet"/>
 </head>
 <body class="min-h-screen bg-base-200">
 <div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden">
-<button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square">
+<button type="button" data-sidebar-toggle class="btn btn-ghost btn-sm btn-square">
 <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg>
 </button>
 <a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">vor</span><span class="opacity-60">tex</span></a>
 </div>
-<div id="sidebar-overlay" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
+<div id="sidebar-overlay" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" data-sidebar-close></div>
 <div class="flex">{sidebar}
 <main class="flex-1 p-4 lg:p-6 min-w-0">
 {content}
@@ -105,6 +105,26 @@ fn page_shell(sidebar: &str, title: &str, content: &str) -> String {
         sidebar = sidebar,
         content = content,
     )
+}
+
+/// Wrap a fully-rendered page in a Response carrying a *strict* CSP —
+/// `script-src 'self'` with NO `'unsafe-inline'`. Use only for pages proven
+/// free of inline `<script>` and inline `on*=` handlers: all behaviour is
+/// delegated through `/static/vortex.js` (see the CSP-safe delegated handlers
+/// there). `security_headers_middleware` preserves this handler-set CSP
+/// instead of applying the permissive global default.
+fn strict_csp_page(html: String) -> Response {
+    use vortex_plugin_sdk::axum::http::{header, HeaderValue};
+    let mut resp = Html(html).into_response();
+    resp.headers_mut().insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(
+            "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; \
+             connect-src 'self'; img-src 'self' data: https://*.tile.openstreetmap.org; \
+             font-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'",
+        ),
+    );
+    resp
 }
 
 /// GET /contacts — list all contacts with search, filter, sort, pagination.
@@ -130,7 +150,7 @@ async fn list_contacts(
         user.is_admin(),
         &state.plugin_registry,
         &user.roles,
-        "",
+        &db_ctx.custom_apps_html,
     );
 
     let config = ListConfig::new("Contacts", "contacts")
@@ -169,7 +189,10 @@ async fn list_contacts(
         )
         .column(ListColumn::new("city", "City").searchable().sql_expr("c.city"))
         .column(ListColumn::new("state_name", "State").sortable().sql_expr("st.name"))
-        .column(ListColumn::new("country_name", "Country").sortable().searchable().sql_expr("co.name"))
+        // Country is not free-text searchable: it lives on the joined
+        // `countries` table, and an OR against a post-join column defeats
+        // the contacts trigram indexes that make search fast at 12M rows.
+        .column(ListColumn::new("country_name", "Country").sortable().sql_expr("co.name"))
         .column(
             ListColumn::new("is_company", "Company").bool_badge(
                 "Company",
@@ -191,6 +214,18 @@ async fn list_contacts(
         .create("New Contact", "/contacts/new")
         .pivot_url("/pivot/contacts?rows=contact_type")
         .default_sort("name")
+        // The two LEFT JOINs are many-to-one on FK→PK, so they preserve
+        // base cardinality: COUNT(join) == reltuples(contacts). This lets
+        // large unfiltered browses skip the full-scan COUNT(*). c.id gives
+        // a stable tiebreaker for LIMIT/OFFSET paging. Backed by
+        // idx_contacts_name_browse (name, id) — see migration.
+        .count_estimate_from("contacts")
+        .tiebreak("c.id")
+        // Free-text search routes through a trigram-indexed id-prefilter on
+        // the base table so ILIKE '%…%' uses idx_contacts_*_coalesce_trgm
+        // instead of scanning 12M joined rows. All searchable columns above
+        // (name, email, city) are contacts columns — required by prefilter.
+        .search_prefilter("contacts c")
         .group_by_options(&[
             ("contact_type", "Type"),
             ("country_name", "Country"),
@@ -233,7 +268,7 @@ async fn new_contact_form(
         "contacts", display_name, &initials, &installed,
         user.is_admin(),
         &state.plugin_registry, &user.roles,
-        "",
+        &db_ctx.custom_apps_html,
     );
 
     // Country dropdown, same source as the edit form. Malaysia is
@@ -291,18 +326,11 @@ async fn new_contact_form(
     // field added in Settings ▸ Custom Fields shows here without a code change.
     let cc = contact_custom(&db, None).await;
 
-    let content = format!(
-        r#"<a href="/contacts" class="btn btn-ghost btn-sm mb-2">← Back to Contacts</a>
-<h1 class="text-2xl font-bold mb-6">New Contact</h1>
-
-<form method="POST" action="/contacts/create">
-<div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
-
-<!-- Left column -->
-<div class="card bg-base-100 shadow">
-<div class="card-body">
-<h2 class="card-title text-lg mb-4">General</h2>
-<div class="form-control mb-3">
+    // Field groups — identical field markup to before, now wrapped as flat
+    // sheet sections (see vortex_plugin_sdk::framework::form_section_raw) instead
+    // of floating cards, so the whole form reads as one Odoo-style sheet.
+    let general = format!(
+        r#"<div class="form-control mb-3">
 <label class="label"><span class="label-text">Name *</span></label>
 <input name="name" class="input input-bordered input-sm" required/>
 </div>
@@ -338,16 +366,15 @@ async fn new_contact_form(
 <input type="checkbox" name="active" class="checkbox checkbox-sm" checked/>
 <span class="label-text">Active</span>
 </label>
-</div>
-</div>
-</div>
+</div>"#,
+        cf_name = cc.name,
+        cf_ctype = cc.contact_type,
+        cf_vat = cc.vat_number,
+        cf_credit = cc.credit_limit,
+    );
 
-<!-- Right column -->
-<div class="space-y-6">
-<div class="card bg-base-100 shadow">
-<div class="card-body">
-<h2 class="card-title text-lg mb-4">Contact Info</h2>
-<div class="form-control mb-3">
+    let contact_info = format!(
+        r#"<div class="form-control mb-3">
 <label class="label"><span class="label-text">Email</span></label>
 <input name="email" type="email" autocomplete="email" class="input input-bordered input-sm"/>
 </div>
@@ -361,14 +388,14 @@ async fn new_contact_form(
 <label class="label"><span class="label-text">Mobile</span></label>
 <input name="mobile" type="tel" inputmode="tel" class="input input-bordered input-sm"/>
 </div>
-{cf_mobile}
-</div>
-</div>
+{cf_mobile}"#,
+        cf_email = cc.email,
+        cf_phone = cc.phone,
+        cf_mobile = cc.mobile,
+    );
 
-<div class="card bg-base-100 shadow">
-<div class="card-body">
-<h2 class="card-title text-lg mb-4">Address</h2>
-<div class="form-control mb-3">
+    let address = format!(
+        r#"<div class="form-control mb-3">
 <label class="label"><span class="label-text">Street</span></label>
 <input name="street" autocomplete="address-line1" class="input input-bordered input-sm" placeholder="Address line 1"/>
 <input name="street2" autocomplete="address-line2" class="input input-bordered input-sm mt-1" placeholder="Address line 2"/>
@@ -393,69 +420,45 @@ async fn new_contact_form(
 <div class="form-control mb-3">
 <label class="label"><span class="label-text">Country</span></label>
 <select name="country_id" id="country-select" class="select select-bordered select-sm"
-  onchange="loadStates(this.value)">
+  data-load-states data-states-target="state-select">
 {country_options}
 </select>
-</div>
-<script>
-async function loadStates(countryId) {{
-  var sel = document.getElementById('state-select');
-  sel.innerHTML = '<option value="">Loading...</option>';
-  if (!countryId) {{
-    sel.innerHTML = '<option value="">-- Select State --</option>';
-    return;
-  }}
-  try {{
-    var res = await fetch('/api/states/' + countryId);
-    if (!res.ok) {{
-      sel.innerHTML = '<option value="">Error loading states</option>';
-      return;
-    }}
-    var states = await res.json();
-    sel.innerHTML = '<option value="">-- Select State --</option>';
-    for (var i = 0; i < states.length; i++) {{
-      var opt = document.createElement('option');
-      opt.value = states[i].id;
-      opt.textContent = states[i].name + ' (' + states[i].code + ')';
-      sel.appendChild(opt);
-    }}
-    if (states.length === 0) {{
-      sel.innerHTML = '<option value="">No states available</option>';
-    }}
-  }} catch(e) {{
-    sel.innerHTML = '<option value="">Error: ' + e.message + '</option>';
-  }}
-}}
-</script>
-</div>
-</div>
-</div>
-</div>
+</div>"#,
+    );
 
-<div class="form-control mt-4">
+    let notes = format!(
+        r#"<div class="form-control">
 <label class="label"><span class="label-text">Notes</span></label>
 <textarea name="notes" class="textarea textarea-bordered" rows="3"></textarea>
 </div>
-{cf_notes}
-{bottom}
-<div class="mt-6 flex gap-2">
-<button type="submit" class="btn btn-primary btn-sm">Create</button>
-<a href="/contacts" class="btn btn-ghost btn-sm">Cancel</a>
-</div>
-</form>"#,
-        country_options = country_options,
-        cf_name = cc.name,
-        cf_ctype = cc.contact_type,
-        cf_vat = cc.vat_number,
-        cf_credit = cc.credit_limit,
-        cf_email = cc.email,
-        cf_phone = cc.phone,
-        cf_mobile = cc.mobile,
+{cf_notes}"#,
         cf_notes = cc.notes,
+    );
+
+    // Two columns of flat sections inside one sheet (masonry-ish via the
+    // existing 2-col grid), then full-width Notes + any bottom-anchored custom
+    // fields, all in a single centered container.
+    let inner = format!(
+        r#"<div class="grid grid-cols-1 lg:grid-cols-2 gap-6 gap-x-10">{general}<div class="space-y-6">{contact_info}{address}</div></div>{notes}{bottom}"#,
+        general = vortex_plugin_sdk::framework::form_section_raw("General", &general),
+        contact_info = vortex_plugin_sdk::framework::form_section_raw("Contact Info", &contact_info),
+        address = vortex_plugin_sdk::framework::form_section_raw("Address", &address),
+        notes = vortex_plugin_sdk::framework::form_section_raw("Notes", &notes),
         bottom = cc.bottom,
     );
 
-    Html(page_shell(&sidebar, "New Contact", &content)).into_response()
+    let content = vortex_plugin_sdk::framework::render_form_sheet(&vortex_plugin_sdk::framework::FormSheet {
+        max_width: vortex_plugin_sdk::framework::SHEET_WIDTH,
+        back_href: "/contacts",
+        control_row: "",
+        form_attrs: r#"method="POST" action="/contacts/create""#,
+        title: "New Contact",
+        inner: &inner,
+        footer: r#"<a href="/contacts" class="btn btn-ghost">Cancel</a><button type="submit" class="btn btn-primary">Create</button>"#,
+        below: "",
+    });
+
+    strict_csp_page(page_shell(&sidebar, "New Contact", &content))
 }
 
 /// POST /contacts/create — create a new contact with auto-generated
@@ -595,8 +598,13 @@ async fn edit_contact(
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
     Extension(db_ctx): Extension<DatabaseContext>,
+    headers: vortex_plugin_sdk::axum::http::HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Response {
+    // Preserve the caller's list state (search/sort/page) on "Back to
+    // Contacts" — derived from the Referer so a record opened from a
+    // filtered/searched list returns to that same view, not page 1.
+    let back_href = vortex_plugin_sdk::framework::list_return_href(&headers, "/contacts");
     let display_name = user.full_name.as_deref().unwrap_or(&user.username);
     let initials = vortex_plugin_sdk::framework::get_initials(display_name);
     let installed = db_ctx.installed_modules.clone();
@@ -604,7 +612,7 @@ async fn edit_contact(
         "contacts", display_name, &initials, &installed,
         user.is_admin(),
         &state.plugin_registry, &user.roles,
-        "",
+        &db_ctx.custom_apps_html,
     );
 
     let row = match vortex_plugin_sdk::sqlx::query(
@@ -741,7 +749,7 @@ async fn edit_contact(
     // already-archived records get an Un-archive button that restores them.
     let archive_button = if active {
         format!(
-            r#"<form method="POST" action="/contacts/{id}/archive" onsubmit="return confirm('Archive this contact?')">
+            r#"<form method="POST" action="/contacts/{id}/archive" data-confirm="Archive this contact?">
 <button class="btn btn-warning btn-sm btn-outline">Archive</button>
 </form>"#,
             id = id,
@@ -787,32 +795,10 @@ async fn edit_contact(
     let ids = id.to_string();
     let cc = contact_custom(&db, Some(&ids)).await;
 
-    let content = format!(
-        r#"<div class="flex items-center justify-between mb-6">
-<div>
-<a href="/contacts" class="btn btn-ghost btn-sm mb-2">← Back to Contacts</a>
-<h1 class="text-2xl font-bold">{name} <span class="text-base-content/40 font-mono text-sm">{code}</span></h1>
-</div>
-<div class="flex items-center gap-2">
-{portal_button}
-{duplicate_button}
-{archive_button}
-</div>
-</div>
-
-{status_bar}
-
-{approval_panel}
-
-<form method="POST" action="/contacts/{id}" id="record-form">
-<fieldset class="contents"{form_disabled}>
-<div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
-
-<!-- Left column -->
-<div class="card bg-base-100 shadow">
-<div class="card-body">
-<h2 class="card-title text-lg mb-4">General</h2>
-<div class="form-control mb-3">
+    // Field groups — identical field markup (values preserved) to before, now
+    // flat sheet sections instead of floating cards.
+    let general = format!(
+        r#"<div class="form-control mb-3">
 <label class="label"><span class="label-text">Name *</span></label>
 <input name="name" class="input input-bordered input-sm" value="{name_val}" required/>
 </div>
@@ -848,16 +834,24 @@ async fn edit_contact(
 <input type="checkbox" name="active" class="checkbox checkbox-sm" {active_checked}/>
 <span class="label-text">Active</span>
 </label>
-</div>
-</div>
-</div>
+</div>"#,
+        name_val = esc(&name),
+        vat = esc(vat_number.as_deref().unwrap_or("")),
+        credit = credit_limit.map(|c| format!("{:.2}", c)).unwrap_or_default(),
+        cf_name = cc.name,
+        cf_ctype = cc.contact_type,
+        cf_vat = cc.vat_number,
+        cf_credit = cc.credit_limit,
+        sel_cust = sel(&contact_type, "customer"),
+        sel_supp = sel(&contact_type, "supplier"),
+        sel_both = sel(&contact_type, "both"),
+        sel_other = sel(&contact_type, "other"),
+        is_company_checked = if is_company { "checked" } else { "" },
+        active_checked = if active { "checked" } else { "" },
+    );
 
-<!-- Right column -->
-<div class="space-y-6">
-<div class="card bg-base-100 shadow">
-<div class="card-body">
-<h2 class="card-title text-lg mb-4">Contact Info</h2>
-<div class="form-control mb-3">
+    let contact_info = format!(
+        r#"<div class="form-control mb-3">
 <label class="label"><span class="label-text">Email</span></label>
 <input name="email" type="email" autocomplete="email" class="input input-bordered input-sm" value="{email_val}"/>
 </div>
@@ -871,14 +865,17 @@ async fn edit_contact(
 <label class="label"><span class="label-text">Mobile</span></label>
 <input name="mobile" type="tel" inputmode="tel" class="input input-bordered input-sm" value="{mobile_val}"/>
 </div>
-{cf_mobile}
-</div>
-</div>
+{cf_mobile}"#,
+        email_val = esc(email.as_deref().unwrap_or("")),
+        phone_val = esc(phone.as_deref().unwrap_or("")),
+        mobile_val = esc(mobile.as_deref().unwrap_or("")),
+        cf_email = cc.email,
+        cf_phone = cc.phone,
+        cf_mobile = cc.mobile,
+    );
 
-<div class="card bg-base-100 shadow">
-<div class="card-body">
-<h2 class="card-title text-lg mb-4">Address</h2>
-<div class="form-control mb-3">
+    let address = format!(
+        r#"<div class="form-control mb-3">
 <label class="label"><span class="label-text">Street</span></label>
 <input name="street" autocomplete="address-line1" class="input input-bordered input-sm" value="{street_val}" placeholder="Address line 1"/>
 <input name="street2" autocomplete="address-line2" class="input input-bordered input-sm mt-1" value="{street2_val}" placeholder="Address line 2"/>
@@ -903,95 +900,86 @@ async fn edit_contact(
 <div class="form-control mb-3">
 <label class="label"><span class="label-text">Country</span></label>
 <select name="country_id" id="country-select" class="select select-bordered select-sm"
-  onchange="loadStates(this.value)">
+  data-load-states data-states-target="state-select">
 {country_options}
 </select>
-</div>
-<script>
-async function loadStates(countryId) {{
-  var sel = document.getElementById('state-select');
-  sel.innerHTML = '<option value="">Loading...</option>';
-  if (!countryId) {{
-    sel.innerHTML = '<option value="">-- Select State --</option>';
-    return;
-  }}
-  try {{
-    var res = await fetch('/api/states/' + countryId);
-    if (!res.ok) {{
-      sel.innerHTML = '<option value="">Error loading states</option>';
-      return;
-    }}
-    var states = await res.json();
-    sel.innerHTML = '<option value="">-- Select State --</option>';
-    for (var i = 0; i < states.length; i++) {{
-      var opt = document.createElement('option');
-      opt.value = states[i].id;
-      opt.textContent = states[i].name + ' (' + states[i].code + ')';
-      sel.appendChild(opt);
-    }}
-    if (states.length === 0) {{
-      sel.innerHTML = '<option value="">No states available</option>';
-    }}
-  }} catch(e) {{
-    sel.innerHTML = '<option value="">Error: ' + e.message + '</option>';
-  }}
-}}
-</script>
-</div>
-</div>
-<div class="lg:col-span-2">{record_panels}</div>
-</div>
-</div>
+</div>"#,
+        street_val = esc(street.as_deref().unwrap_or("")),
+        street2_val = esc(street2.as_deref().unwrap_or("")),
+        street3_val = esc(street3.as_deref().unwrap_or("")),
+        zip_val = esc(zip.as_deref().unwrap_or("")),
+        city_val = esc(city.as_deref().unwrap_or("")),
+        state_options = state_options,
+        country_options = country_options,
+    );
 
-<div class="form-control mt-4">
+    let notes = format!(
+        r#"<div class="form-control">
 <label class="label"><span class="label-text">Notes</span></label>
 <textarea name="notes" class="textarea textarea-bordered" rows="3">{notes_val}</textarea>
 </div>
-{cf_notes}
+{cf_notes}"#,
+        notes_val = esc(notes.as_deref().unwrap_or("")),
+        cf_notes = cc.notes,
+    );
+
+    // Header (back link, name, action buttons), status bar, and approval panel
+    // stay above the sheet; the field area is wrapped as one Odoo-style sheet
+    // inside the record form. The <fieldset class="contents"> disable-wrapper
+    // encloses both the sheet and its footer so a locked record is fully
+    // read-only, so this form builds the sheet inline rather than via
+    // render_form_sheet (which owns its own <form>). Chatter/history sit below.
+    let content = format!(
+        r#"<div class="max-w-6xl mx-auto">
+<div class="flex items-center justify-between mb-6">
+<div>
+<a href="{back_href}" class="btn btn-ghost btn-sm mb-2">← Back to Contacts</a>
+<h1 class="text-2xl font-bold">{name} <span class="text-base-content/40 font-mono text-sm">{code}</span></h1>
+</div>
+<div class="flex items-center gap-2">
+{portal_button}
+{duplicate_button}
+{archive_button}
+</div>
+</div>
+
+{status_bar}
+
+{approval_panel}
+
+<form method="POST" action="/contacts/{id}" id="record-form">
+<fieldset class="contents"{form_disabled}>
+<div class="bg-base-100 rounded-lg shadow-sm border border-base-300 p-6 md:p-8">
+<div class="grid grid-cols-1 lg:grid-cols-2 gap-6 gap-x-10">
+{general}
+<div class="space-y-6">{contact_info}{address}</div>
+<div class="lg:col-span-2">{record_panels}</div>
+</div>
+{notes}
 {bottom}
-<div class="mt-6 flex gap-2">
-<button type="submit" class="btn btn-primary btn-sm">Save</button>
-<a href="/contacts" class="btn btn-ghost btn-sm">Cancel</a>
+</div>
+<div class="flex justify-end gap-2 mt-4">
+<a href="{back_href}" class="btn btn-ghost">Cancel</a>
+<button type="submit" class="btn btn-primary">Save</button>
 </div>
 </fieldset>
 </form>
+</div>
 
 {activity_panel}
 
 {history_panel}"#,
         id = id,
+        back_href = esc(&back_href),
         activity_panel = activity_panel,
         name = esc(&name),
         code = esc(code.as_deref().unwrap_or("")),
-        name_val = esc(&name),
-        email_val = esc(email.as_deref().unwrap_or("")),
-        phone_val = esc(phone.as_deref().unwrap_or("")),
-        mobile_val = esc(mobile.as_deref().unwrap_or("")),
-        street_val = esc(street.as_deref().unwrap_or("")),
-        street2_val = esc(street2.as_deref().unwrap_or("")),
-        street3_val = esc(street3.as_deref().unwrap_or("")),
-        city_val = esc(city.as_deref().unwrap_or("")),
-        zip_val = esc(zip.as_deref().unwrap_or("")),
-        country_options = country_options,
-        state_options = state_options,
-        vat = esc(vat_number.as_deref().unwrap_or("")),
-        credit = credit_limit.map(|c| format!("{:.2}", c)).unwrap_or_default(),
-        notes_val = esc(notes.as_deref().unwrap_or("")),
-        cf_name = cc.name,
-        cf_ctype = cc.contact_type,
-        cf_vat = cc.vat_number,
-        cf_credit = cc.credit_limit,
-        cf_email = cc.email,
-        cf_phone = cc.phone,
-        cf_mobile = cc.mobile,
-        cf_notes = cc.notes,
+        general = vortex_plugin_sdk::framework::form_section_raw("General", &general),
+        contact_info = vortex_plugin_sdk::framework::form_section_raw("Contact Info", &contact_info),
+        address = vortex_plugin_sdk::framework::form_section_raw("Address", &address),
+        notes = vortex_plugin_sdk::framework::form_section_raw("Notes", &notes),
+        record_panels = record_panels,
         bottom = cc.bottom,
-        sel_cust = sel(&contact_type, "customer"),
-        sel_supp = sel(&contact_type, "supplier"),
-        sel_both = sel(&contact_type, "both"),
-        sel_other = sel(&contact_type, "other"),
-        is_company_checked = if is_company { "checked" } else { "" },
-        active_checked = if active { "checked" } else { "" },
         history_panel = history_panel,
         status_bar = status_bar,
         approval_panel = approval_panel,
@@ -1001,7 +989,7 @@ async function loadStates(countryId) {{
         portal_button = portal_button,
     );
 
-    Html(page_shell(&sidebar, &format!("Edit {}", name), &content)).into_response()
+    strict_csp_page(page_shell(&sidebar, &format!("Edit {}", name), &content))
 }
 
 /// The contact model's tracked fields — Vortex's `tracking=True` analogue.
@@ -1396,3 +1384,4 @@ async fn duplicate_contact(
     info!(id = %new_id, source = %id, code = %code, "contact duplicated");
     vortex_plugin_sdk::axum::response::Redirect::to(&format!("/contacts/{new_id}")).into_response()
 }
+

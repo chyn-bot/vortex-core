@@ -141,6 +141,37 @@ pub struct ListConfig {
     /// next to the create button. Typically `/pivot/<model>?rows=<field>`.
     /// Requires the model to be registered in `ir_model` / `ir_model_field`.
     pub pivot_url: Option<&'static str>,
+    /// Explicit `ORDER BY` tiebreaker expression appended after the sort
+    /// key to guarantee a **total** order (stable `LIMIT/OFFSET` paging).
+    /// For a simple single-table list the framework appends bare `id`
+    /// automatically; set this when a `custom_from` join makes `id`
+    /// ambiguous — e.g. `"c.id"`. Must be an identifier/expression the
+    /// list author controls, never request input.
+    pub tiebreak: Option<&'static str>,
+    /// Base relation whose `pg_class.reltuples` estimate stands in for an
+    /// exact `COUNT(*)` on large **unfiltered** lists. The framework uses
+    /// the plain `table` automatically for single-table lists; set this to
+    /// opt a *joined* list (`custom_from`) into the estimate, asserting the
+    /// joins are cardinality-preserving (many-to-one on the base rows) so
+    /// `COUNT(join) == reltuples(base)`. Any filter/search still forces an
+    /// exact count. Author-controlled identifier, never request input.
+    pub count_estimate_from: Option<&'static str>,
+    /// Base relation + alias (e.g. `"contacts c"`) used to pre-filter a
+    /// free-text search through a materialized `id IN (…)` subquery instead
+    /// of an inline `OR ILIKE` across the joined result.
+    ///
+    /// On a large table a leading-wildcard `ILIKE` search is only fast if a
+    /// trigram (`pg_trgm` GIN) index can be used — which requires the
+    /// predicate to hit the **base** table directly, not a post-join
+    /// expression, and requires the planner not to be lured by the sort
+    /// index into an ordered scan + filter. Wrapping the search in
+    /// `<alias>.id IN (SELECT id FROM <base> WHERE <search>)` forces the
+    /// trigram bitmap scan first, then joins/sorts only the matches.
+    ///
+    /// **Precondition:** every `searchable` column must be a column of this
+    /// base relation (no joined `sql_expr` search columns), since the
+    /// subquery selects from the base alone. Author-controlled identifier.
+    pub search_prefilter: Option<&'static str>,
 }
 
 impl ListConfig {
@@ -158,6 +189,9 @@ impl ListConfig {
             custom_from: None,
             custom_select: None,
             pivot_url: None,
+            tiebreak: None,
+            count_estimate_from: None,
+            search_prefilter: None,
         }
     }
 
@@ -209,6 +243,36 @@ impl ListConfig {
     pub fn pivot_url(mut self, url: &'static str) -> Self {
         self.pivot_url = Some(url);
         self
+    }
+
+    /// Set an explicit `ORDER BY` tiebreaker (e.g. `"c.id"`) for joined
+    /// lists where the automatic bare-`id` tiebreaker would be ambiguous.
+    pub fn tiebreak(mut self, expr: &'static str) -> Self {
+        self.tiebreak = Some(expr);
+        self
+    }
+
+    /// Opt a joined list into the fast `reltuples` count estimate by naming
+    /// the cardinality-preserving base relation (e.g. `"contacts"`).
+    pub fn count_estimate_from(mut self, table: &'static str) -> Self {
+        self.count_estimate_from = Some(table);
+        self
+    }
+
+    /// Route free-text search through a trigram-friendly `id IN (…)`
+    /// prefilter on the given base relation + alias (e.g. `"contacts c"`).
+    /// Requires all searchable columns to belong to that base relation and
+    /// a `pg_trgm` GIN index to exist. See `search_prefilter`.
+    pub fn search_prefilter(mut self, base_alias: &'static str) -> Self {
+        self.search_prefilter = Some(base_alias);
+        self
+    }
+
+    /// The alias portion of `search_prefilter` (`"contacts c"` → `"c"`,
+    /// `"contacts"` → `"contacts"`), used to qualify `<alias>.id`.
+    pub(crate) fn prefilter_alias(&self) -> Option<&'static str> {
+        self.search_prefilter
+            .map(|s| s.rsplit(char::is_whitespace).next().unwrap_or(s))
     }
 
     /// Get searchable SQL expressions (uses `sql_expr` when set).

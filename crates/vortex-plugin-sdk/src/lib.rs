@@ -133,8 +133,9 @@ pub mod prelude {
 
     // ── Form engine ── (declare once: render + validate + save)
     pub use vortex_framework::form::{
-        execute_form_save, load_record, render_form, typeahead_widget, FieldKind, FormConfig,
-        FormField, FormMode, LookupSource, SaveOutcome,
+        execute_form_save, form_section, form_section_raw, load_record, render_form,
+        render_form_sheet, typeahead_widget, FieldKind, FormConfig, FormField, FormMode, FormSheet,
+        LookupSource, SaveOutcome, SHEET_WIDTH,
     };
 
     // ── Audit ledger ── (every state change: `state.audit.log(...)`)

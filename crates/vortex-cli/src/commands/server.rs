@@ -67,11 +67,13 @@ async fn public_context_middleware(
     .into_iter()
     .collect();
 
+    let custom_apps_html = custom_apps_nav(pool.pool(), "").await;
     request.extensions_mut().insert(pool.clone());
     request.extensions_mut().insert(DatabaseContext {
         db_name,
         pool,
         installed_modules,
+        custom_apps_html,
     });
     next.run(request).await
 }
@@ -239,13 +241,22 @@ async fn auth_middleware(
                 .await;
             }
 
-            // Fetch user roles
+            // Fetch user roles. A role owned by a plugin (owning_module set) only
+            // counts while that module is installed here — so a leftover grant to
+            // an uninstalled module's role (e.g. "EAM Admin" in a plain
+            // accounting tenant) grants nothing, and reactivates automatically if
+            // the module is ever installed. Core roles (owning_module NULL) always
+            // apply.
             let roles: Vec<String> = sqlx::query_scalar(
                 r#"
                 SELECT r.name
                 FROM roles r
                 JOIN user_roles ur ON ur.role_id = r.id
                 WHERE ur.user_id = $1
+                  AND (r.owning_module IS NULL
+                       OR r.owning_module IN (
+                           SELECT technical_name FROM installed_modules WHERE state = 'installed'
+                       ))
                 "#
             )
             .bind(session.user_id)
@@ -276,6 +287,7 @@ async fn auth_middleware(
             .collect();
 
             // Inject Arc<ConnectionPool> for plugin handlers (Extension-based extraction)
+            let custom_apps_html = custom_apps_nav(pool.pool(), "").await;
             request.extensions_mut().insert(pool.clone());
 
             // Inject DatabaseContext for downstream extractors (Db, InstalledModules)
@@ -283,6 +295,7 @@ async fn auth_middleware(
                 db_name,
                 pool,
                 installed_modules: db_installed_modules,
+                custom_apps_html,
             });
 
             next.run(request).await
@@ -449,6 +462,8 @@ async fn api_auth_middleware(
         db_name,
         pool,
         installed_modules,
+        // Bearer/API requests don't render the admin sidebar — skip the query.
+        custom_apps_html: String::new(),
     });
 
     next.run(request).await
@@ -592,6 +607,7 @@ async fn resolve_bearer(
         db_name,
         pool: pool.clone(),
         installed_modules,
+        custom_apps_html: custom_apps_nav(pool.pool(), "").await,
     };
     Some((auth_user, pool, db_ctx, tok))
 }
@@ -1402,9 +1418,9 @@ fn module_not_installed_page(module_name: &str) -> String {
     format!(r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style><title>Module Not Installed</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=18" rel="stylesheet"/>
-<script src="/static/vortex.js?v=18" defer></script>
-<script src="/static/vendor/tailwind.js"></script></head>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script>
+<link href="/static/tailwind.css?v=21" rel="stylesheet"/></head>
 <body class="min-h-screen bg-base-200 flex items-center justify-center">
 <div class="card bg-base-100 shadow-xl max-w-md w-full">
 <div class="card-body items-center text-center">
@@ -2200,7 +2216,32 @@ pub async fn run(host: String, port: u16, _workers: Option<usize>) -> Result<()>
         for plugin in state.plugin_registry.plugins_iter() {
             plugin.register_jobs(&mut job_registry);
         }
-        vortex_framework::jobs::JobWorker::new(job_registry).start(state.clone());
+        // Assemble the batch-run processor registry from plugin contributions,
+        // then register the generic `batch.chunk` worker that dispatches to it.
+        let mut batch_registry = vortex_framework::batch::BatchRegistry::new();
+        // Built-in processors (batch.noop load-test baseline), then plugins.
+        vortex_framework::batch::register_builtin(&mut batch_registry);
+        for plugin in state.plugin_registry.plugins_iter() {
+            plugin.register_batch(&mut batch_registry);
+        }
+        vortex_framework::batch::register_worker(
+            &mut job_registry,
+            std::sync::Arc::new(batch_registry),
+        );
+        // Throughput tuning for high-volume batch runs. Defaults (batch 10,
+        // poll 5s) suit light background work; a large billing/import run wants
+        // more claimed-per-tick and a tighter poll. Both overridable via env so
+        // ops can tune without a rebuild:
+        //   VORTEX_JOB_BATCH   — jobs claimed & run concurrently per tick
+        //   VORTEX_JOB_POLL_MS — poll interval in milliseconds
+        let mut worker = vortex_framework::jobs::JobWorker::new(job_registry);
+        if let Some(n) = std::env::var("VORTEX_JOB_BATCH").ok().and_then(|v| v.parse::<i64>().ok()) {
+            worker = worker.with_batch_size(n);
+        }
+        if let Some(ms) = std::env::var("VORTEX_JOB_POLL_MS").ok().and_then(|v| v.parse::<u64>().ok()) {
+            worker = worker.with_poll_interval(std::time::Duration::from_millis(ms));
+        }
+        worker.start(state.clone());
     }
 
     // Run each plugin's async startup hook. Failures are logged but do
@@ -2265,6 +2306,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         // keeps old bookmarks and stray links working.
         .route("/dashboard", get(|| async { Redirect::to("/home") }))
         .route("/auth/logout", post(logout).get(logout))
+        .route("/auth/ping", post(session_ping).get(session_ping))
         .route("/partials/recent-activity", get(recent_activity))
         .route("/partials/system-status", get(system_status))
         // Home partials
@@ -2294,8 +2336,11 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/blueprints/{model}", get(blueprint_designer))
         .route("/blueprints/{model}/archive", post(blueprint_archive))
         .route("/blueprints/{model}/menu", post(blueprint_toggle_menu))
+        .route("/blueprints/{model}/enable-stages", post(blueprint_enable_stages))
         .route("/blueprints/{model}/history", get(blueprint_history))
+        .route("/blueprints/{model}/restore", post(blueprint_restore))
         .route("/blueprints/{model}/layout", post(blueprint_set_layout))
+        .route("/blueprints/{model}/sections", post(blueprint_set_sections))
         .route("/blueprints/{model}/fields", post(blueprint_add_field))
         .route("/blueprints/{model}/fields/{name}/rename", post(blueprint_rename_field))
         .route("/blueprints/{model}/fields/{name}/delete", post(blueprint_remove_field))
@@ -2504,6 +2549,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/form/{model}", post(dynamic_form_create))
         .route("/form/{model}/{id}", get(dynamic_form_edit))
         .route("/form/{model}/{id}", post(dynamic_form_update))
+        .route("/form/{model}/{id}/stage/{target}", post(dynamic_form_stage))
         // API endpoints
         .route("/api/notifications", get(api_notifications))
         .route("/api/countries", get(api_countries))
@@ -2531,6 +2577,12 @@ fn build_router(state: Arc<AppState>) -> Router {
     // `Plugin::reports()` is enough.
     let protected_routes =
         protected_routes.merge(vortex_framework::reports::reports_routes());
+    // ─── Batch run admin UI (core batch engine) ───────────────────
+    // Operator surface over runs the batch engine executes: progress,
+    // the fail-item exception queue, and retry. Admin-gated inside the
+    // handlers.
+    let protected_routes =
+        protected_routes.merge(vortex_framework::batch_admin::admin_routes());
     let protected_routes = protected_routes
         // Auth middleware wraps everything
         .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
@@ -2739,7 +2791,11 @@ async fn api_notifications(
     }))
 }
 
-async fn login_page(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Html<String> {
+async fn login_page(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Html<String> {
     // Host-scoped: on gaia.vortex.com this is just ["gaia"], so the
     // picker disappears and other tenants' names never reach the page.
     let databases = login_databases(&state, &headers).await;
@@ -2749,12 +2805,11 @@ async fn login_page(State(state): State<Arc<AppState>>, headers: HeaderMap) -> H
         let options: String = databases.iter().map(|db| {
             format!(r#"<option value="{0}">{0}</option>"#, html_escape(db))
         }).collect();
-        format!(r#"
-                    <div class="form-control mb-4">
+        format!(r#"<div class="form-control mb-4">
                         <label class="label">
                             <span class="label-text">Database</span>
                         </label>
-                        <select name="database" class="select select-bordered">
+                        <select name="database" class="select select-bordered login-input w-full">
                             {options}
                         </select>
                     </div>"#)
@@ -2762,17 +2817,22 @@ async fn login_page(State(state): State<Arc<AppState>>, headers: HeaderMap) -> H
         String::new()
     };
 
+    // An inactivity sign-out (from the idle-timeout client) lands here with
+    // `?reason=timeout` — explain why they're back at login instead of leaving
+    // them guessing. Any other reason value is ignored.
+    let notice_html = if q.get("reason").map(|r| r == "timeout").unwrap_or(false) {
+        r#"<div class="alert alert-info mb-4 text-sm"><span>You were signed out due to inactivity. Please sign in again.</span></div>"#
+    } else {
+        ""
+    };
+
     let template = include_str!("../../templates/login_standalone.html");
-    // Inject database selector before the username field
-    let html = template.replace(
-        r#"<div class="form-control mb-4">
-                        <label class="label">
-                            <span class="label-text">Username</span>"#,
-        &format!(r#"{db_selector_html}
-                    <div class="form-control mb-4">
-                        <label class="label">
-                            <span class="label-text">Username</span>"#),
-    );
+    // Inject the database selector at the `<!-- DB_SELECTOR -->` placeholder in
+    // the form (above the username field). A plain string swap keeps the
+    // template free to be restyled without touching this handler.
+    let html = template
+        .replace("<!-- DB_SELECTOR -->", &db_selector_html)
+        .replace("<!-- NOTICE -->", notice_html);
     Html(html)
 }
 
@@ -3111,8 +3171,8 @@ fn portal_shell(title: &str, who: &str, active: &str, body: &str) -> String {
 <title>{title} · Portal</title>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=18" rel="stylesheet"/>
-<script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<link href="/static/tailwind.css?v=21" rel="stylesheet"/>
 <style>
 body {{ background: oklch(var(--b2)); color: oklch(var(--bc)); }}
 .pbar {{ background: oklch(var(--b1)); border-bottom: 1px solid oklch(var(--b3)); position: sticky; top: 0; z-index: 40; }}
@@ -3162,7 +3222,7 @@ fn portal_login_html(err: Option<&str>) -> String {
 <title>Portal Sign in</title><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<script src="/static/vendor/tailwind.js"></script>
+<link href="/static/tailwind.css?v=21" rel="stylesheet"/>
 <style>body{{background:#0b0f0a;color:#e5e7eb}}</style></head>
 <body class="min-h-screen flex items-center justify-center p-4">
 <div class="w-full max-w-sm" style="background:#12160f;border:1px solid #263019;border-radius:.75rem;padding:1.5rem">
@@ -3695,8 +3755,8 @@ fn intake_admin_shell(user: &AuthUser, title: &str, inner: &str) -> Html<String>
 <script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>{title} - Settings</title>
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=18" rel="stylesheet"/>
-<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script></head>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script><link href="/static/tailwind.css?v=21" rel="stylesheet"/></head>
 <body class="min-h-screen bg-base-200">
 <div class="navbar bg-base-100 shadow-lg"><div class="flex-1"><a href="/" class="btn btn-ghost text-xl">remicle</a></div><div class="flex-none"><span class="text-sm">@{user}</span></div></div>
 <div class="container mx-auto p-6 max-w-4xl">{inner}</div></body></html>"##,
@@ -4471,6 +4531,8 @@ async fn portal_auth_middleware(
         db_name,
         pool,
         installed_modules: db_installed_modules,
+        // Portal (customer-facing) uses its own chrome, not build_sidebar.
+        custom_apps_html: String::new(),
     });
     next.run(request).await
 }
@@ -4843,8 +4905,8 @@ fn portal_admin_shell(user: &AuthUser, title: &str, inner: &str) -> Html<String>
 <script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>{title} - Settings</title>
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=18" rel="stylesheet"/>
-<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script></head>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script><link href="/static/tailwind.css?v=21" rel="stylesheet"/></head>
 <body class="min-h-screen bg-base-200">
 <div class="navbar bg-base-100 shadow-lg"><div class="flex-1"><a href="/settings" class="btn btn-ghost text-xl">remicle</a></div><div class="flex-none"><span class="text-sm">@{user}</span></div></div>
 <div class="container mx-auto p-6 max-w-5xl">{inner}</div></body></html>"##,
@@ -5515,7 +5577,7 @@ fn portal_invite_page_html(token: &str, err: Option<&str>) -> String {
 <title>Set your password</title><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<script src="/static/vendor/tailwind.js"></script>
+<link href="/static/tailwind.css?v=21" rel="stylesheet"/>
 <style>body{{background:#0b0f0a;color:#e5e7eb}}</style></head>
 <body class="min-h-screen flex items-center justify-center p-4">
 <div class="w-full max-w-sm" style="background:#12160f;border:1px solid #263019;border-radius:.75rem;padding:1.5rem">
@@ -5562,7 +5624,7 @@ async fn portal_invite_page(
         Err(r) => return r,
     };
     if portal_invite_lookup(&db, &token).await.is_none() {
-        let body = r#"<!DOCTYPE html><html data-theme="dark"><head><title>Invite</title><link href="/static/vendor/daisyui.min.css" rel="stylesheet"/><script src="/static/vendor/tailwind.js"></script><style>body{background:#0b0f0a;color:#e5e7eb}</style></head><body class="min-h-screen flex items-center justify-center p-4"><div class="text-center"><h1 class="text-xl font-bold mb-2">Invitation not valid</h1><p class="text-base-content/60">This invite link has expired or already been used. Ask your account manager to resend it.</p></div></body></html>"#;
+        let body = r#"<!DOCTYPE html><html data-theme="dark"><head><title>Invite</title><link href="/static/vendor/daisyui.min.css" rel="stylesheet"/><link href="/static/tailwind.css?v=21" rel="stylesheet"/><style>body{background:#0b0f0a;color:#e5e7eb}</style></head><body class="min-h-screen flex items-center justify-center p-4"><div class="text-center"><h1 class="text-xl font-bold mb-2">Invitation not valid</h1><p class="text-base-content/60">This invite link has expired or already been used. Ask your account manager to resend it.</p></div></body></html>"#;
         return (StatusCode::NOT_FOUND, Html(body)).into_response();
     }
     Html(portal_invite_page_html(&token, None)).into_response()
@@ -5666,6 +5728,13 @@ async fn security_headers_middleware(
         .map(|c| c.contains("frame-ancestors"))
         .unwrap_or(false);
 
+    // A handler may set its own CSP (e.g. a page migrated to a strict,
+    // no-'unsafe-inline' policy). Honour it: don't slam the permissive
+    // global default on top. Pages that set nothing still get the default.
+    let has_own_csp = response
+        .headers()
+        .contains_key(header::CONTENT_SECURITY_POLICY);
+
     let headers = response.headers_mut();
     if is_html {
         headers.insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
@@ -5677,7 +5746,7 @@ async fn security_headers_middleware(
     headers.insert("X-XSS-Protection", "1; mode=block".parse().unwrap());
     headers.insert("Referrer-Policy", "strict-origin-when-cross-origin".parse().unwrap());
     headers.insert("Permissions-Policy", "camera=(), microphone=(), geolocation=()".parse().unwrap());
-    if !embeddable {
+    if !embeddable && !has_own_csp {
         headers.insert(
             "Content-Security-Policy",
             // Self-contained by policy: all CSS/JS is vendored under
@@ -5685,6 +5754,11 @@ async fn security_headers_middleware(
             // correctly). The one external allowance is OpenStreetMap
             // tiles, which are runtime map data, not page assets; fully
             // air-gapped sites point Leaflet at a local tile server.
+            //
+            // NOTE: this default still carries script-src 'unsafe-inline'
+            // because most pages still ship inline handlers/scripts. Pages
+            // migrated off inline JS set their own strict CSP header on the
+            // response, which the `has_own_csp` guard above preserves.
             "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data: https://*.tile.openstreetmap.org; font-src 'self'".parse().unwrap(),
         );
     }
@@ -5718,10 +5792,21 @@ fn hash_token(token: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// Keep-alive for the idle-timeout client. The auth middleware slides the
+/// session's expiry on every authenticated request (throttled to once a
+/// minute), so this endpoint's whole job is to *be* such a request — letting an
+/// actively-typing user (who makes no other request) hold their session open.
+/// Returns 204; if the session has already lapsed the middleware bounces it to
+/// login before this runs.
+async fn session_ping() -> Response {
+    StatusCode::NO_CONTENT.into_response()
+}
+
 async fn logout(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     // Revoke the session in database
     let _ = sqlx::query(
@@ -5750,15 +5835,22 @@ async fn logout(
     // Use a real HTTP 302 redirect so it works both from HTMX
     // (sidebar logout button) and from a direct browser hit
     // (typing /auth/logout in the address bar).
+    // Carry an inactivity reason through to the login screen so it can explain
+    // why the user landed back there (vs. a deliberate logout).
+    let dest = if q.get("reason").map(|r| r == "timeout").unwrap_or(false) {
+        "/login?reason=timeout"
+    } else {
+        "/login"
+    };
     let mut headers = HeaderMap::new();
     headers.insert(
         header::SET_COOKIE,
         "session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0".parse().unwrap(),
     );
-    headers.insert(header::LOCATION, "/login".parse().unwrap());
+    headers.insert(header::LOCATION, dest.parse().unwrap());
     // Also send HX-Redirect so HTMX callers do a full-page
     // navigation instead of trying to swap into the current page.
-    headers.insert("HX-Redirect", "/login".parse().unwrap());
+    headers.insert("HX-Redirect", dest.parse().unwrap());
     (StatusCode::FOUND, headers).into_response()
 }
 
@@ -6504,6 +6596,25 @@ struct BlueprintFieldForm {
     related_model: Option<String>,
     #[serde(default)]
     options: Option<String>,
+    // Checkboxes — present ("on"/"1") only when ticked.
+    #[serde(default)]
+    required: Option<String>,
+    #[serde(default)]
+    unique: Option<String>,
+    // Auto-number settings — only read when field_type == "autonumber".
+    #[serde(default)]
+    seq_prefix: Option<String>,
+    #[serde(default)]
+    seq_padding: Option<String>,
+    #[serde(default)]
+    seq_scope: Option<String>,
+    #[serde(default)]
+    seq_separator: Option<String>,
+}
+
+/// A checkbox is "on" when the browser submits it (unticked boxes are absent).
+fn checkbox_on(v: &Option<String>) -> bool {
+    matches!(v.as_deref(), Some("on") | Some("1") | Some("true"))
 }
 
 #[derive(serde::Deserialize)]
@@ -6524,7 +6635,10 @@ const BLUEPRINT_FIELD_TYPES: &[(&str, &str)] = &[
     ("date", "Date"),
     ("datetime", "Date & time"),
     ("selection", "Dropdown"),
+    ("autonumber", "Auto number (with prefix)"),
     ("many2one", "Link to a record"),
+    ("many2many", "Link to many records"),
+    ("one2many", "Related records list"),
 ];
 
 fn blueprint_type_label(ft: &str) -> String {
@@ -6746,21 +6860,96 @@ async fn blueprint_designer(
         target_options.push_str(&format!(r#"<optgroup label="Core records">{core_opts}</optgroup>"#));
     }
 
-    // Layout rows: an order box + a "list column" checkbox per field, submitted
-    // as one form (order__<f> / list__<f>). Sequence drives order in both the
-    // generic form and list; is_visible drives list-column membership.
+    // Per-field form width (col_span). Read best-effort in its own query so a
+    // tenant DB that predates migration 153 still renders the designer — the
+    // widths just default to Full.
+    let width_map: std::collections::HashMap<String, i16> = sqlx::query(
+        "SELECT name, col_span FROM ir_model_field WHERE model_id = $1 AND source = 'blueprint'",
+    )
+    .bind(model_id)
+    .fetch_all(&db)
+    .await
+    .map(|rows| {
+        rows.iter()
+            .map(|r| (r.get::<String, _>("name"), r.try_get::<i16, _>("col_span").unwrap_or(2)))
+            .collect()
+    })
+    .unwrap_or_default();
+
+    // Per-field section (card grouping), read best-effort like col_span — a DB
+    // predating migration 154 has no `section` column, so these default empty.
+    let section_map: std::collections::HashMap<String, String> = sqlx::query(
+        "SELECT name, section FROM ir_model_field WHERE model_id = $1 AND source = 'blueprint'",
+    )
+    .bind(model_id)
+    .fetch_all(&db)
+    .await
+    .map(|rows| {
+        rows.iter()
+            .filter_map(|r| {
+                r.try_get::<Option<String>, _>("section")
+                    .ok()
+                    .flatten()
+                    .map(|s| (r.get::<String, _>("name"), s))
+            })
+            .collect()
+    })
+    .unwrap_or_default();
+
+    // Per-section width ("half" | "full"), keyed by section label. Best-effort
+    // like the maps above so a DB predating migration 156 just shows every
+    // section as full width.
+    let section_width: std::collections::HashMap<String, String> = sqlx::query_scalar::<_, serde_json::Value>(
+        "SELECT section_config FROM ir_model WHERE id = $1",
+    )
+    .bind(model_id)
+    .fetch_one(&db)
+    .await
+    .ok()
+    .and_then(|v| v.as_object().map(|o| {
+        o.iter()
+            .filter_map(|(k, val)| val.get("width").and_then(|w| w.as_str()).map(|w| (k.clone(), w.to_string())))
+            .collect()
+    }))
+    .unwrap_or_default();
+
+    // Distinct section labels in field order (blank/"General" is the ungrouped
+    // flow, not a configurable section) — drives the Section layout card below.
+    let mut distinct_sections: Vec<String> = Vec::new();
+    for f in &fields {
+        let fname: String = f.get("name");
+        if let Some(s) = section_map.get(&fname) {
+            let s = s.trim();
+            if !s.is_empty() && s != "General" && !distinct_sections.iter().any(|d| d == s) {
+                distinct_sections.push(s.to_string());
+            }
+        }
+    }
+
+    // Layout rows: an order box, a form-width picker, a section name, and a
+    // "list column" checkbox per field, submitted as one form (order__<f> /
+    // width__<f> / section__<f> / list__<f>). Sequence drives order in both the
+    // generic form and list; col_span + section lay the form out in section
+    // cards / two columns; is_visible drives list-column membership.
     let mut layout_rows = String::new();
     for (idx, f) in fields.iter().enumerate() {
         let fname: String = f.get("name");
         let flabel: String = f.get("display_name");
         let in_list: bool = f.get("is_visible");
+        let span = width_map.get(&fname).copied().unwrap_or(2);
+        let section = section_map.get(&fname).cloned().unwrap_or_default();
         layout_rows.push_str(&format!(
             r#"<tr class="hover"><td>{flabel} <code class="text-xs opacity-60">{fname}</code></td>
 <td><input type="number" name="order__{fname}" value="{ord}" class="input input-bordered input-xs w-20"/></td>
+<td><input type="text" name="section__{fname}" value="{section}" placeholder="General" class="input input-bordered input-xs w-32"/></td>
+<td><select name="width__{fname}" class="select select-bordered select-xs"><option value="2"{full}>Full</option><option value="1"{half}>Half</option></select></td>
 <td class="text-center"><input type="checkbox" name="list__{fname}" class="checkbox checkbox-sm"{checked}/></td></tr>"#,
             flabel = html_escape(&flabel),
             fname = html_escape(&fname),
             ord = (idx + 1) * 10,
+            section = html_escape(&section),
+            full = if span >= 2 { " selected" } else { "" },
+            half = if span <= 1 { " selected" } else { "" },
             checked = if in_list { " checked" } else { "" },
         ));
     }
@@ -6812,14 +7001,45 @@ async fn blueprint_designer(
         format!(
             r#"<div class="card bg-base-100 shadow mb-6 max-w-2xl"><div class="card-body p-4">
 <h2 class="card-title text-base mb-1">Layout</h2>
-<p class="text-sm opacity-60 mb-3">Order drives both the form and the list. Untick <em>List column</em> to hide a field from the list view — it stays editable on the form.</p>
+<p class="text-sm opacity-60 mb-3">Order drives both the form and the list. <em>Section</em> groups fields into cards (blank = General); sections lay out two-up across the full width like the Contacts form. Set a field to <em>Half</em> width to place it beside the next Half field in its section. Untick <em>List column</em> to hide a field from the list view — it stays editable on the form.</p>
 <form action="/blueprints/{model}/layout" method="POST">
-<table class="table table-sm"><thead><tr><th>Field</th><th>Order</th><th class="text-center">List column</th></tr></thead>
+<table class="table table-sm"><thead><tr><th>Field</th><th>Order</th><th>Section</th><th>Form width</th><th class="text-center">List column</th></tr></thead>
 <tbody>{layout_rows}</tbody></table>
 <div class="mt-3"><button class="btn btn-primary btn-sm">Save layout</button></div>
 </form></div></div>"#,
             model = html_escape(&model),
             layout_rows = layout_rows,
+        )
+    };
+
+    // Section layout card: give each named section a form width. Two Half
+    // sections sit side by side; a Full section spans the row (the page break).
+    let section_card = if distinct_sections.is_empty() {
+        String::new()
+    } else {
+        let mut rows = String::new();
+        for s in &distinct_sections {
+            let half = section_width.get(s).map(|w| w == "half").unwrap_or(false);
+            rows.push_str(&format!(
+                r#"<tr class="hover"><td>{label}</td>
+<td><select name="secw__{label_attr}" class="select select-bordered select-xs"><option value="full"{full}>Full row</option><option value="half"{half}>Half (side by side)</option></select></td></tr>"#,
+                label = html_escape(s),
+                label_attr = html_escape(s),
+                full = if half { "" } else { " selected" },
+                half = if half { " selected" } else { "" },
+            ));
+        }
+        format!(
+            r#"<div class="card bg-base-100 shadow mb-6 max-w-2xl"><div class="card-body p-4">
+<h2 class="card-title text-base mb-1">Section layout</h2>
+<p class="text-sm opacity-60 mb-3">Arrange your sections across the form. <em>Half</em> sections pack two-up side by side; a <em>Full row</em> section spans the width and breaks the row — so <code>[Half][Half]</code> then a <code>[Full]</code> gives you two columns above a full-width block.</p>
+<form action="/blueprints/{model}/sections" method="POST">
+<table class="table table-sm"><thead><tr><th>Section</th><th>Width</th></tr></thead>
+<tbody>{rows}</tbody></table>
+<div class="mt-3"><button class="btn btn-primary btn-sm">Save section layout</button></div>
+</form></div></div>"#,
+            model = html_escape(&model),
+            rows = rows,
         )
     };
 
@@ -6835,12 +7055,17 @@ async fn blueprint_designer(
         )
     };
 
+    // Whether this Blueprint's table already has a record_state column (stages
+    // enabled) — drives the header's "Enable stages" vs "Stages" control.
+    let stages_on = vortex_framework::blueprint::stages_enabled(&db, &model).await;
+
     let body = format!(
         r#"<div class="flex justify-between items-center mb-6">
 <div><div class="flex items-center gap-2"><a href="/blueprints" class="btn btn-ghost btn-sm btn-square">←</a><h1 class="text-2xl font-bold">{label}</h1><span class="badge badge-ghost">{status}</span></div>
 <p class="text-base-content/60 mt-1">Technical name <code>{model}</code></p></div>
 <div class="flex gap-2"><a href="/list/{model}" class="btn btn-primary">Open records →</a>
 {menu_btn}
+{stages_btn}
 <a href="/blueprints/{model}/history" class="btn btn-ghost">History</a>
 <a href="/blueprints/{model}/export" class="btn btn-ghost">Export</a>
 <form action="/blueprints/{model}/archive" method="POST" onsubmit="return confirm('Archive this Blueprint? Its records are kept.')"><button class="btn btn-ghost text-error">Archive</button></form></div>
@@ -6851,6 +7076,7 @@ async fn blueprint_designer(
 <tbody>{field_rows}</tbody></table>
 </div></div>
 {layout_card}
+{section_card}
 <div class="card bg-base-100 shadow max-w-2xl"><div class="card-body p-4">
 <h2 class="card-title text-base mb-2">Add a field</h2>
 <form action="/blueprints/{model}/fields" method="POST" class="flex flex-col gap-3">
@@ -6858,21 +7084,39 @@ async fn blueprint_designer(
 <div class="form-control"><label class="label py-1"><span class="label-text">Label</span></label><input name="label" class="input input-bordered input-sm" placeholder="e.g. Amount" required/></div>
 <div class="form-control"><label class="label py-1"><span class="label-text">Type</span></label><select name="field_type" class="select select-bordered select-sm">{type_options}</select></div>
 {target_field}
+<label class="label cursor-pointer gap-2 py-1" title="Users must fill this field in before saving"><input type="checkbox" name="required" class="checkbox checkbox-sm"/><span class="label-text">Required</span></label>
+<label class="label cursor-pointer gap-2 py-1" title="No two records may share this value"><input type="checkbox" name="unique" class="checkbox checkbox-sm"/><span class="label-text">Unique</span></label>
 <button class="btn btn-primary btn-sm">Add field</button>
 </div>
 <div class="form-control w-full"><label class="label py-1"><span class="label-text">Options <span class="opacity-50">(for Dropdown — one per line)</span></span></label><textarea name="options" rows="3" class="textarea textarea-bordered textarea-sm" placeholder="Open&#10;In Progress&#10;Closed"></textarea></div>
-</form></div></div>"#,
+<div class="flex flex-wrap gap-3 items-end pt-2 border-t border-base-300">
+<div class="text-xs opacity-50 w-full -mb-1">Auto number settings <span class="opacity-70">(for the Auto number type)</span></div>
+<div class="form-control"><label class="label py-1"><span class="label-text">Prefix</span></label><input name="seq_prefix" class="input input-bordered input-sm w-24" placeholder="VIS"/></div>
+<div class="form-control"><label class="label py-1"><span class="label-text">Separator</span></label><input name="seq_separator" class="input input-bordered input-sm w-16" value="-"/></div>
+<div class="form-control"><label class="label py-1"><span class="label-text">Digits</span></label><input name="seq_padding" type="number" min="1" max="12" class="input input-bordered input-sm w-20" value="4"/></div>
+<div class="form-control"><label class="label py-1"><span class="label-text">Reset</span></label><select name="seq_scope" class="select select-bordered select-sm"><option value="global">Never</option><option value="yearly">Yearly</option><option value="monthly">Monthly</option></select></div>
+<div class="text-xs opacity-50">e.g. <code>VIS-2026-0001</code></div>
+</div>
+</form>
+<div class="text-sm text-base-content/60 mt-3 pt-3 border-t border-base-300">Need a field that derives its value automatically (a total, or a value pulled from a linked record)? Add a <a href="/settings/computed-fields?model={model}" class="link link-primary">computed field</a> — it shows read-only on the record.</div>
+</div></div>"#,
         label = html_escape(&label),
         status = html_escape(&status),
         model = html_escape(&model),
         field_rows = field_rows,
         layout_card = layout_card,
+        section_card = section_card,
         type_options = blueprint_type_options(),
         target_field = target_field,
         menu_btn = if show_in_menu {
             format!(r#"<form action="/blueprints/{m}/menu" method="POST"><input type="hidden" name="show" value="0"><button class="btn btn-ghost" title="Remove this app from the sidebar">✓ In menu — remove</button></form>"#, m = html_escape(&model))
         } else {
             format!(r#"<form action="/blueprints/{m}/menu" method="POST"><input type="hidden" name="show" value="1"><button class="btn btn-ghost" title="Add this app to the sidebar navigation">+ Add to menu</button></form>"#, m = html_escape(&model))
+        },
+        stages_btn = if stages_on {
+            r#"<a href="/settings/stages" class="btn btn-ghost" title="Edit this app's stages and transition buttons">Stages ⚙</a>"#.to_string()
+        } else {
+            format!(r#"<form action="/blueprints/{m}/enable-stages" method="POST" onsubmit="return confirm('Enable a stage workflow (status bar) for this app? This adds a status column and a starter Draft → In Progress → Done flow you can then customise in Settings → Stages.')"><button class="btn btn-ghost" title="Add a status-bar workflow to this app">+ Enable stages</button></form>"#, m = html_escape(&model))
         },
     );
     blueprint_shell(
@@ -6896,6 +7140,19 @@ async fn blueprint_add_field(
         return blueprint_forbidden();
     }
     use vortex_framework::blueprint::{BlueprintOp, SubmitOutcome};
+    // An auto-number field carries its prefix/width/reset/separator as a JSON
+    // options blob (the framework validates + normalises it); every other type
+    // uses the plain Options textarea unchanged.
+    let options = if form.field_type == "autonumber" {
+        Some(serde_json::json!({
+            "prefix": form.seq_prefix.clone().unwrap_or_default(),
+            "padding": form.seq_padding.as_deref().and_then(|s| s.trim().parse::<i64>().ok()).unwrap_or(4),
+            "scope": form.seq_scope.clone().unwrap_or_else(|| "global".to_string()),
+            "separator": form.seq_separator.clone().unwrap_or_else(|| "-".to_string()),
+        }).to_string())
+    } else {
+        form.options.clone()
+    };
     match vortex_framework::blueprint::submit(
         &state,
         &db,
@@ -6906,12 +7163,50 @@ async fn blueprint_add_field(
             label: form.label.clone(),
             field_type: form.field_type.clone(),
             related_model: form.related_model.clone(),
-            options: form.options.clone(),
+            options,
+            required: checkbox_on(&form.required),
+            unique: checkbox_on(&form.unique),
         },
     )
     .await
     {
         Ok(SubmitOutcome::Applied { .. }) => Redirect::to(&format!("/blueprints/{model}")).into_response(),
+        Ok(SubmitOutcome::Pending) => Redirect::to("/blueprints/approvals").into_response(),
+        Err(e) => error_response(&e),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct BlueprintRestoreForm {
+    version: i32,
+}
+
+/// POST /blueprints/{model}/restore — restore the field set to an earlier
+/// version (governed; may drop columns, so the history UI confirms data loss).
+async fn blueprint_restore(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(model): Path<String>,
+    Form(form): Form<BlueprintRestoreForm>,
+) -> Response {
+    if !user.is_admin() {
+        return blueprint_forbidden();
+    }
+    use vortex_framework::blueprint::{BlueprintOp, SubmitOutcome};
+    match vortex_framework::blueprint::submit(
+        &state,
+        &db,
+        &db_ctx.db_name,
+        &user,
+        BlueprintOp::Restore { model: model.clone(), version: form.version },
+    )
+    .await
+    {
+        Ok(SubmitOutcome::Applied { .. }) => {
+            Redirect::to(&format!("/blueprints/{model}/history")).into_response()
+        }
         Ok(SubmitOutcome::Pending) => Redirect::to("/blueprints/approvals").into_response(),
         Err(e) => error_response(&e),
     }
@@ -7048,6 +7343,106 @@ async fn blueprint_toggle_menu(
     Redirect::to(&format!("/blueprints/{model}")).into_response()
 }
 
+/// POST /blueprints/{model}/enable-stages — turn on the stage workflow (status
+/// bar) for a Blueprint: adds a `record_state` column and, the first time,
+/// seeds a starter Draft → In Progress → Done workflow with transition buttons.
+/// Admin-only; the service audits + versions. No approval gate (it's a column
+/// add + presentation metadata, like the menu toggle).
+async fn blueprint_enable_stages(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(model): Path<String>,
+) -> Response {
+    if !user.is_admin() {
+        return blueprint_forbidden();
+    }
+    match vortex_framework::blueprint::enable_stages(&state, &db, &db_ctx.db_name, &user, &model)
+        .await
+    {
+        Ok(()) => Redirect::to(&format!("/blueprints/{model}")).into_response(),
+        Err(e) => error_response(&e),
+    }
+}
+
+/// POST /form/{model}/{id}/stage/{target} — move a record to a new stage from
+/// the generic form's status bar. Gated by exactly the rules the buttons render
+/// with (`StageActions::can_transition`), so a hand-crafted POST can't reach a
+/// transition the user wouldn't be shown.
+async fn dynamic_form_stage(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path((model, id, target)): Path<(String, uuid::Uuid, String)>,
+) -> Response {
+    let table: Option<String> =
+        sqlx::query_scalar("SELECT table_name FROM ir_model WHERE name = $1 AND is_active = true")
+            .bind(&model)
+            .fetch_optional(&db)
+            .await
+            .ok()
+            .flatten();
+    let Some(table) = table else {
+        return (StatusCode::NOT_FOUND, Html("Model not found")).into_response();
+    };
+    if !validate_identifier(&table) {
+        return (StatusCode::BAD_REQUEST, Html("Invalid model")).into_response();
+    }
+
+    let current: String = sqlx::query_scalar::<_, Option<String>>(&format!(
+        "SELECT record_state FROM {table} WHERE id = $1"
+    ))
+    .bind(id)
+    .fetch_optional(&db)
+    .await
+    .ok()
+    .flatten()
+    .flatten()
+    .unwrap_or_default();
+
+    // Both gates mirror what the bar/buttons would render: the target must be a
+    // real stage, and the current→target move must be one this user may make.
+    let bar = vortex_framework::StatusBar::from_db(&db, &model, &table, "record_state").await;
+    if !bar.is_valid(&target) {
+        return error_response("Unknown stage.");
+    }
+    let actions = vortex_framework::StageActions::from_db(&db, &model).await;
+    if !actions.can_transition(&current, &target, &user.roles) {
+        return (
+            StatusCode::FORBIDDEN,
+            Html(forbidden_page("You cannot make that stage change.")),
+        )
+            .into_response();
+    }
+
+    if let Err(e) = sqlx::query(&format!(
+        "UPDATE {table} SET record_state = $1, updated_at = now() WHERE id = $2"
+    ))
+    .bind(&target)
+    .bind(id)
+    .execute(&db)
+    .await
+    {
+        return error_response(&format!("Could not change stage: {e}"));
+    }
+
+    api_audit(
+        &state,
+        &db_ctx.db_name,
+        &user,
+        AuditAction::Custom("record_stage_changed".into()),
+        AuditSeverity::Info,
+        &model,
+        Some(&id.to_string()),
+        serde_json::json!({ "from": current, "to": target }),
+    )
+    .await;
+
+    Redirect::to(&format!("/form/{model}/{id}")).into_response()
+}
+
 /// GET /blueprints/{model}/history — the schema-history timeline. Renders each
 /// version snapshot (who/when) with the field-level diff against the previous
 /// one, computed by `vortex_framework::blueprint::diff_definitions`. Read-only:
@@ -7090,7 +7485,9 @@ async fn blueprint_history(
     .unwrap_or_default();
 
     // Build the diff for each version against its predecessor, then render
-    // newest-first.
+    // newest-first. The highest version is the current state — every earlier one
+    // gets a "Restore" control.
+    let latest_version: i32 = versions.iter().map(|v| v.get::<i32, _>("version")).max().unwrap_or(0);
     let mut entries: Vec<String> = Vec::new();
     let mut prev_def: Option<serde_json::Value> = None;
     for v in &versions {
@@ -7126,14 +7523,28 @@ async fn blueprint_history(
                 })
                 .collect::<String>()
         };
+        // Current version = no restore; earlier versions get a data-loss-warned
+        // Restore button that reconciles the field set back to that snapshot.
+        let restore_btn = if vnum == latest_version {
+            r#"<span class="badge badge-ghost badge-sm">current</span>"#.to_string()
+        } else {
+            format!(
+                r#"<form method="POST" action="/blueprints/{model}/restore" onsubmit="return confirm('Restore to version {vnum}? Fields added since then will be DROPPED and their data permanently lost. This is recorded as a new version.');">
+<input type="hidden" name="version" value="{vnum}"/>
+<button class="btn btn-ghost btn-xs text-warning" title="Restore the field set to this version">↩ Restore</button></form>"#,
+                model = html_escape(&model),
+                vnum = vnum,
+            )
+        };
         entries.push(format!(
             r#"<div class="card bg-base-100 shadow-sm border border-base-300"><div class="card-body p-4">
 <div class="flex items-center justify-between mb-2"><h3 class="font-semibold">Version {vnum}</h3>
-<span class="text-xs opacity-60">{by} · {at}</span></div>
+<div class="flex items-center gap-2"><span class="text-xs opacity-60">{by} · {at}</span>{restore_btn}</div></div>
 {changes}</div></div>"#,
             vnum = vnum,
             by = html_escape(applied_by.as_deref().unwrap_or("system")),
             at = applied_at.format("%Y-%m-%d %H:%M UTC"),
+            restore_btn = restore_btn,
             changes = change_html,
         ));
         prev_def = Some(def);
@@ -7368,6 +7779,8 @@ async fn blueprint_set_layout(
     }
     let mut orders: std::collections::HashMap<String, i32> = std::collections::HashMap::new();
     let mut list_fields: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut widths: std::collections::HashMap<String, i16> = std::collections::HashMap::new();
+    let mut sections: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for (k, v) in &pairs {
         if let Some(name) = k.strip_prefix("order__") {
             if let Ok(n) = v.trim().parse::<i32>() {
@@ -7375,6 +7788,12 @@ async fn blueprint_set_layout(
             }
         } else if let Some(name) = k.strip_prefix("list__") {
             list_fields.insert(name.to_string());
+        } else if let Some(name) = k.strip_prefix("width__") {
+            if let Ok(n) = v.trim().parse::<i16>() {
+                widths.insert(name.to_string(), n);
+            }
+        } else if let Some(name) = k.strip_prefix("section__") {
+            sections.insert(name.to_string(), v.clone());
         }
     }
     match vortex_framework::blueprint::set_layout(
@@ -7385,11 +7804,59 @@ async fn blueprint_set_layout(
         &model,
         &orders,
         &list_fields,
+        &widths,
+        &sections,
     )
     .await
     {
         Ok(()) => Redirect::to(&format!("/blueprints/{model}")).into_response(),
         Err(e) => error_response(&e),
+    }
+}
+
+/// POST /blueprints/{model}/sections — save per-section form width. The body is
+/// flat `secw__<label>=half|full` pairs (one per named section). Full is the
+/// implicit default (a section spanning its own row); Half packs a section
+/// side-by-side with the next Half section. Admin-only + audited.
+async fn blueprint_set_sections(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(model): Path<String>,
+    Form(pairs): Form<Vec<(String, String)>>,
+) -> Response {
+    if !user.is_admin() {
+        return blueprint_forbidden();
+    }
+    let mut cfg = serde_json::Map::new();
+    for (k, v) in &pairs {
+        if let Some(label) = k.strip_prefix("secw__") {
+            let label = label.trim();
+            if label.is_empty() {
+                continue;
+            }
+            let w = if v == "half" { "half" } else { "full" };
+            cfg.insert(label.to_string(), serde_json::json!({ "width": w }));
+        }
+    }
+    let cfg_val = serde_json::Value::Object(cfg);
+    match sqlx::query("UPDATE ir_model SET section_config = $1 WHERE name = $2")
+        .bind(&cfg_val)
+        .bind(&model)
+        .execute(&db)
+        .await
+    {
+        Ok(_) => {
+            api_audit(
+                &state, &db_ctx.db_name, &user,
+                AuditAction::Custom("blueprint_section_layout".into()), AuditSeverity::Info,
+                "ir_model", Some(&model),
+                serde_json::json!({ "sections": cfg_val }),
+            ).await;
+            Redirect::to(&format!("/blueprints/{model}")).into_response()
+        }
+        Err(e) => error_response(&format!("Could not save section layout: {e}")),
     }
 }
 
@@ -8442,8 +8909,14 @@ struct RoleRow {
 /// any number of roles (e.g. System Administrator *and* EAM Manager); the
 /// `user_roles` table is many-to-many and the login path aggregates them all.
 async fn generate_role_checkboxes(db: &PgPool, selected_roles: &[uuid::Uuid]) -> String {
+    // Only offer core roles and roles whose owning module is installed here — an
+    // uninstalled plugin's roles must not be assignable (they'd grant nothing
+    // anyway; see the auth middleware's role filter).
     let roles = sqlx::query_as::<_, RoleRow>(
-        "SELECT id, name, description FROM roles ORDER BY name"
+        "SELECT id, name, description FROM roles \
+         WHERE owning_module IS NULL \
+            OR owning_module IN (SELECT technical_name FROM installed_modules WHERE state = 'installed') \
+         ORDER BY name"
     )
     .fetch_all(db)
     .await
@@ -8666,9 +9139,9 @@ async fn access_control_page(
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Access Control - Remicle</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=18" rel="stylesheet"/>
-<script src="/static/vortex.js?v=18" defer></script>
-    <script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script>
+    <link href="/static/tailwind.css?v=21" rel="stylesheet"/>
     <script src="/static/vendor/htmx.min.js"></script>
     <script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style>
 </head>
@@ -9156,9 +9629,9 @@ async fn modules_list_with_filter(
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Apps & Modules - Remicle</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet" type="text/css" />
-<link href="/static/vortex.css?v=18" rel="stylesheet"/>
-<script src="/static/vortex.js?v=18" defer></script>
-    <script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script>
+    <link href="/static/tailwind.css?v=21" rel="stylesheet"/>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar-modules').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay-modules').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="text-base-content/60">micle</span></a><button onclick="(function(){{var h=document.documentElement,c=h.getAttribute('data-theme')==='dark'?'corporate':'dark';h.setAttribute('data-theme',c);localStorage.setItem('theme',c);document.querySelectorAll('.theme-icon-sun,.theme-icon-moon').forEach(function(e){{e.classList.toggle('hidden')}})}})();" class="btn btn-ghost btn-sm btn-square ml-auto"><svg class="theme-icon-sun w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5" stroke-width="2"/><path stroke-linecap="round" stroke-width="2" d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg><svg class="theme-icon-moon w-5 h-5 hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg></button></div>
@@ -9502,9 +9975,9 @@ async fn modules_detail(
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>{name} - Apps & Modules</title>
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet" type="text/css"/>
-<link href="/static/vortex.css?v=18" rel="stylesheet"/>
-<script src="/static/vortex.js?v=18" defer></script>
-<script src="/static/vendor/tailwind.js"></script></head>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script>
+<link href="/static/tailwind.css?v=21" rel="stylesheet"/></head>
 <body class="min-h-screen bg-base-200"><main class="max-w-4xl mx-auto p-4 lg:p-8">
 <a href="/modules" class="btn btn-ghost btn-sm mb-4 gap-2">← Back to Apps &amp; Modules</a>
 <div class="card bg-base-100 shadow-md mb-4"><div class="card-body">
@@ -9797,6 +10270,46 @@ async fn module_install(
     axum::Json(ModuleOperationResponse { success: true, message, error: None }).into_response()
 }
 
+/// Extract the base-table names targeted by `DROP TABLE [IF EXISTS] <name>`
+/// statements in a migration's down SQL, so uninstall can re-drop them with
+/// CASCADE (FK-ordering-proof). Schema qualifiers and quotes are stripped; the
+/// caller validates each name as an identifier before it reaches SQL.
+fn collect_drop_table_names(sql: &str) -> Vec<String> {
+    let lower = sql.to_ascii_lowercase();
+    let bytes = sql.as_bytes();
+    let mut names = Vec::new();
+    let mut from = 0usize;
+    while let Some(rel) = lower[from..].find("drop table") {
+        let mut cur = from + rel + "drop table".len();
+        // optional "if exists"
+        let tail = lower[cur..].trim_start();
+        cur += lower[cur..].len() - tail.len();
+        if lower[cur..].starts_with("if exists") {
+            cur += "if exists".len();
+        }
+        while cur < bytes.len() && bytes[cur].is_ascii_whitespace() {
+            cur += 1;
+        }
+        let start = cur;
+        while cur < bytes.len() {
+            let c = bytes[cur];
+            if c.is_ascii_alphanumeric() || c == b'_' || c == b'.' || c == b'"' {
+                cur += 1;
+            } else {
+                break;
+            }
+        }
+        let raw = &sql[start..cur];
+        // last dotted segment (drop schema qualifier), unquoted
+        let name = raw.rsplit('.').next().unwrap_or(raw).trim_matches('"').to_string();
+        if !name.is_empty() {
+            names.push(name);
+        }
+        from = start.max(from + rel + "drop table".len());
+    }
+    names
+}
+
 async fn module_uninstall(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
@@ -9872,7 +10385,73 @@ async fn module_uninstall(
         }).into_response();
     }
 
-    // Update state to uninstalled
+    // Full teardown: remove everything the module put in this tenant DB, so an
+    // uninstalled module leaves nothing behind (schema, roles, grants, registry
+    // metadata, i18n, migration records). The migration records are deleted so a
+    // future reinstall re-runs the ups; `vortex db migrate` won't recreate the
+    // schema in the meantime because it now skips uninstalled modules.
+
+    // 1) Clear this module's role grants first, so deleting the roles (below, or
+    //    inside a down-migration) can't trip a user_roles foreign key.
+    let _ = sqlx::query(
+        "DELETE FROM user_roles ur USING roles r \
+         WHERE ur.role_id = r.id AND r.owning_module = $1",
+    )
+    .bind(&module_id)
+    .execute(&db)
+    .await;
+
+    // 2) Run the plugin's own down-migrations in reverse order to drop its
+    //    tables (and any roles/policies those migrations seed). Best-effort:
+    //    the down SQL uses IF EXISTS and is idempotent, so a re-run completes a
+    //    partial teardown; a failure is logged, not fatal.
+    if let Some(plugin) = state
+        .plugin_registry
+        .plugins_iter()
+        .find(|p| p.technical_name() == module_id)
+    {
+        let mut migs = plugin.migrations();
+        migs.reverse();
+        let mut drop_tables: Vec<String> = Vec::new();
+        for m in &migs {
+            if let Some(down) = m.down_sql {
+                // Run statements individually (best-effort): a single failing
+                // statement — e.g. a DROP blocked by a not-yet-dropped FK — must
+                // not roll back the rest of the file (which `raw_sql`'s implicit
+                // batch transaction would). This also runs the non-table cleanup
+                // (role deletes, dropped constraints, sequences) the downs carry.
+                for stmt in crate::commands::db::split_sql_statements(down) {
+                    if let Err(e) = sqlx::raw_sql(&stmt).execute(&db).await {
+                        tracing::warn!(module = %module_id, migration = %m.name, error = %e, "down-migration statement failed during uninstall");
+                    }
+                }
+                drop_tables.extend(collect_drop_table_names(down));
+            }
+        }
+        // Guarantee the tables are gone: re-drop every table the downs target
+        // with CASCADE, so a foreign-key dependency the plain DROPs couldn't
+        // resolve (a referencing table dropped later, or a cycle) can't leave
+        // orphaned tables behind. CASCADE removes only inbound FK constraints +
+        // dependent views, never other base tables.
+        for t in drop_tables {
+            if validate_identifier(&t) {
+                let _ = sqlx::raw_sql(&format!("DROP TABLE IF EXISTS \"{}\" CASCADE", t)).execute(&db).await;
+            }
+        }
+    }
+
+    // 3) Sweep residual metadata the down-migrations don't own.
+    let _ = sqlx::query("DELETE FROM roles WHERE owning_module = $1").bind(&module_id).execute(&db).await;
+    let _ = sqlx::query(
+        "DELETE FROM ir_model_field f USING ir_model m \
+         WHERE f.model_id = m.id AND m.module = $1",
+    ).bind(&module_id).execute(&db).await;
+    let _ = sqlx::query("DELETE FROM ir_model WHERE module = $1").bind(&module_id).execute(&db).await;
+    let _ = sqlx::query("DELETE FROM translations WHERE module = $1").bind(&module_id).execute(&db).await;
+    // 4) Forget the migration records so reinstall re-applies the ups.
+    let _ = sqlx::query("DELETE FROM vortex_migrations WHERE module = $1").bind(&module_id).execute(&db).await;
+
+    // 5) Flip the flag last.
     let result = sqlx::query(
         "UPDATE installed_modules SET state = 'uninstalled', updated_at = NOW() WHERE technical_name = $1"
     )
@@ -9991,20 +10570,26 @@ async fn module_upgrade(
 // Dynamic Sidebar Menu Helper
 // ============================================================================
 
-/// Sidebar `<li>` items for the generic model views (list/kanban/graph/
-/// calendar/pivot). These reuse the same aggregated plugin-registry menu as
-/// every plugin page — via [`vortex_framework::build_sidebar_nav`] — instead
-/// of the sparse `ir_ui_menu` fallback in [`build_sidebar_menu`], so the
-/// left-hand menu no longer vanishes when switching into a non-list view.
-async fn generic_view_sidebar(
+/// Full canonical `<aside>` sidebar (nav + user footer via `build_sidebar`) for
+/// the generic model views (list/kanban/graph/calendar/pivot) AND the generic
+/// record form. Returns the complete sidebar — the same aggregated
+/// plugin-registry menu as every plugin page plus the "Custom Apps" Blueprint
+/// group and the user footer — so those pages render through `render_app_shell`
+/// identically to the rest of the system, instead of a bespoke top-navbar +
+/// sparse `ir_ui_menu` menu that made the left-hand chrome inconsistent.
+async fn generic_view_shell_sidebar(
     state: &AppState,
     user: &AuthUser,
     db_ctx: &DatabaseContext,
     active: &str,
 ) -> String {
     let apps = custom_apps_nav(db_ctx.pool.pool(), active).await;
-    vortex_framework::build_sidebar_nav(
+    let display_name = user.full_name.as_deref().unwrap_or(&user.username);
+    let initials = get_initials(display_name);
+    vortex_framework::build_sidebar(
         active,
+        display_name,
+        &initials,
         &db_ctx.installed_modules,
         user.is_admin(),
         &state.plugin_registry,
@@ -10048,105 +10633,6 @@ async fn custom_apps_nav(db: &sqlx::PgPool, active_model: &str) -> String {
             label = vortex_framework::html_escape(&label),
         ));
     }
-    html
-}
-
-async fn build_sidebar_menu(db: &PgPool, user_roles: &[String], current_model: &str) -> String {
-    // Fetch menu items
-    let menus = sqlx::query(
-        r#"SELECT id, name, parent_id, sequence, icon, action_type, action_model, action_view_type, action_url, groups
-           FROM ir_ui_menu WHERE active = true ORDER BY sequence, name"#
-    )
-    .fetch_all(db)
-    .await
-    .unwrap_or_default();
-
-    // Icon mapping
-    let get_icon = |icon: &str| -> &str {
-        match icon {
-            "dashboard" => r#"<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2V6zM14 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2v-2zM14 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2z"/></svg>"#,
-            "users" => r#"<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197m9 5.197v-1"/></svg>"#,
-            "building" => r#"<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5M9 7h1m-1 4h1m4-4h1m-1 4h1m-5 10v-5a1 1 0 011-1h2a1 1 0 011 1v5m-4 0h4"/></svg>"#,
-            "shield" => r#"<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"/></svg>"#,
-            "lock" => r#"<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"/></svg>"#,
-            "cog" | "settings" => r#"<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/></svg>"#,
-            "puzzle" | "apps" => r#"<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 4a2 2 0 114 0v1a1 1 0 001 1h3a1 1 0 011 1v3a1 1 0 01-1 1h-1a2 2 0 100 4h1a1 1 0 011 1v3a1 1 0 01-1 1h-3a1 1 0 01-1-1v-1a2 2 0 10-4 0v1a1 1 0 01-1 1H7a1 1 0 01-1-1v-3a1 1 0 00-1-1H4a2 2 0 110-4h1a1 1 0 001-1V7a1 1 0 011-1h3a1 1 0 001-1V4z"/></svg>"#,
-            "folder" => r#"<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"/></svg>"#,
-            "user" => r#"<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"/></svg>"#,
-            _ => r#"<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10" stroke-width="2"/></svg>"#,
-        }
-    };
-
-    // Build hierarchical menu
-    let mut html = String::new();
-
-    // Get top-level menus (no parent)
-    for menu in menus.iter().filter(|m| m.try_get::<Option<uuid::Uuid>, _>("parent_id").ok().flatten().is_none()) {
-        let name: String = menu.get("name");
-        let icon: Option<String> = menu.get("icon");
-        let action_type: Option<String> = menu.get("action_type");
-        let groups: Option<String> = menu.get("groups");
-
-        // Check group permissions
-        if let Some(ref g) = groups {
-            if let Ok(allowed_groups) = serde_json::from_str::<Vec<String>>(g) {
-                if !allowed_groups.is_empty() && !user_roles.iter().any(|r| allowed_groups.contains(r)) {
-                    continue;
-                }
-            }
-        }
-
-        let menu_id: uuid::Uuid = menu.get("id");
-        let icon_html = icon.as_deref().map(get_icon).unwrap_or("");
-
-        // Check if this is a section header (no action) or a link
-        if action_type.is_none() {
-            // It's a section header - find children
-            let children: Vec<_> = menus.iter()
-                .filter(|m| m.try_get::<Option<uuid::Uuid>, _>("parent_id").ok().flatten() == Some(menu_id))
-                .collect();
-
-            if !children.is_empty() {
-                html.push_str(&format!(r#"<li class="menu-title mt-4"><span>{}</span></li>"#, name));
-
-                for child in children {
-                    let child_name: String = child.get("name");
-                    let child_icon: Option<String> = child.get("icon");
-                    let child_action_type: Option<String> = child.get("action_type");
-                    let child_action_model: Option<String> = child.get("action_model");
-                    let child_action_url: Option<String> = child.get("action_url");
-                    let child_view_type: String = child.try_get("action_view_type").unwrap_or_else(|_| "list".to_string());
-
-                    let child_icon_html = child_icon.as_deref().map(get_icon).unwrap_or("");
-
-                    let href = match child_action_type.as_deref() {
-                        Some("model") => {
-                            let model = child_action_model.unwrap_or_default();
-                            let is_active = model == current_model;
-                            let active_class = if is_active { " active" } else { "" };
-                            format!(r#"<li><a href="/{}/{}" class="nav-item{}">{}<span class="sidebar-text">{}</span></a></li>"#,
-                                child_view_type, model, active_class, child_icon_html, child_name)
-                        }
-                        Some("url") => {
-                            let url = child_action_url.unwrap_or_default();
-                            format!(r#"<li><a href="{}" class="nav-item">{}<span class="sidebar-text">{}</span></a></li>"#,
-                                url, child_icon_html, child_name)
-                        }
-                        _ => format!(r#"<li><a class="nav-item">{}<span class="sidebar-text">{}</span></a></li>"#,
-                            child_icon_html, child_name),
-                    };
-                    html.push_str(&href);
-                }
-            }
-        } else {
-            // It's a direct link (like Dashboard)
-            let action_url: Option<String> = menu.get("action_url");
-            let href = action_url.unwrap_or_else(|| "/home".to_string());
-            html.push_str(&format!(r#"<li><a href="{}" class="nav-item">{}<span class="sidebar-text">{}</span></a></li>"#,
-                href, icon_html, name));
-        }
-    }
-
     html
 }
 
@@ -10261,7 +10747,10 @@ async fn generic_list_view(
     // attributes from the field type instead.
     let field_rows = sqlx::query(
         "SELECT name, display_name, field_type, selection_options, related_model
-         FROM ir_model_field WHERE model_id = $1 AND is_visible = true ORDER BY sequence"
+         FROM ir_model_field WHERE model_id = $1 AND is_visible = true
+           AND field_type NOT IN ('many2many', 'one2many')
+           AND COALESCE(is_computed, false) = false
+         ORDER BY sequence"
     )
     .bind(model_id)
     .fetch_all(&db)
@@ -10597,7 +11086,7 @@ async fn generic_list_view(
     }
 
     // Build dynamic sidebar
-    let sidebar_menu = generic_view_sidebar(&state, &user, &db_ctx, &model_name).await;
+    let sidebar = generic_view_shell_sidebar(&state, &user, &db_ctx, &model_name).await;
 
     // Fetch saved filters for this model
     let saved_filters = sqlx::query(
@@ -10615,57 +11104,9 @@ async fn generic_list_view(
         format!(r#"<option value="{}">{}</option>"#, id, name)
     }).collect();
 
-    // Build full page
-    Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style><title>{}</title>
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=18" rel="stylesheet"/>
-<script src="/static/vortex.js?v=18" defer></script>
-<script src="/static/vendor/tailwind.js"></script>
-<style>
-body {{ background: oklch(var(--b2)); color: oklch(var(--bc)); }}
-.top-navbar {{ background: oklch(var(--b1)); border-bottom: 1px solid oklch(var(--b3)); position: sticky; top: 0; z-index: 50; }}
-.sidebar {{ background: oklch(var(--b1)); border-right: 1px solid oklch(var(--b3)); }}
-.card {{ background: oklch(var(--b1)); border: 1px solid oklch(var(--b3)); }}
-.table {{ color: oklch(var(--bc)); }}
-.table th {{ color: #8BC53F; font-weight: 600; background: oklch(var(--b1)); }}
-.table tr:hover {{ background: oklch(var(--b3)); }}
-.menu a {{ color: oklch(var(--bc)/0.7); }}
-.menu a:hover, .menu a.active {{ background: oklch(var(--b3)); color: oklch(var(--bc)); }}
-.text-muted {{ color: oklch(var(--bc)/0.6); }}
-.btn-primary {{ background: #8BC53F; border-color: #8BC53F; color: #000; }}
-.btn-primary:hover {{ background: #6BA32E; border-color: #6BA32E; }}
-.user-badge {{ background: #8BC53F; color: #000; font-weight: 600; }}
-@media (max-width: 768px) {{
-    .sidebar {{ display: none; }}
-    .main-content {{ padding: 1rem; }}
-    .table {{ font-size: 0.85rem; }}
-    h1 {{ font-size: 1.5rem; }}
-}}
-</style>
-</head><body class="min-h-screen">
-<nav class="top-navbar px-4 py-3 flex items-center justify-between">
-    <div class="flex items-center gap-2"><button class="btn btn-ghost btn-sm btn-square md:hidden" onclick="var s=document.querySelector('.sidebar');s.classList.toggle('hidden');s.classList.toggle('md:block')"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="text-xl font-bold"><span style="color:#8BC53F">re</span><span class="text-muted">micle</span></a></div>
-    <div class="flex items-center gap-2 md:gap-3">
-        <a href="/home" class="text-base-content text-sm hover:underline hidden md:inline">Home</a>
-        <a href="/settings" class="text-base-content text-sm hover:underline hidden md:inline">Settings</a>
-        <a href="/notifications" class="btn btn-ghost btn-circle btn-sm relative" title="Notifications">
-            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9"/></svg>
-            <span class="absolute top-0 right-0 w-2 h-2 bg-red-500 rounded-full"></span>
-        </a>
-        <button onclick="(function(){{var h=document.documentElement,c=h.getAttribute('data-theme')==='dark'?'corporate':'dark';h.setAttribute('data-theme',c);localStorage.setItem('theme',c);document.querySelectorAll('.theme-icon-sun,.theme-icon-moon').forEach(function(e){{e.classList.toggle('hidden')}})}})();" class="btn btn-ghost btn-circle btn-sm" title="Toggle theme"><svg class="theme-icon-sun w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5" stroke-width="2"/><path stroke-linecap="round" stroke-width="2" d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg><svg class="theme-icon-moon w-5 h-5 hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg></button>
-        <div class="user-badge px-3 py-1 rounded-full text-sm">@{}</div>
-    </div>
-</nav>
-<div class="flex">
-<aside class="sidebar w-64 min-h-screen p-4 hidden md:block">
-<ul class="menu mt-2">
-{}
-</ul>
-</aside>
-<main class="flex-1 p-4 md:p-6 main-content">
-<div class="flex flex-col md:flex-row justify-between items-start md:items-center mb-6 gap-4">
-<div><h1 class="text-xl md:text-2xl font-bold">{}</h1><p class="text-muted">Manage {}</p></div>
+    // Build page body (canonical chrome via render_app_shell + build_sidebar).
+    let body = format!(r#"<div class="flex flex-col md:flex-row justify-between items-start md:items-center mb-6 gap-4">
+<div><h1 class="text-xl md:text-2xl font-bold">{}</h1><p class="opacity-60">Manage {}</p></div>
 <div class="flex gap-2 flex-wrap">
     <div class="btn-group">
         <a href="/list/{}" class="btn btn-sm btn-active" title="List View">
@@ -10684,11 +11125,11 @@ body {{ background: oklch(var(--b2)); color: oklch(var(--bc)); }}
     <a href="{}" class="btn btn-primary btn-sm">+ New</a>
 </div>
 </div>
-<div class="card mb-4">
+<div class="card bg-base-100 shadow mb-4">
 <div class="card-body p-3 md:p-4">
 <form method="GET" action="/list/{}" class="flex flex-wrap gap-3 items-end">
     <div class="form-control">
-        <label class="label py-0"><span class="label-text text-xs text-muted">Saved Filters</span></label>
+        <label class="label py-0"><span class="label-text text-xs opacity-60">Saved Filters</span></label>
         <select class="select select-bordered select-sm bg-transparent" onchange="if(this.value) window.location='?saved_filter='+this.value">
             <option value="">-- Select --</option>
             {}
@@ -10701,19 +11142,13 @@ body {{ background: oklch(var(--b2)); color: oklch(var(--bc)); }}
 </form>
 </div>
 </div>
-<div class="card overflow-x-auto">
+<div class="card bg-base-100 shadow overflow-x-auto">
 <table class="table">
 <thead><tr>{}</tr></thead>
 <tbody>{}</tbody>
 </table>
 {}
-</div>
-</main>
-</div>
-</body></html>"#,
-        model_display_name,
-        user.username,
-        sidebar_menu,
+</div>"#,
         model_display_name, model_display_name.to_lowercase(),
         model_name, model_name, model_name, model_name,
         vortex_framework::new_record_url(&model_name), model_name,
@@ -10747,7 +11182,9 @@ body {{ background: oklch(var(--b2)); color: oklch(var(--bc)); }}
             };
             build_pagination_html(page, per_page, total, &base_url)
         }
-    )).into_response()
+    );
+
+    Html(vortex_framework::render_app_shell(&model_display_name, &sidebar, &body)).into_response()
 }
 
 // ============================================================================
@@ -11011,7 +11448,7 @@ async fn generic_kanban_view(
     let agg = pick("agg").filter(|a| ["count", "sum", "avg", "min", "max"].contains(&a.as_str())).unwrap_or_else(|| "sum".to_string());
     let drag_enabled = pick("drag").as_deref() != Some("0");
 
-    let sidebar_menu = generic_view_sidebar(&state, &user, &db_ctx, &model_name).await;
+    let sidebar = generic_view_shell_sidebar(&state, &user, &db_ctx, &model_name).await;
     let mut current_cfg = std::collections::BTreeMap::new();
     if !group_by.is_empty() { current_cfg.insert("group_by".to_string(), group_by.clone()); }
     let view_bar = vortex_framework::saved_views::render_view_bar(
@@ -11215,10 +11652,8 @@ async fn generic_kanban_view(
         board.push_str(r#"<div class="kb-empty">No groupable field to build a board. Pick a Group-by field.</div>"#);
     }
 
-    let html = KANBAN_SHELL
+    let body = KANBAN_BODY
         .replace("__TITLE__", &html_escape(&model_display_name))
-        .replace("__USER__", &html_escape(&user.username))
-        .replace("__SIDEBAR__", &sidebar_menu)
         .replace("__LISTURL__", &html_escape(&list_view_url))
         .replace("__FIELDS__", &html_escape(&fields_json))
         .replace("__CONFIG__", &html_escape(&config_json))
@@ -11226,45 +11661,19 @@ async fn generic_kanban_view(
         .replace("__DRAG__", if drag_enabled { "1" } else { "0" })
         .replace("__BOARD__", &board)
         .replace("__MODEL__", &html_escape(&model_name))
-        .replace("__NEWURL__", &html_escape(&vortex_framework::new_record_url(&model_name)));
-    Html(html.replace("<!--VIEW_BAR-->", &view_bar)).into_response()
+        .replace("__NEWURL__", &html_escape(&vortex_framework::new_record_url(&model_name)))
+        .replace("<!--VIEW_BAR-->", &view_bar);
+    Html(vortex_framework::render_app_shell_with(
+        &format!("{} - Kanban", model_display_name),
+        &sidebar,
+        &body,
+        r#"<link href="/static/kanban.css?v=1" rel="stylesheet"/>"#,
+        r#"<div id="kb-toast" class="kb-toast"></div><script src="/static/kanban.js?v=1"></script>"#,
+    )).into_response()
 }
 
-const KANBAN_SHELL: &str = r#"<!DOCTYPE html><html data-theme="dark"><head>
-<script>(function(){var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)})()</script>
-<style>[data-theme="corporate"] .theme-icon-sun{display:none !important}[data-theme="corporate"] .theme-icon-moon{display:inline-block !important}</style>
-<title>__TITLE__ - Kanban</title>
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=18" rel="stylesheet"/>
-<link href="/static/kanban.css?v=1" rel="stylesheet"/>
-<script src="/static/vortex.js?v=18" defer></script>
-<script src="/static/vendor/tailwind.js"></script>
-<style>
-body { background: oklch(var(--b2)); color: oklch(var(--bc)); }
-.top-navbar { background: oklch(var(--b1)); border-bottom: 1px solid oklch(var(--b3)); position: sticky; top: 0; z-index: 50; }
-.sidebar { background: oklch(var(--b1)); border-right: 1px solid oklch(var(--b3)); }
-.text-muted { color: oklch(var(--bc)/0.6); }
-.user-badge { background: #8BC53F; color: #000; font-weight: 600; }
-</style>
-</head><body class="min-h-screen">
-<nav class="top-navbar px-4 py-3 flex items-center justify-between">
-  <div class="flex items-center gap-2">
-    <button class="btn btn-ghost btn-sm btn-square md:hidden" onclick="var s=document.querySelector('.sidebar');s.classList.toggle('hidden');s.classList.toggle('md:block')"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button>
-    <a href="/home" class="text-xl font-bold"><span style="color:#8BC53F">re</span><span class="text-muted">micle</span></a>
-  </div>
-  <div class="flex items-center gap-2 md:gap-3">
-    <a href="/home" class="text-base-content text-sm hover:underline hidden md:inline">Home</a>
-    <a href="/settings" class="text-base-content text-sm hover:underline hidden md:inline">Settings</a>
-    <button onclick="(function(){var h=document.documentElement,c=h.getAttribute('data-theme')==='dark'?'corporate':'dark';h.setAttribute('data-theme',c);localStorage.setItem('theme',c);document.querySelectorAll('.theme-icon-sun,.theme-icon-moon').forEach(function(e){e.classList.toggle('hidden')})})();" class="btn btn-ghost btn-circle btn-sm" title="Toggle theme"><svg class="theme-icon-sun w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5" stroke-width="2"/><path stroke-linecap="round" stroke-width="2" d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg><svg class="theme-icon-moon w-5 h-5 hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg></button>
-    <div class="user-badge px-3 py-1 rounded-full text-sm">@__USER__</div>
-  </div>
-</nav>
-<div class="flex">
-<aside class="sidebar w-64 min-h-screen p-4 hidden md:block"><ul class="menu mt-2">__SIDEBAR__</ul></aside>
-<main class="flex-1 p-4 md:p-6 min-w-0">
-<div class="flex flex-col md:flex-row justify-between items-start md:items-center mb-4 gap-4">
-  <div><h1 class="text-xl md:text-2xl font-bold">__TITLE__</h1><p class="text-muted">Kanban — drag cards between columns to change stage</p></div>
+const KANBAN_BODY: &str = r#"<div class="flex flex-col md:flex-row justify-between items-start md:items-center mb-4 gap-4">
+  <div><h1 class="text-xl md:text-2xl font-bold">__TITLE__</h1><p class="opacity-60">Kanban — drag cards between columns to change stage</p></div>
   <div class="flex gap-2 flex-wrap">
     <div class="btn-group">
       <a href="__LISTURL__" class="btn btn-sm" title="List View"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 10h16M4 14h16M4 18h16"/></svg></a>
@@ -11273,16 +11682,11 @@ body { background: oklch(var(--b2)); color: oklch(var(--bc)); }
       <a href="/pivot/__MODEL__" class="btn btn-sm" title="Pivot View"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 10h18M3 14h18m-9-4v8m-7 0h14a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg></a>
     </div>
     <!--VIEW_BAR-->
-    <a href="__NEWURL__" class="btn btn-sm" style="background:#8BC53F;border-color:#8BC53F;color:#000">+ New</a>
+    <a href="__NEWURL__" class="btn btn-primary btn-sm">+ New</a>
   </div>
 </div>
 <div id="kb-config" class="kb-config"></div>
-<div id="kanban-root" class="kb-board" data-model="__MODEL__" data-group="__GROUP__" data-drag="__DRAG__" data-fields="__FIELDS__" data-config="__CONFIG__">__BOARD__</div>
-</main>
-</div>
-<div id="kb-toast" class="kb-toast"></div>
-<script src="/static/kanban.js?v=1"></script>
-</body></html>"#;
+<div id="kanban-root" class="kb-board" data-model="__MODEL__" data-group="__GROUP__" data-drag="__DRAG__" data-fields="__FIELDS__" data-config="__CONFIG__">__BOARD__</div>"#;
 
 // ============================================================================
 // Generic Graph View
@@ -11401,56 +11805,27 @@ async fn generic_graph_view(
     )
     .await;
 
-    let sidebar_menu = generic_view_sidebar(&state, &user, &db_ctx, &model_name).await;
+    let sidebar = generic_view_shell_sidebar(&state, &user, &db_ctx, &model_name).await;
 
-    let html = GRAPH_SHELL
+    let body = GRAPH_BODY
         .replace("__TITLE__", &html_escape(&model_display_name))
-        .replace("__USER__", &html_escape(&user.username))
-        .replace("__SIDEBAR__", &sidebar_menu)
         .replace("__LISTURL__", &html_escape(&list_view_url))
         .replace("__FIELDS__", &html_escape(&fields_json))
         .replace("__CONFIG__", &html_escape(&config_json))
         .replace("__MODEL__", &html_escape(&model_name))
-        .replace("__NEWURL__", &html_escape(&vortex_framework::new_record_url(&model_name)));
-    Html(html.replace("<!--VIEW_BAR-->", &view_bar)).into_response()
+        .replace("__NEWURL__", &html_escape(&vortex_framework::new_record_url(&model_name)))
+        .replace("<!--VIEW_BAR-->", &view_bar);
+    Html(vortex_framework::render_app_shell_with(
+        &format!("{} - Graph", model_display_name),
+        &sidebar,
+        &body,
+        r#"<link href="/static/pivot.css?v=25" rel="stylesheet"/><link href="/static/graph.css?v=2" rel="stylesheet"/>"#,
+        r#"<script src="/static/vendor/chart.umd.js"></script><script src="/static/graph.js?v=2"></script>"#,
+    )).into_response()
 }
 
-const GRAPH_SHELL: &str = r#"<!DOCTYPE html><html data-theme="dark"><head>
-<script>(function(){var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)})()</script>
-<style>[data-theme="corporate"] .theme-icon-sun{display:none !important}[data-theme="corporate"] .theme-icon-moon{display:inline-block !important}</style>
-<title>__TITLE__ - Graph</title>
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=18" rel="stylesheet"/>
-<link href="/static/pivot.css?v=25" rel="stylesheet"/>
-<link href="/static/graph.css?v=2" rel="stylesheet"/>
-<script src="/static/vortex.js?v=18" defer></script>
-<script src="/static/vendor/tailwind.js"></script>
-<style>
-body { background: oklch(var(--b2)); color: oklch(var(--bc)); }
-.top-navbar { background: oklch(var(--b1)); border-bottom: 1px solid oklch(var(--b3)); position: sticky; top: 0; z-index: 50; }
-.sidebar { background: oklch(var(--b1)); border-right: 1px solid oklch(var(--b3)); }
-.text-muted { color: oklch(var(--bc)/0.6); }
-.user-badge { background: #8BC53F; color: #000; font-weight: 600; }
-</style>
-</head><body class="min-h-screen">
-<nav class="top-navbar px-4 py-3 flex items-center justify-between">
-  <div class="flex items-center gap-2">
-    <button class="btn btn-ghost btn-sm btn-square md:hidden" onclick="var s=document.querySelector('.sidebar');s.classList.toggle('hidden');s.classList.toggle('md:block')"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button>
-    <a href="/home" class="text-xl font-bold"><span style="color:#8BC53F">re</span><span class="text-muted">micle</span></a>
-  </div>
-  <div class="flex items-center gap-2 md:gap-3">
-    <a href="/home" class="text-base-content text-sm hover:underline hidden md:inline">Home</a>
-    <a href="/settings" class="text-base-content text-sm hover:underline hidden md:inline">Settings</a>
-    <button onclick="(function(){var h=document.documentElement,c=h.getAttribute('data-theme')==='dark'?'corporate':'dark';h.setAttribute('data-theme',c);localStorage.setItem('theme',c);document.querySelectorAll('.theme-icon-sun,.theme-icon-moon').forEach(function(e){e.classList.toggle('hidden')})})();" class="btn btn-ghost btn-circle btn-sm" title="Toggle theme"><svg class="theme-icon-sun w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5" stroke-width="2"/><path stroke-linecap="round" stroke-width="2" d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg><svg class="theme-icon-moon w-5 h-5 hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg></button>
-    <div class="user-badge px-3 py-1 rounded-full text-sm">@__USER__</div>
-  </div>
-</nav>
-<div class="flex">
-<aside class="sidebar w-64 min-h-screen p-4 hidden md:block"><ul class="menu mt-2">__SIDEBAR__</ul></aside>
-<main class="flex-1 p-4 md:p-6 min-w-0">
-<div class="flex flex-col md:flex-row justify-between items-start md:items-center mb-4 gap-4">
-  <div><h1 class="text-xl md:text-2xl font-bold">__TITLE__</h1><p class="text-muted">Graph — drag fields into X-axis, Series and Measures</p></div>
+const GRAPH_BODY: &str = r#"<div class="flex flex-col md:flex-row justify-between items-start md:items-center mb-4 gap-4">
+  <div><h1 class="text-xl md:text-2xl font-bold">__TITLE__</h1><p class="opacity-60">Graph — drag fields into X-axis, Series and Measures</p></div>
   <div class="flex gap-2 flex-wrap">
     <div class="btn-group">
       <a href="__LISTURL__" class="btn btn-sm" title="List View"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 10h16M4 14h16M4 18h16"/></svg></a>
@@ -11467,7 +11842,7 @@ body { background: oklch(var(--b2)); color: oklch(var(--bc)); }
         <li><a id="g-export-pdf">PDF document</a></li>
       </ul>
     </div>
-    <a href="__NEWURL__" class="btn btn-sm" style="background:#8BC53F;border-color:#8BC53F;color:#000">+ New</a>
+    <a href="__NEWURL__" class="btn btn-primary btn-sm">+ New</a>
   </div>
 </div>
 <div class="g-wrap">
@@ -11486,11 +11861,7 @@ body { background: oklch(var(--b2)); color: oklch(var(--bc)); }
     </div>
   </div>
 </div>
-<div id="graph-root" data-model="__MODEL__" data-data-url="/pivot/__MODEL__/data" data-fields="__FIELDS__" data-config="__CONFIG__"></div>
-<script src="/static/vendor/chart.umd.js"></script>
-<script src="/static/graph.js?v=2"></script>
-</main>
-</div></body></html>"#;
+<div id="graph-root" data-model="__MODEL__" data-data-url="/pivot/__MODEL__/data" data-fields="__FIELDS__" data-config="__CONFIG__"></div>"#;
 
 // ============================================================================
 // Calendar View
@@ -11634,18 +12005,23 @@ async fn generic_calendar_view(
     })
     .to_string();
 
-    let sidebar_menu = generic_view_sidebar(&state, &user, &db_ctx, &model_name).await;
+    let sidebar = generic_view_shell_sidebar(&state, &user, &db_ctx, &model_name).await;
 
-    let html = CALENDAR_SHELL
+    let body = CALENDAR_BODY
         .replace("__TITLE__", &html_escape(&model_display_name))
-        .replace("__USER__", &html_escape(&user.username))
-        .replace("__SIDEBAR__", &sidebar_menu)
         .replace("__LISTURL__", &html_escape(&list_view_url))
         .replace("__FIELDS__", &html_escape(&fields_json))
         .replace("__CONFIG__", &html_escape(&config_json))
         .replace("__MODEL__", &html_escape(&model_name))
-        .replace("__NEWURL__", &html_escape(&vortex_framework::new_record_url(&model_name)));
-    Html(html.replace("<!--VIEW_BAR-->", &view_bar)).into_response()
+        .replace("__NEWURL__", &html_escape(&vortex_framework::new_record_url(&model_name)))
+        .replace("<!--VIEW_BAR-->", &view_bar);
+    Html(vortex_framework::render_app_shell_with(
+        &format!("{} - Calendar", model_display_name),
+        &sidebar,
+        &body,
+        r#"<link href="/static/calendar.css?v=1" rel="stylesheet"/>"#,
+        r#"<script src="/static/calendar.js?v=2"></script>"#,
+    )).into_response()
 }
 
 /// GET /calendar/{model}/data — events overlapping the `[start,end]` range as
@@ -11878,41 +12254,8 @@ async fn generic_calendar_data(
     .into_response()
 }
 
-const CALENDAR_SHELL: &str = r#"<!DOCTYPE html><html data-theme="dark"><head>
-<script>(function(){var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)})()</script>
-<style>[data-theme="corporate"] .theme-icon-sun{display:none !important}[data-theme="corporate"] .theme-icon-moon{display:inline-block !important}</style>
-<title>__TITLE__ - Calendar</title>
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=18" rel="stylesheet"/>
-<link href="/static/calendar.css?v=1" rel="stylesheet"/>
-<script src="/static/vortex.js?v=18" defer></script>
-<script src="/static/vendor/tailwind.js"></script>
-<style>
-body { background: oklch(var(--b2)); color: oklch(var(--bc)); }
-.top-navbar { background: oklch(var(--b1)); border-bottom: 1px solid oklch(var(--b3)); position: sticky; top: 0; z-index: 50; }
-.sidebar { background: oklch(var(--b1)); border-right: 1px solid oklch(var(--b3)); }
-.text-muted { color: oklch(var(--bc)/0.6); }
-.user-badge { background: #8BC53F; color: #000; font-weight: 600; }
-</style>
-</head><body class="min-h-screen">
-<nav class="top-navbar px-4 py-3 flex items-center justify-between">
-  <div class="flex items-center gap-2">
-    <button class="btn btn-ghost btn-sm btn-square md:hidden" onclick="var s=document.querySelector('.sidebar');s.classList.toggle('hidden');s.classList.toggle('md:block')"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button>
-    <a href="/home" class="text-xl font-bold"><span style="color:#8BC53F">re</span><span class="text-muted">micle</span></a>
-  </div>
-  <div class="flex items-center gap-2 md:gap-3">
-    <a href="/home" class="text-base-content text-sm hover:underline hidden md:inline">Home</a>
-    <a href="/settings" class="text-base-content text-sm hover:underline hidden md:inline">Settings</a>
-    <button onclick="(function(){var h=document.documentElement,c=h.getAttribute('data-theme')==='dark'?'corporate':'dark';h.setAttribute('data-theme',c);localStorage.setItem('theme',c);document.querySelectorAll('.theme-icon-sun,.theme-icon-moon').forEach(function(e){e.classList.toggle('hidden')})})();" class="btn btn-ghost btn-circle btn-sm" title="Toggle theme"><svg class="theme-icon-sun w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5" stroke-width="2"/><path stroke-linecap="round" stroke-width="2" d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg><svg class="theme-icon-moon w-5 h-5 hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg></button>
-    <div class="user-badge px-3 py-1 rounded-full text-sm">@__USER__</div>
-  </div>
-</nav>
-<div class="flex">
-<aside class="sidebar w-64 min-h-screen p-4 hidden md:block"><ul class="menu mt-2">__SIDEBAR__</ul></aside>
-<main class="flex-1 p-4 md:p-6 min-w-0">
-<div class="flex flex-col md:flex-row justify-between items-start md:items-center mb-4 gap-4">
-  <div><h1 class="text-xl md:text-2xl font-bold">__TITLE__</h1><p class="text-muted">Calendar — click a day to add, drag fields to reconfigure</p></div>
+const CALENDAR_BODY: &str = r#"<div class="flex flex-col md:flex-row justify-between items-start md:items-center mb-4 gap-4">
+  <div><h1 class="text-xl md:text-2xl font-bold">__TITLE__</h1><p class="opacity-60">Calendar — click a day to add, drag fields to reconfigure</p></div>
   <div class="flex gap-2 flex-wrap">
     <div class="btn-group">
       <a href="__LISTURL__" class="btn btn-sm" title="List View"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 10h16M4 14h16M4 18h16"/></svg></a>
@@ -11922,7 +12265,7 @@ body { background: oklch(var(--b2)); color: oklch(var(--bc)); }
       <a href="/pivot/__MODEL__" class="btn btn-sm" title="Pivot View"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 10h18M3 14h18m-9-4v8m-7 0h14a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg></a>
     </div>
     <!--VIEW_BAR-->
-    <a href="__NEWURL__" class="btn btn-sm" style="background:#8BC53F;border-color:#8BC53F;color:#000">+ New</a>
+    <a href="__NEWURL__" class="btn btn-primary btn-sm">+ New</a>
   </div>
 </div>
 <div id="cal-config" class="cal-config"></div>
@@ -11930,11 +12273,7 @@ body { background: oklch(var(--b2)); color: oklch(var(--bc)); }
 <div id="cal-legend" class="cal-legend" style="display:none"></div>
 <div id="cal-body" class="cal-body">
   <div id="calendar-root" data-model="__MODEL__" data-fields="__FIELDS__" data-config="__CONFIG__"></div>
-</div>
-<script src="/static/calendar.js?v=2"></script>
-</main>
-</div>
-</body></html>"#;
+</div>"#;
 
 // ============================================================================
 // Generic Pivot View (Excel-style, client-rendered)
@@ -12049,58 +12388,30 @@ async fn generic_pivot_view(
     )
     .await;
 
-    let sidebar_menu = generic_view_sidebar(&state, &user, &db_ctx, &model_name).await;
+    let sidebar = generic_view_shell_sidebar(&state, &user, &db_ctx, &model_name).await;
 
     // Shell built by token replacement (not format!) so the inline navbar JS
     // keeps its braces without escaping. Dynamic JSON goes into HTML-escaped
     // double-quoted data-* attributes.
-    let html = PIVOT_SHELL
+    let body = PIVOT_BODY
         .replace("__TITLE__", &html_escape(&model_display_name))
-        .replace("__USER__", &html_escape(&user.username))
-        .replace("__SIDEBAR__", &sidebar_menu)
         .replace("__LISTURL__", &html_escape(&list_view_url))
         .replace("__FIELDS__", &html_escape(&fields_json))
         .replace("__CONFIG__", &html_escape(&config_json))
         .replace("__MODEL__", &html_escape(&model_name))
-        .replace("__NEWURL__", &html_escape(&vortex_framework::new_record_url(&model_name)));
-    Html(html.replace("<!--VIEW_BAR-->", &view_bar)).into_response()
+        .replace("__NEWURL__", &html_escape(&vortex_framework::new_record_url(&model_name)))
+        .replace("<!--VIEW_BAR-->", &view_bar);
+    Html(vortex_framework::render_app_shell_with(
+        &format!("{} - Pivot", model_display_name),
+        &sidebar,
+        &body,
+        r#"<link href="/static/pivot.css?v=25" rel="stylesheet"/>"#,
+        r#"<script src="/static/pivot.js?v=25"></script>"#,
+    )).into_response()
 }
 
-const PIVOT_SHELL: &str = r#"<!DOCTYPE html><html data-theme="dark"><head>
-<script>(function(){var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)})()</script>
-<style>[data-theme="corporate"] .theme-icon-sun{display:none !important}[data-theme="corporate"] .theme-icon-moon{display:inline-block !important}</style>
-<title>__TITLE__ - Pivot</title>
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=18" rel="stylesheet"/>
-<link href="/static/pivot.css?v=25" rel="stylesheet"/>
-<script src="/static/vortex.js?v=18" defer></script>
-<script src="/static/vendor/tailwind.js"></script>
-<style>
-body { background: oklch(var(--b2)); color: oklch(var(--bc)); }
-.top-navbar { background: oklch(var(--b1)); border-bottom: 1px solid oklch(var(--b3)); position: sticky; top: 0; z-index: 50; }
-.sidebar { background: oklch(var(--b1)); border-right: 1px solid oklch(var(--b3)); }
-.text-muted { color: oklch(var(--bc)/0.6); }
-.user-badge { background: #8BC53F; color: #000; font-weight: 600; }
-</style>
-</head><body class="min-h-screen">
-<nav class="top-navbar px-4 py-3 flex items-center justify-between">
-  <div class="flex items-center gap-2">
-    <button class="btn btn-ghost btn-sm btn-square md:hidden" onclick="var s=document.querySelector('.sidebar');s.classList.toggle('hidden');s.classList.toggle('md:block')"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button>
-    <a href="/home" class="text-xl font-bold"><span style="color:#8BC53F">re</span><span class="text-muted">micle</span></a>
-  </div>
-  <div class="flex items-center gap-2 md:gap-3">
-    <a href="/home" class="text-base-content text-sm hover:underline hidden md:inline">Home</a>
-    <a href="/settings" class="text-base-content text-sm hover:underline hidden md:inline">Settings</a>
-    <button onclick="(function(){var h=document.documentElement,c=h.getAttribute('data-theme')==='dark'?'corporate':'dark';h.setAttribute('data-theme',c);localStorage.setItem('theme',c);document.querySelectorAll('.theme-icon-sun,.theme-icon-moon').forEach(function(e){e.classList.toggle('hidden')})})();" class="btn btn-ghost btn-circle btn-sm" title="Toggle theme"><svg class="theme-icon-sun w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5" stroke-width="2"/><path stroke-linecap="round" stroke-width="2" d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg><svg class="theme-icon-moon w-5 h-5 hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg></button>
-    <div class="user-badge px-3 py-1 rounded-full text-sm">@__USER__</div>
-  </div>
-</nav>
-<div class="flex">
-<aside class="sidebar w-64 min-h-screen p-4 hidden md:block"><ul class="menu mt-2">__SIDEBAR__</ul></aside>
-<main class="flex-1 p-4 md:p-6 min-w-0">
-<div class="flex flex-col md:flex-row justify-between items-start md:items-center mb-4 gap-4">
-  <div><h1 class="text-xl md:text-2xl font-bold">__TITLE__</h1><p class="text-muted">Pivot table — drag fields into Rows, Columns and Values</p></div>
+const PIVOT_BODY: &str = r#"<div class="flex flex-col md:flex-row justify-between items-start md:items-center mb-4 gap-4">
+  <div><h1 class="text-xl md:text-2xl font-bold">__TITLE__</h1><p class="opacity-60">Pivot table — drag fields into Rows, Columns and Values</p></div>
   <div class="flex gap-2 flex-wrap">
     <div class="btn-group">
       <a href="__LISTURL__" class="btn btn-sm" title="List View"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 10h16M4 14h16M4 18h16"/></svg></a>
@@ -12111,7 +12422,7 @@ body { background: oklch(var(--b2)); color: oklch(var(--bc)); }
     </div>
     <!--VIEW_BAR-->
     <button id="pv-export" class="btn btn-sm gap-1" title="Export to Excel (CSV)"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v2a2 2 0 002 2h12a2 2 0 002-2v-2M7 10l5 5 5-5M12 15V3"/></svg>Excel</button>
-    <a href="__NEWURL__" class="btn btn-sm" style="background:#8BC53F;border-color:#8BC53F;color:#000">+ New</a>
+    <a href="__NEWURL__" class="btn btn-primary btn-sm">+ New</a>
   </div>
 </div>
 <div class="pv-wrap">
@@ -12127,10 +12438,7 @@ body { background: oklch(var(--b2)); color: oklch(var(--bc)); }
     </div>
   </div>
 </div>
-<div id="pivot-root" data-model="__MODEL__" data-data-url="/pivot/__MODEL__/data" data-fields="__FIELDS__" data-config="__CONFIG__"></div>
-<script src="/static/pivot.js?v=25"></script>
-</main>
-</div></body></html>"#;
+<div id="pivot-root" data-model="__MODEL__" data-data-url="/pivot/__MODEL__/data" data-fields="__FIELDS__" data-config="__CONFIG__"></div>"#;
 
 /// GET /pivot/{model}/data — aggregated pivot matrix as JSON. Every field name
 /// is allow-listed against the model registry; subtotals and grand totals are
@@ -13117,8 +13425,8 @@ async fn contacts_new(State(state): State<Arc<AppState>>, Db(db): Db, Extension(
     }
 
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style><title>New Contact</title><meta name="viewport" content="width=device-width, initial-scale=1.0"><link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=18" rel="stylesheet"/>
-<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script><link href="/static/tailwind.css?v=21" rel="stylesheet"/>
 <style>
 .country-dropdown {{ position: relative; }}
 .country-dropdown .dropdown-content {{ max-height: 300px; overflow-y: auto; width: 100%; }}
@@ -13421,8 +13729,8 @@ async fn contacts_edit(
     };
 
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style><title>Edit Contact</title><meta name="viewport" content="width=device-width, initial-scale=1.0"><link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=18" rel="stylesheet"/>
-<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script><script src="/static/vendor/htmx.min.js"></script>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script><link href="/static/tailwind.css?v=21" rel="stylesheet"/><script src="/static/vendor/htmx.min.js"></script>
 <style>
 .country-dropdown {{ position: relative; }}
 .country-dropdown .dropdown-content {{ max-height: 300px; overflow-y: auto; width: 100%; }}
@@ -14719,9 +15027,9 @@ async fn notifications_page(
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Notifications - Remicle</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=18" rel="stylesheet"/>
-<script src="/static/vortex.js?v=18" defer></script>
-    <script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script>
+    <link href="/static/tailwind.css?v=21" rel="stylesheet"/>
     <style>
         body {{ background: oklch(var(--b2)); color: oklch(var(--bc)); }}
         .navbar {{ background: oklch(var(--b1)); border-bottom: 1px solid oklch(var(--b3)); }}
@@ -14837,9 +15145,9 @@ async fn settings_index(
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Settings - Remicle</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=18" rel="stylesheet"/>
-<script src="/static/vortex.js?v=18" defer></script>
-    <script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script>
+    <link href="/static/tailwind.css?v=21" rel="stylesheet"/>
     <style>
         body {{ background: oklch(var(--b2)); color: oklch(var(--bc)); }}
         .card {{ background: oklch(var(--b1)); border: 1px solid oklch(var(--b3)); }}
@@ -15622,9 +15930,9 @@ async fn render_custom_fields_page(db: &sqlx::PgPool, username: &str, error: Opt
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Custom Fields - Settings</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-    <link href="/static/vortex.css?v=18" rel="stylesheet"/>
-    <script src="/static/vortex.js?v=18" defer></script>
-    <script src="/static/vendor/tailwind.js"></script>
+    <link href="/static/vortex.css?v=20" rel="stylesheet"/>
+    <script src="/static/vortex.js?v=20" defer></script>
+    <link href="/static/tailwind.css?v=21" rel="stylesheet"/>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg">
@@ -15968,8 +16276,8 @@ async fn render_automation_rules_page(db: &sqlx::PgPool, username: &str, error: 
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Automation Rules - Settings</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-    <link href="/static/vortex.css?v=18" rel="stylesheet"/>
-    <script src="/static/vendor/tailwind.js"></script>
+    <link href="/static/vortex.css?v=20" rel="stylesheet"/>
+    <link href="/static/tailwind.css?v=21" rel="stylesheet"/>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg"><div class="flex-1"><a href="/" class="btn btn-ghost text-xl">remicle</a></div><div class="flex-none"><span class="text-sm">@{username}</span></div></div>
@@ -16102,7 +16410,12 @@ struct ComputedFieldForm {
     help: Option<String>,
 }
 
-async fn render_computed_fields_page(db: &sqlx::PgPool, username: &str, error: Option<&str>) -> String {
+async fn render_computed_fields_page(
+    db: &sqlx::PgPool,
+    username: &str,
+    error: Option<&str>,
+    prefill_model: Option<&str>,
+) -> String {
     use vortex_framework::ui::html_escape;
 
     let models = sqlx::query("SELECT name, display_name FROM ir_model WHERE is_active = true ORDER BY display_name")
@@ -16111,9 +16424,13 @@ async fn render_computed_fields_page(db: &sqlx::PgPool, username: &str, error: O
     for m in &models {
         let name: String = m.get("name");
         let label: String = m.get("display_name");
-        model_options.push_str(&format!(r#"<option value="{}">{} ({})</option>"#,
-            html_escape(&name), html_escape(&label), html_escape(&name)));
+        let selected = if prefill_model == Some(name.as_str()) { " selected" } else { "" };
+        model_options.push_str(&format!(r#"<option value="{}"{}>{} ({})</option>"#,
+            html_escape(&name), selected, html_escape(&label), html_escape(&name)));
     }
+    // Deep-linked from a Blueprint designer (?model=…): open the create dialog
+    // straight away with that model preselected.
+    let modal_open = if prefill_model.is_some() { " open" } else { "" };
     let mut kind_options = String::new();
     for (code, label) in vortex_framework::computed_fields::COMPUTE_KINDS {
         kind_options.push_str(&format!(r#"<option value="{code}">{label}</option>"#));
@@ -16122,7 +16439,11 @@ async fn render_computed_fields_page(db: &sqlx::PgPool, username: &str, error: O
     let fields = vortex_framework::computed_fields::list_all(db).await;
     let mut rows_html = String::new();
     for (model, model_label, f) in &fields {
-        let kind_badge = if f.kind == "related" { "related" } else { "formula" };
+        let kind_badge = match f.kind.as_str() {
+            "related" => "related",
+            "rollup" => "rollup",
+            _ => "formula",
+        };
         rows_html.push_str(&format!(
             r##"<tr>
                 <td>{model_label} <code class="text-xs opacity-60">{model}</code></td>
@@ -16156,8 +16477,8 @@ async fn render_computed_fields_page(db: &sqlx::PgPool, username: &str, error: O
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Computed Fields - Settings</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-    <link href="/static/vortex.css?v=18" rel="stylesheet"/>
-    <script src="/static/vendor/tailwind.js"></script>
+    <link href="/static/vortex.css?v=20" rel="stylesheet"/>
+    <link href="/static/tailwind.css?v=21" rel="stylesheet"/>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg"><div class="flex-1"><a href="/" class="btn btn-ghost text-xl">remicle</a></div><div class="flex-none"><span class="text-sm">@{username}</span></div></div>
@@ -16174,7 +16495,7 @@ async fn render_computed_fields_page(db: &sqlx::PgPool, username: &str, error: O
         </div></div>
         <div class="mt-4"><a href="/settings" class="btn btn-ghost btn-sm">← Back to Settings</a></div>
     </div>
-    <dialog id="create-modal" class="modal"><div class="modal-box max-w-2xl">
+    <dialog id="create-modal" class="modal"{modal_open}><div class="modal-box max-w-2xl">
         <h3 class="font-bold text-lg mb-4">New Computed Field</h3>
         <form method="post" action="/settings/computed-fields">
             <div class="form-control mb-3"><label class="label"><span class="label-text">Model</span></label>
@@ -16189,8 +16510,8 @@ async fn render_computed_fields_page(db: &sqlx::PgPool, username: &str, error: O
             <div class="form-control mb-3"><label class="label"><span class="label-text">Kind</span></label>
                 <select name="kind" class="select select-bordered">{kind_options}</select></div>
             <div class="form-control mb-3"><label class="label"><span class="label-text">Definition</span></label>
-                <input type="text" name="expr" class="input input-bordered font-mono" placeholder="qty * unit_price   —or—   partner_id.email" required/>
-                <span class="label-text-alt opacity-60 mt-1">Formula: arithmetic on number fields (+ - * / and parentheses). Related: link_field.target_field</span></div>
+                <input type="text" name="expr" class="input input-bordered font-mono" placeholder="qty * unit_price   —or—   partner_id.email   —or—   lines | sum | qty * unit_price" required/>
+                <span class="label-text-alt opacity-60 mt-1"><b>Formula:</b> arithmetic on number fields (+ - * / and parentheses), e.g. <code>qty * unit_price</code>. <b>Related:</b> <code>link_field.target_field</code>. <b>Rollup:</b> <code>list_field | sum | formula</code> — aggregate (sum, count, avg, min, max) over a related list; <code>count</code> needs no formula.</span></div>
             <div class="form-control mb-3"><label class="label"><span class="label-text">Help text (optional)</span></label>
                 <input type="text" name="help" class="input input-bordered" placeholder="Shown under the field"/></div>
             <div class="modal-action">
@@ -16206,11 +16527,15 @@ async fn computed_fields_list(
     State(_state): State<Arc<AppState>>,
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     if !user.is_system_admin() && !user.has_role("Administrator") {
         return Redirect::to("/settings").into_response();
     }
-    Html(render_computed_fields_page(&db, &user.username, None).await).into_response()
+    // ?model=x_foo (from a Blueprint designer link) preselects that model and
+    // opens the create dialog.
+    let prefill = q.get("model").map(String::as_str).filter(|s| !s.is_empty());
+    Html(render_computed_fields_page(&db, &user.username, None, prefill).await).into_response()
 }
 
 async fn computed_field_create(
@@ -16238,7 +16563,7 @@ async fn computed_field_create(
             let _ = state.audit.log(audit).await;
             Redirect::to("/settings/computed-fields").into_response()
         }
-        Err(e) => Html(render_computed_fields_page(&db, &user.username, Some(&e)).await).into_response(),
+        Err(e) => Html(render_computed_fields_page(&db, &user.username, Some(&e), Some(form.model.trim())).await).into_response(),
     }
 }
 
@@ -16253,7 +16578,7 @@ async fn computed_field_delete(
         return Redirect::to("/settings").into_response();
     }
     if let Err(e) = vortex_framework::computed_fields::delete(&db, form.model.trim(), form.name.trim()).await {
-        return Html(render_computed_fields_page(&db, &user.username, Some(&e)).await).into_response();
+        return Html(render_computed_fields_page(&db, &user.username, Some(&e), None).await).into_response();
     }
     let audit = AuditEntry::new(AuditAction::ConfigChanged, AuditSeverity::Info)
         .with_user(vortex_common::UserId(user.id))
@@ -16610,9 +16935,9 @@ async fn activity_types_list(
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Activity Types - Settings</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=18" rel="stylesheet"/>
-<script src="/static/vortex.js?v=18" defer></script>
-    <script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script>
+    <link href="/static/tailwind.css?v=21" rel="stylesheet"/>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg">
@@ -16773,9 +17098,9 @@ async fn activity_type_edit(
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{} - Activity Type</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=18" rel="stylesheet"/>
-<script src="/static/vortex.js?v=18" defer></script>
-    <script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script>
+    <link href="/static/tailwind.css?v=21" rel="stylesheet"/>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg">
@@ -16907,8 +17232,8 @@ fn settings_write_error(back: &str, msg: &str) -> Response {
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Error</title>
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=18" rel="stylesheet"/>
-<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script><link href="/static/tailwind.css?v=21" rel="stylesheet"/>
 </head><body class="min-h-screen bg-base-200"><div class="container mx-auto p-6 max-w-xl">
 <div class="alert alert-error mb-4"><span>{}</span></div>
 <a href="{}" class="btn btn-ghost btn-sm">← Back</a>
@@ -16926,8 +17251,8 @@ fn settings_write_ok(back: &str, msg: &str) -> Response {
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Done</title>
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=18" rel="stylesheet"/>
-<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script><link href="/static/tailwind.css?v=21" rel="stylesheet"/>
 </head><body class="min-h-screen bg-base-200"><div class="container mx-auto p-6 max-w-xl">
 <div class="alert alert-success mb-4"><span>{}</span></div>
 <a href="{}" class="btn btn-ghost btn-sm">← Back</a>
@@ -16997,8 +17322,8 @@ async fn countries_list(
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Countries - Settings</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=18" rel="stylesheet"/>
-<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script><link href="/static/tailwind.css?v=21" rel="stylesheet"/>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg">
@@ -17151,8 +17476,8 @@ async fn country_edit(
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{name} - Country</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=18" rel="stylesheet"/>
-<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script><link href="/static/tailwind.css?v=21" rel="stylesheet"/>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg">
@@ -17330,8 +17655,8 @@ async fn states_list(
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>States - Settings</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=18" rel="stylesheet"/>
-<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script><link href="/static/tailwind.css?v=21" rel="stylesheet"/>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg">
@@ -17477,8 +17802,8 @@ async fn state_edit(
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{name} - State</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=18" rel="stylesheet"/>
-<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script><link href="/static/tailwind.css?v=21" rel="stylesheet"/>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg">
@@ -17676,8 +18001,8 @@ async fn stages_list(
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Stages - Settings</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=18" rel="stylesheet"/>
-<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script><link href="/static/tailwind.css?v=21" rel="stylesheet"/>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg">
@@ -17836,8 +18161,8 @@ async fn stage_edit(
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{label} - Stage</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=18" rel="stylesheet"/>
-<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script><link href="/static/tailwind.css?v=21" rel="stylesheet"/>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg">
@@ -17996,7 +18321,7 @@ fn button_color_options(selected: &str) -> String {
 }
 
 async fn role_options(db: &sqlx::PgPool, selected: &str) -> String {
-    let roles: Vec<String> = sqlx::query_scalar("SELECT name FROM roles ORDER BY name")
+    let roles: Vec<String> = sqlx::query_scalar("SELECT name FROM roles WHERE owning_module IS NULL OR owning_module IN (SELECT technical_name FROM installed_modules WHERE state = 'installed') ORDER BY name")
         .fetch_all(db)
         .await
         .unwrap_or_default();
@@ -18088,8 +18413,8 @@ async fn stage_buttons_list(
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Stage Buttons - Settings</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=18" rel="stylesheet"/>
-<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script><link href="/static/tailwind.css?v=21" rel="stylesheet"/>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg">
@@ -18257,8 +18582,8 @@ async fn stage_button_edit(
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{label} - Stage Button</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=18" rel="stylesheet"/>
-<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script><link href="/static/tailwind.css?v=21" rel="stylesheet"/>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg">
@@ -18509,8 +18834,8 @@ async fn approval_rules_list(Db(db): Db, Extension(user): Extension<AuthUser>) -
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Approval Rules - Settings</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=18" rel="stylesheet"/>
-<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script><link href="/static/tailwind.css?v=21" rel="stylesheet"/>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg">
@@ -18879,8 +19204,8 @@ async fn email_servers_list(Db(db): Db, Extension(user): Extension<AuthUser>) ->
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Email / SMTP - Settings</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=18" rel="stylesheet"/>
-<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script><link href="/static/tailwind.css?v=21" rel="stylesheet"/>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg">
@@ -19085,8 +19410,8 @@ async fn email_server_edit(
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{name} - Mail Server</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=18" rel="stylesheet"/>
-<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script><link href="/static/tailwind.css?v=21" rel="stylesheet"/>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg">
@@ -19351,8 +19676,8 @@ async fn jobs_list(
 <script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Jobs - Settings</title>
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=18" rel="stylesheet"/>
-<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script></head>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script><link href="/static/tailwind.css?v=21" rel="stylesheet"/></head>
 <body class="min-h-screen bg-base-200">
 <div class="navbar bg-base-100 shadow-lg"><div class="flex-1"><a href="/" class="btn btn-ghost text-xl">remicle</a></div><div class="flex-none"><span class="text-sm">@{user}</span></div></div>
 <div class="container mx-auto p-6 max-w-5xl">
@@ -19397,8 +19722,8 @@ fn api_tokens_page_shell(user: &AuthUser, inner: &str) -> Html<String> {
 <script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>API Tokens - Settings</title>
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=18" rel="stylesheet"/>
-<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script></head>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script><link href="/static/tailwind.css?v=21" rel="stylesheet"/></head>
 <body class="min-h-screen bg-base-200">
 <div class="navbar bg-base-100 shadow-lg"><div class="flex-1"><a href="/" class="btn btn-ghost text-xl">remicle</a></div><div class="flex-none"><span class="text-sm">@{user}</span></div></div>
 <div class="container mx-auto p-6 max-w-5xl">{inner}</div></body></html>"##,
@@ -19577,8 +19902,8 @@ fn webhooks_page_shell(user: &AuthUser, title: &str, inner: &str) -> Html<String
 <script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>{title} - Settings</title>
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=18" rel="stylesheet"/>
-<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script></head>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script><link href="/static/tailwind.css?v=21" rel="stylesheet"/></head>
 <body class="min-h-screen bg-base-200">
 <div class="navbar bg-base-100 shadow-lg"><div class="flex-1"><a href="/" class="btn btn-ghost text-xl">remicle</a></div><div class="flex-none"><span class="text-sm">@{user}</span></div></div>
 <div class="container mx-auto p-6 max-w-4xl">{inner}</div></body></html>"##,
@@ -20428,8 +20753,8 @@ async fn sequences_list(
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Sequences - Settings</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=18" rel="stylesheet"/>
-<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script><link href="/static/tailwind.css?v=21" rel="stylesheet"/>
     <script src="/static/vendor/htmx.min.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
@@ -20633,8 +20958,8 @@ async fn sequence_edit(
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{} - Sequence</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=18" rel="stylesheet"/>
-<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script><link href="/static/tailwind.css?v=21" rel="stylesheet"/>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg">
@@ -20825,9 +21150,9 @@ async fn cron_list(
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Scheduled Jobs - Settings</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=18" rel="stylesheet"/>
-<script src="/static/vortex.js?v=18" defer></script>
-    <script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script>
+    <link href="/static/tailwind.css?v=21" rel="stylesheet"/>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg">
@@ -21047,9 +21372,9 @@ async fn cron_edit(
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{} - Scheduled Job</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=18" rel="stylesheet"/>
-<script src="/static/vortex.js?v=18" defer></script>
-    <script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script>
+    <link href="/static/tailwind.css?v=21" rel="stylesheet"/>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg">
@@ -21357,7 +21682,7 @@ async fn report_single(
     <script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style>
     <meta charset="UTF-8">
     <title>{} - {}</title>
-    <script src="/static/vendor/tailwind.js"></script>
+    <link href="/static/tailwind.css?v=21" rel="stylesheet"/>
     <style>
         {}
         @media print {{
@@ -21468,7 +21793,7 @@ async fn report_list(
     <script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style>
     <meta charset="UTF-8">
     <title>{}</title>
-    <script src="/static/vendor/tailwind.js"></script>
+    <link href="/static/tailwind.css?v=21" rel="stylesheet"/>
     <style>
         @media print {{
             body {{ print-color-adjust: exact; -webkit-print-color-adjust: exact; }}
@@ -21623,8 +21948,8 @@ async fn reports_list(Db(db): Db, Extension(user): Extension<AuthUser>) -> Respo
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Reports - Settings</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=18" rel="stylesheet"/>
-<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script><link href="/static/tailwind.css?v=21" rel="stylesheet"/>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg"><div class="flex-1"><a href="/" class="btn btn-ghost text-xl">remicle</a></div><div class="flex-none"><span class="text-sm">@{user}</span></div></div>
@@ -21752,7 +22077,7 @@ async fn report_edit(Db(db): Db, Extension(user): Extension<AuthUser>, Path(id):
     let field_opts_filter = report_field_options(&db, &def.model_name, "", None).await;
     let group_opts = report_field_options(&db, &def.model_name, def.group_field.as_deref().unwrap_or(""), Some("— No grouping —")).await;
     let sort_opts = report_field_options(&db, &def.model_name, def.sort_field.as_deref().unwrap_or(""), Some("— Default —")).await;
-    let roles: Vec<String> = sqlx::query_scalar("SELECT name FROM roles ORDER BY name").fetch_all(&db).await.unwrap_or_default();
+    let roles: Vec<String> = sqlx::query_scalar("SELECT name FROM roles WHERE owning_module IS NULL OR owning_module IN (SELECT technical_name FROM installed_modules WHERE state = 'installed') ORDER BY name").fetch_all(&db).await.unwrap_or_default();
     let role_opts: String = {
         let mut o = format!(r#"<option value=""{}>— Any user —</option>"#, if def.required_role.is_none() { " selected" } else { "" });
         for r in &roles {
@@ -21817,8 +22142,8 @@ async fn report_edit(Db(db): Db, Extension(user): Extension<AuthUser>, Path(id):
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{name} - Report</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=18" rel="stylesheet"/>
-<script src="/static/vortex.js?v=18" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script><link href="/static/tailwind.css?v=21" rel="stylesheet"/>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg"><div class="flex-1"><a href="/" class="btn btn-ghost text-xl">remicle</a></div><div class="flex-none"><span class="text-sm">@{user}</span></div></div>
@@ -22365,24 +22690,29 @@ async fn dynamic_form_new(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
     Path(model_name): Path<String>,
     Query(prefill): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
-    let _ = &state;
-    render_dynamic_form(&db, &user, &model_name, None, &prefill).await
+    render_dynamic_form(&state, &db_ctx, &db, &user, &model_name, None, &prefill).await
 }
 
 async fn dynamic_form_edit(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
     Path((model_name, record_id)): Path<(String, uuid::Uuid)>,
+    // Query carries `_return` when a line was opened from a parent's list; it is
+    // not used to seed fields on an existing record (that's gated on new).
+    Query(query): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
-    let _ = &state;
-    render_dynamic_form(&db, &user, &model_name, Some(record_id), &std::collections::HashMap::new()).await
+    render_dynamic_form(&state, &db_ctx, &db, &user, &model_name, Some(record_id), &query).await
 }
 
 async fn render_dynamic_form(
+    state: &AppState,
+    db_ctx: &DatabaseContext,
     db: &PgPool,
     user: &AuthUser,
     model_name: &str,
@@ -22423,6 +22753,7 @@ async fn render_dynamic_form(
         "SELECT name, display_name, field_type, selection_options, related_model
          FROM ir_model_field
          WHERE model_id = $1 AND name NOT IN ('id', 'created_at', 'updated_at', 'active')
+           AND COALESCE(is_computed, false) = false
          ORDER BY sequence, display_name"
     )
     .bind(model_id)
@@ -22444,6 +22775,81 @@ async fn render_dynamic_form(
             model_name
         ));
     }
+
+    // Per-field form width (col_span: 1 = half, 2 = full row), read best-effort
+    // in its own query — a tenant DB that predates migration 153 has no col_span
+    // column, so the query fails and every field defaults to full width (the old
+    // one-field-per-row behaviour). Kept out of the fail-loud field query above
+    // so drift can't blank the whole form.
+    let width_map: std::collections::HashMap<String, i16> = sqlx::query(
+        "SELECT name, col_span FROM ir_model_field WHERE model_id = $1",
+    )
+    .bind(model_id)
+    .fetch_all(db)
+    .await
+    .map(|rows| {
+        rows.iter()
+            .map(|r| (r.get::<String, _>("name"), r.try_get::<i16, _>("col_span").unwrap_or(2)))
+            .collect()
+    })
+    .unwrap_or_default();
+
+    // Per-field section (card grouping), read best-effort like col_span so a DB
+    // predating migration 154 still renders (every field falls into "General").
+    let section_map: std::collections::HashMap<String, String> = sqlx::query(
+        "SELECT name, section FROM ir_model_field WHERE model_id = $1",
+    )
+    .bind(model_id)
+    .fetch_all(db)
+    .await
+    .map(|rows| {
+        rows.iter()
+            .filter_map(|r| {
+                r.try_get::<Option<String>, _>("section")
+                    .ok()
+                    .flatten()
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|s| (r.get::<String, _>("name"), s))
+            })
+            .collect()
+    })
+    .unwrap_or_default();
+
+    // Per-section width ("half" | "full"), keyed by section label. Read
+    // best-effort like the other layout maps — a DB predating migration 156 has
+    // no section_config column, so the query fails and every section defaults to
+    // full width (its own row), i.e. the old stacked layout.
+    let section_width: std::collections::HashMap<String, String> = sqlx::query_scalar::<_, serde_json::Value>(
+        "SELECT section_config FROM ir_model WHERE id = $1",
+    )
+    .bind(model_id)
+    .fetch_one(db)
+    .await
+    .ok()
+    .and_then(|v| v.as_object().map(|o| {
+        o.iter()
+            .filter_map(|(k, val)| {
+                val.get("width").and_then(|w| w.as_str()).map(|w| (k.clone(), w.to_string()))
+            })
+            .collect()
+    }))
+    .unwrap_or_default();
+
+    // Per-field "required" flag, read best-effort like col_span/section so a DB
+    // predating migration 155 (no is_required column) simply treats every field
+    // as optional rather than blanking the form.
+    let required_map: std::collections::HashMap<String, bool> = sqlx::query(
+        "SELECT name, is_required FROM ir_model_field WHERE model_id = $1",
+    )
+    .bind(model_id)
+    .fetch_all(db)
+    .await
+    .map(|rows| {
+        rows.iter()
+            .map(|r| (r.get::<String, _>("name"), r.try_get::<bool, _>("is_required").unwrap_or(false)))
+            .collect()
+    })
+    .unwrap_or_default();
 
     // Fetch existing record if editing
     let record_data: std::collections::HashMap<String, String> = if let Some(rid) = record_id {
@@ -22487,8 +22893,40 @@ async fn render_dynamic_form(
             .collect()
     };
 
-    // Build form fields HTML
-    let mut form_fields = String::new();
+    // Build form fields HTML in the user's configured field order, opening a new
+    // section block only when the section label CHANGES from the previous field.
+    // Grouping used to bucket every field of a section together, which yanked a
+    // mid-form field out of order (a field set to a section jumped above/below
+    // where its Order put it). Streaming by consecutive runs keeps strict field
+    // order; a blank / "General" label is treated as ungrouped and renders with
+    // no heading so plain fields flow inline like an unsectioned form.
+    let mut sections_html = String::new();
+    let mut cur_label = String::new();
+    let mut cur_body = String::new();
+    let mut started = false;
+    // Wrap one completed run in the shared sheet-section chrome. A "General" /
+    // blank label means ungrouped → no heading; a named section gets its rule.
+    // Width comes from section_config: a "half" section takes one grid column
+    // (and lays its own fields out in a single column so they don't cramp); any
+    // other value — including the default — spans the full row. Two half sections
+    // pack side by side; a full section between them is the page break.
+    let render_block = |label: &str, body: &str| -> String {
+        if body.is_empty() {
+            return String::new();
+        }
+        let heading = if !label.trim().is_empty() && label != "General" { label } else { "" };
+        let half = section_width.get(label).map(|w| w == "half").unwrap_or(false);
+        let (span_cls, inner_grid) = if half {
+            ("lg:col-span-1", format!(r#"<div class="grid grid-cols-1 gap-x-6">{}</div>"#, body))
+        } else {
+            ("lg:col-span-2", format!(r#"<div class="grid grid-cols-1 md:grid-cols-2 gap-x-6">{}</div>"#, body))
+        };
+        format!(
+            r#"<div class="{span}">{section}</div>"#,
+            span = span_cls,
+            section = vortex_framework::form::form_section_raw(heading, &inner_grid),
+        )
+    };
     for field in &fields {
         let field_name: String = field.get("name");
         let display_name: String = field.get("display_name");
@@ -22496,8 +22934,18 @@ async fn render_dynamic_form(
         let selection_options: Option<serde_json::Value> = field.get("selection_options");
         let relation_model: Option<String> = field.get("related_model");
 
+        // Half-width fields (col_span=1) take one column of the 2-col grid so two
+        // sit side by side; full-width (default) span the row. On mobile the grid
+        // is single-column, so everything stacks regardless.
+        let span_class = if width_map.get(&field_name).copied().unwrap_or(2) <= 1 {
+            "md:col-span-1"
+        } else {
+            "md:col-span-2"
+        };
+
         let current_value = record_data.get(&field_name).cloned().unwrap_or_default();
-        let required_attr = "";  // Can add required logic later based on field metadata
+        let is_required = required_map.get(&field_name).copied().unwrap_or(false);
+        let required_attr = if is_required { "required" } else { "" };
         let readonly_attr = "";
 
         let input_html = match field_type.as_str() {
@@ -22608,6 +23056,72 @@ async fn render_dynamic_form(
                     field_name, current_value.replace(" ", "T"), required_attr, readonly_attr
                 )
             },
+            "many2many" => {
+                // Multi-link: a real multi-select for choosing plus a hidden
+                // comma-joined input that carries the selection on submit (the
+                // Form<HashMap> extractor keeps one value per name, so the CSV
+                // hidden field is what the save path reads and syncs to the link
+                // table). Current links come from the junction.
+                match &relation_model {
+                    Some(rel_model) => match resolve_m2o_target(db, rel_model).await {
+                        Some(t) => {
+                            let jt = vortex_orm::blueprint::m2m_junction_name(&table_name, &field_name);
+                            let current_ids: Vec<String> = if let Some(rid) = record_id {
+                                sqlx::query_scalar::<_, uuid::Uuid>(&format!("SELECT target_id FROM {} WHERE owner_id = $1", jt))
+                                    .bind(rid).fetch_all(db).await.unwrap_or_default()
+                                    .iter().map(|u| u.to_string()).collect()
+                            } else { Vec::new() };
+                            let disp = if t.has_name { "COALESCE(name, id::text)" } else { "id::text" };
+                            let act = if t.has_active { "WHERE active = true" } else { "" };
+                            let recs = sqlx::query(&format!("SELECT id, {} as name FROM {} {} ORDER BY name LIMIT 500", disp, t.table, act))
+                                .fetch_all(db).await.unwrap_or_default();
+                            let mut opts = String::new();
+                            for rec in &recs {
+                                let rid: uuid::Uuid = rec.get("id");
+                                let rname: String = rec.get("name");
+                                let sel = if current_ids.contains(&rid.to_string()) { " selected" } else { "" };
+                                opts.push_str(&format!(r#"<option value="{}"{}>{}</option>"#, rid, sel, html_escape(&rname)));
+                            }
+                            format!(
+                                r#"<select multiple size="6" class="select select-bordered w-full h-auto" onchange="(function(s){{var a=[];for(var i=0;i<s.options.length;i++){{if(s.options[i].selected)a.push(s.options[i].value);}}document.getElementById('m2m_{f}').value=a.join(',');}})(this)">{opts}</select><input type="hidden" id="m2m_{f}" name="{f}" value="{cur}"/><div class="text-xs opacity-50 mt-1">Hold Ctrl / Cmd to select more than one.</div>"#,
+                                f = field_name, opts = opts, cur = current_ids.join(",")
+                            )
+                        }
+                        None => format!(r#"<div class="text-sm opacity-60">Link target unavailable.</div><input type="hidden" name="{}" value=""/>"#, field_name),
+                    },
+                    None => format!(r#"<input type="hidden" name="{}" value=""/>"#, field_name),
+                }
+            },
+            "one2many" => {
+                // Inline editable line grid: a spreadsheet of the child model's
+                // cell fields, added/removed client-side and saved together with
+                // the parent (see render_o2m_grid / sync_blueprint_o2m). Works on
+                // a brand-new parent too — the rows are written straight after the
+                // parent INSERT.
+                let meta = selection_options.as_ref().and_then(|o| {
+                    let ct = o.get("child_table").and_then(|v| v.as_str())?.to_string();
+                    let inv = o.get("inverse_field").and_then(|v| v.as_str())?.to_string();
+                    Some((ct, inv))
+                });
+                match meta {
+                    Some((child_table, inverse)) if validate_identifier(&child_table) && validate_identifier(&inverse) => {
+                        let child_model = relation_model.clone().unwrap_or_default();
+                        render_o2m_grid(db, &field_name, &child_model, &child_table, &inverse, record_id).await
+                    }
+                    _ => r#"<div class="text-sm opacity-60">This related list isn't configured correctly.</div>"#.to_string(),
+                }
+            },
+            "autonumber" => {
+                // Generated on create by dynamic_form_create — never user-editable.
+                // Rendered `disabled` (so it doesn't submit; the value is minted
+                // server-side, not trusted from the form) with the existing value
+                // for a saved record or a placeholder for a new one.
+                let ph = if record_id.is_some() { "" } else { "Auto-assigned on save" };
+                format!(
+                    r#"<input type="text" class="input input-bordered w-full bg-base-200 text-base-content/70" value="{}" placeholder="{}" disabled />"#,
+                    current_value, ph
+                )
+            },
             _ => {
                 // Default to text input
                 format!(
@@ -22617,15 +23131,41 @@ async fn render_dynamic_form(
             }
         };
 
-        let required_badge = "";  // Can add required indicator later based on field metadata
+        let required_badge = if is_required {
+            r#"<span class="text-error" title="Required">*</span>"#
+        } else {
+            ""
+        };
 
-        form_fields.push_str(&format!(
-            r#"<div class="form-control mb-4">
+        let field_html = format!(
+            r#"<div class="form-control mb-4 {}">
                 <label class="label"><span class="label-text">{} {}</span></label>
                 {}
             </div>"#,
-            display_name, required_badge, input_html
-        ));
+            span_class, display_name, required_badge, input_html
+        );
+
+        let label = section_map
+            .get(&field_name)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "General".to_string());
+        // Section changed → close the run so far, then start the new one. The
+        // field itself always lands in the run for its own label, so order holds.
+        if started && label != cur_label {
+            sections_html.push_str(&render_block(&cur_label, &cur_body));
+            cur_body.clear();
+        }
+        cur_label = label;
+        started = true;
+        cur_body.push_str(&field_html);
+    }
+    // Flush the final run. Sections render as flat labelled groups (uppercase
+    // heading + rule) inside the one form "sheet", Odoo-style, not floating
+    // cards; `form_section` is the shared sheet primitive so the generic form
+    // and core forms render identical field groups.
+    if started {
+        sections_html.push_str(&render_block(&cur_label, &cur_body));
     }
 
     let (action_url, submit_text, title) = if let Some(rid) = record_id {
@@ -22634,8 +23174,54 @@ async fn render_dynamic_form(
         (format!("/form/{}", model_name), "Create", format!("New {}", model_display_name))
     };
 
-    // Build sidebar
-    let sidebar_menu = build_sidebar_menu(db, &user.roles, model_name).await;
+    // Full app-shell chrome — the SAME header, sidebar, and user footer
+    // (avatar/name/theme-toggle/logout) as every other page, via build_sidebar +
+    // render_app_shell. The generic record form is no longer a bespoke inline
+    // layout, so navigating into a Custom App looks identical to the rest of the
+    // system. The Custom Apps group + current-model active highlight come from
+    // custom_apps_nav(model_name).
+    let display_name = user.full_name.as_deref().unwrap_or(&user.username);
+    let initials = get_initials(display_name);
+    let apps = custom_apps_nav(db_ctx.pool.pool(), model_name).await;
+    let sidebar = build_sidebar(
+        model_name,
+        display_name,
+        &initials,
+        &db_ctx.installed_modules,
+        user.is_admin(),
+        &state.plugin_registry,
+        &user.roles,
+        &apps,
+    );
+
+    // Stage status bar — for a saved record whose Blueprint has stages enabled
+    // (a `record_state` column, present here as a key in `record_data`, plus
+    // stages defined in `record_stages`). Reuses the core StatusBar/StageActions
+    // widgets; the role-gated transition buttons POST to the gated
+    // /form/{model}/{id}/stage/{target} endpoint. New (unsaved) records show no
+    // bar — there's nothing to transition yet.
+    let stage_bar = match record_id {
+        Some(rid) => {
+            let state_val = record_data.get("record_state").cloned().unwrap_or_default();
+            if state_val.is_empty() {
+                String::new()
+            } else {
+                let bar = vortex_framework::StatusBar::from_db(db, model_name, &table_name, "record_state").await;
+                if bar.has_stages() {
+                    let actions = vortex_framework::StageActions::from_db(db, model_name).await;
+                    let base = format!("/form/{}/{}/stage", model_name, rid);
+                    format!(
+                        r#"<div class="mb-4 flex flex-wrap items-center justify-between gap-3"><div>{}</div><div>{}</div></div>"#,
+                        bar.render(&state_val, &base),
+                        actions.render(&state_val, &user.roles, &base),
+                    )
+                } else {
+                    String::new()
+                }
+            }
+        }
+        None => String::new(),
+    };
 
     // Activity stream (chatter) + History (audit trail) — same record primitives
     // every plugin record page uses. Only meaningful for an existing record, so
@@ -22649,63 +23235,551 @@ async fn render_dynamic_form(
         None => (String::new(), String::new()),
     };
 
-    let html = format!(
-        r##"<!DOCTYPE html>
-<html data-theme="dark">
-<head>
-    <script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{}</title>
-    <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=18" rel="stylesheet"/>
-<script src="/static/vortex.js?v=18" defer></script>
-    <script src="/static/vendor/tailwind.js"></script>
-</head>
-<body class="min-h-screen bg-base-200">
-<div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden"><button onclick="document.getElementById('sidebar-inline').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay-inline').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg></button><a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">re</span><span class="opacity-60">micle</span></a><button onclick="(function(){{var h=document.documentElement,c=h.getAttribute('data-theme')==='dark'?'corporate':'dark';h.setAttribute('data-theme',c);localStorage.setItem('theme',c);document.querySelectorAll('.theme-icon-sun,.theme-icon-moon').forEach(function(e){{e.classList.toggle('hidden')}})}})();" class="btn btn-ghost btn-sm btn-square ml-auto"><svg class="theme-icon-sun w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5" stroke-width="2"/><path stroke-linecap="round" stroke-width="2" d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg><svg class="theme-icon-moon w-5 h-5 hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/></svg></button></div>
-<div id="sidebar-overlay-inline" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar-inline').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
-<div class="flex">
-    <aside id="sidebar-inline" class="w-64 bg-base-100 shadow-lg min-h-screen p-4 fixed lg:static top-0 left-0 z-40 h-full -translate-x-full lg:translate-x-0 transition-transform duration-200">
-        <div class="text-xl font-bold mb-6"><span class="text-success">re</span><span class="opacity-60">micle</span></div>
-        <ul class="menu">{}</ul>
-    </aside>
-    <main class="flex-1 p-4 lg:p-6 min-w-0">
-        <div class="mb-6">
-            <a href="/list/{}" class="btn btn-ghost btn-sm">← Back to List</a>
-        </div>
-
-        <div class="card bg-base-100 shadow max-w-2xl">
-            <div class="card-body">
-                <h2 class="card-title">{}</h2>
-
-                <form method="post" action="{}">
-                    {}
-                    <div class="card-actions justify-end mt-6">
-                        <a href="/list/{}" class="btn btn-ghost">Cancel</a>
-                        <button type="submit" class="btn btn-primary">{}</button>
-                    </div>
-                </form>
-            </div>
-        </div>
-        <div class="max-w-2xl mt-6 flex flex-col gap-6">{}{}</div>
-    </main>
-</div>
-</body>
-</html>"##,
-        title,
-        sidebar_menu,
+    // Compose the canonical record-form sheet (shared with core forms via the
+    // vortex_framework::form primitive). Sections lay out two-up as a masonry so
+    // a short section next to a tall one packs tightly; the sheet itself is
+    // wider than the old max-w-5xl so it fills the main column instead of
+    // stranding a large gutter on wide screens.
+    // A `_return` query param (set by the one2many "+ Add" deep-link) sends the
+    // user back to the parent record after saving/cancelling this child, so
+    // header→line entry loops home. Same-origin paths only (guards open-redirect).
+    let return_url = prefill
+        .get("_return")
+        .filter(|r| r.starts_with('/') && !r.starts_with("//"))
+        .cloned();
+    let back_href = return_url.clone().unwrap_or_else(|| format!("/list/{}", model_name));
+    // Carry `_return` through the form submit so create/update can honour it.
+    let return_hidden = return_url
+        .as_deref()
+        .map(|r| format!(r#"<input type="hidden" name="_return" value="{}"/>"#, html_escape(r)))
+        .unwrap_or_default();
+    // Computed fields (related lookups + safe arithmetic) render read-only below
+    // the editable fields, evaluated live for an existing record. The engine
+    // returns an empty string when the model has none, so this is inert for
+    // plain Blueprints.
+    let computed_html = vortex_framework::computed_fields::render_for_form(
+        db,
         model_name,
-        title,
-        action_url,
-        form_fields,
-        model_name,
-        submit_text,
-        activity_panel,
-        history_panel
+        record_id.map(|r| r.to_string()).as_deref(),
+    )
+    .await;
+    // Sections lay out on a deterministic two-column grid (not CSS columns, which
+    // auto-balance and can't pin a section side-by-side or span it full-width).
+    // Each block carries its own lg:col-span-{1,2} from render_block; items-start
+    // keeps a short section from stretching to its neighbour's height.
+    let inner = format!(
+        r#"{return_hidden}<div class="grid grid-cols-1 lg:grid-cols-2 gap-x-10 items-start">{fields}</div>{computed}"#,
+        return_hidden = return_hidden,
+        fields = sections_html,
+        computed = computed_html,
     );
+    let footer = format!(
+        r#"<a href="{cancel}" class="btn btn-ghost">Cancel</a><button type="submit" class="btn btn-primary">{submit}</button>"#,
+        cancel = back_href,
+        submit = submit_text,
+    );
+    let form_attrs = format!(r#"method="post" action="{}""#, action_url);
+    let below = format!("{}{}", activity_panel, history_panel);
+    let body = vortex_framework::form::render_form_sheet(&vortex_framework::form::FormSheet {
+        max_width: vortex_framework::form::SHEET_WIDTH,
+        back_href: &back_href,
+        control_row: &stage_bar,
+        form_attrs: &form_attrs,
+        title: &title,
+        inner: &inner,
+        footer: &footer,
+        below: &below,
+    });
 
-    Html(html).into_response()
+    Html(vortex_framework::render_app_shell(&title, &sidebar, &body)).into_response()
+}
+
+/// Display names of `is_required` Blueprint fields left blank in `form_data`.
+/// Best-effort: on a DB predating migration 155 the query errors and no field is
+/// treated as required (matching the drift-safe render path).
+async fn blueprint_required_missing(
+    db: &sqlx::PgPool,
+    model_name: &str,
+    form_data: &std::collections::HashMap<String, String>,
+) -> Vec<String> {
+    let rows = sqlx::query(
+        "SELECT f.name, f.display_name FROM ir_model_field f \
+         JOIN ir_model m ON m.id = f.model_id \
+         WHERE m.name = $1 AND f.is_required = true",
+    )
+    .bind(model_name)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+    rows.iter()
+        .filter_map(|r| {
+            let name: String = r.get("name");
+            let filled = form_data.get(&name).map(|v| !v.trim().is_empty()).unwrap_or(false);
+            if filled { None } else { Some(r.get::<String, _>("display_name")) }
+        })
+        .collect()
+}
+
+/// Sync a Blueprint record's many2many link tables from the submitted form. Each
+/// m2m field arrives as a comma-joined list of target ids in a hidden input; we
+/// replace that record's rows in the field's junction table. Best-effort per
+/// field — a bad id is dropped rather than failing the whole save.
+async fn sync_blueprint_m2m(
+    db: &sqlx::PgPool,
+    table_name: &str,
+    model_name: &str,
+    record_id: uuid::Uuid,
+    form_data: &std::collections::HashMap<String, String>,
+) {
+    let rows = sqlx::query(
+        "SELECT f.name FROM ir_model_field f JOIN ir_model m ON m.id = f.model_id \
+         WHERE m.name = $1 AND f.field_type = 'many2many'",
+    )
+    .bind(model_name)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+    for r in &rows {
+        let field: String = r.get("name");
+        if !validate_identifier(&field) {
+            continue;
+        }
+        let jt = vortex_orm::blueprint::m2m_junction_name(table_name, &field);
+        let ids: Vec<uuid::Uuid> = form_data
+            .get(&field)
+            .map(|csv| csv.split(',').filter_map(|s| s.trim().parse().ok()).collect())
+            .unwrap_or_default();
+        let _ = sqlx::query(&format!("DELETE FROM {} WHERE owner_id = $1", jt))
+            .bind(record_id)
+            .execute(db)
+            .await;
+        for tid in ids {
+            let _ = sqlx::query(&format!(
+                "INSERT INTO {} (owner_id, target_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                jt
+            ))
+            .bind(record_id)
+            .bind(tid)
+            .execute(db)
+            .await;
+        }
+    }
+}
+
+/// One editable column in a one2many inline grid — a child-model field that can
+/// be typed straight into the parent's line table.
+struct O2mGridCol {
+    name: String,
+    label: String,
+    field_type: String,
+    options: Option<serde_json::Value>,
+}
+
+/// The child-model fields that become editable columns in the inline line grid.
+/// Only plain, cell-editable types are included — the inverse many2one back to
+/// the parent, computed fields, and nested relations are left off (they belong
+/// on the child's own form, not a spreadsheet cell).
+async fn o2m_grid_columns(db: &sqlx::PgPool, child_model: &str, inverse: &str) -> Vec<O2mGridCol> {
+    sqlx::query(
+        "SELECT f.name, f.display_name, f.field_type, f.selection_options \
+         FROM ir_model_field f JOIN ir_model m ON m.id = f.model_id \
+         WHERE m.name = $1 AND f.is_visible = true \
+           AND COALESCE(f.is_computed, false) = false \
+           AND f.field_type IN ('string','char','text','integer','float','decimal','monetary','number','date','datetime','boolean','selection') \
+           AND f.name <> $2 \
+           AND f.name NOT IN ('id','created_at','updated_at','active','record_state') \
+         ORDER BY f.sequence, f.display_name",
+    )
+    .bind(child_model)
+    .bind(inverse)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default()
+    .iter()
+    .map(|r| O2mGridCol {
+        name: r.get("name"),
+        label: r.get("display_name"),
+        field_type: r.get("field_type"),
+        options: r.try_get::<Option<serde_json::Value>, _>("selection_options").ok().flatten(),
+    })
+    .collect()
+}
+
+/// Render one editable grid cell for the given child column and current value.
+fn o2m_cell_input(c: &O2mGridCol, v: &str) -> String {
+    let name = html_escape(&c.name);
+    match c.field_type.as_str() {
+        "boolean" => format!(
+            r#"<input type="checkbox" data-col="{n}" class="o2mc checkbox checkbox-sm"{chk}/>"#,
+            n = name, chk = if v == "true" { " checked" } else { "" }
+        ),
+        "integer" | "float" | "decimal" | "monetary" | "number" => format!(
+            r#"<input type="number" step="any" data-col="{n}" class="o2mc input input-bordered input-sm w-full" value="{v}"/>"#,
+            n = name, v = html_escape(v)
+        ),
+        "date" => format!(
+            r#"<input type="date" data-col="{n}" class="o2mc input input-bordered input-sm w-full" value="{v}"/>"#,
+            n = name, v = html_escape(v)
+        ),
+        "datetime" => format!(
+            r#"<input type="datetime-local" data-col="{n}" class="o2mc input input-bordered input-sm w-full" value="{v}"/>"#,
+            n = name, v = html_escape(&v.replace(' ', "T"))
+        ),
+        "selection" => {
+            let mut opts = String::from(r#"<option value=""></option>"#);
+            if let Some(serde_json::Value::Array(arr)) = &c.options {
+                for it in arr {
+                    let (val, lab) = match it {
+                        serde_json::Value::Object(o) => (
+                            o.get("value").and_then(|x| x.as_str()).unwrap_or(""),
+                            o.get("label").and_then(|x| x.as_str())
+                                .or_else(|| o.get("value").and_then(|x| x.as_str())).unwrap_or(""),
+                        ),
+                        serde_json::Value::String(s) => (s.as_str(), s.as_str()),
+                        _ => ("", ""),
+                    };
+                    if val.is_empty() { continue; }
+                    let sel = if val == v { " selected" } else { "" };
+                    opts.push_str(&format!(
+                        r#"<option value="{}"{}>{}</option>"#,
+                        html_escape(val), sel, html_escape(lab)
+                    ));
+                }
+            }
+            format!(
+                r#"<select data-col="{n}" class="o2mc select select-bordered select-sm w-full">{o}</select>"#,
+                n = name, o = opts
+            )
+        }
+        _ => format!(
+            r#"<input type="text" data-col="{n}" class="o2mc input input-bordered input-sm w-full" value="{v}"/>"#,
+            n = name, v = html_escape(v)
+        ),
+    }
+}
+
+/// One grid row `<tr>` for the inline editor. `id` is the child record's uuid
+/// (empty for a not-yet-saved new row); `vals` maps column name → current text.
+fn o2m_row_html(
+    field: &str,
+    cols: &[O2mGridCol],
+    id: &str,
+    vals: &std::collections::HashMap<String, String>,
+) -> String {
+    let mut cells = String::new();
+    for c in cols {
+        let v = vals.get(&c.name).map(String::as_str).unwrap_or("");
+        cells.push_str(&format!(r#"<td class="p-1 align-top">{}</td>"#, o2m_cell_input(c, v)));
+    }
+    cells.push_str(&format!(
+        r#"<td class="p-1 align-top text-center"><button type="button" class="btn btn-ghost btn-xs text-error" title="Remove line" onclick="o2mDel_{f}(this)">✕</button></td>"#,
+        f = field
+    ));
+    format!(r#"<tr data-id="{id}">{cells}</tr>"#, id = html_escape(id), cells = cells)
+}
+
+/// The inline editable line grid for a Blueprint one2many field — a spreadsheet
+/// of the child model's cell fields with add/remove rows that all save together
+/// with the parent (serialised into the hidden `__o2m_{field}` JSON input and
+/// applied by [`sync_blueprint_o2m`]). Works for a brand-new parent too: the
+/// rows are held client-side and written straight after the parent INSERT.
+async fn render_o2m_grid(
+    db: &sqlx::PgPool,
+    field: &str,
+    child_model: &str,
+    child_table: &str,
+    inverse: &str,
+    record_id: Option<uuid::Uuid>,
+) -> String {
+    let cols = o2m_grid_columns(db, child_model, inverse).await;
+    if cols.is_empty() {
+        return r#"<div class="text-sm opacity-60">This related list has no editable line fields yet — add fields to the linked model first.</div>"#.to_string();
+    }
+
+    // Existing lines (edit mode): pull every grid column as text so one decode
+    // path covers strings, numbers, dates and booleans alike.
+    let mut body = String::new();
+    if let Some(rid) = record_id {
+        let select_cols: String = cols
+            .iter()
+            .map(|c| format!("\"{c}\"::text AS \"{c}\"", c = c.name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let q = format!(
+            "SELECT id::text AS id, {cols} FROM {tbl} WHERE \"{inv}\" = $1 ORDER BY created_at",
+            cols = select_cols, tbl = child_table, inv = inverse
+        );
+        let rows = sqlx::query(&q).bind(rid).fetch_all(db).await.unwrap_or_default();
+        for r in &rows {
+            let id: String = r.try_get("id").unwrap_or_default();
+            let mut vals = std::collections::HashMap::new();
+            for c in &cols {
+                let v: Option<String> = r.try_get(c.name.as_str()).ok().flatten();
+                vals.insert(c.name.clone(), v.unwrap_or_default());
+            }
+            body.push_str(&o2m_row_html(field, &cols, &id, &vals));
+        }
+    }
+
+    // Column headers.
+    let mut thead = String::new();
+    for c in &cols {
+        thead.push_str(&format!(
+            r#"<th class="text-xs font-semibold text-left px-1">{}</th>"#,
+            html_escape(&c.label)
+        ));
+    }
+    thead.push_str(r#"<th class="w-8"></th>"#);
+
+    // A blank row, embedded as a JS string literal (serde gives correct escaping)
+    // so "+ Add line" can clone it client-side without a round-trip.
+    let empty_row = o2m_row_html(field, &cols, "", &std::collections::HashMap::new());
+    let empty_row_js = serde_json::to_string(&empty_row).unwrap_or_else(|_| "\"\"".to_string());
+
+    format!(
+        r##"<div class="border border-base-300 rounded-lg overflow-x-auto">
+<table class="table table-sm w-full m-0">
+<thead><tr class="bg-base-200">{thead}</tr></thead>
+<tbody id="o2mbody_{f}">{body}</tbody>
+</table>
+</div>
+<button type="button" class="btn btn-sm btn-ghost mt-2" onclick="o2mAdd_{f}()">+ Add line</button>
+<input type="hidden" name="__o2m_{f}" id="__o2m_{f}"/>
+<script>
+(function(){{
+  var ROW = {row};
+  window.o2mSync_{f} = function(){{
+    var b = document.getElementById('o2mbody_{f}');
+    if(!b) return;
+    var out = [];
+    b.querySelectorAll(':scope > tr').forEach(function(tr){{
+      var o = {{ _id: tr.getAttribute('data-id') || '' }};
+      tr.querySelectorAll('[data-col]').forEach(function(el){{
+        o[el.getAttribute('data-col')] = (el.type === 'checkbox') ? (el.checked ? 'true' : 'false') : el.value;
+      }});
+      out.push(o);
+    }});
+    document.getElementById('__o2m_{f}').value = JSON.stringify(out);
+  }};
+  window.o2mAdd_{f} = function(){{
+    document.getElementById('o2mbody_{f}').insertAdjacentHTML('beforeend', ROW);
+    window.o2mSync_{f}();
+  }};
+  window.o2mDel_{f} = function(btn){{
+    var tr = btn.closest('tr'); if(tr) tr.remove();
+    window.o2mSync_{f}();
+  }};
+  var b = document.getElementById('o2mbody_{f}');
+  if(b){{ b.addEventListener('input', window.o2mSync_{f}); b.addEventListener('change', window.o2mSync_{f}); }}
+  window.o2mSync_{f}();
+}})();
+</script>"##,
+        thead = thead, body = body, f = field, row = empty_row_js
+    )
+}
+
+/// Apply the inline line-grid edits for a Blueprint record. Each one2many field
+/// arrives as a hidden `__o2m_{field}` JSON array of line objects (`_id` plus
+/// the child's cell columns). We upsert every submitted line against the child
+/// table — pinning the inverse many2one to this parent — and delete any child
+/// row the user removed from the grid. Best-effort per field; a malformed or
+/// absent payload is skipped so lines are never silently wiped.
+async fn sync_blueprint_o2m(
+    db: &sqlx::PgPool,
+    model_name: &str,
+    record_id: uuid::Uuid,
+    form_data: &std::collections::HashMap<String, String>,
+) {
+    let fields = sqlx::query(
+        "SELECT f.name, f.related_model, f.selection_options \
+         FROM ir_model_field f JOIN ir_model m ON m.id = f.model_id \
+         WHERE m.name = $1 AND f.field_type = 'one2many'",
+    )
+    .bind(model_name)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+
+    for f in &fields {
+        let field: String = f.get("name");
+        let child_model: String = f.try_get::<Option<String>, _>("related_model").ok().flatten().unwrap_or_default();
+        let opts: Option<serde_json::Value> = f.try_get::<Option<serde_json::Value>, _>("selection_options").ok().flatten();
+        let (child_table, inverse) = match opts.as_ref().and_then(|o| {
+            Some((
+                o.get("child_table")?.as_str()?.to_string(),
+                o.get("inverse_field")?.as_str()?.to_string(),
+            ))
+        }) {
+            Some(v) => v,
+            None => continue,
+        };
+        if !validate_identifier(&child_table) || !validate_identifier(&inverse) {
+            continue;
+        }
+
+        // Payload present? A form without this grid (e.g. an API submit or a
+        // no-JS client) leaves the lines untouched rather than deleting them.
+        let payload = match form_data.get(&format!("__o2m_{}", field)) {
+            Some(p) => p,
+            None => continue,
+        };
+        let lines = match serde_json::from_str::<serde_json::Value>(payload) {
+            Ok(serde_json::Value::Array(a)) => a,
+            _ => continue,
+        };
+
+        // Accepted child columns (the grid columns) + their catalog types.
+        let allowed: std::collections::HashSet<String> =
+            o2m_grid_columns(db, &child_model, &inverse).await
+                .into_iter().map(|c| c.name).collect();
+        if allowed.is_empty() {
+            continue;
+        }
+        let udt: std::collections::HashMap<String, String> = sqlx::query(
+            "SELECT column_name, udt_name FROM information_schema.columns WHERE table_name = $1",
+        )
+        .bind(&child_table)
+        .fetch_all(db)
+        .await
+        .unwrap_or_default()
+        .iter()
+        .map(|r| (r.get::<String, _>("column_name"), r.get::<String, _>("udt_name")))
+        .collect();
+
+        // Every child id that survives this save (existing rows kept + new rows
+        // inserted); anything else linked to this parent was removed in the grid.
+        let mut keep: Vec<uuid::Uuid> = Vec::new();
+        for line in &lines {
+            let obj = match line.as_object() { Some(o) => o, None => continue };
+            let id = obj.get("_id").and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .and_then(|s| s.parse::<uuid::Uuid>().ok());
+
+            // Collect (col, udt) + value for the accepted columns in this line.
+            let mut cols: Vec<(String, String)> = Vec::new();
+            let mut vals: Vec<Option<String>> = Vec::new();
+            for (k, v) in obj {
+                if k == "_id" || !allowed.contains(k) || !validate_identifier(k) { continue; }
+                let Some(u) = udt.get(k) else { continue };
+                let s = v.as_str().unwrap_or("").trim().to_string();
+                cols.push((k.clone(), u.clone()));
+                vals.push(if s.is_empty() { None } else { Some(s) });
+            }
+
+            match id {
+                Some(cid) => {
+                    if !cols.is_empty() {
+                        let set: Vec<String> = cols.iter().enumerate()
+                            .map(|(i, (c, u))| format!("\"{}\" = ${}::{}", c, i + 1, u))
+                            .collect();
+                        let q = format!(
+                            "UPDATE {tbl} SET {set}, updated_at = NOW() WHERE id = ${idp} AND \"{inv}\" = ${invp}",
+                            tbl = child_table, set = set.join(", "),
+                            idp = cols.len() + 1, inv = inverse, invp = cols.len() + 2
+                        );
+                        let mut query = sqlx::query(&q);
+                        for val in &vals { query = query.bind(val); }
+                        query = query.bind(cid).bind(record_id);
+                        let _ = query.execute(db).await;
+                    }
+                    keep.push(cid);
+                }
+                None => {
+                    // Skip an all-blank new row (a spare row the user never typed in).
+                    if vals.iter().all(|v| v.is_none()) { continue; }
+                    let mut colnames: Vec<String> = cols.iter().map(|(c, _)| format!("\"{}\"", c)).collect();
+                    let mut phs: Vec<String> = cols.iter().enumerate()
+                        .map(|(i, (_, u))| format!("${}::{}", i + 1, u)).collect();
+                    colnames.push(format!("\"{}\"", inverse));
+                    phs.push(format!("${}", cols.len() + 1));
+                    let q = format!(
+                        "INSERT INTO {tbl} ({cols}) VALUES ({phs}) RETURNING id",
+                        tbl = child_table, cols = colnames.join(", "), phs = phs.join(", ")
+                    );
+                    let mut query = sqlx::query(&q);
+                    for val in &vals { query = query.bind(val); }
+                    query = query.bind(record_id);
+                    if let Ok(row) = query.fetch_one(db).await {
+                        keep.push(row.get::<uuid::Uuid, _>("id"));
+                    }
+                }
+            }
+        }
+
+        // Delete lines the user removed from the grid (everything linked to this
+        // parent that isn't in the kept set — an empty set clears them all).
+        let _ = sqlx::query(&format!(
+            "DELETE FROM {tbl} WHERE \"{inv}\" = $1 AND NOT (id = ANY($2::uuid[]))",
+            tbl = child_table, inv = inverse
+        ))
+        .bind(record_id)
+        .bind(&keep)
+        .execute(db)
+        .await;
+    }
+}
+
+/// Mint the next value of a Blueprint auto-number field, e.g. `VIS-2026-0001`.
+/// Runtime analogue of `vortex_orm::sequence::next` (whose spec is `&'static`,
+/// so it can't take user-chosen prefixes): one atomic UPSERT against the shared
+/// `sequences` table claims the next counter for `(code, period)`, then the
+/// prefix / period / zero-padded number / suffix are formatted from the field's
+/// stored config. `cfg` is the field's `selection_options` object. Returns None
+/// (skip, leave the column NULL) if the counter can't be claimed.
+async fn blueprint_next_sequence(
+    db: &sqlx::PgPool,
+    code: &str,
+    cfg: Option<&serde_json::Value>,
+) -> Option<String> {
+    let prefix = cfg.and_then(|c| c.get("prefix")).and_then(|v| v.as_str()).unwrap_or("");
+    let padding = cfg.and_then(|c| c.get("padding")).and_then(|v| v.as_i64()).unwrap_or(4).clamp(1, 12) as usize;
+    let scope = cfg.and_then(|c| c.get("scope")).and_then(|v| v.as_str()).unwrap_or("global");
+    let separator = cfg.and_then(|c| c.get("separator")).and_then(|v| v.as_str()).unwrap_or("-");
+    let suffix = cfg.and_then(|c| c.get("suffix")).and_then(|v| v.as_str()).unwrap_or("");
+
+    let now = chrono::Utc::now();
+    let period = match scope {
+        "yearly" => now.format("%Y").to_string(),
+        "monthly" => now.format("%Y-%m").to_string(),
+        _ => String::new(),
+    };
+    // Atomic claim: first call for (code, period) inserts at 1, later calls bump
+    // by 1 — two concurrent creates always get two distinct numbers.
+    let next_val: i64 = sqlx::query_scalar(
+        "INSERT INTO sequences (code, scope, current_value, updated_at) VALUES ($1, $2, 1, NOW()) \
+         ON CONFLICT (code, scope) DO UPDATE SET current_value = sequences.current_value + 1, updated_at = NOW() \
+         RETURNING current_value",
+    )
+    .bind(code)
+    .bind(&period)
+    .fetch_one(db)
+    .await
+    .ok()?;
+
+    let number = format!("{:0width$}", next_val, width = padding);
+    let mut out = String::new();
+    out.push_str(prefix);
+    if !period.is_empty() {
+        out.push_str(separator);
+        out.push_str(&period);
+    }
+    out.push_str(separator);
+    out.push_str(&number);
+    out.push_str(suffix);
+    Some(out)
+}
+
+/// Turn a write error into a user-facing message — a unique-index violation
+/// (SQLSTATE 23505, from a Blueprint "Unique" field) reads as a plain
+/// duplicate-value message instead of a raw Postgres error.
+fn friendly_write_error(e: &sqlx::Error) -> String {
+    if let sqlx::Error::Database(dbe) = e {
+        if dbe.code().as_deref() == Some("23505") {
+            return "That value is already used by another record — this field must be unique."
+                .to_string();
+        }
+    }
+    format!("Error: {e}")
 }
 
 async fn dynamic_form_create(
@@ -22727,6 +23801,13 @@ async fn dynamic_form_create(
     let Some(table_name) = table_name else {
         return (StatusCode::NOT_FOUND, Html("Model not found")).into_response();
     };
+
+    // Enforce required fields server-side (the `required` input attribute is the
+    // first line; this catches API/no-JS submits).
+    let missing = blueprint_required_missing(&db, &model_name, &form_data).await;
+    if !missing.is_empty() {
+        return error_response(&format!("Please fill in the required field(s): {}.", missing.join(", ")));
+    }
 
     // Real columns + their Postgres types, straight from the catalog. This does
     // three things a bare text-bind loop can't: (1) casts each value to the
@@ -22759,12 +23840,48 @@ async fn dynamic_form_create(
         let Some(udt) = col_types.get(key) else {
             continue; // not a real column — ignore
         };
+        // A uuid column (a many2one) with a non-uuid value — e.g. a mis-entered
+        // relation — is skipped (left NULL) rather than casting `''::uuid` and
+        // failing the whole INSERT.
+        if udt == "uuid" && uuid::Uuid::parse_str(value.trim()).is_err() {
+            continue;
+        }
         let n = values.len() + 1;
         columns.push(format!("\"{}\"", key));
         placeholders.push(format!("${}::{}", n, udt));
         // Handle checkbox values
         let val = if value == "on" { "true".to_string() } else { value.clone() };
         values.push(val);
+    }
+
+    // Mint auto-number references. These fields render disabled (never submitted),
+    // so their value is generated here from the field's stored config and added
+    // to the INSERT. Sequence code is namespaced by table + column so two fields
+    // (or two Blueprints) never share a counter.
+    let autonum = sqlx::query(
+        "SELECT f.name, f.selection_options FROM ir_model_field f \
+         JOIN ir_model m ON m.id = f.model_id \
+         WHERE m.name = $1 AND f.field_type = 'autonumber'",
+    )
+    .bind(&model_name)
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default();
+    for r in &autonum {
+        let fname: String = r.get("name");
+        // Only a real column, and only if the form didn't already carry a value.
+        let Some(udt) = col_types.get(&fname) else { continue };
+        if columns.iter().any(|c| c.trim_matches('"') == fname) {
+            continue;
+        }
+        let cfg: Option<serde_json::Value> = r.try_get::<Option<serde_json::Value>, _>("selection_options").ok().flatten();
+        let code = format!("bp:{}:{}", table_name, fname);
+        if let Some(val) = blueprint_next_sequence(&db, &code, cfg.as_ref()).await {
+            let n = values.len() + 1;
+            columns.push(format!("\"{}\"", fname));
+            placeholders.push(format!("${}::{}", n, udt));
+            values.push(val);
+        }
     }
 
     if columns.is_empty() {
@@ -22796,11 +23913,25 @@ async fn dynamic_form_create(
                 &model_name, Some(&new_id.to_string()),
                 serde_json::json!({ "fields": columns.len() }),
             ).await;
-            Redirect::to(&format!("/form/{}/{}", model_name, new_id)).into_response()
+            // Sync many2many links (hidden CSV inputs — not physical columns).
+            sync_blueprint_m2m(&db, &table_name, &model_name, new_id, &form_data).await;
+            // Sync one2many inline-grid lines (hidden `__o2m_*` JSON payloads).
+            sync_blueprint_o2m(&db, &model_name, new_id, &form_data).await;
+            // Recompute computed fields AFTER the lines are written, so a rollup
+            // (sum/count over the one2many) sees the rows just synced. Best-effort
+            // — a formula problem shouldn't fail the save.
+            if let Err(e) = vortex_framework::computed_fields::store_values(&db, &model_name, new_id).await {
+                tracing::warn!(model = %model_name, error = %e, "computed field store after create failed");
+            }
+            // Return to the parent record when this was a one2many "+ Add" line.
+            let dest = form_data
+                .get("_return")
+                .filter(|r| r.starts_with('/') && !r.starts_with("//"))
+                .cloned()
+                .unwrap_or_else(|| format!("/form/{}/{}", model_name, new_id));
+            Redirect::to(&dest).into_response()
         }
-        Err(e) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, Html(format!("Error: {}", e))).into_response()
-        }
+        Err(e) => error_response(&friendly_write_error(&e)),
     }
 }
 
@@ -22823,6 +23954,12 @@ async fn dynamic_form_update(
     let Some(table_name) = table_name else {
         return (StatusCode::NOT_FOUND, Html("Model not found")).into_response();
     };
+
+    // Enforce required fields server-side, same as create.
+    let missing = blueprint_required_missing(&db, &model_name, &form_data).await;
+    if !missing.is_empty() {
+        return error_response(&format!("Please fill in the required field(s): {}.", missing.join(", ")));
+    }
 
     // Real columns + types from the catalog — same rationale as create: cast
     // to the true column type, whitelist column names, and number placeholders
@@ -22849,6 +23986,17 @@ async fn dynamic_form_update(
         let Some(udt) = col_types.get(key) else {
             continue; // not a real column — ignore
         };
+        // Empty input clears the column (NULL). Critically, never bind "" and
+        // cast it — `''::date` / `''::uuid` / `''::numeric` all raise a cast
+        // error that used to fail the whole save (the "white page" on edit when
+        // any typed field — an unselected relation, a blank date/number — was
+        // left empty). A uuid column with a non-uuid value is likewise cleared.
+        if value.trim().is_empty()
+            || (udt == "uuid" && uuid::Uuid::parse_str(value.trim()).is_err())
+        {
+            set_clauses.push(format!("\"{}\" = NULL", key));
+            continue;
+        }
         let n = values.len() + 1;
         set_clauses.push(format!("\"{}\" = ${}::{}", key, n, udt));
         // Handle checkbox values - if checkbox is unchecked, it won't be in form_data
@@ -22857,7 +24005,15 @@ async fn dynamic_form_update(
     }
 
     if set_clauses.is_empty() {
-        return Redirect::to(&format!("/form/{}/{}", model_name, record_id)).into_response();
+        // No scalar columns changed, but many2many links / one2many lines may have.
+        sync_blueprint_m2m(&db, &table_name, &model_name, record_id, &form_data).await;
+        sync_blueprint_o2m(&db, &model_name, record_id, &form_data).await;
+        let dest = form_data
+            .get("_return")
+            .filter(|r| r.starts_with('/') && !r.starts_with("//"))
+            .cloned()
+            .unwrap_or_else(|| format!("/form/{}/{}", model_name, record_id));
+        return Redirect::to(&dest).into_response();
     }
 
     let query = format!(
@@ -22883,9 +24039,21 @@ async fn dynamic_form_update(
                 &model_name, Some(&record_id.to_string()),
                 serde_json::json!({ "fields": set_clauses.len() }),
             ).await;
-            Redirect::to(&format!("/form/{}/{}", model_name, record_id)).into_response()
+            sync_blueprint_m2m(&db, &table_name, &model_name, record_id, &form_data).await;
+            sync_blueprint_o2m(&db, &model_name, record_id, &form_data).await;
+            // Recompute computed fields AFTER the lines are written so a rollup
+            // over the one2many reflects the rows just synced.
+            if let Err(e) = vortex_framework::computed_fields::store_values(&db, &model_name, record_id).await {
+                tracing::warn!(model = %model_name, error = %e, "computed field store after update failed");
+            }
+            let dest = form_data
+                .get("_return")
+                .filter(|r| r.starts_with('/') && !r.starts_with("//"))
+                .cloned()
+                .unwrap_or_else(|| format!("/form/{}/{}", model_name, record_id));
+            Redirect::to(&dest).into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Html(format!("Error: {}", e))).into_response(),
+        Err(e) => error_response(&friendly_write_error(&e)),
     }
 }
 

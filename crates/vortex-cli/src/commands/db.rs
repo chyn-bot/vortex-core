@@ -192,7 +192,7 @@ async fn apply_and_record_migration(
 /// (`$$…$$` / `$tag$…$tag$`), and line/block comments. Used only by the
 /// "already exists" recovery path in [`apply_and_record_migration`], so a
 /// partially-applied migration's remaining statements can each be run alone.
-fn split_sql_statements(sql: &str) -> Vec<String> {
+pub(crate) fn split_sql_statements(sql: &str) -> Vec<String> {
     let b = sql.as_bytes();
     let n = b.len();
     let mut i = 0usize;
@@ -888,6 +888,24 @@ async fn run_plugin_migrations(pool: &PgPool) -> Result<(usize, usize)> {
         let module = plugin.technical_name();
         let migrations = plugin.migrations();
         if migrations.is_empty() {
+            continue;
+        }
+
+        // Don't re-provision a module the tenant has explicitly uninstalled —
+        // a proper uninstall drops its schema and deletes its migration records,
+        // so without this gate the next `migrate` would recreate everything it
+        // removed. A module ABSENT from installed_modules (a brand-new DB, or a
+        // plugin seen for the first time) still provisions, so initial tenant
+        // provisioning is unchanged. Best-effort: on any query error, provision.
+        let uninstalled: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM installed_modules WHERE technical_name = $1 AND state = 'uninstalled')",
+        )
+        .bind(module)
+        .fetch_one(pool)
+        .await
+        .unwrap_or(false);
+        if uninstalled {
+            println!("  Skipping '{}' — module is uninstalled in this database", module);
             continue;
         }
 

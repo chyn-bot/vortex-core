@@ -139,4 +139,12 @@ pub struct DatabaseContext {
     pub db_name: String,
     pub pool: Arc<ConnectionPool>,
     pub installed_modules: HashSet<String>,
+    /// Pre-rendered "Custom Apps" sidebar group (Blueprint models the admin
+    /// flagged `show_in_menu`) for THIS tenant, computed once per request when
+    /// the context is built. Threaded into `build_sidebar`'s `apps_html` so the
+    /// group shows on every page — plugin pages included — not just the host
+    /// pages that used to compute it inline. Active-agnostic (no entry marked
+    /// current); host views that need the active highlight recompute per-page.
+    /// Empty string when the tenant has no menu-flagged blueprints.
+    pub custom_apps_html: String,
 }

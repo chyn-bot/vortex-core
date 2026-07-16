@@ -16,7 +16,7 @@
 //!   `vortex-cli/src/commands/server.rs` because they are the host's
 //!   own concerns, not framework-level primitives.
 
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use chrono::{DateTime, Utc};
 
@@ -85,6 +85,59 @@ pub fn get_initials(name: &str) -> String {
         .to_uppercase()
 }
 
+/// Build a "back to list" href that preserves the caller's list state
+/// (search / sort / filters / page) by reading it off the request `Referer`.
+///
+/// A record page opened from `/contacts?search=foo&page=3` should return to
+/// that exact view, not the bare list. Same-origin navigation carries the
+/// full list URL in the `Referer` under the platform's
+/// `strict-origin-when-cross-origin` policy, so this recovers it without
+/// threading list state through every record link.
+///
+/// The result is **only ever** a path+query on `list_path`: a `Referer`
+/// pointing at a record page, another module, or an external origin falls
+/// back to the bare `list_path`. The host portion is stripped, so the return
+/// value is always a relative path on our own origin — it can never become
+/// an open redirect. Because the query portion is attacker-influenceable,
+/// **callers must HTML-escape the value** before embedding it in an
+/// attribute (e.g. via [`html_escape`]).
+///
+/// ```
+/// use axum::http::HeaderMap;
+/// use vortex_framework::ui::list_return_href;
+///
+/// let mut h = HeaderMap::new();
+/// h.insert("referer", "http://host/contacts?search=foo&page=3".parse().unwrap());
+/// assert_eq!(list_return_href(&h, "/contacts"), "/contacts?search=foo&page=3");
+///
+/// // Wrong path or no referer → bare list path.
+/// assert_eq!(list_return_href(&HeaderMap::new(), "/contacts"), "/contacts");
+/// ```
+pub fn list_return_href(headers: &HeaderMap, list_path: &str) -> String {
+    let referer = match headers.get("referer").and_then(|v| v.to_str().ok()) {
+        Some(r) => r,
+        None => return list_path.to_string(),
+    };
+    // Reduce an absolute referer (scheme://host/path?q) to path+query.
+    let path_and_query = match referer.find("://") {
+        Some(i) => match referer[i + 3..].find('/') {
+            Some(j) => &referer[i + 3 + j..],
+            None => return list_path.to_string(),
+        },
+        None => referer, // already relative
+    };
+    // Honor it only when the path is exactly the list path.
+    let path = path_and_query
+        .split(|c| c == '?' || c == '#')
+        .next()
+        .unwrap_or("");
+    if path == list_path {
+        path_and_query.to_string()
+    } else {
+        list_path.to_string()
+    }
+}
+
 /// Render a short relative-time string like `"5 min ago"` for a past
 /// timestamp.
 pub fn format_time_ago(dt: DateTime<Utc>) -> String {
@@ -105,19 +158,39 @@ pub fn format_time_ago(dt: DateTime<Utc>) -> String {
 /// HTMX will still swap the DOM (HTMX ignores 4xx by default); the
 /// inline alert markup makes the error visible to the user.
 pub fn error_response(message: &str) -> Response {
-    (
-        StatusCode::OK,
-        Html(format!(
-            r#"<div class="alert alert-error mb-4">
-    <svg xmlns="http://www.w3.org/2000/svg" class="stroke-current shrink-0 h-5 w-5" fill="none" viewBox="0 0 24 24">
-        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2m7-2a9 9 0 11-18 0 9 9 0 0118 0z" />
-    </svg>
-    <span>{}</span>
-</div>"#,
-            html_escape(message)
-        )),
-    )
-        .into_response()
+    // A full, styled document — not a bare fragment. When a handler returns this
+    // as a whole-page response (e.g. a failed form save), a fragment renders as
+    // an unstyled near-blank "white page"; a complete page with the stylesheet
+    // shows the message clearly and offers a way back (which preserves the
+    // half-filled form via the browser's back cache).
+    let body = format!(
+        r##"<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Something went wrong</title>
+<script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script>
+<link href="/static/vendor/daisyui.min.css" rel="stylesheet">
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<link href="/static/tailwind.css?v=21" rel="stylesheet"/>
+</head>
+<body class="min-h-screen bg-base-200 flex items-center justify-center p-6">
+<div class="card bg-base-100 shadow-xl max-w-lg w-full"><div class="card-body">
+<div class="flex items-center gap-3">
+<svg xmlns="http://www.w3.org/2000/svg" class="text-error shrink-0 h-7 w-7" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+</svg>
+<h1 class="card-title">That didn’t go through</h1>
+</div>
+<p class="text-base-content/80 mt-1">{msg}</p>
+<div class="card-actions justify-end mt-4">
+<button class="btn btn-ghost" onclick="history.back()">← Go back</button>
+</div>
+</div></div>
+</body></html>"##,
+        msg = html_escape(message)
+    );
+    (StatusCode::OK, Html(body)).into_response()
 }
 
 /// Format an integer with comma separators (e.g. `50064` → `"50,064"`).
@@ -232,9 +305,9 @@ pub fn forbidden_page(action: &str) -> String {
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Access Denied - Vortex</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-    <link href="/static/vortex.css?v=18" rel="stylesheet">
-    <script src="/static/vortex.js?v=18" defer></script>
-    <script src="/static/vendor/tailwind.js"></script>
+    <link href="/static/vortex.css?v=20" rel="stylesheet">
+    <script src="/static/vortex.js?v=20" defer></script>
+    <link href="/static/tailwind.css?v=21" rel="stylesheet"/>
 </head>
 <body class="min-h-screen bg-base-200 flex items-center justify-center">
     <div class="card bg-base-100 shadow-xl max-w-md">
@@ -265,6 +338,45 @@ mod tests {
     #[test]
     fn html_escape_covers_owasp_set() {
         assert_eq!(html_escape("<>\"'&"), "&lt;&gt;&quot;&#x27;&amp;");
+    }
+
+    fn referer(r: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("referer", r.parse().unwrap());
+        h
+    }
+
+    #[test]
+    fn list_return_href_preserves_query_from_absolute_referer() {
+        let h = referer("http://localhost:3003/contacts?search=23356&page=3");
+        assert_eq!(list_return_href(&h, "/contacts"), "/contacts?search=23356&page=3");
+    }
+
+    #[test]
+    fn list_return_href_preserves_query_from_relative_referer() {
+        let h = referer("/accounting?sort=date&dir=desc");
+        assert_eq!(list_return_href(&h, "/accounting"), "/accounting?sort=date&dir=desc");
+    }
+
+    #[test]
+    fn list_return_href_falls_back_without_or_on_wrong_referer() {
+        assert_eq!(list_return_href(&HeaderMap::new(), "/inventory"), "/inventory");
+        // A record page under the same module is not the list itself.
+        let h = referer("http://host/inventory/abc-123");
+        assert_eq!(list_return_href(&h, "/inventory"), "/inventory");
+        // A different module's list.
+        let h = referer("http://host/contacts?search=x");
+        assert_eq!(list_return_href(&h, "/inventory"), "/inventory");
+    }
+
+    #[test]
+    fn list_return_href_output_is_always_relative_never_cross_origin() {
+        // Host is stripped by design: a crafted cross-origin referer yields
+        // only a relative link to our own list, never an open redirect.
+        let h = referer("http://evil.example/contacts?x=1");
+        let out = list_return_href(&h, "/contacts");
+        assert_eq!(out, "/contacts?x=1");
+        assert!(out.starts_with('/'));
     }
 
     #[test]

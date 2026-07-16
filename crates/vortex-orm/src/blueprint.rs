@@ -120,6 +120,9 @@ pub fn column_type(field_type: &str) -> Result<&'static str, BlueprintError> {
     Ok(match field_type {
         "string" | "char" => "VARCHAR(255)",
         "selection" => "VARCHAR(64)",
+        // Auto-number: a generated reference string (e.g. "VIS-2026-0001") is
+        // written on create, so the column is a short text field.
+        "autonumber" => "VARCHAR(64)",
         "text" => "TEXT",
         "boolean" => "BOOLEAN",
         "integer" => "INTEGER",
@@ -206,6 +209,115 @@ pub async fn add_reference_column(
     let stmt = format!(
         "ALTER TABLE {table} ADD COLUMN {column} UUID REFERENCES {target_table}(id) ON DELETE SET NULL"
     );
+    sqlx::query(&stmt).execute(&mut **tx).await?;
+    log_ddl(tx, blueprint_id, &stmt).await?;
+    Ok(())
+}
+
+/// Deterministic name for a Blueprint column's uniqueness index. Postgres
+/// truncates identifiers at 63 bytes; `x_`-prefixed tables plus a column name
+/// are comfortably short, but truncate defensively so two long fields can't
+/// collide on a silently-shortened index name.
+fn unique_index_name(table: &str, column: &str) -> String {
+    let raw = format!("uq_{table}_{column}");
+    if raw.len() > 63 {
+        raw[..63].to_string()
+    } else {
+        raw
+    }
+}
+
+/// Enforce uniqueness on a Blueprint column with a partial UNIQUE index over
+/// active rows only, so a soft-deleted (`active = false`) record never blocks
+/// reuse of its value. NULLs are exempt from UNIQUE in Postgres, so a
+/// not-yet-filled optional field allows many blank rows. Fails loudly (23505 or
+/// a duplicate-data error) if existing rows already violate the constraint —
+/// the caller surfaces that to the user.
+pub async fn add_unique_index(
+    tx: &mut Transaction<'_, Postgres>,
+    table: &str,
+    column: &str,
+    blueprint_id: Uuid,
+) -> Result<(), BlueprintError> {
+    validate_table(table)?;
+    validate_column(column)?;
+    let index = unique_index_name(table, column);
+    validate_identifier(&index)?;
+    let stmt = format!("CREATE UNIQUE INDEX {index} ON {table} ({column}) WHERE active");
+    sqlx::query(&stmt).execute(&mut **tx).await?;
+    log_ddl(tx, blueprint_id, &stmt).await?;
+    Ok(())
+}
+
+/// Junction-table name for a many2many field: `<owner_table>_<field>_rel`,
+/// length-capped like [`unique_index_name`].
+pub fn m2m_junction_name(owner_table: &str, field: &str) -> String {
+    let raw = format!("{owner_table}_{field}_rel");
+    if raw.len() > 63 {
+        raw[..63].to_string()
+    } else {
+        raw
+    }
+}
+
+/// Create the link table for a many2many field: `(owner_id, target_id)` with a
+/// composite primary key and cascade deletes on both sides, so removing either
+/// record cleans up its links. `target_table` may be a compiled (non-`x_`)
+/// table, so it is validated as a plain identifier — the caller must confirm it
+/// names a real model first.
+pub async fn create_m2m_junction(
+    tx: &mut Transaction<'_, Postgres>,
+    owner_table: &str,
+    field: &str,
+    target_table: &str,
+    blueprint_id: Uuid,
+) -> Result<(), BlueprintError> {
+    validate_table(owner_table)?;
+    validate_column(field)?;
+    validate_identifier(target_table)?;
+    let jt = m2m_junction_name(owner_table, field);
+    validate_identifier(&jt)?;
+    let stmt = format!(
+        "CREATE TABLE {jt} (\
+         owner_id UUID NOT NULL REFERENCES {owner_table}(id) ON DELETE CASCADE, \
+         target_id UUID NOT NULL REFERENCES {target_table}(id) ON DELETE CASCADE, \
+         PRIMARY KEY (owner_id, target_id))"
+    );
+    sqlx::query(&stmt).execute(&mut **tx).await?;
+    log_ddl(tx, blueprint_id, &stmt).await?;
+    Ok(())
+}
+
+/// Drop a many2many field's link table (idempotent).
+pub async fn drop_m2m_junction(
+    tx: &mut Transaction<'_, Postgres>,
+    owner_table: &str,
+    field: &str,
+    blueprint_id: Uuid,
+) -> Result<(), BlueprintError> {
+    validate_table(owner_table)?;
+    validate_column(field)?;
+    let jt = m2m_junction_name(owner_table, field);
+    validate_identifier(&jt)?;
+    let stmt = format!("DROP TABLE IF EXISTS {jt}");
+    sqlx::query(&stmt).execute(&mut **tx).await?;
+    log_ddl(tx, blueprint_id, &stmt).await?;
+    Ok(())
+}
+
+/// Drop a Blueprint column's uniqueness index (idempotent). Used when a field is
+/// removed or its uniqueness is turned off.
+pub async fn drop_unique_index(
+    tx: &mut Transaction<'_, Postgres>,
+    table: &str,
+    column: &str,
+    blueprint_id: Uuid,
+) -> Result<(), BlueprintError> {
+    validate_table(table)?;
+    validate_column(column)?;
+    let index = unique_index_name(table, column);
+    validate_identifier(&index)?;
+    let stmt = format!("DROP INDEX IF EXISTS {index}");
     sqlx::query(&stmt).execute(&mut **tx).await?;
     log_ddl(tx, blueprint_id, &stmt).await?;
     Ok(())

@@ -214,8 +214,15 @@ async fn resolve(db: &PgPool, model: &str) -> Result<(Uuid, Uuid, String), Strin
 
 /// Snapshot the current blueprint fields as JSON for a version record.
 async fn snapshot(tx: &mut Transaction<'_, Postgres>, model_id: Uuid) -> Result<serde_json::Value, String> {
+    // Full field definition so a version can be faithfully restored — relation
+    // target, dropdown options, validation flags, computed formula, and layout,
+    // not just name/type. Older snapshots predate these keys; the restore path
+    // treats each as optional.
     let rows = sqlx::query(
-        "SELECT name, display_name, field_type, sequence, is_visible FROM ir_model_field
+        "SELECT name, display_name, field_type, sequence, is_visible, related_model,
+                selection_options, is_required, is_unique, is_computed,
+                compute_kind, compute_expr, col_span, section
+         FROM ir_model_field
          WHERE model_id = $1 AND source = 'blueprint' ORDER BY sequence",
     )
     .bind(model_id)
@@ -231,6 +238,15 @@ async fn snapshot(tx: &mut Transaction<'_, Postgres>, model_id: Uuid) -> Result<
                 "type": r.get::<String, _>("field_type"),
                 "sequence": r.get::<i32, _>("sequence"),
                 "in_list": r.get::<bool, _>("is_visible"),
+                "related_model": r.try_get::<Option<String>, _>("related_model").unwrap_or(None),
+                "options": r.try_get::<Option<serde_json::Value>, _>("selection_options").unwrap_or(None),
+                "required": r.try_get::<bool, _>("is_required").unwrap_or(false),
+                "unique": r.try_get::<bool, _>("is_unique").unwrap_or(false),
+                "computed": r.try_get::<bool, _>("is_computed").unwrap_or(false),
+                "compute_kind": r.try_get::<Option<String>, _>("compute_kind").unwrap_or(None),
+                "compute_expr": r.try_get::<Option<String>, _>("compute_expr").unwrap_or(None),
+                "col_span": r.try_get::<i16, _>("col_span").unwrap_or(2),
+                "section": r.try_get::<Option<String>, _>("section").unwrap_or(None),
             })
         })
         .collect();
@@ -380,6 +396,35 @@ fn parse_selection_options(raw: &str) -> Result<serde_json::Value, String> {
     Ok(serde_json::Value::Array(opts))
 }
 
+/// Validate and normalise an auto-number field's config (submitted by the
+/// designer as a JSON object) into the `selection_options` value stored on the
+/// field. Shape: `{ "prefix", "padding", "scope", "separator", "suffix" }`. The
+/// create handler reads this to mint the next reference (e.g. `VIS-2026-0001`).
+fn parse_autonumber_config(raw: &str) -> Result<serde_json::Value, String> {
+    let v: serde_json::Value = serde_json::from_str(raw.trim())
+        .map_err(|_| "Auto-number settings were malformed".to_string())?;
+    // Prefix: short uppercase-ish token; kept as-is but length-capped.
+    let prefix: String = v.get("prefix").and_then(|x| x.as_str()).unwrap_or("").trim().chars().take(16).collect();
+    // Padding: how many zero-padded digits (1..=12), default 4.
+    let padding = v.get("padding").and_then(|x| x.as_i64()).unwrap_or(4).clamp(1, 12);
+    // Scope: how often the counter resets.
+    let scope = match v.get("scope").and_then(|x| x.as_str()).unwrap_or("global") {
+        s @ ("yearly" | "monthly" | "global") => s.to_string(),
+        _ => "global".to_string(),
+    };
+    // Separator between prefix / period / number; default "-".
+    let separator: String = v.get("separator").and_then(|x| x.as_str()).unwrap_or("-").chars().take(3).collect();
+    let suffix: String = v.get("suffix").and_then(|x| x.as_str()).unwrap_or("").trim().chars().take(16).collect();
+    Ok(serde_json::json!({
+        "autonumber": true,
+        "prefix": prefix,
+        "padding": padding,
+        "scope": scope,
+        "separator": separator,
+        "suffix": suffix,
+    }))
+}
+
 /// Resolve a many2one target: any active model — Blueprint **or** compiled —
 /// whose physical table carries a `name` column (the display the generic
 /// picker/JOIN reads). Returns the target's table name. Requiring a real `name`
@@ -404,10 +449,37 @@ async fn resolve_relation_target(db: &PgPool, target_model: &str) -> Result<Stri
     .ok_or_else(|| format!("'{target_model}' is not a valid relation target"))
 }
 
+/// Find the one many2one field on `child_model` that links back to `owner_model`
+/// — the inverse of a one2many. Exactly one is required: zero means the child
+/// has no link back (add one first); more than one is ambiguous.
+async fn find_inverse_m2o(db: &PgPool, child_model: &str, owner_model: &str) -> Result<String, String> {
+    let names: Vec<String> = sqlx::query_scalar(
+        "SELECT f.name FROM ir_model_field f
+         JOIN ir_model m ON m.id = f.model_id
+         WHERE m.name = $1 AND f.field_type = 'many2one' AND f.related_model = $2
+         ORDER BY f.name",
+    )
+    .bind(child_model)
+    .bind(owner_model)
+    .fetch_all(db)
+    .await
+    .map_err(dberr)?;
+    match names.len() {
+        0 => Err(format!(
+            "'{child_model}' has no field linking back here. Add a \"Link to a record\" field on '{child_model}' that points to this record type first."
+        )),
+        1 => Ok(names.into_iter().next().unwrap()),
+        _ => Err(format!(
+            "'{child_model}' links back more than once, so the child list is ambiguous. (Choosing among multiple inverse links isn't supported yet.)"
+        )),
+    }
+}
+
 /// Add a field to a Blueprint. Scalars add a typed column; `selection` also
 /// stores its options; `many2one` adds a real UUID FK to another Blueprint and
 /// stores the target's model name in `related_model` (which the generic layer
 /// uses to render the picker and resolve labels).
+#[allow(clippy::too_many_arguments)]
 pub async fn add_field(
     state: &AppState,
     db: &PgPool,
@@ -418,31 +490,59 @@ pub async fn add_field(
     field_type: &str,
     related_model: Option<&str>,
     options_raw: Option<&str>,
+    is_required: bool,
+    is_unique: bool,
 ) -> Result<(), String> {
     let col = slugify(label);
     ddl::validate_identifier(&col).map_err(|e| format!("invalid field name: {e}"))?;
-    // Validate the type against the physical-column vocabulary up front.
-    ddl::column_type(field_type).map_err(|e| format!("unsupported field type: {e}"))?;
+    // Physical-column types are validated against the column vocabulary; the
+    // relational types (many2many = link table, one2many = virtual inverse) are
+    // not columns, so they skip that check.
+    let is_m2m = field_type == "many2many";
+    let is_o2m = field_type == "one2many";
+    if !is_m2m && !is_o2m {
+        ddl::column_type(field_type).map_err(|e| format!("unsupported field type: {e}"))?;
+    }
     gate(state, user, "blueprint.alter", model).await?;
 
+    let (model_id, blueprint_id, table) = resolve(db, model).await?;
+
     // Type-specific inputs, validated before opening the transaction.
-    let selection_options: Option<serde_json::Value> = if field_type == "selection" {
+    let mut selection_options: Option<serde_json::Value> = if field_type == "selection" {
         Some(parse_selection_options(options_raw.unwrap_or(""))?)
+    } else if field_type == "autonumber" {
+        Some(parse_autonumber_config(options_raw.unwrap_or(""))?)
     } else {
         None
     };
-    let (related, target_table): (Option<String>, Option<String>) = if field_type == "many2one" {
-        let target = related_model
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .ok_or("Pick a record type this field links to")?;
-        let table = resolve_relation_target(db, target).await?;
-        (Some(target.to_string()), Some(table))
-    } else {
-        (None, None)
+    // Relation target/child model resolution.
+    let (related, target_table): (Option<String>, Option<String>) = match field_type {
+        "many2one" | "many2many" => {
+            let target = related_model
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or("Pick a record type this field links to")?;
+            let table = resolve_relation_target(db, target).await?;
+            (Some(target.to_string()), Some(table))
+        }
+        "one2many" => {
+            let child = related_model
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or("Pick the child record type this list shows")?;
+            let child_table = resolve_relation_target(db, child).await?;
+            // Auto-detect the child's many2one field that points back at us, so
+            // the builder doesn't have to name the inverse. Exactly one is
+            // required (no ambiguity).
+            let inverse = find_inverse_m2o(db, child, model).await?;
+            selection_options = Some(serde_json::json!({
+                "inverse_field": inverse,
+                "child_table": child_table,
+            }));
+            (Some(child.to_string()), None)
+        }
+        _ => (None, None),
     };
-
-    let (model_id, blueprint_id, table) = resolve(db, model).await?;
 
     let fcount: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM ir_model_field WHERE model_id = $1 AND source = 'blueprint'")
@@ -467,13 +567,24 @@ pub async fn add_field(
         return Err(format!("A field named '{col}' already exists"));
     }
 
-    match &target_table {
-        Some(tt) => ddl::add_reference_column(&mut tx, &table, &col, tt, blueprint_id)
+    match field_type {
+        "many2one" => ddl::add_reference_column(&mut tx, &table, &col, target_table.as_deref().unwrap(), blueprint_id)
             .await
             .map_err(|e| format!("add relation column failed: {e}"))?,
-        None => ddl::add_column(&mut tx, &table, &col, field_type, blueprint_id)
+        "many2many" => ddl::create_m2m_junction(&mut tx, &table, &col, target_table.as_deref().unwrap(), blueprint_id)
+            .await
+            .map_err(|e| format!("create link table failed: {e}"))?,
+        "one2many" => { /* virtual inverse — no schema change on this table */ }
+        _ => ddl::add_column(&mut tx, &table, &col, field_type, blueprint_id)
             .await
             .map_err(|e| format!("add column failed: {e}"))?,
+    }
+
+    // Uniqueness applies only to real scalar/relation columns.
+    if is_unique && !is_m2m && !is_o2m {
+        ddl::add_unique_index(&mut tx, &table, &col, blueprint_id)
+            .await
+            .map_err(|e| format!("add unique constraint failed: {e}"))?;
     }
 
     let seq: i32 =
@@ -486,8 +597,8 @@ pub async fn add_field(
     sqlx::query(
         "INSERT INTO ir_model_field
             (model_id, name, display_name, field_type, sequence, source, is_custom, is_visible,
-             related_model, selection_options)
-         VALUES ($1, $2, $3, $4, $5, 'blueprint', false, true, $6, $7)",
+             related_model, selection_options, is_required, is_unique)
+         VALUES ($1, $2, $3, $4, $5, 'blueprint', false, true, $6, $7, $8, $9)",
     )
     .bind(model_id)
     .bind(&col)
@@ -496,6 +607,8 @@ pub async fn add_field(
     .bind(seq)
     .bind(&related)
     .bind(&selection_options)
+    .bind(is_required)
+    .bind(is_unique)
     .execute(&mut *tx)
     .await
     .map_err(dberr)?;
@@ -534,6 +647,20 @@ pub async fn rename_field(
     gate(state, user, "blueprint.alter", model).await?;
 
     let (model_id, blueprint_id, table) = resolve(db, model).await?;
+
+    // A relation field's link table / inverse is derived from its name, so a
+    // rename would orphan it. Disallow for now (delete + re-add instead).
+    let ftype: Option<String> = sqlx::query_scalar(
+        "SELECT field_type FROM ir_model_field WHERE model_id = $1 AND name = $2 AND source = 'blueprint'",
+    )
+    .bind(model_id)
+    .bind(from)
+    .fetch_optional(db)
+    .await
+    .map_err(dberr)?;
+    if matches!(ftype.as_deref(), Some("many2many") | Some("one2many")) {
+        return Err("Relation fields can't be renamed yet — delete and re-add instead.".to_string());
+    }
     let mut tx = db.begin().await.map_err(dberr)?;
 
     ddl::rename_column(&mut tx, &table, from, &to, blueprint_id)
@@ -583,11 +710,29 @@ pub async fn remove_field(
     gate(state, user, "blueprint.alter", model).await?;
 
     let (model_id, blueprint_id, table) = resolve(db, model).await?;
+
+    // Branch the physical cleanup on the field kind: a link table for m2m, no
+    // schema change for a virtual o2m, a plain column drop otherwise.
+    let field_type: Option<String> = sqlx::query_scalar(
+        "SELECT field_type FROM ir_model_field WHERE model_id = $1 AND name = $2 AND source = 'blueprint'",
+    )
+    .bind(model_id)
+    .bind(name)
+    .fetch_optional(db)
+    .await
+    .map_err(dberr)?;
+
     let mut tx = db.begin().await.map_err(dberr)?;
 
-    ddl::drop_column(&mut tx, &table, name, blueprint_id)
-        .await
-        .map_err(|e| format!("drop column failed: {e}"))?;
+    match field_type.as_deref() {
+        Some("many2many") => ddl::drop_m2m_junction(&mut tx, &table, name, blueprint_id)
+            .await
+            .map_err(|e| format!("drop link table failed: {e}"))?,
+        Some("one2many") => { /* virtual — no schema to drop */ }
+        _ => ddl::drop_column(&mut tx, &table, name, blueprint_id)
+            .await
+            .map_err(|e| format!("drop column failed: {e}"))?,
+    }
 
     sqlx::query("DELETE FROM ir_model_field WHERE model_id = $1 AND name = $2 AND source = 'blueprint'")
         .bind(model_id)
@@ -607,6 +752,204 @@ pub async fn remove_field(
         AuditSeverity::Warning,
         model,
         serde_json::json!({ "field": name }),
+    )
+    .await;
+    Ok(())
+}
+
+/// Re-create a single Blueprint field inside an open transaction from a snapshot
+/// field JSON (see [`snapshot`]). Used by [`restore_version`] to add back a
+/// field that a prior version had. Returns `Ok(false)` (skipped, not an error)
+/// when the snapshot lacks enough to rebuild it faithfully — e.g. an old
+/// snapshot of a relation field with no recorded target.
+async fn recreate_field_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    db: &PgPool,
+    model_id: Uuid,
+    blueprint_id: Uuid,
+    table: &str,
+    f: &serde_json::Value,
+) -> Result<bool, String> {
+    let name = f.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    if name.is_empty() {
+        return Ok(false);
+    }
+    ddl::validate_identifier(name).map_err(|e| format!("invalid field name '{name}': {e}"))?;
+    let label = f.get("label").and_then(|v| v.as_str()).unwrap_or(name);
+    let ftype = f.get("type").and_then(|v| v.as_str()).unwrap_or("string");
+    let seq = f.get("sequence").and_then(|v| v.as_i64()).unwrap_or(10) as i32;
+    let in_list = f.get("in_list").and_then(|v| v.as_bool()).unwrap_or(true);
+    let is_required = f.get("required").and_then(|v| v.as_bool()).unwrap_or(false);
+    let is_unique = f.get("unique").and_then(|v| v.as_bool()).unwrap_or(false);
+    let is_computed = f.get("computed").and_then(|v| v.as_bool()).unwrap_or(false);
+    let col_span = f.get("col_span").and_then(|v| v.as_i64()).unwrap_or(2) as i16;
+    let section = f.get("section").and_then(|v| v.as_str());
+
+    // Computed fields are virtual (no physical column) — restore the registry
+    // row only. A computed field without its formula can't be rebuilt.
+    if is_computed {
+        let kind = f.get("compute_kind").and_then(|v| v.as_str());
+        let expr = f.get("compute_expr").and_then(|v| v.as_str());
+        let (Some(kind), Some(expr)) = (kind, expr) else { return Ok(false) };
+        sqlx::query(
+            "INSERT INTO ir_model_field
+                (model_id, name, display_name, field_type, sequence, source, is_custom,
+                 is_visible, is_computed, compute_kind, compute_expr, col_span, section)
+             VALUES ($1,$2,$3,$4,$5,'blueprint',false,$6,true,$7,$8,$9,$10)",
+        )
+        .bind(model_id).bind(name).bind(label).bind(ftype).bind(seq).bind(in_list)
+        .bind(kind).bind(expr).bind(col_span).bind(section)
+        .execute(&mut **tx).await.map_err(dberr)?;
+        return Ok(true);
+    }
+
+    // Physical / relational schema per kind.
+    match ftype {
+        "many2one" => {
+            let Some(target) = f.get("related_model").and_then(|v| v.as_str()).filter(|s| !s.is_empty())
+            else {
+                return Ok(false); // old snapshot with no target — can't rebuild the FK
+            };
+            let target_table = resolve_relation_target(db, target).await?;
+            ddl::add_reference_column(tx, table, name, &target_table, blueprint_id)
+                .await
+                .map_err(|e| format!("restore relation column '{name}' failed: {e}"))?;
+        }
+        "many2many" => {
+            let Some(target) = f.get("related_model").and_then(|v| v.as_str()).filter(|s| !s.is_empty())
+            else {
+                return Ok(false); // can't rebuild the link table without a target
+            };
+            let target_table = resolve_relation_target(db, target).await?;
+            ddl::create_m2m_junction(tx, table, name, &target_table, blueprint_id)
+                .await
+                .map_err(|e| format!("restore link table '{name}' failed: {e}"))?;
+        }
+        "one2many" => { /* virtual — metadata only (options carries the inverse) */ }
+        _ => {
+            ddl::add_column(tx, table, name, ftype, blueprint_id)
+                .await
+                .map_err(|e| format!("restore column '{name}' failed: {e}"))?;
+        }
+    }
+    if is_unique && ftype != "many2many" && ftype != "one2many" {
+        ddl::add_unique_index(tx, table, name, blueprint_id)
+            .await
+            .map_err(|e| format!("restore unique index for '{name}' failed: {e}"))?;
+    }
+
+    let related = f.get("related_model").and_then(|v| v.as_str());
+    let options = f.get("options").filter(|v| !v.is_null()).cloned();
+    sqlx::query(
+        "INSERT INTO ir_model_field
+            (model_id, name, display_name, field_type, sequence, source, is_custom, is_visible,
+             related_model, selection_options, is_required, is_unique, col_span, section)
+         VALUES ($1,$2,$3,$4,$5,'blueprint',false,$6,$7,$8,$9,$10,$11,$12)",
+    )
+    .bind(model_id).bind(name).bind(label).bind(ftype).bind(seq).bind(in_list)
+    .bind(related).bind(options).bind(is_required).bind(is_unique).bind(col_span).bind(section)
+    .execute(&mut **tx).await.map_err(dberr)?;
+    Ok(true)
+}
+
+/// Restore a Blueprint's fields to those captured in version `target_version`:
+/// fields present now but not in that version are **dropped** (their column and
+/// data are destroyed — the UI confirms this), and fields in that version but
+/// missing now are re-created. Fields present in both are left untouched (a
+/// field's type never changes, so same-name means same definition). Records and
+/// their values in surviving columns are preserved. The restore is itself
+/// recorded as a new version, so history only moves forward.
+pub async fn restore_version(
+    state: &AppState,
+    db: &PgPool,
+    db_name: &str,
+    user: &AuthUser,
+    model: &str,
+    target_version: i32,
+) -> Result<(), String> {
+    gate(state, user, "blueprint.alter", model).await?;
+    let (model_id, blueprint_id, table) = resolve(db, model).await?;
+
+    let def: Option<serde_json::Value> = sqlx::query_scalar(
+        "SELECT definition FROM blueprint_version WHERE blueprint_id = $1 AND version = $2",
+    )
+    .bind(blueprint_id)
+    .bind(target_version)
+    .fetch_optional(db)
+    .await
+    .map_err(dberr)?;
+    let Some(def) = def else {
+        return Err(format!("Version {target_version} not found for this Blueprint."));
+    };
+    let target_fields = def.get("fields").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    let target_names: std::collections::HashSet<String> = target_fields
+        .iter()
+        .filter_map(|f| f.get("name").and_then(|v| v.as_str()).map(str::to_string))
+        .collect();
+
+    let current = sqlx::query(
+        "SELECT name, is_computed FROM ir_model_field WHERE model_id = $1 AND source = 'blueprint'",
+    )
+    .bind(model_id)
+    .fetch_all(db)
+    .await
+    .map_err(dberr)?;
+    let current_names: std::collections::HashSet<String> =
+        current.iter().map(|r| r.get::<String, _>("name")).collect();
+
+    let mut tx = db.begin().await.map_err(dberr)?;
+    let mut dropped: Vec<String> = Vec::new();
+    let mut added: Vec<String> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
+
+    // Drop fields not in the target version. The display `name` field is never
+    // dropped (it's the record's identity).
+    for row in &current {
+        let n: String = row.get("name");
+        if n == "name" || target_names.contains(&n) {
+            continue;
+        }
+        let computed: bool = row.try_get("is_computed").unwrap_or(false);
+        if !computed {
+            ddl::drop_column(&mut tx, &table, &n, blueprint_id)
+                .await
+                .map_err(|e| format!("drop column '{n}' failed: {e}"))?;
+        }
+        sqlx::query("DELETE FROM ir_model_field WHERE model_id = $1 AND name = $2 AND source = 'blueprint'")
+            .bind(model_id).bind(&n)
+            .execute(&mut *tx).await.map_err(dberr)?;
+        dropped.push(n);
+    }
+
+    // Re-add fields the target version had but that are gone now.
+    for f in &target_fields {
+        let n = f.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        if n.is_empty() || n == "name" || current_names.contains(n) {
+            continue;
+        }
+        if recreate_field_in_tx(&mut tx, db, model_id, blueprint_id, &table, f).await? {
+            added.push(n.to_string());
+        } else {
+            skipped.push(n.to_string());
+        }
+    }
+
+    record_version(&mut tx, blueprint_id, model_id, user).await?;
+    tx.commit().await.map_err(dberr)?;
+
+    audit(
+        state,
+        db_name,
+        user,
+        "blueprint_restored",
+        AuditSeverity::Warning,
+        model,
+        serde_json::json!({
+            "restored_to_version": target_version,
+            "dropped": dropped,
+            "added": added,
+            "skipped": skipped,
+        }),
     )
     .await;
     Ok(())
@@ -656,6 +999,8 @@ pub async fn set_layout(
     model: &str,
     orders: &HashMap<String, i32>,
     list_fields: &HashSet<String>,
+    widths: &HashMap<String, i16>,
+    sections: &HashMap<String, String>,
 ) -> Result<(), String> {
     gate(state, user, "blueprint.alter", model).await?;
 
@@ -677,14 +1022,25 @@ pub async fn set_layout(
 
     let plan = plan_layout(&existing, orders, list_fields)?;
     for (name, seq, in_list) in &plan {
+        // Form width: 1 = half column, 2 = full row. Anything else clamps to a
+        // full row so a malformed submission can't hide a field. Absent = full.
+        let span: i16 = widths.get(name).copied().unwrap_or(2).clamp(1, 2);
+        // Section: trimmed, capped, empty → NULL (falls back to "General").
+        let section: Option<String> = sections
+            .get(name)
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.chars().take(64).collect());
         sqlx::query(
-            "UPDATE ir_model_field SET sequence = $3, is_visible = $4
+            "UPDATE ir_model_field SET sequence = $3, is_visible = $4, col_span = $5, section = $6
              WHERE model_id = $1 AND name = $2 AND source = 'blueprint'",
         )
         .bind(model_id)
         .bind(name)
         .bind(*seq)
         .bind(*in_list)
+        .bind(span)
+        .bind(section)
         .execute(&mut *tx)
         .await
         .map_err(dberr)?;
@@ -704,6 +1060,133 @@ pub async fn set_layout(
     )
     .await;
     Ok(())
+}
+
+/// Enable the stage workflow (status bar) for a Blueprint: add the
+/// `record_state` column to its table if missing and, the first time only, seed
+/// a starter Draft → In Progress → Done set of stages plus the two transition
+/// buttons that move between them — so the bar works immediately. Admins then
+/// refine stages/buttons from Settings → Stages (both are generic per-model
+/// catalogs). Idempotent; presentation-level metadata + a column add, so it
+/// applies directly with no approval gate (like the menu toggle).
+pub async fn enable_stages(
+    state: &AppState,
+    db: &PgPool,
+    db_name: &str,
+    user: &AuthUser,
+    model: &str,
+) -> Result<(), String> {
+    gate(state, user, "blueprint.alter", model).await?;
+    let (model_id, blueprint_id, table) = resolve(db, model).await?;
+    if table.is_empty() || !table.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Err("Invalid table name".to_string());
+    }
+    let mut tx = db.begin().await.map_err(dberr)?;
+
+    // 1. record_state column (idempotent — safe to click twice).
+    sqlx::query(&format!(
+        "ALTER TABLE {table} ADD COLUMN IF NOT EXISTS record_state VARCHAR(64)"
+    ))
+    .execute(&mut *tx)
+    .await
+    .map_err(dberr)?;
+
+    // 2. Seed a working starter workflow the first time only. If the admin has
+    //    already defined stages for this model, leave them untouched.
+    let have: i64 = sqlx::query_scalar("SELECT count(*) FROM record_stages WHERE model = $1")
+        .bind(model)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(dberr)?;
+    if have == 0 {
+        for (i, (code, label, color)) in [
+            ("draft", "Draft", "neutral"),
+            ("in_progress", "In Progress", "info"),
+            ("done", "Done", "success"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            sqlx::query(
+                "INSERT INTO record_stages (model, code, label, color, sequence, always_visible, locked, active) \
+                 VALUES ($1, $2, $3, $4, $5, true, false, true)",
+            )
+            .bind(model)
+            .bind(code)
+            .bind(label)
+            .bind(color)
+            .bind((i as i32 + 1) * 10)
+            .execute(&mut *tx)
+            .await
+            .map_err(dberr)?;
+        }
+        for (i, (label, from, to, color)) in [
+            ("Start", "draft", "in_progress", "info"),
+            ("Mark Done", "in_progress", "done", "success"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            sqlx::query(
+                "INSERT INTO record_stage_actions (model, label, target_stage, from_stage, color, sequence, active) \
+                 VALUES ($1, $2, $3, $4, $5, $6, true)",
+            )
+            .bind(model)
+            .bind(label)
+            .bind(to)
+            .bind(from)
+            .bind(color)
+            .bind((i as i32 + 1) * 10)
+            .execute(&mut *tx)
+            .await
+            .map_err(dberr)?;
+        }
+    }
+
+    // 3. Give every existing row the first stage so the bar always has a value.
+    sqlx::query(&format!(
+        "UPDATE {table} SET record_state = 'draft' WHERE record_state IS NULL"
+    ))
+    .execute(&mut *tx)
+    .await
+    .map_err(dberr)?;
+
+    record_version(&mut tx, blueprint_id, model_id, user).await?;
+    tx.commit().await.map_err(dberr)?;
+
+    audit(
+        state,
+        db_name,
+        user,
+        "blueprint_stages_enabled",
+        AuditSeverity::Info,
+        model,
+        serde_json::json!({ "seeded_starter_workflow": have == 0 }),
+    )
+    .await;
+    Ok(())
+}
+
+/// Does this Blueprint's table have the `record_state` column (i.e. are stages
+/// enabled)? Best-effort — a false is also returned on any query error.
+pub async fn stages_enabled(db: &PgPool, model: &str) -> bool {
+    let table: Option<String> =
+        sqlx::query_scalar("SELECT table_name FROM ir_model WHERE name = $1 AND source = 'blueprint'")
+            .bind(model)
+            .fetch_optional(db)
+            .await
+            .ok()
+            .flatten();
+    let Some(table) = table else { return false };
+    sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM information_schema.columns \
+         WHERE table_schema = 'public' AND table_name = $1 AND column_name = 'record_state'",
+    )
+    .bind(&table)
+    .fetch_one(db)
+    .await
+    .map(|n| n > 0)
+    .unwrap_or(false)
 }
 
 /// Archive a Blueprint: soft-delete (status='archived', model inactive). The
@@ -770,9 +1253,14 @@ pub enum BlueprintOp {
         field_type: String,
         related_model: Option<String>,
         options: Option<String>,
+        #[serde(default)]
+        required: bool,
+        #[serde(default)]
+        unique: bool,
     },
     RenameField { model: String, from: String, new_label: String },
     RemoveField { model: String, name: String },
+    Restore { model: String, version: i32 },
     Archive { model: String },
 }
 
@@ -783,7 +1271,8 @@ impl BlueprintOp {
             BlueprintOp::Create { .. } => "blueprint.create",
             BlueprintOp::AddField { .. }
             | BlueprintOp::RenameField { .. }
-            | BlueprintOp::RemoveField { .. } => "blueprint.alter",
+            | BlueprintOp::RemoveField { .. }
+            | BlueprintOp::Restore { .. } => "blueprint.alter",
             BlueprintOp::Archive { .. } => "blueprint.delete",
         }
     }
@@ -796,6 +1285,7 @@ impl BlueprintOp {
             BlueprintOp::AddField { model, .. }
             | BlueprintOp::RenameField { model, .. }
             | BlueprintOp::RemoveField { model, .. }
+            | BlueprintOp::Restore { model, .. }
             | BlueprintOp::Archive { model } => model.clone(),
         }
     }
@@ -806,6 +1296,7 @@ impl BlueprintOp {
             BlueprintOp::AddField { .. } => "add_field",
             BlueprintOp::RenameField { .. } => "rename_field",
             BlueprintOp::RemoveField { .. } => "remove_field",
+            BlueprintOp::Restore { .. } => "restore",
             BlueprintOp::Archive { .. } => "archive",
         }
     }
@@ -821,6 +1312,7 @@ impl BlueprintOp {
                 format!("Rename “{from}” → “{new_label}” on {model}")
             }
             BlueprintOp::RemoveField { model, name } => format!("Delete field “{name}” from {model}"),
+            BlueprintOp::Restore { model, version } => format!("Restore {model} to version {version}"),
             BlueprintOp::Archive { model } => format!("Archive {model}"),
         }
     }
@@ -891,9 +1383,11 @@ async fn execute_op(
         BlueprintOp::Create { label } => {
             create(state, db, db_name, user, label).await.map(Some)
         }
-        BlueprintOp::AddField { model, label, field_type, related_model, options } => add_field(
+        BlueprintOp::AddField {
+            model, label, field_type, related_model, options, required, unique,
+        } => add_field(
             state, db, db_name, user, model, label, field_type,
-            related_model.as_deref(), options.as_deref(),
+            related_model.as_deref(), options.as_deref(), *required, *unique,
         )
         .await
         .map(|_| None),
@@ -902,6 +1396,9 @@ async fn execute_op(
         }
         BlueprintOp::RemoveField { model, name } => {
             remove_field(state, db, db_name, user, model, name).await.map(|_| None)
+        }
+        BlueprintOp::Restore { model, version } => {
+            restore_version(state, db, db_name, user, model, *version).await.map(|_| None)
         }
         BlueprintOp::Archive { model } => {
             archive(state, db, db_name, user, model).await.map(|_| None)
@@ -1422,6 +1919,8 @@ mod tests {
             field_type: "monetary".into(),
             related_model: None,
             options: None,
+            required: false,
+            unique: false,
         };
         // Payload survives a JSON round-trip (how it's stored + replayed).
         let json = serde_json::to_value(&op).unwrap();

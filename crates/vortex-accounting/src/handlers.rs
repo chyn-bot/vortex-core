@@ -48,9 +48,9 @@ pub(crate) fn page_shell(sidebar: &str, title: &str, content: &str) -> String {
 <title>{title} - Vortex</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=18" rel="stylesheet"/>
-<script src="/static/vortex.js?v=18" defer></script>
-<script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script>
+<link href="/static/tailwind.css?v=21" rel="stylesheet"/>
 </head>
 <body class="min-h-screen bg-base-200">
 <div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden">
@@ -81,7 +81,7 @@ pub(crate) fn render_sidebar(state: &AppState, user: &AuthUser, db_ctx: &Databas
         user.is_admin(),
         &state.plugin_registry,
         &user.roles,
-        "",
+        &db_ctx.custom_apps_html,
     )
 }
 
@@ -415,13 +415,16 @@ async fn new_move_form(
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
     Extension(db_ctx): Extension<DatabaseContext>,
+    headers: vortex_plugin_sdk::axum::http::HeaderMap,
 ) -> Response {
     let sidebar = render_sidebar(&state, &user, &db_ctx);
+    // Return to the exact list view (search/sort/page) this form was opened from.
+    let back_href = vortex_plugin_sdk::framework::list_return_href(&headers, "/accounting");
     let journals = journal_options(&db, None).await;
 
     let content = format!(
         r#"<div class="max-w-xl">
-<a href="/accounting" class="btn btn-ghost btn-sm mb-4">← Back to Journal Entries</a>
+<a href="{back_href}" class="btn btn-ghost btn-sm mb-4">← Back to Journal Entries</a>
 <h1 class="text-2xl font-bold mb-6">New Journal Entry</h1>
 <form method="POST" action="/accounting/moves/create">
 <div class="card bg-base-100 shadow"><div class="card-body">
@@ -449,6 +452,7 @@ async fn new_move_form(
 <p class="text-sm opacity-60 mt-4">Lines are added on the entry page; the entry can be posted once debits equal credits.</p>
 </div>"#,
         journals = journals,
+        back_href = vortex_plugin_sdk::framework::html_escape(&back_href),
     );
     Html(page_shell(&sidebar, "New Journal Entry", &content)).into_response()
 }
@@ -512,9 +516,12 @@ async fn move_detail(
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
     Extension(db_ctx): Extension<DatabaseContext>,
+    headers: vortex_plugin_sdk::axum::http::HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Response {
     let esc = vortex_plugin_sdk::framework::html_escape;
+    // Return to the exact list view (search/sort/page) the record was opened from.
+    let back_href = vortex_plugin_sdk::framework::list_return_href(&headers, "/accounting");
     let sidebar = render_sidebar(&state, &user, &db_ctx);
 
     let Some(head) = vortex_plugin_sdk::sqlx::query(
@@ -752,7 +759,7 @@ async fn move_detail(
 
     let content = format!(
         r#"<div class="max-w-5xl">
-<a href="/accounting" class="btn btn-ghost btn-sm mb-4">← Back to Journal Entries</a>
+<a href="{back_href}" class="btn btn-ghost btn-sm mb-4">← Back to Journal Entries</a>
 <div class="flex items-center justify-between mb-4">
 <h1 class="text-2xl font-bold">{number} <span class="text-base opacity-60 font-normal">{journal_code} · {journal_name}</span> {badge}</h1>
 <div>{actions}</div>
@@ -777,6 +784,7 @@ async fn move_detail(
 <div class="mt-6">{activity_panel}</div>
 <div class="mt-6">{history}</div>
 </div>"#,
+        back_href = esc(&back_href),
         number = esc(&number),
         journal_code = esc(&journal_code),
         journal_name = esc(&journal_name),
@@ -1051,14 +1059,14 @@ async fn list_accounts(
     Html(page_shell(&sidebar, "Chart of Accounts", &list_html)).into_response()
 }
 
-fn account_form(action: &str, values: Option<(&str, &str, &str, bool, bool)>) -> String {
+/// The account (chart-of-accounts) field body, rendered as a flat sheet section.
+/// Callers wrap it in the canonical [`FormSheet`] chrome (form + footer).
+fn account_form(values: Option<(&str, &str, &str, bool, bool)>) -> String {
     let (code, name, account_type, reconcile, active) =
         values.unwrap_or(("", "", "", false, true));
     let esc = vortex_plugin_sdk::framework::html_escape;
-    format!(
-        r#"<form method="POST" action="{action}">
-<div class="card bg-base-100 shadow"><div class="card-body">
-<div class="grid grid-cols-2 gap-3">
+    let fields = format!(
+        r#"<div class="grid grid-cols-2 gap-3">
 <div class="form-control mb-3">
 <label class="label"><span class="label-text">Code *</span></label>
 <input name="code" value="{code}" class="input input-bordered input-sm font-mono" required maxlength="16"/>
@@ -1079,11 +1087,7 @@ fn account_form(action: &str, values: Option<(&str, &str, &str, bool, bool)>) ->
 <div class="form-control mb-3">
 <label class="label cursor-pointer justify-start gap-2"><input type="checkbox" name="active" value="1" class="checkbox checkbox-sm"{active_checked}/><span class="label-text">Active</span></label>
 </div>
-</div>
-<button type="submit" class="btn btn-primary btn-sm">Save</button>
-</div></div>
-</form>"#,
-        action = action,
+</div>"#,
         code = esc(code),
         name = esc(name),
         type_options = account_type_options(if account_type.is_empty() {
@@ -1093,7 +1097,8 @@ fn account_form(action: &str, values: Option<(&str, &str, &str, bool, bool)>) ->
         }),
         reconcile_checked = if reconcile { " checked" } else { "" },
         active_checked = if active { " checked" } else { "" },
-    )
+    );
+    vortex_plugin_sdk::framework::form_section_raw("", &fields)
 }
 
 async fn new_account_form(
@@ -1103,14 +1108,16 @@ async fn new_account_form(
     Extension(db_ctx): Extension<DatabaseContext>,
 ) -> Response {
     let sidebar = render_sidebar(&state, &user, &db_ctx);
-    let content = format!(
-        r#"<div class="max-w-xl">
-<a href="/accounting/accounts" class="btn btn-ghost btn-sm mb-4">← Back to Chart of Accounts</a>
-<h1 class="text-2xl font-bold mb-6">New Account</h1>
-{form}
-</div>"#,
-        form = account_form("/accounting/accounts/create", None),
-    );
+    let content = vortex_plugin_sdk::framework::render_form_sheet(&vortex_plugin_sdk::framework::FormSheet {
+        max_width: vortex_plugin_sdk::framework::SHEET_WIDTH,
+        back_href: "/accounting/accounts",
+        control_row: "",
+        form_attrs: r#"method="POST" action="/accounting/accounts/create""#,
+        title: "New Account",
+        inner: &account_form(None),
+        footer: r#"<a href="/accounting/accounts" class="btn btn-ghost">Cancel</a><button type="submit" class="btn btn-primary">Save</button>"#,
+        below: "",
+    });
     Html(page_shell(&sidebar, "New Account", &content)).into_response()
 }
 
@@ -1188,20 +1195,29 @@ async fn edit_account(
 
     let activity_panel = vortex_plugin_sdk::framework::render_chatter_panel("acc_account", id);
 
+    // Rich header h1 (code — name + type badge) lives inside the sheet, so this
+    // form builds the canonical sheet inline rather than via render_form_sheet
+    // (whose title is HTML-escaped). Chatter/history sit below.
     let content = format!(
-        r#"<div class="max-w-xl">
-<a href="/accounting/accounts" class="btn btn-ghost btn-sm mb-4">← Back to Chart of Accounts</a>
+        r#"<div class="max-w-6xl mx-auto">
+<div class="mb-3"><a href="/accounting/accounts" class="btn btn-ghost btn-sm">← Back to Chart of Accounts</a></div>
+<form method="POST" action="/accounting/accounts/{id}">
+<div class="bg-base-100 rounded-lg shadow-sm border border-base-300 p-6 md:p-8">
 <h1 class="text-2xl font-bold mb-6">{code} — {name} <span class="badge badge-ghost">{type_label}</span></h1>
 {form}
-<div class="mt-6">{activity_panel}</div>
+</div>
+<div class="flex justify-end gap-2 mt-4">
+<a href="/accounting/accounts" class="btn btn-ghost">Cancel</a>
+<button type="submit" class="btn btn-primary">Save</button>
+</div>
+</form>
+<div class="mt-8 flex flex-col gap-6">{activity_panel}</div>
 </div>"#,
+        id = id,
         code = vortex_plugin_sdk::framework::html_escape(&code),
         name = vortex_plugin_sdk::framework::html_escape(&name),
         type_label = account_type_label(&account_type),
-        form = account_form(
-            &format!("/accounting/accounts/{id}"),
-            Some((&code, &name, &account_type, reconcile, active)),
-        ),
+        form = account_form(Some((&code, &name, &account_type, reconcile, active))),
     );
     Html(page_shell(&sidebar, "Edit Account", &content)).into_response()
 }
@@ -1324,13 +1340,11 @@ async fn edit_journal(
 
     let activity_panel = vortex_plugin_sdk::framework::render_chatter_panel("acc_journal", id);
 
-    let content = format!(
-        r#"<div class="max-w-xl">
-<a href="/accounting/journals" class="btn btn-ghost btn-sm mb-4">← Back to Journals</a>
-<h1 class="text-2xl font-bold mb-6">{code} — {name} <span class="badge badge-ghost">{jtype}</span></h1>
-<form method="POST" action="/accounting/journals/{id}">
-<div class="card bg-base-100 shadow"><div class="card-body">
-<div class="form-control mb-3">
+    // Rich header h1 (code — name + type badge) lives inside the sheet, so this
+    // form builds the canonical sheet inline rather than via render_form_sheet
+    // (whose title is HTML-escaped). Chatter/history sit below.
+    let fields = format!(
+        r#"<div class="form-control mb-3">
 <label class="label"><span class="label-text">Name *</span></label>
 <input name="name" value="{name}" class="input input-bordered input-sm" required maxlength="120"/>
 </div>
@@ -1341,18 +1355,31 @@ async fn edit_journal(
 <div class="form-control mb-4">
 <label class="label"><span class="label-text">Note</span></label>
 <textarea name="note" class="textarea textarea-bordered textarea-sm" rows="2">{note}</textarea>
+</div>"#,
+        name = esc(&name),
+        accounts = accounts,
+        note = esc(note.as_deref().unwrap_or("")),
+    );
+    let content = format!(
+        r#"<div class="max-w-6xl mx-auto">
+<div class="mb-3"><a href="/accounting/journals" class="btn btn-ghost btn-sm">← Back to Journals</a></div>
+<form method="POST" action="/accounting/journals/{id}">
+<div class="bg-base-100 rounded-lg shadow-sm border border-base-300 p-6 md:p-8">
+<h1 class="text-2xl font-bold mb-6">{code} — {name} <span class="badge badge-ghost">{jtype}</span></h1>
+{section}
 </div>
-<button type="submit" class="btn btn-primary btn-sm">Save</button>
-</div></div>
+<div class="flex justify-end gap-2 mt-4">
+<a href="/accounting/journals" class="btn btn-ghost">Cancel</a>
+<button type="submit" class="btn btn-primary">Save</button>
+</div>
 </form>
-<div class="mt-6">{activity_panel}</div>
+<div class="mt-8 flex flex-col gap-6">{activity_panel}</div>
 </div>"#,
         id = id,
         code = esc(&code),
         name = esc(&name),
         jtype = esc(&journal_type),
-        accounts = accounts,
-        note = esc(note.as_deref().unwrap_or("")),
+        section = vortex_plugin_sdk::framework::form_section_raw("", &fields),
     );
     Html(page_shell(&sidebar, "Edit Journal", &content)).into_response()
 }

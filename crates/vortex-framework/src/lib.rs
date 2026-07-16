@@ -36,8 +36,12 @@ pub mod antivirus;
 pub mod api;
 pub mod captcha;
 pub mod approval;
+pub mod assembly;
+pub mod audit_events;
 pub mod audit_trail;
 pub mod automation;
+pub mod batch;
+pub mod batch_admin;
 pub mod blueprint;
 pub mod intake;
 pub mod chatter;
@@ -65,17 +69,25 @@ pub mod registry;
 pub mod saved_views;
 pub mod report_jobs;
 pub mod reports;
+pub mod rules;
 pub mod scheduler;
 pub mod shell;
 pub mod sidebar;
+pub mod snapshot;
 pub mod state;
 pub mod status;
 pub mod tracking;
+pub mod trial;
 pub mod ui;
 pub mod user_reports;
 pub mod webhooks;
 
 pub use api::{ResolvedToken, TokenRow};
+pub use assembly::{AssembledDocument, Calculator, CalculatorChain, LineItem};
+pub use batch::{
+    BatchProcessor, BatchRegistry, ItemContext, ItemOutcome, NewBatchRun, NewItem, ProcessError,
+    RunStatus,
+};
 pub use webhooks::WebhookEndpoint;
 pub use approval::{ApprovalRequest, ApprovalStep, DecisionOutcome, NewRequest};
 pub use audit_trail::render_audit_trail;
@@ -107,16 +119,23 @@ pub use reports::{
     ReportRegistry,
 };
 pub use flash::{flash_redirect, FlashKind};
+pub use rules::{
+    evaluate as evaluate_rules, AdjustmentResult, Amount, Condition, EvalOutcome, NewRule, Rule,
+    RuleFiring, RuleSet,
+};
 pub use qr::qr_svg;
 pub use record_panel::{
     handle_record_panel_saves, render_record_panels, PanelSaveCtx, RecordPanel, RecordPanelDef,
     HOST_FORM_ID,
 };
 pub use scheduler::{Schedule, ScheduledAction, ScheduledActionDef, Scheduler};
+pub use form::{form_section, form_section_raw, render_form_sheet, FormSheet, SHEET_WIDTH};
 pub use shell::{render_app_shell, render_app_shell_with};
+pub use snapshot::{FrozenRecord, SnapshotSet};
+pub use trial::{RunMode, SideEffect};
 pub use sidebar::{build_sidebar, build_sidebar_nav};
 pub use state::{AppState, DatabaseContext};
 pub use ui::{
     build_pagination_html, error_response, format_number, format_time_ago, forbidden_page,
-    get_initials, html_escape, new_record_url, record_url,
+    get_initials, html_escape, list_return_href, new_record_url, record_url,
 };

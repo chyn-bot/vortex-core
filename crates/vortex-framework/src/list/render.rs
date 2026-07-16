@@ -378,6 +378,15 @@ fn render_pagination(result: &ListResult, params: &ListParams, base_url: &str) -
     let start = params.offset() + 1;
     let end = (params.offset() + params.page_size).min(result.total as u64);
 
+    // For a large unfiltered list the total is a planner estimate, shown
+    // with a leading `~` so the operator knows it is approximate (and the
+    // trailing pages may be a few rows off). Any filter makes it exact.
+    let total_label = if result.total_is_estimate {
+        format!("~{}", result.total)
+    } else {
+        result.total.to_string()
+    };
+
     let mut html = String::new();
     html.push_str(&format!(
         r#"<div class="flex items-center justify-between p-4 text-sm text-base-content/60">
@@ -385,7 +394,7 @@ fn render_pagination(result: &ListResult, params: &ListParams, base_url: &str) -
 <div class="join">"#,
         start = start,
         end = end,
-        total = result.total,
+        total = total_label,
     ));
 
     // Previous
@@ -439,7 +448,7 @@ mod tests {
     use crate::list::config::ListColumn;
 
     fn empty_result(total: i64, page: u64, page_size: u64, total_pages: u64) -> ListResult {
-        ListResult { rows: Vec::new(), total, page, page_size, total_pages }
+        ListResult { rows: Vec::new(), total, total_is_estimate: false, page, page_size, total_pages }
     }
 
     #[test]

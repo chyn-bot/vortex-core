@@ -152,15 +152,9 @@ pub async fn render_form(
 
     let mut body = String::new();
     for section in &config.sections {
-        if let Some(title) = &section.title {
-            body.push_str(&format!(
-                r#"<h2 class="text-sm font-semibold uppercase opacity-60 mt-4 mb-2">{}</h2>"#,
-                html_escape(title)
-            ));
-        }
-        // Fields lay out on a responsive two-column grid; long inputs
-        // (textareas) span the full row.
-        body.push_str(r#"<div class="grid grid-cols-1 md:grid-cols-2 gap-x-8">"#);
+        // Fields lay out on a responsive two-column grid inside a flat sheet
+        // section (shared primitive); long inputs (textareas) span the full row.
+        let mut fields_html = String::new();
         for field in &section.fields {
             let value = values
                 .get(&field.name)
@@ -204,7 +198,7 @@ pub async fn render_form(
             } else {
                 ""
             };
-            body.push_str(&format!(
+            fields_html.push_str(&format!(
                 r#"<label class="form-control mb-3{span}"><div class="label"><span class="label-text">{label}{star}</span>{help}</div>{widget}<div class="label">{error}</div></label>"#,
                 span = span,
                 label = html_escape(&field.label),
@@ -215,11 +209,11 @@ pub async fn render_form(
             ));
             // Custom fields anchored to render right after this one (Initiative
             // #2 placement). Empty unless an admin positioned a field here.
-            body.push_str(
+            fields_html.push_str(
                 &crate::custom_fields::render_anchor_group(db, &config.table, record_id, &field.name).await,
             );
         }
-        body.push_str("</div>");
+        body.push_str(&super::form_section(section.title.as_deref().unwrap_or(""), &fields_html));
     }
 
     // Per-tenant custom fields for this model render as an extra section inside
@@ -232,21 +226,25 @@ pub async fn render_form(
     // fields, evaluated live in Edit mode. Empty string when the model has none.
     body.push_str(&crate::computed_fields::render_for_form(db, &config.table, record_id).await);
 
-    format!(
-        r##"<div class="max-w-5xl"><h1 class="text-2xl font-bold mb-6">{heading}</h1>{top_errors}
-<form method="post" action="{action}" class="card bg-base-100 shadow"><div class="card-body">
-{body}
-<div class="card-actions justify-end mt-2">
-<a href="{cancel}" class="btn btn-ghost">Cancel</a>
-<button type="submit" class="btn btn-primary">{submit}</button>
-</div></div></form></div>"##,
-        heading = html_escape(&heading),
-        top_errors = top_errors,
-        action = action,
-        body = body,
-        cancel = config.base_url,
+    // Wrap in the canonical centered sheet (shared with the generic Blueprint
+    // form). Validation errors render just inside the sheet, above the fields.
+    let inner = format!("{top_errors}{body}", top_errors = top_errors, body = body);
+    let footer = format!(
+        r#"<a href="{cancel}" class="btn btn-ghost">Cancel</a><button type="submit" class="btn btn-primary">{submit}</button>"#,
+        cancel = html_escape(&config.base_url),
         submit = submit,
-    )
+    );
+    let form_attrs = format!(r#"method="post" action="{}""#, html_escape(&action));
+    super::render_form_sheet(&super::FormSheet {
+        max_width: super::SHEET_WIDTH,
+        back_href: "",
+        control_row: "",
+        form_attrs: &form_attrs,
+        title: &heading,
+        inner: &inner,
+        footer: &footer,
+        below: "",
+    })
 }
 
 #[cfg(test)]
@@ -307,6 +305,16 @@ mod tests {
         assert!(html.contains("Details"));
         assert!(html.contains("action=\"/items/create\""));
         assert!(html.contains("Name is required"));
+        // Contract: the config-driven form engine — which every scaffolded
+        // plugin routes its create/edit forms through — MUST emit the canonical
+        // centered sheet. If this breaks, new plugins silently drift off the
+        // core form UI, so pin the sheet's structural markers here.
+        assert!(html.contains(crate::form::SHEET_WIDTH), "render_form must use the sheet width");
+        assert!(
+            html.contains("bg-base-100 rounded-lg shadow-sm border border-base-300"),
+            "render_form must wrap fields in the sheet container"
+        );
+        assert!(!html.contains("card bg-base-100 shadow"), "render_form must not use floating cards");
 
         let html = render_form(
             &pool, &c, FormMode::Edit, Some("abc-123"),

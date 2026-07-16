@@ -144,9 +144,9 @@ fn page_shell(title: &str, sidebar: &str) -> (String, &'static str) {
         r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><title>{}</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=18" rel="stylesheet"/>
-<script src="/static/vortex.js?v=18" defer></script>
-<script src="/static/vendor/tailwind.js"></script></head>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script>
+<link href="/static/tailwind.css?v=21" rel="stylesheet"/></head>
 <body class="min-h-screen bg-base-200">
 <div class="flex">{}<main class="flex-1 p-4 lg:p-6 min-w-0">"#,
         html_escape(title),
@@ -203,7 +203,7 @@ async fn cr_list(
         user.is_admin(),
         &state.plugin_registry,
         &user.roles,
-        "",
+        &db_ctx.custom_apps_html,
     );
 
     let mut body = String::new();
@@ -260,7 +260,7 @@ async fn cr_new_form(
         user.is_admin(),
         &state.plugin_registry,
         &user.roles,
-        "",
+        &db_ctx.custom_apps_html,
     );
 
     let mut cat_opts = String::new();
@@ -563,7 +563,7 @@ async fn cr_detail(
         user.is_admin(),
         &state.plugin_registry,
         &user.roles,
-        "",
+        &db_ctx.custom_apps_html,
     );
 
     let requester_display = requester_name.as_deref().unwrap_or(&requester_username);

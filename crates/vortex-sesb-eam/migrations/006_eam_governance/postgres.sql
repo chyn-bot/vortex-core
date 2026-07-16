@@ -259,3 +259,14 @@ BEGIN
             eam_approval_matrix, eam_approval_request, eam_approval_line TO vortex_runtime';
     END IF;
 END$$;
+
+-- Tag the roles seeded above with their owning module, so the platform scopes
+-- them to SESB EAM's install state: the auth path and the role pickers hide /
+-- ignore a plugin's roles wherever that plugin isn't installed. The core
+-- `roles.owning_module` column is added by an earlier core migration, which
+-- always runs before plugin migrations, so it exists here. On tenants that
+-- pre-date this line the same tagging is done by that core migration's backfill.
+UPDATE roles SET owning_module = 'sesb_eam'
+ WHERE company_id IS NULL
+   AND name IN ('EAM User', 'EAM Officer', 'EAM Manager', 'EAM Admin',
+                'EAM Asset Creator', 'EAM Asset Verifier');
