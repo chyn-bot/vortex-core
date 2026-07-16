@@ -365,6 +365,15 @@ pub trait Plugin: Send + Sync {
     /// Default: no job handlers.
     fn register_jobs(&self, _registry: &mut crate::jobs::JobRegistry) {}
 
+    /// Register batch-run processors (`crate::batch`). Called once at startup
+    /// while the host assembles the [`crate::batch::BatchRegistry`], before the
+    /// job worker starts. A processor is looked up by a run's `run_kind`, so
+    /// namespace kinds with the plugin's technical name — e.g. `billing.cycle`
+    /// — to avoid collisions.
+    ///
+    /// Default: no batch processors.
+    fn register_batch(&self, _registry: &mut crate::batch::BatchRegistry) {}
+
     /// Called once during host startup after the plugin is registered
     /// but before its routes are mounted. Use this for any initial
     /// setup that cannot be done in a synchronous constructor: loading

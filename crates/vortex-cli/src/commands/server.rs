@@ -2269,6 +2269,16 @@ pub async fn run(host: String, port: u16, _workers: Option<usize>) -> Result<()>
         for plugin in state.plugin_registry.plugins_iter() {
             plugin.register_jobs(&mut job_registry);
         }
+        // Assemble the batch-run processor registry from plugin contributions,
+        // then register the generic `batch.chunk` worker that dispatches to it.
+        let mut batch_registry = vortex_framework::batch::BatchRegistry::new();
+        for plugin in state.plugin_registry.plugins_iter() {
+            plugin.register_batch(&mut batch_registry);
+        }
+        vortex_framework::batch::register_worker(
+            &mut job_registry,
+            std::sync::Arc::new(batch_registry),
+        );
         vortex_framework::jobs::JobWorker::new(job_registry).start(state.clone());
     }
 
@@ -2600,6 +2610,12 @@ fn build_router(state: Arc<AppState>) -> Router {
     // `Plugin::reports()` is enough.
     let protected_routes =
         protected_routes.merge(vortex_framework::reports::reports_routes());
+    // ─── Batch run admin UI (core batch engine) ───────────────────
+    // Operator surface over runs the batch engine executes: progress,
+    // the fail-item exception queue, and retry. Admin-gated inside the
+    // handlers.
+    let protected_routes =
+        protected_routes.merge(vortex_framework::batch_admin::admin_routes());
     let protected_routes = protected_routes
         // Auth middleware wraps everything
         .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
