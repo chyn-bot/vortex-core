@@ -63,6 +63,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use rust_decimal::Decimal;
 use serde_json::{json, Value};
 use sqlx::postgres::PgPool;
 use sqlx::Row;
@@ -584,11 +585,64 @@ pub async fn retry_exceptions(
 
 // ─── Chunk worker ────────────────────────────────────────────────────────
 
+// ─── Run control: pause / resume / cancel ────────────────────────────────
+
+/// Pause a running run. Queued chunks bail at their boundary (leaving items
+/// pending), in-flight chunks finish their current batch. Idempotent for an
+/// already-paused run; a no-op unless the run is `running`.
+pub async fn pause(pool: &PgPool, run_id: Uuid) -> Result<(), String> {
+    sqlx::query("UPDATE batch_run SET status='paused' WHERE id=$1 AND status='running'")
+        .bind(run_id)
+        .execute(pool)
+        .await
+        .map_err(|e| format!("pause failed: {e}"))?;
+    Ok(())
+}
+
+/// Resume a paused run: flip it back to `running` and re-dispatch its remaining
+/// pending items (chunk jobs consumed while paused are re-created; processing is
+/// idempotent, so any stragglers are harmless). Returns chunk jobs dispatched.
+pub async fn resume(state: &Arc<AppState>, pool: &PgPool, run_id: Uuid) -> Result<usize, String> {
+    let res = sqlx::query("UPDATE batch_run SET status='running' WHERE id=$1 AND status='paused'")
+        .bind(run_id)
+        .execute(pool)
+        .await
+        .map_err(|e| format!("resume failed: {e}"))?;
+    if res.rows_affected() == 0 {
+        return Ok(0); // not paused — nothing to resume
+    }
+    start(state, pool, run_id).await
+}
+
+/// Cancel a run. It stops making progress (queued/future chunks bail, in-flight
+/// chunks finish their current batch) and is marked terminal. Pending items are
+/// left as-is for the record. Idempotent; a no-op on an already-terminal run.
+pub async fn cancel(pool: &PgPool, run_id: Uuid) -> Result<(), String> {
+    sqlx::query(
+        "UPDATE batch_run SET status='cancelled', finished_at=NOW() \
+         WHERE id=$1 AND status IN ('pending','running','paused')",
+    )
+    .bind(run_id)
+    .execute(pool)
+    .await
+    .map_err(|e| format!("cancel failed: {e}"))?;
+    Ok(())
+}
+
 // ─── Built-in processors + load harness ──────────────────────────────────
 
 /// `run_kind` of the built-in no-op processor used for load testing and
 /// smoke-testing the engine end to end without a domain plugin.
 pub const NOOP_RUN_KIND: &str = "batch.noop";
+
+/// `run_kind` of the built-in invoice load-test processor. Diagnostic sibling of
+/// [`NOOP_RUN_KIND`]: it does *realistic* per-item persistence — one invoice row
+/// plus N line rows — so a load test measures true write-bound throughput, not
+/// just engine overhead. It writes to the conventional load-test tables
+/// `lt_invoice` / `lt_invoice_line` (created by the benchmark harness), reads
+/// `customer_id` from the item payload and `line_count` (default 5) from the run
+/// params. Not for production billing — that is a vertical's own processor.
+pub const LOADTEST_INVOICE_RUN_KIND: &str = "batch.loadtest_invoice";
 
 /// Register the engine's built-in processors into `reg`. Currently just
 /// [`NOOP_RUN_KIND`]: a processor that does no domain work, so a run of it
@@ -608,6 +662,80 @@ pub fn register_builtin(reg: &mut BatchRegistry) {
             tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
         }
         Ok(None)
+    });
+
+    reg.register(LOADTEST_INVOICE_RUN_KIND, |ctx: ItemContext| async move {
+        // Assemble a simple invoice: `line_count` lines, deterministic amounts
+        // (realism of the numbers doesn't affect write cost — the point is the
+        // persistence). This mirrors what a real billing processor does at the
+        // write step: one header row + its lines.
+        let line_count = ctx
+            .params
+            .get("line_count")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(5)
+            .clamp(1, 100) as i32;
+        let customer_id = ctx
+            .payload
+            .get("customer_id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<Uuid>().ok())
+            .ok_or_else(|| ProcessError::at("parse", "item payload missing/invalid customer_id"))?;
+        let invoice_no = format!("INV-{}", ctx.item_key);
+
+        // Build the lines and total.
+        let mut total = Decimal::ZERO;
+        let mut line_vals = String::new();
+        for n in 1..=line_count {
+            let unit = Decimal::from(10 * n);
+            total += unit; // qty 1
+            if n > 1 {
+                line_vals.push(',');
+            }
+            // ($k..) placeholders filled below; 5 bound values per line after inv_id.
+            let b = 1 + (n as usize - 1) * 5;
+            line_vals.push_str(&format!(
+                "($1,${},${},${},${},${})",
+                b + 1,
+                b + 2,
+                b + 3,
+                b + 4,
+                b + 5
+            ));
+        }
+
+        // Insert the invoice header.
+        let inv_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO lt_invoice (run_id, customer_id, invoice_no, total, status) \
+             VALUES ($1,$2,$3,$4,'posted') RETURNING id",
+        )
+        .bind(ctx.run_id)
+        .bind(customer_id)
+        .bind(&invoice_no)
+        .bind(total)
+        .fetch_one(&ctx.pool)
+        .await
+        .map_err(|e| ProcessError::at("persist", format!("invoice insert failed: {e}")))?;
+
+        // Insert its lines in one multi-row statement.
+        let sql = format!(
+            "INSERT INTO lt_invoice_line (invoice_id, line_no, description, quantity, unit_price, amount) VALUES {line_vals}"
+        );
+        let mut q = sqlx::query(&sql).bind(inv_id);
+        for n in 1..=line_count {
+            let unit = Decimal::from(10 * n);
+            q = q
+                .bind(n)
+                .bind(format!("Line item {n}"))
+                .bind(Decimal::ONE)
+                .bind(unit)
+                .bind(unit);
+        }
+        q.execute(&ctx.pool)
+            .await
+            .map_err(|e| ProcessError::at("persist", format!("line insert failed: {e}")))?;
+
+        Ok(Some(json!({ "invoice_id": inv_id.to_string() })))
     });
 }
 
@@ -696,7 +824,11 @@ async fn handle_chunk(ctx: JobContext, batch_reg: Arc<BatchRegistry>) -> Result<
     .map_err(|e| format!("batch.chunk: load run failed: {e}"))?;
     let Some(run) = run else { return Ok(()) };
     let status: String = run.get("status");
-    if status == "cancelled" || status == "failed" {
+    // Cancelled/failed runs are terminal; a paused run should stop consuming
+    // work at the chunk boundary and leave its items pending for resume. In all
+    // three cases the chunk bails as a no-op success (the ir_job is done; the
+    // items are untouched), so pause/cancel take effect between chunks.
+    if status == "cancelled" || status == "failed" || status == "paused" {
         return Ok(());
     }
     let run_kind: String = run.get("run_kind");
