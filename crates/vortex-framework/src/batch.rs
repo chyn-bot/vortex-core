@@ -370,6 +370,19 @@ pub async fn start(
     let chunk_size: i32 = row.get::<i32, _>("chunk_size").max(1);
     let db_name: Option<String> = row.try_get("db_name").ok().flatten();
 
+    // Refresh planner statistics before the chunk workers start their batched
+    // writes. `add_items` bulk-loads the work set; immediately afterwards the
+    // table's stats are stale, and the (id, status) join in handle_chunk's
+    // set-based UPDATE will otherwise be planned as a hash-scan over *all*
+    // pending rows per chunk instead of a PK nested-loop — a 400k load test
+    // measured ~3s per chunk-write under the bad plan vs milliseconds after
+    // ANALYZE. Best-effort: a failure here (e.g. permissions) must not block the
+    // run, only leave it to autovacuum to catch up.
+    let _ = sqlx::query("ANALYZE batch_run_item")
+        .execute(pool)
+        .await
+        .map_err(|e| tracing::warn!(error = %e, "batch.start: ANALYZE skipped"));
+
     // Page through pending item ids in id order, enqueuing one job per chunk.
     let mut chunks = 0usize;
     let mut after: Option<Uuid> = None;
