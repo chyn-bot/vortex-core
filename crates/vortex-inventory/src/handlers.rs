@@ -911,15 +911,18 @@ async fn new_product_form(
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
     Extension(db_ctx): Extension<DatabaseContext>,
+    headers: vortex_plugin_sdk::axum::http::HeaderMap,
 ) -> Response {
     let sidebar = render_sidebar(&state, &user, &db_ctx);
+    // Return to the exact list view (search/sort/page) this form was opened from.
+    let back_href = vortex_plugin_sdk::framework::list_return_href(&headers, "/inventory");
     let categories = category_options(&db, None).await;
     let uoms = uom_options(&db, None).await;
     let doc_defaults = doc_defaults_card(&db, None, None, None, None, None).await;
 
     let content = format!(
         r#"<div class="max-w-2xl">
-<a href="/inventory" class="btn btn-ghost btn-sm mb-4">← Back to Products</a>
+<a href="{back_href}" class="btn btn-ghost btn-sm mb-4">← Back to Products</a>
 <h1 class="text-2xl font-bold mb-6">New Product</h1>
 <form method="POST" action="/inventory/products/create">
 <div class="card bg-base-100 shadow"><div class="card-body">
@@ -995,12 +998,13 @@ async fn new_product_form(
 {doc_defaults}
 <div class="flex gap-2 mt-4">
 <button type="submit" class="btn btn-primary btn-sm">Create</button>
-<a href="/inventory" class="btn btn-ghost btn-sm">Cancel</a>
+<a href="{back_href}" class="btn btn-ghost btn-sm">Cancel</a>
 </div>
 </form>
 </div>"#,
         categories = categories,
         uoms = uoms,
+        back_href = vortex_plugin_sdk::framework::html_escape(&back_href),
     );
 
     Html(page_shell(&sidebar, "New Product", &content)).into_response()
@@ -1109,9 +1113,12 @@ async fn edit_product(
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
     Extension(db_ctx): Extension<DatabaseContext>,
+    headers: vortex_plugin_sdk::axum::http::HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Response {
     let sidebar = render_sidebar(&state, &user, &db_ctx);
+    // Return to the exact list view (search/sort/page) the record was opened from.
+    let back_href = vortex_plugin_sdk::framework::list_return_href(&headers, "/inventory");
 
     let row = match vortex_plugin_sdk::sqlx::query(
         "SELECT id, code, name, barcode, description, sales_description, purchase_description, classification_code, income_account_id, expense_account_id, sales_tax_id, purchase_tax_id, list_price, category_id, product_type, \
@@ -1237,7 +1244,7 @@ async fn edit_product(
     let content = format!(
         r#"<div class="flex items-center justify-between mb-6">
 <div>
-<a href="/inventory" class="btn btn-ghost btn-sm mb-2">← Back to Products</a>
+<a href="{back_href}" class="btn btn-ghost btn-sm mb-2">← Back to Products</a>
 <h1 class="text-2xl font-bold">{name} <span class="text-base-content/40 font-mono text-sm">{code}</span></h1>
 </div>
 <div class="flex items-center gap-2">
@@ -1348,10 +1355,11 @@ async fn edit_product(
 <div class="mt-6">{doc_defaults}</div>
 <div class="mt-6 flex gap-2">
 <button type="submit" class="btn btn-primary btn-sm">Save</button>
-<a href="/inventory" class="btn btn-ghost btn-sm">Cancel</a>
+<a href="{back_href}" class="btn btn-ghost btn-sm">Cancel</a>
 </div>
 </form>"#,
         id = id,
+        back_href = esc(&back_href),
         name = esc(&name),
         code = esc(&code),
         dup_btn = duplicate_button(&format!("/inventory/products/{id}/duplicate")),

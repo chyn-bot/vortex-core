@@ -593,41 +593,6 @@ async fn create_contact(
 }
 
 /// GET /contacts/:id — edit form for an existing contact.
-/// Build a "back to list" href that preserves the caller's list state
-/// (search / sort / page) by reading it off the `Referer`.
-///
-/// Same-origin navigation from the list carries the full query string under
-/// our `strict-origin-when-cross-origin` referrer policy, so a record opened
-/// from `/contacts?search=…&page=3` returns to that exact view. The result
-/// is **only ever** a path+query on `list_path` — a referer pointing
-/// anywhere else falls back to the bare list path, so this can't be turned
-/// into an open redirect. The caller still HTML-escapes the value before
-/// embedding it, since the query portion is attacker-influenceable.
-fn list_return_href(headers: &vortex_plugin_sdk::axum::http::HeaderMap, list_path: &str) -> String {
-    let referer = match headers.get("referer").and_then(|v| v.to_str().ok()) {
-        Some(r) => r,
-        None => return list_path.to_string(),
-    };
-    // Reduce an absolute referer (scheme://host/path?q) to path+query.
-    let path_and_query = match referer.find("://") {
-        Some(i) => match referer[i + 3..].find('/') {
-            Some(j) => &referer[i + 3 + j..],
-            None => return list_path.to_string(),
-        },
-        None => referer, // already relative
-    };
-    // Honor it only when the path is exactly the list path.
-    let path = path_and_query
-        .split(|c| c == '?' || c == '#')
-        .next()
-        .unwrap_or("");
-    if path == list_path {
-        path_and_query.to_string()
-    } else {
-        list_path.to_string()
-    }
-}
-
 async fn edit_contact(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
@@ -639,7 +604,7 @@ async fn edit_contact(
     // Preserve the caller's list state (search/sort/page) on "Back to
     // Contacts" — derived from the Referer so a record opened from a
     // filtered/searched list returns to that same view, not page 1.
-    let back_href = list_return_href(&headers, "/contacts");
+    let back_href = vortex_plugin_sdk::framework::list_return_href(&headers, "/contacts");
     let display_name = user.full_name.as_deref().unwrap_or(&user.username);
     let initials = vortex_plugin_sdk::framework::get_initials(display_name);
     let installed = db_ctx.installed_modules.clone();
@@ -1420,56 +1385,3 @@ async fn duplicate_contact(
     vortex_plugin_sdk::axum::response::Redirect::to(&format!("/contacts/{new_id}")).into_response()
 }
 
-#[cfg(test)]
-mod back_href_tests {
-    use super::list_return_href;
-    use vortex_plugin_sdk::axum::http::HeaderMap;
-
-    fn with_referer(r: &str) -> HeaderMap {
-        let mut h = HeaderMap::new();
-        h.insert("referer", r.parse().unwrap());
-        h
-    }
-
-    #[test]
-    fn preserves_list_query_from_absolute_referer() {
-        let h = with_referer("http://localhost:3003/contacts?search=23356&page=3");
-        assert_eq!(
-            list_return_href(&h, "/contacts"),
-            "/contacts?search=23356&page=3"
-        );
-    }
-
-    #[test]
-    fn preserves_query_from_relative_referer() {
-        let h = with_referer("/contacts?sort=name&dir=desc");
-        assert_eq!(list_return_href(&h, "/contacts"), "/contacts?sort=name&dir=desc");
-    }
-
-    #[test]
-    fn bare_list_path_when_no_referer() {
-        assert_eq!(list_return_href(&HeaderMap::new(), "/contacts"), "/contacts");
-    }
-
-    #[test]
-    fn ignores_referer_whose_path_is_not_the_list() {
-        // A record page or another module must not become the back target
-        // — the path doesn't match, so fall back to the list root.
-        let h = with_referer("http://localhost:3003/contacts/abc-123");
-        assert_eq!(list_return_href(&h, "/contacts"), "/contacts");
-        let h = with_referer("http://localhost:3003/accounting/invoices");
-        assert_eq!(list_return_href(&h, "/contacts"), "/contacts");
-    }
-
-    #[test]
-    fn output_is_always_a_relative_path_never_cross_origin() {
-        // The host is stripped by design: we only ever emit a path+query
-        // relative to our own origin, so a crafted cross-origin referer
-        // cannot become an open redirect — at worst it yields a harmless
-        // relative link to our own list (the caller HTML-escapes it too).
-        let h = with_referer("http://evil.example/contacts?x=1");
-        let out = list_return_href(&h, "/contacts");
-        assert_eq!(out, "/contacts?x=1");
-        assert!(out.starts_with('/'), "must be relative, got: {out}");
-    }
-}

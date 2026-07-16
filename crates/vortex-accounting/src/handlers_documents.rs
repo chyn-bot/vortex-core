@@ -978,11 +978,14 @@ async fn new_document_form(
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
     Extension(db_ctx): Extension<DatabaseContext>,
+    headers: vortex_plugin_sdk::axum::http::HeaderMap,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
     let sidebar = render_sidebar(&state, &user, &db_ctx);
     let kind = query.get("kind").map(String::as_str).unwrap_or("customer_invoice");
     let (family_title, family_url, partner_kind) = doc_family(kind);
+    // Return to the exact family list view (search/sort/page) if we came from it.
+    let back_href = vortex_plugin_sdk::framework::list_return_href(&headers, family_url);
     // Partner is a typeahead over contacts (thousands of rows), scoped to the
     // right side of the ledger. The descriptor is signed server-side, so this
     // filter can't be tampered with by the browser.
@@ -1033,7 +1036,7 @@ async fn new_document_form(
 
     let content = format!(
         r#"<div class="max-w-xl">
-<a href="{family_url}" class="btn btn-ghost btn-sm mb-4">← Back to {family_title}</a>
+<a href="{back_href}" class="btn btn-ghost btn-sm mb-4">← Back to {family_title}</a>
 <h1 class="text-2xl font-bold mb-6">New {label}</h1>
 <form method="POST" action="/accounting/documents/create">
 <div class="card bg-base-100 shadow"><div class="card-body">
@@ -1064,7 +1067,7 @@ async fn new_document_form(
 </form>
 <p class="text-sm opacity-60 mt-4">Lines are added on the document page; posting expands them into balanced journal lines.</p>
 </div>"#,
-        family_url = family_url,
+        back_href = vortex_plugin_sdk::framework::html_escape(&back_href),
         family_title = family_title,
         label = doc_type_label(kind),
         type_options = type_options,
@@ -1189,6 +1192,7 @@ async fn document_detail(
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
     Extension(db_ctx): Extension<DatabaseContext>,
+    headers: vortex_plugin_sdk::axum::http::HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Response {
     let esc = vortex_plugin_sdk::framework::html_escape;
@@ -1229,6 +1233,8 @@ async fn document_detail(
     let origin_ref: Option<String> = head.get("origin_ref");
     let is_draft = doc_state == "draft";
     let (family_title, family_url, _) = doc_family(&move_type);
+    // Return to the exact family list view (search/sort/page) if we came from it.
+    let back_href = vortex_plugin_sdk::framework::list_return_href(&headers, family_url);
     let use_kind = if move_type.starts_with("customer") { "sale" } else { "purchase" };
 
     // Document lines. Customer documents show the LHDN classification
@@ -1731,7 +1737,7 @@ onsubmit="return confirm('Reset to draft? You can edit and repost — the docume
 
     let content = format!(
         r#"<div class="w-full">
-<a href="{family_url}" class="btn btn-ghost btn-sm mb-4">← Back to {family_title}</a>
+<a href="{back_href}" class="btn btn-ghost btn-sm mb-4">← Back to {family_title}</a>
 <div class="flex items-center justify-between mb-4">
 <h1 class="text-2xl font-bold">{number} <span class="text-base opacity-60 font-normal">{type_label}</span> {state_badge} {payment_badge}</h1>
 <div class="vortex-actions">{actions}</div>
@@ -1760,7 +1766,7 @@ onsubmit="return confirm('Reset to draft? You can edit and repost — the docume
 <div class="mt-6">{activity_panel}</div>
 <div class="mt-6">{history}</div>
 </div>"#,
-        family_url = family_url,
+        back_href = vortex_plugin_sdk::framework::html_escape(&back_href),
         family_title = family_title,
         number = esc(&number),
         type_label = doc_type_label(&move_type),

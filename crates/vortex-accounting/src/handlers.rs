@@ -415,13 +415,16 @@ async fn new_move_form(
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
     Extension(db_ctx): Extension<DatabaseContext>,
+    headers: vortex_plugin_sdk::axum::http::HeaderMap,
 ) -> Response {
     let sidebar = render_sidebar(&state, &user, &db_ctx);
+    // Return to the exact list view (search/sort/page) this form was opened from.
+    let back_href = vortex_plugin_sdk::framework::list_return_href(&headers, "/accounting");
     let journals = journal_options(&db, None).await;
 
     let content = format!(
         r#"<div class="max-w-xl">
-<a href="/accounting" class="btn btn-ghost btn-sm mb-4">← Back to Journal Entries</a>
+<a href="{back_href}" class="btn btn-ghost btn-sm mb-4">← Back to Journal Entries</a>
 <h1 class="text-2xl font-bold mb-6">New Journal Entry</h1>
 <form method="POST" action="/accounting/moves/create">
 <div class="card bg-base-100 shadow"><div class="card-body">
@@ -449,6 +452,7 @@ async fn new_move_form(
 <p class="text-sm opacity-60 mt-4">Lines are added on the entry page; the entry can be posted once debits equal credits.</p>
 </div>"#,
         journals = journals,
+        back_href = vortex_plugin_sdk::framework::html_escape(&back_href),
     );
     Html(page_shell(&sidebar, "New Journal Entry", &content)).into_response()
 }
@@ -512,9 +516,12 @@ async fn move_detail(
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
     Extension(db_ctx): Extension<DatabaseContext>,
+    headers: vortex_plugin_sdk::axum::http::HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Response {
     let esc = vortex_plugin_sdk::framework::html_escape;
+    // Return to the exact list view (search/sort/page) the record was opened from.
+    let back_href = vortex_plugin_sdk::framework::list_return_href(&headers, "/accounting");
     let sidebar = render_sidebar(&state, &user, &db_ctx);
 
     let Some(head) = vortex_plugin_sdk::sqlx::query(
@@ -752,7 +759,7 @@ async fn move_detail(
 
     let content = format!(
         r#"<div class="max-w-5xl">
-<a href="/accounting" class="btn btn-ghost btn-sm mb-4">← Back to Journal Entries</a>
+<a href="{back_href}" class="btn btn-ghost btn-sm mb-4">← Back to Journal Entries</a>
 <div class="flex items-center justify-between mb-4">
 <h1 class="text-2xl font-bold">{number} <span class="text-base opacity-60 font-normal">{journal_code} · {journal_name}</span> {badge}</h1>
 <div>{actions}</div>
@@ -777,6 +784,7 @@ async fn move_detail(
 <div class="mt-6">{activity_panel}</div>
 <div class="mt-6">{history}</div>
 </div>"#,
+        back_href = esc(&back_href),
         number = esc(&number),
         journal_code = esc(&journal_code),
         journal_name = esc(&journal_name),

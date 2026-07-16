@@ -16,7 +16,7 @@
 //!   `vortex-cli/src/commands/server.rs` because they are the host's
 //!   own concerns, not framework-level primitives.
 
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use chrono::{DateTime, Utc};
 
@@ -83,6 +83,59 @@ pub fn get_initials(name: &str) -> String {
         .take(2)
         .collect::<String>()
         .to_uppercase()
+}
+
+/// Build a "back to list" href that preserves the caller's list state
+/// (search / sort / filters / page) by reading it off the request `Referer`.
+///
+/// A record page opened from `/contacts?search=foo&page=3` should return to
+/// that exact view, not the bare list. Same-origin navigation carries the
+/// full list URL in the `Referer` under the platform's
+/// `strict-origin-when-cross-origin` policy, so this recovers it without
+/// threading list state through every record link.
+///
+/// The result is **only ever** a path+query on `list_path`: a `Referer`
+/// pointing at a record page, another module, or an external origin falls
+/// back to the bare `list_path`. The host portion is stripped, so the return
+/// value is always a relative path on our own origin — it can never become
+/// an open redirect. Because the query portion is attacker-influenceable,
+/// **callers must HTML-escape the value** before embedding it in an
+/// attribute (e.g. via [`html_escape`]).
+///
+/// ```
+/// use axum::http::HeaderMap;
+/// use vortex_framework::ui::list_return_href;
+///
+/// let mut h = HeaderMap::new();
+/// h.insert("referer", "http://host/contacts?search=foo&page=3".parse().unwrap());
+/// assert_eq!(list_return_href(&h, "/contacts"), "/contacts?search=foo&page=3");
+///
+/// // Wrong path or no referer → bare list path.
+/// assert_eq!(list_return_href(&HeaderMap::new(), "/contacts"), "/contacts");
+/// ```
+pub fn list_return_href(headers: &HeaderMap, list_path: &str) -> String {
+    let referer = match headers.get("referer").and_then(|v| v.to_str().ok()) {
+        Some(r) => r,
+        None => return list_path.to_string(),
+    };
+    // Reduce an absolute referer (scheme://host/path?q) to path+query.
+    let path_and_query = match referer.find("://") {
+        Some(i) => match referer[i + 3..].find('/') {
+            Some(j) => &referer[i + 3 + j..],
+            None => return list_path.to_string(),
+        },
+        None => referer, // already relative
+    };
+    // Honor it only when the path is exactly the list path.
+    let path = path_and_query
+        .split(|c| c == '?' || c == '#')
+        .next()
+        .unwrap_or("");
+    if path == list_path {
+        path_and_query.to_string()
+    } else {
+        list_path.to_string()
+    }
 }
 
 /// Render a short relative-time string like `"5 min ago"` for a past
@@ -285,6 +338,45 @@ mod tests {
     #[test]
     fn html_escape_covers_owasp_set() {
         assert_eq!(html_escape("<>\"'&"), "&lt;&gt;&quot;&#x27;&amp;");
+    }
+
+    fn referer(r: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("referer", r.parse().unwrap());
+        h
+    }
+
+    #[test]
+    fn list_return_href_preserves_query_from_absolute_referer() {
+        let h = referer("http://localhost:3003/contacts?search=23356&page=3");
+        assert_eq!(list_return_href(&h, "/contacts"), "/contacts?search=23356&page=3");
+    }
+
+    #[test]
+    fn list_return_href_preserves_query_from_relative_referer() {
+        let h = referer("/accounting?sort=date&dir=desc");
+        assert_eq!(list_return_href(&h, "/accounting"), "/accounting?sort=date&dir=desc");
+    }
+
+    #[test]
+    fn list_return_href_falls_back_without_or_on_wrong_referer() {
+        assert_eq!(list_return_href(&HeaderMap::new(), "/inventory"), "/inventory");
+        // A record page under the same module is not the list itself.
+        let h = referer("http://host/inventory/abc-123");
+        assert_eq!(list_return_href(&h, "/inventory"), "/inventory");
+        // A different module's list.
+        let h = referer("http://host/contacts?search=x");
+        assert_eq!(list_return_href(&h, "/inventory"), "/inventory");
+    }
+
+    #[test]
+    fn list_return_href_output_is_always_relative_never_cross_origin() {
+        // Host is stripped by design: a crafted cross-origin referer yields
+        // only a relative link to our own list, never an open redirect.
+        let h = referer("http://evil.example/contacts?x=1");
+        let out = list_return_href(&h, "/contacts");
+        assert_eq!(out, "/contacts?x=1");
+        assert!(out.starts_with('/'));
     }
 
     #[test]

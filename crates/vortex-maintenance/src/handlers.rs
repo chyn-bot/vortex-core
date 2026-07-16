@@ -854,9 +854,12 @@ async fn create_work_order(
 async fn edit_work_order(
     State(state): State<Arc<AppState>>, Db(db): Db,
     Extension(user): Extension<AuthUser>, Extension(db_ctx): Extension<DatabaseContext>,
+    headers: vortex_plugin_sdk::axum::http::HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Response {
     let sidebar = render_sidebar(&state, &user, &db_ctx);
+    // Return to the exact list view (search/sort/page) the record was opened from.
+    let back_href = vortex_plugin_sdk::framework::list_return_href(&headers, "/maintenance");
     let row = match vortex_plugin_sdk::sqlx::query(
         "SELECT w.number, w.asset_id, w.wo_type, w.priority, w.state, \
                 w.scheduled_date::text AS scheduled_date, w.assigned_to, w.consume_location_id, \
@@ -1006,7 +1009,7 @@ async fn edit_work_order(
     let activity_panel = vortex_plugin_sdk::framework::render_chatter_panel("maint_work_order", id);
     let content = format!(
         r#"<div class="flex items-center justify-between mb-4">
-<div><a href="/maintenance" class="btn btn-ghost btn-sm mb-2">← Back to Work Orders</a>
+<div><a href="{back_href}" class="btn btn-ghost btn-sm mb-2">← Back to Work Orders</a>
 <h1 class="text-2xl font-bold">{number} {badge}</h1></div>
 <div>{actions}</div></div>
 
@@ -1022,6 +1025,7 @@ async fn edit_work_order(
 </div></div>
 <div class="mt-6">{activity_panel}</div>"#,
         number = esc(&number), badge = wo_state_badge(&wstate), actions = actions,
+        back_href = esc(&back_href),
         header = header, parts = parts_html, add_part = add_part,
     );
     Html(page_shell(&sidebar, &format!("WO {}", number), &content)).into_response()

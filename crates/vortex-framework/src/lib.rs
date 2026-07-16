@@ -137,5 +137,5 @@ pub use sidebar::{build_sidebar, build_sidebar_nav};
 pub use state::{AppState, DatabaseContext};
 pub use ui::{
     build_pagination_html, error_response, format_number, format_time_ago, forbidden_page,
-    get_initials, html_escape, new_record_url, record_url,
+    get_initials, html_escape, list_return_href, new_record_url, record_url,
 };
