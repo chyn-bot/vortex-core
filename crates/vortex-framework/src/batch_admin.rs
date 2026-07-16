@@ -42,6 +42,9 @@ pub fn admin_routes() -> Router<Arc<AppState>> {
         .route("/batch/runs/{id}/exceptions", get(exceptions_page))
         .route("/batch/runs/{id}/retry", post(retry_all))
         .route("/batch/runs/{id}/items/{item_id}/retry", post(retry_one))
+        .route("/batch/runs/{id}/pause", post(pause_run))
+        .route("/batch/runs/{id}/resume", post(resume_run))
+        .route("/batch/runs/{id}/cancel", post(cancel_run))
 }
 
 /// Wrap a page body in the standard app shell with the sidebar, marking the
@@ -68,6 +71,7 @@ fn status_badge(status: &str) -> &'static str {
     match status {
         "completed" => r#"<span class="badge badge-success badge-sm">Completed</span>"#,
         "running" => r#"<span class="badge badge-info badge-sm">Running</span>"#,
+        "paused" => r#"<span class="badge badge-warning badge-sm">Paused</span>"#,
         "pending" => r#"<span class="badge badge-ghost badge-sm">Pending</span>"#,
         "cancelled" => r#"<span class="badge badge-warning badge-sm">Cancelled</span>"#,
         "failed" => r#"<span class="badge badge-error badge-sm">Failed</span>"#,
@@ -181,6 +185,30 @@ async fn run_detail(
         ""
     };
 
+    // Status-aware run controls: pause/cancel while active, resume while paused.
+    let controls = match run.status.as_str() {
+        "running" => format!(
+            r#"<form method="POST" action="/batch/runs/{id}/pause" class="inline"><button class="btn btn-sm">Pause</button></form>
+               <form method="POST" action="/batch/runs/{id}/cancel" class="inline"><button class="btn btn-sm btn-error btn-outline" onclick="return confirm('Cancel this run?')">Cancel</button></form>"#,
+            id = id
+        ),
+        "paused" => format!(
+            r#"<form method="POST" action="/batch/runs/{id}/resume" class="inline"><button class="btn btn-sm btn-primary">Resume</button></form>
+               <form method="POST" action="/batch/runs/{id}/cancel" class="inline"><button class="btn btn-sm btn-error btn-outline" onclick="return confirm('Cancel this run?')">Cancel</button></form>"#,
+            id = id
+        ),
+        "pending" => format!(
+            r#"<form method="POST" action="/batch/runs/{id}/cancel" class="inline"><button class="btn btn-sm btn-error btn-outline">Cancel</button></form>"#,
+            id = id
+        ),
+        _ => String::new(),
+    };
+    let controls_block = if controls.is_empty() {
+        String::new()
+    } else {
+        format!(r#"<div class="flex gap-2 mb-4">{controls}</div>"#)
+    };
+
     let exceptions_block = if run.exception_items > 0 {
         format!(
             r#"<div class="alert alert-warning mt-6">
@@ -216,8 +244,9 @@ async fn run_detail(
   </div>
 
   <div class="mb-1 text-sm opacity-70">{pct}% processed</div>
-  <progress class="progress progress-primary w-full" value="{processed}" max="{total_or_one}"></progress>
+  <progress class="progress progress-primary w-full mb-4" value="{processed}" max="{total_or_one}"></progress>
 
+  {controls_block}
   {exceptions_block}
 </div>"#,
         kind = html_escape(&run.run_kind),
@@ -230,6 +259,7 @@ async fn run_detail(
         exceptions = run.exception_items,
         pct = pct,
         total_or_one = run.total_items.max(1),
+        controls_block = controls_block,
         exceptions_block = exceptions_block,
     );
 
@@ -348,4 +378,52 @@ async fn retry_one(
     )
     .await;
     Redirect::to(&format!("/batch/runs/{id}/exceptions")).into_response()
+}
+
+async fn pause_run(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Path(id): Path<Uuid>,
+    Extension(user): Extension<AuthUser>,
+) -> Response {
+    if !user.is_admin() {
+        return (axum::http::StatusCode::FORBIDDEN, Html(forbidden_page("Batch Runs"))).into_response();
+    }
+    if let Err(e) = crate::batch::pause(&db, id).await {
+        return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
+    crate::audit_events::emit(&state, &user, "batch.run.paused", "batch_run", id.to_string(), serde_json::json!({})).await;
+    Redirect::to(&format!("/batch/runs/{id}")).into_response()
+}
+
+async fn resume_run(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Path(id): Path<Uuid>,
+    Extension(user): Extension<AuthUser>,
+) -> Response {
+    if !user.is_admin() {
+        return (axum::http::StatusCode::FORBIDDEN, Html(forbidden_page("Batch Runs"))).into_response();
+    }
+    if let Err(e) = crate::batch::resume(&state, &db, id).await {
+        return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
+    crate::audit_events::emit(&state, &user, "batch.run.resumed", "batch_run", id.to_string(), serde_json::json!({})).await;
+    Redirect::to(&format!("/batch/runs/{id}")).into_response()
+}
+
+async fn cancel_run(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Path(id): Path<Uuid>,
+    Extension(user): Extension<AuthUser>,
+) -> Response {
+    if !user.is_admin() {
+        return (axum::http::StatusCode::FORBIDDEN, Html(forbidden_page("Batch Runs"))).into_response();
+    }
+    if let Err(e) = crate::batch::cancel(&db, id).await {
+        return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
+    crate::audit_events::emit(&state, &user, "batch.run.cancelled", "batch_run", id.to_string(), serde_json::json!({})).await;
+    Redirect::to(&format!("/batch/runs/{id}")).into_response()
 }
