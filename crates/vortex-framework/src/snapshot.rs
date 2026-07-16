@@ -183,6 +183,33 @@ pub async fn seal(pool: &PgPool, set_id: Uuid) -> Result<(), String> {
     Ok(())
 }
 
+/// Like [`seal`], but also writes a WORM audit event attributing the seal to
+/// `user`. Sealing freezes the inputs a computation reads, so it is a
+/// defensibility checkpoint worth attributing in the ledger.
+pub async fn seal_audited(
+    state: &crate::state::AppState,
+    user: &crate::auth::AuthUser,
+    pool: &PgPool,
+    set_id: Uuid,
+) -> Result<(), String> {
+    seal(pool, set_id).await?;
+    let set = get_set(pool, set_id).await.ok().flatten();
+    let count = record_count(pool, set_id).await.unwrap_or(0);
+    let (label, version) = set
+        .map(|s| (s.label, s.version))
+        .unwrap_or_default();
+    crate::audit_events::emit(
+        state,
+        user,
+        "snapshot.sealed",
+        "snapshot_set",
+        set_id.to_string(),
+        serde_json::json!({ "label": label, "version": version, "records": count }),
+    )
+    .await;
+    Ok(())
+}
+
 /// Read one frozen record's data by entity key. This is the only thing a
 /// deterministic calculation should read.
 pub async fn get_record(

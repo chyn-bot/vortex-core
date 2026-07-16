@@ -2219,6 +2219,8 @@ pub async fn run(host: String, port: u16, _workers: Option<usize>) -> Result<()>
         // Assemble the batch-run processor registry from plugin contributions,
         // then register the generic `batch.chunk` worker that dispatches to it.
         let mut batch_registry = vortex_framework::batch::BatchRegistry::new();
+        // Built-in processors (batch.noop load-test baseline), then plugins.
+        vortex_framework::batch::register_builtin(&mut batch_registry);
         for plugin in state.plugin_registry.plugins_iter() {
             plugin.register_batch(&mut batch_registry);
         }
@@ -2226,7 +2228,20 @@ pub async fn run(host: String, port: u16, _workers: Option<usize>) -> Result<()>
             &mut job_registry,
             std::sync::Arc::new(batch_registry),
         );
-        vortex_framework::jobs::JobWorker::new(job_registry).start(state.clone());
+        // Throughput tuning for high-volume batch runs. Defaults (batch 10,
+        // poll 5s) suit light background work; a large billing/import run wants
+        // more claimed-per-tick and a tighter poll. Both overridable via env so
+        // ops can tune without a rebuild:
+        //   VORTEX_JOB_BATCH   — jobs claimed & run concurrently per tick
+        //   VORTEX_JOB_POLL_MS — poll interval in milliseconds
+        let mut worker = vortex_framework::jobs::JobWorker::new(job_registry);
+        if let Some(n) = std::env::var("VORTEX_JOB_BATCH").ok().and_then(|v| v.parse::<i64>().ok()) {
+            worker = worker.with_batch_size(n);
+        }
+        if let Some(ms) = std::env::var("VORTEX_JOB_POLL_MS").ok().and_then(|v| v.parse::<u64>().ok()) {
+            worker = worker.with_poll_interval(std::time::Duration::from_millis(ms));
+        }
+        worker.start(state.clone());
     }
 
     // Run each plugin's async startup hook. Failures are logged but do

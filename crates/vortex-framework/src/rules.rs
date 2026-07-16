@@ -400,6 +400,39 @@ pub async fn publish(pool: &PgPool, rule_set_id: Uuid) -> Result<(), String> {
     Ok(())
 }
 
+/// Like [`publish`], but also writes a WORM audit event attributing the publish
+/// to `user`. Publishing a rule version changes what every subsequent run
+/// computes, so it is a governance action a regulated deployment must be able to
+/// attribute — hence the audited entry point for UI/admin callers.
+pub async fn publish_audited(
+    state: &crate::state::AppState,
+    user: &crate::auth::AuthUser,
+    pool: &PgPool,
+    rule_set_id: Uuid,
+) -> Result<(), String> {
+    publish(pool, rule_set_id).await?;
+    // Include code/version in the event for a human-readable ledger entry.
+    let meta = sqlx::query("SELECT code, version FROM rule_set WHERE id=$1")
+        .bind(rule_set_id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten();
+    let (code, version) = meta
+        .map(|r| (r.get::<String, _>("code"), r.get::<i32, _>("version")))
+        .unwrap_or_default();
+    crate::audit_events::emit(
+        state,
+        user,
+        "rule_set.published",
+        "rule_set",
+        rule_set_id.to_string(),
+        serde_json::json!({ "code": code, "version": version }),
+    )
+    .await;
+    Ok(())
+}
+
 fn row_to_rule(r: &sqlx::postgres::PgRow) -> Result<Rule, String> {
     let condition: Value = r.get("condition");
     let amount: Value = r.get("amount");

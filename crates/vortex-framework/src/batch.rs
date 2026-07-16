@@ -271,6 +271,30 @@ pub async fn create_run(pool: &PgPool, spec: NewBatchRun) -> Result<Uuid, String
     Ok(id)
 }
 
+/// Like [`create_run`], but also writes a WORM audit event attributing the run
+/// to `user`. Use from a caller that has a human actor (an admin action, a
+/// trigger carrying a session); system-triggered callers use [`create_run`].
+pub async fn create_run_audited(
+    state: &AppState,
+    user: &crate::auth::AuthUser,
+    pool: &PgPool,
+    spec: NewBatchRun,
+) -> Result<Uuid, String> {
+    let run_kind = spec.run_kind.clone();
+    let trial = spec.trial;
+    let id = create_run(pool, spec).await?;
+    crate::audit_events::emit(
+        state,
+        user,
+        "batch.run.created",
+        "batch_run",
+        id.to_string(),
+        json!({ "run_kind": run_kind, "trial": trial }),
+    )
+    .await;
+    Ok(id)
+}
+
 /// Rows per multi-value INSERT when loading items. Kept well under Postgres'
 /// 65535 bound-parameter ceiling (3 params/row).
 const LOAD_BATCH: usize = 1000;
@@ -547,6 +571,74 @@ pub async fn retry_exceptions(
 
 // ─── Chunk worker ────────────────────────────────────────────────────────
 
+// ─── Built-in processors + load harness ──────────────────────────────────
+
+/// `run_kind` of the built-in no-op processor used for load testing and
+/// smoke-testing the engine end to end without a domain plugin.
+pub const NOOP_RUN_KIND: &str = "batch.noop";
+
+/// Register the engine's built-in processors into `reg`. Currently just
+/// [`NOOP_RUN_KIND`]: a processor that does no domain work, so a run of it
+/// measures the engine's own throughput (dispatch + claim + item writes) — the
+/// load-test baseline. Per-item behaviour is driven by the item payload:
+///
+/// - `{"sleep_ms": N}` — sleep to simulate work of a known cost.
+/// - `{"fail": true}`  — return an error, to exercise the exception path.
+///
+/// Call from the host while assembling the [`BatchRegistry`], before plugins.
+pub fn register_builtin(reg: &mut BatchRegistry) {
+    reg.register(NOOP_RUN_KIND, |ctx: ItemContext| async move {
+        if ctx.payload.get("fail").and_then(|v| v.as_bool()) == Some(true) {
+            return Err(ProcessError::at("noop", "synthetic failure"));
+        }
+        if let Some(ms) = ctx.payload.get("sleep_ms").and_then(|v| v.as_u64()) {
+            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+        }
+        Ok(None)
+    });
+}
+
+/// Build a synthetic load item: a zero-padded key under `prefix` plus a payload.
+/// Pure — the deterministic core of [`seed_run`], exposed for testing.
+pub fn synthetic_item(prefix: &str, index: usize, payload: Value) -> NewItem {
+    NewItem::new(format!("{prefix}-{index:08}"), payload)
+}
+
+/// Seed a load-test run: create a run from `spec` and load `count` synthetic
+/// items (keys `{key_prefix}-00000000` …, each carrying `item_payload`). Returns
+/// the run id, ready for [`start`]. Combine with [`register_builtin`] and a
+/// [`NOOP_RUN_KIND`] spec to measure engine throughput against the target.
+///
+/// The whole flow, for a 400k baseline:
+/// ```rust,ignore
+/// let id = seed_run(pool, NewBatchRun::new(NOOP_RUN_KIND).chunk_size(1000), 400_000, "load", json!({})).await?;
+/// start(state, pool, id).await?;               // watch /batch/runs/{id}
+/// // items/sec ≈ total_items / (finished_at − started_at)
+/// ```
+pub async fn seed_run(
+    pool: &PgPool,
+    spec: NewBatchRun,
+    count: usize,
+    key_prefix: &str,
+    item_payload: Value,
+) -> Result<Uuid, String> {
+    let run_id = create_run(pool, spec).await?;
+    // Build and load in windows so a huge count never holds all items at once.
+    const WINDOW: usize = 5000;
+    let mut buf: Vec<NewItem> = Vec::with_capacity(WINDOW.min(count));
+    for i in 0..count {
+        buf.push(synthetic_item(key_prefix, i, item_payload.clone()));
+        if buf.len() == WINDOW {
+            add_items(pool, run_id, &buf).await?;
+            buf.clear();
+        }
+    }
+    if !buf.is_empty() {
+        add_items(pool, run_id, &buf).await?;
+    }
+    Ok(run_id)
+}
+
 /// Register the `batch.chunk` job handler, capturing the processor registry.
 /// Call once at startup from the host, after building the [`BatchRegistry`]
 /// from plugin contributions. Mirrors [`crate::jobs::register_core_handlers`].
@@ -602,25 +694,33 @@ async fn handle_chunk(ctx: JobContext, batch_reg: Arc<BatchRegistry>) -> Result<
         .get(&run_kind)
         .ok_or_else(|| format!("batch.chunk: no processor registered for run_kind '{run_kind}'"))?;
 
-    let mut n_succeeded = 0i32;
-    let mut n_exception = 0i32;
+    // Bulk-load the still-pending items for this chunk in ONE query. Items
+    // already terminal (a chunk re-run after a crash) are simply absent from the
+    // result, so they are skipped — idempotent restart, without a query per item.
+    let rows = sqlx::query(
+        "SELECT id, item_key, payload, attempts FROM batch_run_item \
+         WHERE run_id = $1 AND id = ANY($2) AND status = 'pending' ORDER BY id",
+    )
+    .bind(run_id)
+    .bind(&item_ids)
+    .fetch_all(&pool)
+    .await
+    .map_err(|e| format!("batch.chunk: load items failed: {e}"))?;
 
-    for item_id in item_ids {
-        // Load the item only if still pending — skips work already done, which
-        // is what makes a chunk re-run after a crash idempotent.
-        let item = sqlx::query(
-            "SELECT item_key, payload, attempts FROM batch_run_item \
-             WHERE id = $1 AND run_id = $2 AND status = 'pending'",
-        )
-        .bind(item_id)
-        .bind(run_id)
-        .fetch_optional(&pool)
-        .await
-        .map_err(|e| format!("batch.chunk: load item failed: {e}"))?;
-        let Some(item) = item else { continue };
-        let item_key: String = item.get("item_key");
-        let payload: Value = item.get("payload");
-        let attempts: i32 = item.get("attempts");
+    // Run the processor per item, accumulating outcomes for a set-based write.
+    // Collecting first means the chunk does O(1) UPDATEs regardless of its size,
+    // instead of one round trip per item — the throughput lever for large runs.
+    // Each outcome class is gathered as a JSON array of rows; the write expands
+    // it server-side with `jsonb_to_recordset` (one bound param, no array-type
+    // encoding to reason about).
+    let mut ok_rows: Vec<Value> = Vec::new();
+    let mut fail_rows: Vec<Value> = Vec::new();
+
+    for row in &rows {
+        let item_id: Uuid = row.get("id");
+        let item_key: String = row.get("item_key");
+        let payload: Value = row.get("payload");
+        let attempts: i32 = row.get("attempts");
 
         let ictx = ItemContext {
             state: ctx.state.clone(),
@@ -630,7 +730,7 @@ async fn handle_chunk(ctx: JobContext, batch_reg: Arc<BatchRegistry>) -> Result<
             params: params.clone(),
             trial,
             item_id,
-            item_key: item_key.clone(),
+            item_key,
             payload,
             attempt: attempts + 1,
         };
@@ -644,42 +744,54 @@ async fn handle_chunk(ctx: JobContext, batch_reg: Arc<BatchRegistry>) -> Result<
         };
 
         match outcome {
-            Ok(result) => {
-                let res = sqlx::query(
-                    "UPDATE batch_run_item SET status='succeeded', result=$3, attempts=attempts+1, \
-                     stage_failed=NULL, error_detail=NULL, processed_at=NOW() \
-                     WHERE id=$1 AND run_id=$2 AND status='pending'",
-                )
-                .bind(item_id)
-                .bind(run_id)
-                .bind(result)
-                .execute(&pool)
-                .await
-                .map_err(|e| format!("batch.chunk: mark succeeded failed: {e}"))?;
-                // Only count if we actually transitioned it (guards double-count
-                // on a chunk re-run).
-                if res.rows_affected() == 1 {
-                    n_succeeded += 1;
-                }
-            }
-            Err(err) => {
-                let res = sqlx::query(
-                    "UPDATE batch_run_item SET status='failed', stage_failed=$3, error_detail=$4, \
-                     attempts=attempts+1, processed_at=NOW() \
-                     WHERE id=$1 AND run_id=$2 AND status='pending'",
-                )
-                .bind(item_id)
-                .bind(run_id)
-                .bind(&err.stage)
-                .bind(&err.message)
-                .execute(&pool)
-                .await
-                .map_err(|e| format!("batch.chunk: mark failed failed: {e}"))?;
-                if res.rows_affected() == 1 {
-                    n_exception += 1;
-                }
-            }
+            Ok(result) => ok_rows.push(json!({
+                "id": item_id.to_string(),
+                // JSON null here maps to SQL NULL in the result column.
+                "result": result.unwrap_or(Value::Null),
+            })),
+            Err(err) => fail_rows.push(json!({
+                "id": item_id.to_string(),
+                "stage": err.stage,
+                "err": err.message,
+            })),
         }
+    }
+
+    // Batched writes: at most one UPDATE per outcome class for the whole chunk.
+    // The `status='pending'` guard keeps a re-run from re-counting an item that
+    // already transitioned (rows_affected reflects only fresh transitions).
+    let mut n_succeeded = 0i32;
+    if !ok_rows.is_empty() {
+        let res = sqlx::query(
+            "UPDATE batch_run_item AS t \
+             SET status='succeeded', result=v.result, attempts=t.attempts+1, \
+                 stage_failed=NULL, error_detail=NULL, processed_at=NOW() \
+             FROM jsonb_to_recordset($1::jsonb) AS v(id uuid, result jsonb) \
+             WHERE t.id = v.id AND t.run_id = $2 AND t.status = 'pending'",
+        )
+        .bind(Value::Array(ok_rows))
+        .bind(run_id)
+        .execute(&pool)
+        .await
+        .map_err(|e| format!("batch.chunk: mark succeeded failed: {e}"))?;
+        n_succeeded = res.rows_affected() as i32;
+    }
+
+    let mut n_exception = 0i32;
+    if !fail_rows.is_empty() {
+        let res = sqlx::query(
+            "UPDATE batch_run_item AS t \
+             SET status='failed', stage_failed=v.stage, error_detail=v.err, \
+                 attempts=t.attempts+1, processed_at=NOW() \
+             FROM jsonb_to_recordset($1::jsonb) AS v(id uuid, stage text, err text) \
+             WHERE t.id = v.id AND t.run_id = $2 AND t.status = 'pending'",
+        )
+        .bind(Value::Array(fail_rows))
+        .bind(run_id)
+        .execute(&pool)
+        .await
+        .map_err(|e| format!("batch.chunk: mark failed failed: {e}"))?;
+        n_exception = res.rows_affected() as i32;
     }
 
     // One counter update for the whole chunk, rather than per item.
@@ -704,13 +816,21 @@ async fn handle_chunk(ctx: JobContext, batch_reg: Arc<BatchRegistry>) -> Result<
     Ok(())
 }
 
-/// Flip a `running` run to `completed` once every item has reached a terminal
-/// state. The conditional `WHERE` makes this safe to call from every chunk —
-/// only one call transitions the row.
+/// Flip a `running` run to `completed` once no item is left `pending`. The
+/// conditional `WHERE` makes this safe to call from every chunk — only one call
+/// transitions the row.
+///
+/// Completion keys off the *item states* (`NOT EXISTS` a pending item), not the
+/// maintained `processed_items` counter. The counter is advisory (for progress
+/// display) and could drift if a process crashes mid-chunk between writing item
+/// outcomes and updating the counter; keying completion off the authoritative
+/// item rows means such drift can never strand a finished run in `running`. The
+/// `(run_id, status, id)` index keeps the check cheap even on a large run.
 async fn maybe_complete(pool: &PgPool, run_id: Uuid) -> Result<(), String> {
     sqlx::query(
         "UPDATE batch_run SET status='completed', finished_at=NOW() \
-         WHERE id=$1 AND status='running' AND processed_items >= total_items",
+         WHERE id=$1 AND status='running' \
+           AND NOT EXISTS (SELECT 1 FROM batch_run_item WHERE run_id=$1 AND status='pending')",
     )
     .bind(run_id)
     .execute(pool)
@@ -760,5 +880,23 @@ mod tests {
         assert!(reg.get("billing.cycle").is_some());
         assert!(reg.get("missing").is_none());
         assert_eq!(reg.kinds(), vec!["billing.cycle"]);
+    }
+
+    #[test]
+    fn register_builtin_adds_noop() {
+        let mut reg = BatchRegistry::new();
+        register_builtin(&mut reg);
+        assert!(reg.get(NOOP_RUN_KIND).is_some());
+    }
+
+    #[test]
+    fn synthetic_item_keys_are_zero_padded_and_ordered() {
+        let a = synthetic_item("load", 0, serde_json::json!({}));
+        let b = synthetic_item("load", 42, serde_json::json!({"sleep_ms": 5}));
+        assert_eq!(a.item_key, "load-00000000");
+        assert_eq!(b.item_key, "load-00000042");
+        // Lexicographic order matches numeric order (what the id-ordered
+        // dispatch relies on for stable paging).
+        assert!(a.item_key < b.item_key);
     }
 }
