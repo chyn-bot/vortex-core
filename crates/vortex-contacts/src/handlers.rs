@@ -189,7 +189,10 @@ async fn list_contacts(
         )
         .column(ListColumn::new("city", "City").searchable().sql_expr("c.city"))
         .column(ListColumn::new("state_name", "State").sortable().sql_expr("st.name"))
-        .column(ListColumn::new("country_name", "Country").sortable().searchable().sql_expr("co.name"))
+        // Country is not free-text searchable: it lives on the joined
+        // `countries` table, and an OR against a post-join column defeats
+        // the contacts trigram indexes that make search fast at 12M rows.
+        .column(ListColumn::new("country_name", "Country").sortable().sql_expr("co.name"))
         .column(
             ListColumn::new("is_company", "Company").bool_badge(
                 "Company",
@@ -211,6 +214,18 @@ async fn list_contacts(
         .create("New Contact", "/contacts/new")
         .pivot_url("/pivot/contacts?rows=contact_type")
         .default_sort("name")
+        // The two LEFT JOINs are many-to-one on FK→PK, so they preserve
+        // base cardinality: COUNT(join) == reltuples(contacts). This lets
+        // large unfiltered browses skip the full-scan COUNT(*). c.id gives
+        // a stable tiebreaker for LIMIT/OFFSET paging. Backed by
+        // idx_contacts_name_browse (name, id) — see migration.
+        .count_estimate_from("contacts")
+        .tiebreak("c.id")
+        // Free-text search routes through a trigram-indexed id-prefilter on
+        // the base table so ILIKE '%…%' uses idx_contacts_*_coalesce_trgm
+        // instead of scanning 12M joined rows. All searchable columns above
+        // (name, email, city) are contacts columns — required by prefilter.
+        .search_prefilter("contacts c")
         .group_by_options(&[
             ("contact_type", "Type"),
             ("country_name", "Country"),

@@ -7,11 +7,24 @@ use vortex_common::{VortexError, VortexResult};
 use super::config::ListConfig;
 use super::params::ListParams;
 
+/// Row-count threshold above which an unfiltered single-table list uses
+/// the planner's `pg_class.reltuples` estimate instead of an exact
+/// `COUNT(*)`. Below this, an exact count is cheap and worth its accuracy;
+/// above it, a full-table `COUNT(*)` on every page load is the dominant
+/// cost of browsing (≈1.3s on a 12M-row table) for a number nobody reads
+/// precisely past the first few significant digits.
+const ESTIMATE_THRESHOLD: i64 = 50_000;
+
 /// Result of executing a list query — rows + total count.
 #[derive(Debug)]
 pub struct ListResult {
     pub rows: Vec<PgRow>,
     pub total: i64,
+    /// True when `total` is a planner estimate (`reltuples`) rather than
+    /// an exact `COUNT(*)`. The UI renders it with a `~` prefix. Only set
+    /// for large, unfiltered, single-table lists; any filter/search makes
+    /// the count exact again.
+    pub total_is_estimate: bool,
     pub page: u64,
     pub page_size: u64,
     pub total_pages: u64,
@@ -56,13 +69,15 @@ pub(crate) struct ListSql {
 /// - `LIMIT`/`OFFSET` are `u64` derived from clamped [`ListParams`]
 ///   (page ≥ 1, page_size ∈ [5, 200]), so interpolating them is safe.
 pub(crate) fn build_list_sql(config: &ListConfig, params: &ListParams) -> ListSql {
-    let (where_clause, binds) = build_where(config, params);
+    let parts = build_conditions(config, params);
 
     let from_clause = config.custom_from.unwrap_or(config.table);
     let select_fields = config
         .custom_select
         .map(String::from)
         .unwrap_or_else(|| config.select_fields());
+
+    let where_clause = assemble_where(config, &parts);
 
     let count_sql = format!("SELECT COUNT(*) FROM {} {}", from_clause, where_clause);
 
@@ -78,7 +93,50 @@ pub(crate) fn build_list_sql(config: &ListConfig, params: &ListParams) -> ListSq
         params.offset(),
     );
 
-    ListSql { count_sql, data_sql, binds }
+    ListSql { count_sql, data_sql, binds: parts.binds }
+}
+
+/// Assemble the final `WHERE` clause from the decomposed [`Conditions`].
+///
+/// Two shapes, depending on `search_prefilter`:
+/// - **Default:** base filter, search, and column filters are AND-ed inline
+///   (`WHERE base AND (…ILIKE $1…) AND col = $2`) — the historical shape.
+/// - **Prefiltered:** when a search is active *and* `search_prefilter` is
+///   set, the search moves into a subquery so a trigram index can drive it:
+///   `WHERE base AND col = $2 AND <alias>.id IN (SELECT id FROM <base>
+///   WHERE …ILIKE $1…)`. The parameter numbering is unchanged (search is
+///   still `$1`), so `binds` order is identical either way.
+fn assemble_where(config: &ListConfig, parts: &Conditions) -> String {
+    let mut conds: Vec<String> = Vec::new();
+    if let Some(base) = &parts.base_filter {
+        conds.push(base.clone());
+    }
+
+    match (&parts.search, config.search_prefilter, config.prefilter_alias()) {
+        // Prefiltered search: base + column filters inline, search via IN.
+        (Some(search), Some(prefilter_from), Some(alias)) => {
+            conds.extend(parts.filters.iter().cloned());
+            conds.push(format!(
+                "{alias}.id IN (SELECT {alias}.id FROM {from} WHERE {search})",
+                alias = alias,
+                from = prefilter_from,
+                search = search,
+            ));
+        }
+        // Default: inline search then column filters (historical order).
+        _ => {
+            if let Some(search) = &parts.search {
+                conds.push(search.clone());
+            }
+            conds.extend(parts.filters.iter().cloned());
+        }
+    }
+
+    if conds.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", conds.join(" AND "))
+    }
 }
 
 /// Build the `ORDER BY` body (without the `ORDER BY` keyword).
@@ -88,6 +146,17 @@ pub(crate) fn build_list_sql(config: &ListConfig, params: &ListParams) -> ListSq
 /// configured default when the requested field is unknown. When a
 /// group-by is active and differs from the sort expression, the group
 /// expression is prepended (ascending) so grouped rows stay contiguous.
+///
+/// A stable `id` tiebreaker is appended for simple single-table lists so
+/// that rows with equal sort values (e.g. millions of contacts sharing a
+/// `created_at`) get a **total** order. Without it, the sort is
+/// only partial and Postgres may return tied rows in a different physical
+/// order per page — making `LIMIT/OFFSET` pagination silently skip or
+/// repeat records across page boundaries. It also lets a composite index
+/// `(sort_col, id)` satisfy the ordering by an index scan rather than a
+/// full sort. The tiebreaker is skipped when a `custom_from` join is in
+/// play (bare `id` could be ambiguous) or when `id` is already the sort
+/// key.
 fn build_order_clause(config: &ListConfig, params: &ListParams) -> String {
     let sort_field_name = params.sort_field.as_deref().unwrap_or(config.default_sort);
     let sort_expr = config.sql_expr_for(sort_field_name).unwrap_or_else(|| {
@@ -97,12 +166,29 @@ fn build_order_clause(config: &ListConfig, params: &ListParams) -> String {
 
     let group_expr = params.group_by.as_deref().and_then(|g| config.sql_expr_for(g));
 
-    match group_expr {
+    let mut order = match group_expr {
         Some(ge) if ge != sort_expr => {
             format!("{} ASC, {} {}", ge, sort_expr, params.sort_dir.as_sql())
         }
         _ => format!("{} {}", sort_expr, params.sort_dir.as_sql()),
+    };
+
+    // Deterministic tiebreaker — see the doc comment above. An explicit
+    // `config.tiebreak` (e.g. `"c.id"`) wins; otherwise a simple
+    // single-table list gets bare `id`. Ascending to match the natural
+    // `(sort_col <dir>, id)` composite index layout; any fixed direction
+    // gives a stable total order.
+    let tiebreak = config
+        .tiebreak
+        .or_else(|| config.custom_from.is_none().then_some("id"));
+    if let Some(tb) = tiebreak {
+        if tb != sort_expr && group_expr != Some(tb) {
+            order.push_str(", ");
+            order.push_str(tb);
+        }
     }
+
+    order
 }
 
 /// Execute the list query against the database. Runs two queries:
@@ -118,14 +204,26 @@ pub async fn execute_list(
 ) -> VortexResult<ListResult> {
     let ListSql { count_sql, data_sql, binds } = build_list_sql(config, params);
 
-    let mut count_q = sqlx::query_scalar::<_, i64>(&count_sql);
-    for val in &binds {
-        count_q = count_q.bind(val);
-    }
-    let total = count_q
-        .fetch_one(pool)
-        .await
-        .map_err(|e| VortexError::QueryExecution(format!("list count: {e}")))?;
+    // Count strategy: an unfiltered list only needs an *exact* count when
+    // the table is small. On large tables the exact `COUNT(*)` is a full
+    // scan run on every page load, so we substitute the planner's
+    // `reltuples` estimate. The estimable relation is the plain table for a
+    // single-table list, or `count_estimate_from` when the author has
+    // asserted a joined list is cardinality-preserving. Any WHERE
+    // condition — base filter, search, or column filter — forces an exact
+    // count so the number always matches what the user actually filtered.
+    let estimate_table = config
+        .count_estimate_from
+        .or_else(|| config.custom_from.is_none().then_some(config.table));
+    let unfiltered = config.base_filter.is_none() && binds.is_empty();
+
+    let (total, total_is_estimate) = match estimate_table {
+        Some(table) if unfiltered => match estimate_row_count(pool, table).await {
+            Some(est) if est >= ESTIMATE_THRESHOLD => (est, true),
+            _ => (exact_count(pool, &count_sql, &binds).await?, false),
+        },
+        _ => (exact_count(pool, &count_sql, &binds).await?, false),
+    };
 
     let mut data_q = sqlx::query(&data_sql);
     for val in &binds {
@@ -145,56 +243,100 @@ pub async fn execute_list(
     Ok(ListResult {
         rows,
         total,
+        total_is_estimate,
         page: params.page,
         page_size: params.page_size,
         total_pages,
     })
 }
 
-/// Build the WHERE clause and positional bind values from
-/// ListConfig + ListParams.
-fn build_where(config: &ListConfig, params: &ListParams) -> (String, Vec<String>) {
-    let mut conditions: Vec<String> = Vec::new();
-    let mut bind_values: Vec<String> = Vec::new();
+/// Run the exact `SELECT COUNT(*)` with its bound values.
+async fn exact_count(pool: &PgPool, count_sql: &str, binds: &[String]) -> VortexResult<i64> {
+    let mut count_q = sqlx::query_scalar::<_, i64>(count_sql);
+    for val in binds {
+        count_q = count_q.bind(val);
+    }
+    count_q
+        .fetch_one(pool)
+        .await
+        .map_err(|e| VortexError::QueryExecution(format!("list count: {e}")))
+}
+
+/// Fast approximate row count from planner statistics. `reltuples` is
+/// maintained by `ANALYZE`/autovacuum and is accurate to a few percent on
+/// an actively-vacuumed table — good enough to size a browse view.
+///
+/// Returns `None` (so the caller falls back to an exact count) when the
+/// relation is unknown, has never been analyzed (`reltuples = -1`), or the
+/// lookup errors. `table` originates from `ListConfig` (`&'static str`),
+/// never request input, and is bound as a value cast to `regclass`.
+async fn estimate_row_count(pool: &PgPool, table: &str) -> Option<i64> {
+    let est: Option<f32> = sqlx::query_scalar("SELECT reltuples FROM pg_class WHERE oid = $1::regclass")
+        .bind(table)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten();
+    match est {
+        Some(r) if r >= 0.0 => Some(r as i64),
+        _ => None,
+    }
+}
+
+/// Decomposed WHERE conditions plus their positional bind values.
+///
+/// Kept as parts (rather than a single joined string) so
+/// [`assemble_where`] can place the search either inline or inside an
+/// `id IN (…)` prefilter subquery without changing bind numbering.
+struct Conditions {
+    /// Static base filter (`config.base_filter`), no bind.
+    base_filter: Option<String>,
+    /// Free-text search predicate `(… ILIKE $1 …)`, present only when a
+    /// non-blank search was supplied. Always uses `$1`.
+    search: Option<String>,
+    /// Column-equality filters, each `expr = $N` (N ≥ 2 when a search is
+    /// present, else N ≥ 1).
+    filters: Vec<String>,
+    /// Bind values in `$1, $2, …` order: search value first (if any),
+    /// then one per column filter.
+    binds: Vec<String>,
+}
+
+/// Build the decomposed WHERE conditions and positional bind values from
+/// ListConfig + ListParams. Parameter numbering matches the order the
+/// binds are returned in: search is `$1`, column filters follow.
+fn build_conditions(config: &ListConfig, params: &ListParams) -> Conditions {
+    let mut binds: Vec<String> = Vec::new();
     let mut param_idx = 0usize;
 
-    // Base filter (e.g. "active = true")
-    if let Some(base) = config.base_filter {
-        conditions.push(base.to_string());
-    }
+    let base_filter = config.base_filter.map(str::to_string);
 
     // Free-text search — ILIKE across all searchable columns (uses sql_expr for JOINed columns)
     let searchable = config.searchable_exprs();
-    if let Some(search) = &params.search {
-        if !searchable.is_empty() && !search.trim().is_empty() {
+    let mut search = None;
+    if let Some(s) = &params.search {
+        if !searchable.is_empty() && !s.trim().is_empty() {
             param_idx += 1;
             let ilike_parts: Vec<String> = searchable
                 .iter()
                 .map(|expr| format!("COALESCE({}::text, '') ILIKE ${}", expr, param_idx))
                 .collect();
-            conditions.push(format!("({})", ilike_parts.join(" OR ")));
-            bind_values.push(format!("%{}%",
-                search.replace('%', "\\%").replace('_', "\\_")
-            ));
+            search = Some(format!("({})", ilike_parts.join(" OR ")));
+            binds.push(format!("%{}%", s.replace('%', "\\%").replace('_', "\\_")));
         }
     }
 
     // Column-level filters (uses sql_expr for JOINed columns)
+    let mut filters: Vec<String> = Vec::new();
     for (field, value) in &params.filters {
         if let Some(sql_expr) = config.sql_expr_for(field) {
             param_idx += 1;
-            conditions.push(format!("{} = ${}", sql_expr, param_idx));
-            bind_values.push(value.clone());
+            filters.push(format!("{} = ${}", sql_expr, param_idx));
+            binds.push(value.clone());
         }
     }
 
-    let where_clause = if conditions.is_empty() {
-        String::new()
-    } else {
-        format!("WHERE {}", conditions.join(" AND "))
-    };
-
-    (where_clause, bind_values)
+    Conditions { base_filter, search, filters, binds }
 }
 
 #[cfg(test)]
@@ -241,8 +383,51 @@ mod tests {
         assert!(sql.data_sql.starts_with(
             "SELECT id, code, name, email, contact_type, country_name FROM contacts"
         ));
-        // Default sort, ascending, with clamped pagination.
-        assert!(sql.data_sql.contains("ORDER BY name ASC LIMIT 25 OFFSET 0"));
+        // Default sort, ascending, with a stable `id` tiebreaker and
+        // clamped pagination.
+        assert!(sql.data_sql.contains("ORDER BY name ASC, id LIMIT 25 OFFSET 0"));
+    }
+
+    #[test]
+    fn order_by_appends_id_tiebreaker_for_single_table() {
+        // Without a total order, tied sort values make LIMIT/OFFSET
+        // pages skip or repeat rows. The `id` tiebreaker prevents that.
+        let sql = build_list_sql(&contacts_config(), &ListParams::default());
+        assert!(sql.data_sql.contains("ORDER BY name ASC, id "), "got: {}", sql.data_sql);
+    }
+
+    #[test]
+    fn tiebreaker_skipped_for_custom_from_joins() {
+        // A bare `id` would be ambiguous across joined tables, so the
+        // tiebreaker is omitted; the join's own ordering stands.
+        let config = contacts_config()
+            .custom_from("contacts c LEFT JOIN countries co ON co.id = c.country_id")
+            .custom_select("c.id, c.name");
+        let sql = build_list_sql(&config, &ListParams::default());
+        assert!(sql.data_sql.contains("ORDER BY name ASC LIMIT"), "got: {}", sql.data_sql);
+        assert!(!sql.data_sql.contains(", id LIMIT"));
+    }
+
+    #[test]
+    fn explicit_tiebreak_applies_to_joined_lists() {
+        // A joined list opts back into a stable order by naming the
+        // qualified PK, which the framework appends verbatim.
+        let config = contacts_config()
+            .custom_from("contacts c LEFT JOIN countries co ON co.id = c.country_id")
+            .custom_select("c.id, c.name")
+            .tiebreak("c.id");
+        let sql = build_list_sql(&config, &ListParams::default());
+        assert!(sql.data_sql.contains("ORDER BY name ASC, c.id LIMIT"), "got: {}", sql.data_sql);
+    }
+
+    #[test]
+    fn tiebreaker_not_duplicated_when_sorting_by_id() {
+        let config = ListConfig::new("X", "t")
+            .column(ListColumn::new("id", "ID").sortable())
+            .default_sort("id");
+        let sql = build_list_sql(&config, &ListParams::default());
+        assert!(sql.data_sql.contains("ORDER BY id ASC LIMIT"), "got: {}", sql.data_sql);
+        assert!(!sql.data_sql.contains("id ASC, id"));
     }
 
     #[test]
@@ -387,6 +572,52 @@ mod tests {
         });
         let sql = build_list_sql(&contacts_config(), &params);
         assert!(sql.data_sql.contains("LIMIT 50 OFFSET 100"));
+    }
+
+    #[test]
+    fn search_prefilter_wraps_search_in_id_subquery() {
+        // With search_prefilter set, a search moves into an id IN (…)
+        // subquery on the base alias so a trigram index can drive it,
+        // while base/column filters stay inline. Search is still $1.
+        let config = contacts_config()
+            .custom_from("contacts c LEFT JOIN countries co ON co.id = c.country_id")
+            .custom_select("c.id, c.name")
+            .search_prefilter("contacts c")
+            .base_filter("c.active = true");
+        let mut filters = HashMap::new();
+        filters.insert("contact_type".to_string(), "customer".to_string());
+        let params = params_with(|p| {
+            p.search = Some("acme".into());
+            p.filters = filters;
+        });
+        let sql = build_list_sql(&config, &params);
+
+        // Search lives inside the subquery, keyed on c.id, using $1.
+        assert!(
+            sql.data_sql.contains(
+                "c.id IN (SELECT c.id FROM contacts c WHERE (COALESCE(name::text, '') ILIKE $1"
+            ),
+            "got: {}",
+            sql.data_sql
+        );
+        // Base filter and the column filter stay inline in the outer WHERE.
+        assert!(sql.data_sql.contains("WHERE c.active = true AND contact_type = $2 AND c.id IN"));
+        // Count shares the identical WHERE.
+        assert!(sql.count_sql.contains("c.id IN (SELECT c.id FROM contacts c WHERE"));
+        // Binds: search first ($1), then the column filter ($2).
+        assert_eq!(sql.binds, vec!["%acme%".to_string(), "customer".to_string()]);
+    }
+
+    #[test]
+    fn search_prefilter_inactive_without_search_is_plain() {
+        // No search → no subquery, even with prefilter configured.
+        let config = contacts_config().search_prefilter("contacts c");
+        let mut filters = HashMap::new();
+        filters.insert("contact_type".to_string(), "customer".to_string());
+        let params = params_with(|p| p.filters = filters);
+        let sql = build_list_sql(&config, &params);
+        assert!(!sql.data_sql.contains(" IN ("));
+        assert!(sql.data_sql.contains("contact_type = $1"));
     }
 
     #[test]
