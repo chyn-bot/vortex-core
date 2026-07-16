@@ -396,6 +396,35 @@ fn parse_selection_options(raw: &str) -> Result<serde_json::Value, String> {
     Ok(serde_json::Value::Array(opts))
 }
 
+/// Validate and normalise an auto-number field's config (submitted by the
+/// designer as a JSON object) into the `selection_options` value stored on the
+/// field. Shape: `{ "prefix", "padding", "scope", "separator", "suffix" }`. The
+/// create handler reads this to mint the next reference (e.g. `VIS-2026-0001`).
+fn parse_autonumber_config(raw: &str) -> Result<serde_json::Value, String> {
+    let v: serde_json::Value = serde_json::from_str(raw.trim())
+        .map_err(|_| "Auto-number settings were malformed".to_string())?;
+    // Prefix: short uppercase-ish token; kept as-is but length-capped.
+    let prefix: String = v.get("prefix").and_then(|x| x.as_str()).unwrap_or("").trim().chars().take(16).collect();
+    // Padding: how many zero-padded digits (1..=12), default 4.
+    let padding = v.get("padding").and_then(|x| x.as_i64()).unwrap_or(4).clamp(1, 12);
+    // Scope: how often the counter resets.
+    let scope = match v.get("scope").and_then(|x| x.as_str()).unwrap_or("global") {
+        s @ ("yearly" | "monthly" | "global") => s.to_string(),
+        _ => "global".to_string(),
+    };
+    // Separator between prefix / period / number; default "-".
+    let separator: String = v.get("separator").and_then(|x| x.as_str()).unwrap_or("-").chars().take(3).collect();
+    let suffix: String = v.get("suffix").and_then(|x| x.as_str()).unwrap_or("").trim().chars().take(16).collect();
+    Ok(serde_json::json!({
+        "autonumber": true,
+        "prefix": prefix,
+        "padding": padding,
+        "scope": scope,
+        "separator": separator,
+        "suffix": suffix,
+    }))
+}
+
 /// Resolve a many2one target: any active model — Blueprint **or** compiled —
 /// whose physical table carries a `name` column (the display the generic
 /// picker/JOIN reads). Returns the target's table name. Requiring a real `name`
@@ -481,6 +510,8 @@ pub async fn add_field(
     // Type-specific inputs, validated before opening the transaction.
     let mut selection_options: Option<serde_json::Value> = if field_type == "selection" {
         Some(parse_selection_options(options_raw.unwrap_or(""))?)
+    } else if field_type == "autonumber" {
+        Some(parse_autonumber_config(options_raw.unwrap_or(""))?)
     } else {
         None
     };

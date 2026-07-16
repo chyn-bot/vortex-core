@@ -105,19 +105,39 @@ pub fn format_time_ago(dt: DateTime<Utc>) -> String {
 /// HTMX will still swap the DOM (HTMX ignores 4xx by default); the
 /// inline alert markup makes the error visible to the user.
 pub fn error_response(message: &str) -> Response {
-    (
-        StatusCode::OK,
-        Html(format!(
-            r#"<div class="alert alert-error mb-4">
-    <svg xmlns="http://www.w3.org/2000/svg" class="stroke-current shrink-0 h-5 w-5" fill="none" viewBox="0 0 24 24">
-        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2m7-2a9 9 0 11-18 0 9 9 0 0118 0z" />
-    </svg>
-    <span>{}</span>
-</div>"#,
-            html_escape(message)
-        )),
-    )
-        .into_response()
+    // A full, styled document — not a bare fragment. When a handler returns this
+    // as a whole-page response (e.g. a failed form save), a fragment renders as
+    // an unstyled near-blank "white page"; a complete page with the stylesheet
+    // shows the message clearly and offers a way back (which preserves the
+    // half-filled form via the browser's back cache).
+    let body = format!(
+        r##"<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Something went wrong</title>
+<script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script>
+<link href="/static/vendor/daisyui.min.css" rel="stylesheet">
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vendor/tailwind.js"></script>
+</head>
+<body class="min-h-screen bg-base-200 flex items-center justify-center p-6">
+<div class="card bg-base-100 shadow-xl max-w-lg w-full"><div class="card-body">
+<div class="flex items-center gap-3">
+<svg xmlns="http://www.w3.org/2000/svg" class="text-error shrink-0 h-7 w-7" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+</svg>
+<h1 class="card-title">That didn’t go through</h1>
+</div>
+<p class="text-base-content/80 mt-1">{msg}</p>
+<div class="card-actions justify-end mt-4">
+<button class="btn btn-ghost" onclick="history.back()">← Go back</button>
+</div>
+</div></div>
+</body></html>"##,
+        msg = html_escape(message)
+    );
+    (StatusCode::OK, Html(body)).into_response()
 }
 
 /// Format an integer with comma separators (e.g. `50064` → `"50,064"`).
@@ -232,8 +252,8 @@ pub fn forbidden_page(action: &str) -> String {
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Access Denied - Vortex</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-    <link href="/static/vortex.css?v=19" rel="stylesheet">
-    <script src="/static/vortex.js?v=19" defer></script>
+    <link href="/static/vortex.css?v=20" rel="stylesheet">
+    <script src="/static/vortex.js?v=20" defer></script>
     <script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200 flex items-center justify-center">

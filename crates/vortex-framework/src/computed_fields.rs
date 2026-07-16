@@ -34,6 +34,7 @@ use crate::ui::html_escape;
 pub const COMPUTE_KINDS: &[(&str, &str)] = &[
     ("related", "Related — pull a value across a link"),
     ("expr", "Formula — arithmetic on this record's number fields"),
+    ("rollup", "Rollup — sum/count/avg over a related list"),
 ];
 
 /// Registry `field_type`s that may take part in an arithmetic formula.
@@ -134,11 +135,13 @@ async fn resolve_related(
     Ok((m2o.to_string(), target.to_string(), ftype.clone()))
 }
 
-/// Turn a validated arithmetic `expr` into a SQL expression over alias `t`.
-/// Only registered numeric fields, numeric literals and `+ - * / ( )` are
-/// allowed; each field becomes `COALESCE(t.<f>::numeric, 0)`. Errors name the
-/// offending token so the author can fix it.
-fn build_expr_sql(expr: &str, numeric: &HashMap<String, String>) -> Result<String, String> {
+/// Turn a validated arithmetic `expr` into a SQL expression over the given table
+/// `alias`. Only registered numeric fields, numeric literals and `+ - * / ( )`
+/// are allowed; each field becomes `COALESCE(<alias>.<f>::numeric, 0)`. Errors
+/// name the offending token so the author can fix it. `alias` is a caller
+/// constant (`"t"` for this record, `"c"` for a rollup's child rows) — never
+/// user input.
+fn build_expr_sql(expr: &str, numeric: &HashMap<String, String>, alias: &str) -> Result<String, String> {
     let mut out = String::new();
     let mut refs = 0usize;
     let bytes = expr.as_bytes();
@@ -173,7 +176,7 @@ fn build_expr_sql(expr: &str, numeric: &HashMap<String, String>) -> Result<Strin
             let name = &expr[start..i];
             match numeric.get(name) {
                 Some(ft) if NUMERIC_TYPES.contains(&ft.as_str()) => {
-                    out.push_str(&format!("COALESCE(t.{name}::numeric, 0)"));
+                    out.push_str(&format!("COALESCE({alias}.{name}::numeric, 0)"));
                     refs += 1;
                 }
                 Some(_) => return Err(format!("{name:?} is not a number field.")),
@@ -187,6 +190,65 @@ fn build_expr_sql(expr: &str, numeric: &HashMap<String, String>) -> Result<Strin
         return Err("A formula must reference at least one number field.".into());
     }
     Ok(out)
+}
+
+/// Aggregate functions a rollup may use.
+const ROLLUP_AGGS: &[&str] = &["sum", "count", "avg", "min", "max"];
+
+/// Parse a rollup `compute_expr` of the form `"<list_field> | <agg> | <formula>"`
+/// (the formula is optional and ignored for `count`). Returns
+/// `(list_field, agg, child_formula)`.
+fn parse_rollup(expr: &str) -> Result<(String, String, String), String> {
+    let parts: Vec<&str> = expr.splitn(3, '|').collect();
+    if parts.len() < 2 {
+        return Err("A rollup reads like \"lines | sum | qty * unit_price\" (or \"lines | count\").".into());
+    }
+    let list = parts[0].trim().to_string();
+    let agg = parts[1].trim().to_ascii_lowercase();
+    let formula = parts.get(2).map(|s| s.trim().to_string()).unwrap_or_default();
+    if !ident(&list) {
+        return Err("The list field must be a plain field name.".into());
+    }
+    if !ROLLUP_AGGS.contains(&agg.as_str()) {
+        return Err("Aggregate must be one of: sum, count, avg, min, max.".into());
+    }
+    if agg != "count" && formula.trim().is_empty() {
+        return Err(format!("A {agg} rollup needs a formula, e.g. \"lines | {agg} | qty * unit_price\"."));
+    }
+    Ok((list, agg, formula))
+}
+
+/// Resolve a one2many field of `model` → `(child_model, child_table, inverse_col)`
+/// from the registry, validating every identifier that will reach SQL.
+async fn resolve_o2m(db: &PgPool, model: &str, field: &str) -> Result<(String, String, String), String> {
+    let row = sqlx::query(
+        "SELECT f.related_model, f.selection_options FROM ir_model_field f \
+         JOIN ir_model m ON m.id = f.model_id \
+         WHERE m.name = $1 AND f.name = $2 AND f.field_type = 'one2many'",
+    )
+    .bind(model)
+    .bind(field)
+    .fetch_optional(db)
+    .await
+    .map_err(|e| format!("lookup failed: {e}"))?
+    .ok_or_else(|| format!("{field:?} is not a related-list (one2many) field of {model}."))?;
+    let child_model: String =
+        row.try_get::<Option<String>, _>("related_model").ok().flatten().unwrap_or_default();
+    let opts: Option<serde_json::Value> =
+        row.try_get::<Option<serde_json::Value>, _>("selection_options").ok().flatten();
+    let (child_table, inverse) = opts
+        .as_ref()
+        .and_then(|o| {
+            Some((
+                o.get("child_table")?.as_str()?.to_string(),
+                o.get("inverse_field")?.as_str()?.to_string(),
+            ))
+        })
+        .ok_or("That related list isn't configured (missing child link).")?;
+    if !ident(&child_table) || !ident(&inverse) {
+        return Err("Related list target is invalid.".into());
+    }
+    Ok((child_model, child_table, inverse))
 }
 
 /// Computed fields defined on `model`, ordered for display. Resilient: empty on
@@ -274,7 +336,19 @@ pub async fn add(
             if numeric.is_empty() {
                 return Err(format!("Unknown or empty model {model:?}."));
             }
-            build_expr_sql(expr, &numeric)?; // validate only
+            build_expr_sql(expr, &numeric, "t")?; // validate only
+            "number".to_string()
+        }
+        "rollup" => {
+            let (list, agg, formula) = parse_rollup(expr)?;
+            let (child_model, _table, _inverse) = resolve_o2m(db, model, &list).await?;
+            if agg != "count" {
+                let child_numeric = registered_fields(db, &child_model).await;
+                if child_numeric.is_empty() {
+                    return Err(format!("The linked {child_model} has no fields to aggregate."));
+                }
+                build_expr_sql(&formula, &child_numeric, "c")?; // validate the child formula
+            }
             "number".to_string()
         }
         _ => return Err("Choose a valid computed kind.".into()),
@@ -356,8 +430,29 @@ async fn evaluate_one(db: &PgPool, model: &str, f: &ComputedField, record_id: Uu
         }
         "expr" => {
             let numeric = registered_fields(db, model).await;
-            let sql_expr = build_expr_sql(&f.expr, &numeric).ok()?;
+            let sql_expr = build_expr_sql(&f.expr, &numeric, "t").ok()?;
             format!("SELECT ({sql_expr})::text FROM {table} t WHERE t.id = $1")
+        }
+        "rollup" => {
+            // Aggregate over the child rows of a one2many, keyed on the inverse
+            // many2one back to this record. `count` needs no formula; the others
+            // aggregate a validated arithmetic expression over the child's own
+            // number columns. `SUM` of no rows coalesces to 0; avg/min/max stay
+            // NULL (rendered blank), which reads correctly for an empty list.
+            let (list, agg, formula) = parse_rollup(&f.expr).ok()?;
+            let (child_model, child_table, inverse) = resolve_o2m(db, model, &list).await.ok()?;
+            if agg == "count" {
+                format!("SELECT COUNT(*)::text FROM {child_table} c WHERE c.{inverse} = $1")
+            } else {
+                let child_numeric = registered_fields(db, &child_model).await;
+                let inner = build_expr_sql(&formula, &child_numeric, "c").ok()?;
+                if agg == "sum" {
+                    format!("SELECT COALESCE(SUM({inner}), 0)::text FROM {child_table} c WHERE c.{inverse} = $1")
+                } else {
+                    let agg_uc = agg.to_ascii_uppercase();
+                    format!("SELECT {agg_uc}({inner})::text FROM {child_table} c WHERE c.{inverse} = $1")
+                }
+            }
         }
         _ => return None,
     };
@@ -449,16 +544,132 @@ pub async fn render_for_form(db: &PgPool, model: &str, record_id: Option<&str>) 
         let muted_cls = if muted { " opacity-60 italic" } else { "" };
         body.push_str(&format!(
             r#"<label class="form-control mb-3"><div class="label"><span class="label-text">{label} <span class="badge badge-ghost badge-sm ml-1">ƒ</span></span>{help}</div>
-<input type="text" value="{value}" class="input input-bordered w-full bg-base-200{muted_cls}" readonly disabled/></label>"#,
+<input type="text" id="cf_{name}" value="{value}" class="input input-bordered w-full bg-base-200{muted_cls}" readonly disabled/></label>"#,
             label = html_escape(&f.label),
+            name = html_escape(&f.name),
             help = help,
             value = value,
             muted_cls = muted_cls,
         ));
     }
     body.push_str("</div>");
+
+    // Live evaluation: recompute formula + rollup fields client-side as the user
+    // types in the form and the inline line grid, so totals update in real time
+    // instead of only after save. `related` fields have no client-side source, so
+    // they keep their server value. The definitions are emitted as JSON and read
+    // by a small dependency-free arithmetic evaluator (no eval / new Function).
+    let defs: Vec<serde_json::Value> = fields
+        .iter()
+        .filter(|f| f.kind == "expr" || f.kind == "rollup")
+        .map(|f| serde_json::json!({ "name": f.name, "kind": f.kind, "expr": f.expr }))
+        .collect();
+    if !defs.is_empty() {
+        let defs_json = serde_json::to_string(&defs).unwrap_or_else(|_| "[]".into());
+        body.push_str(&format!(
+            r#"<script type="application/json" id="computed-defs">{}</script>"#,
+            defs_json
+        ));
+        body.push_str(LIVE_COMPUTE_JS);
+    }
     body
 }
+
+/// Dependency-free client that recomputes `expr` and `rollup` computed fields in
+/// real time. It reads the JSON in `#computed-defs`, tokenises each formula into
+/// RPN once, and on every form `input`/`change` (and grid row add/remove via a
+/// MutationObserver) re-evaluates: `expr` over the record's own inputs, `rollup`
+/// over the inline `#o2mbody_<list>` rows. Only `+ - * / ( )`, numbers and field
+/// names occur in a formula (validated server-side), so a tiny shunting-yard
+/// evaluator is sufficient and safe — no `eval`/`new Function`, CSP-clean.
+const LIVE_COMPUTE_JS: &str = r#"<script>
+(function(){
+  var el = document.getElementById('computed-defs'); if(!el) return;
+  var DEFS; try { DEFS = JSON.parse(el.textContent || '[]'); } catch(e){ return; }
+  if(!DEFS.length) return;
+  var form = el.closest('form') || document.querySelector('form'); if(!form) return;
+
+  function tokenize(s){
+    var t=[], i=0;
+    while(i<s.length){
+      var c=s[i];
+      if(c===' '||c==='\t'){ i++; continue; }
+      if('+-*/()'.indexOf(c)>=0){ t.push(c); i++; continue; }
+      if((c>='0'&&c<='9')||c==='.'){ var j=i; while(j<s.length&&((s[j]>='0'&&s[j]<='9')||s[j]==='.')) j++; t.push({num:parseFloat(s.slice(i,j))}); i=j; continue; }
+      if((c>='a'&&c<='z')||c==='_'){ var j=i; while(j<s.length&&((s[j]>='a'&&s[j]<='z')||(s[j]>='0'&&s[j]<='9')||s[j]==='_')) j++; t.push({id:s.slice(i,j)}); i=j; continue; }
+      return null;
+    }
+    return t;
+  }
+  var PREC={'+':1,'-':1,'*':2,'/':2};
+  function toRPN(toks){
+    var out=[], op=[], prev=null;
+    for(var k=0;k<toks.length;k++){
+      var t=toks[k];
+      if(typeof t==='object'){ out.push(t); }
+      else if(t==='('){ op.push(t); }
+      else if(t===')'){ while(op.length&&op[op.length-1]!=='(') out.push(op.pop()); op.pop(); }
+      else {
+        if(t==='-'&&(prev===null||prev==='('||PREC[prev]!==undefined)) out.push({num:0});
+        while(op.length&&op[op.length-1]!=='('&&PREC[op[op.length-1]]>=PREC[t]) out.push(op.pop());
+        op.push(t);
+      }
+      prev=t;
+    }
+    while(op.length) out.push(op.pop());
+    return out;
+  }
+  function evalRPN(rpn,lookup){
+    var st=[];
+    for(var k=0;k<rpn.length;k++){
+      var t=rpn[k];
+      if(typeof t==='object'){ st.push(('num' in t)?t.num:(lookup(t.id)||0)); }
+      else { var b=st.pop(), a=st.pop(); st.push(t==='+'?a+b:t==='-'?a-b:t==='*'?a*b:(b?a/b:0)); }
+    }
+    return st.length?st[0]:0;
+  }
+  function compile(expr){ var t=tokenize(expr||''); return t?toRPN(t):null; }
+  function run(rpn,lookup){ if(!rpn) return null; try { return evalRPN(rpn,lookup); } catch(e){ return null; } }
+
+  function headerVal(name){ var i=form.querySelector('[name="'+name+'"]'); return i?(parseFloat(i.value)||0):0; }
+  function rollup(list,agg,rpn){
+    var body=document.getElementById('o2mbody_'+list);
+    if(!body) return agg==='count'?0:(agg==='sum'?0:null);
+    var rows=body.querySelectorAll(':scope > tr'), vals=[];
+    if(agg==='count') return rows.length;
+    rows.forEach(function(tr){
+      var lk=function(n){ var c=tr.querySelector('[data-col="'+n+'"]'); return c?(parseFloat(c.value)||0):0; };
+      vals.push(run(rpn,lk)||0);
+    });
+    if(!vals.length) return agg==='sum'?0:null;
+    if(agg==='sum') return vals.reduce(function(a,b){return a+b;},0);
+    if(agg==='avg') return vals.reduce(function(a,b){return a+b;},0)/vals.length;
+    if(agg==='min') return Math.min.apply(null,vals);
+    if(agg==='max') return Math.max.apply(null,vals);
+    return null;
+  }
+
+  DEFS.forEach(function(d){
+    if(d.kind==='expr'){ d._rpn=compile(d.expr); }
+    else if(d.kind==='rollup'){ var p=(d.expr||'').split('|'); d._list=(p[0]||'').trim(); d._agg=(p[1]||'').trim().toLowerCase(); d._rpn=compile((p[2]||'').trim()); }
+  });
+  function fmt(v){ return (Math.round(v*100)/100).toString(); }
+  function recompute(){
+    DEFS.forEach(function(d){
+      var out=document.getElementById('cf_'+d.name); if(!out) return;
+      var v = d.kind==='expr' ? run(d._rpn,headerVal) : rollup(d._list,d._agg,d._rpn);
+      if(v===null||v===undefined||isNaN(v)) return;
+      out.value=fmt(v);
+    });
+  }
+  form.addEventListener('input', recompute);
+  form.addEventListener('change', recompute);
+  DEFS.forEach(function(d){
+    if(d.kind==='rollup'){ var b=document.getElementById('o2mbody_'+d._list); if(b){ new MutationObserver(recompute).observe(b,{childList:true}); } }
+  });
+  recompute();
+})();
+</script>"#;
 
 #[cfg(test)]
 mod tests {
@@ -477,21 +688,39 @@ mod tests {
 
     #[test]
     fn expr_builds_safe_sql() {
-        let sql = build_expr_sql("(qty * unit_price) - discount", &numeric()).unwrap();
+        let sql = build_expr_sql("(qty * unit_price) - discount", &numeric(), "t").unwrap();
         assert_eq!(
             sql,
             "(COALESCE(t.qty::numeric, 0) * COALESCE(t.unit_price::numeric, 0)) - COALESCE(t.discount::numeric, 0)"
         );
+        // A rollup child formula uses the `c` alias.
+        let child = build_expr_sql("qty * unit_price", &numeric(), "c").unwrap();
+        assert_eq!(child, "COALESCE(c.qty::numeric, 0) * COALESCE(c.unit_price::numeric, 0)");
     }
 
     #[test]
     fn expr_rejects_unknown_and_nonnumeric_and_injection() {
-        assert!(build_expr_sql("qty * bogus", &numeric()).is_err(), "unknown field");
-        assert!(build_expr_sql("qty * name", &numeric()).is_err(), "non-numeric field");
-        assert!(build_expr_sql("qty; DROP TABLE x", &numeric()).is_err(), "punctuation");
-        assert!(build_expr_sql("qty = 1", &numeric()).is_err(), "comparison not allowed");
-        assert!(build_expr_sql("5 + 3", &numeric()).is_err(), "must reference a field");
-        assert!(build_expr_sql("2 * qty", &numeric()).is_ok(), "literal with a field is fine");
+        assert!(build_expr_sql("qty * bogus", &numeric(), "t").is_err(), "unknown field");
+        assert!(build_expr_sql("qty * name", &numeric(), "t").is_err(), "non-numeric field");
+        assert!(build_expr_sql("qty; DROP TABLE x", &numeric(), "t").is_err(), "punctuation");
+        assert!(build_expr_sql("qty = 1", &numeric(), "t").is_err(), "comparison not allowed");
+        assert!(build_expr_sql("5 + 3", &numeric(), "t").is_err(), "must reference a field");
+        assert!(build_expr_sql("2 * qty", &numeric(), "t").is_ok(), "literal with a field is fine");
+    }
+
+    #[test]
+    fn rollup_parse_validates() {
+        assert_eq!(
+            parse_rollup("lines | sum | qty * unit_price").unwrap(),
+            ("lines".to_string(), "sum".to_string(), "qty * unit_price".to_string())
+        );
+        assert_eq!(
+            parse_rollup("lines | count").unwrap(),
+            ("lines".to_string(), "count".to_string(), String::new())
+        );
+        assert!(parse_rollup("lines | median | x").is_err(), "unknown aggregate");
+        assert!(parse_rollup("lines | sum").is_err(), "sum needs a formula");
+        assert!(parse_rollup("lines").is_err(), "needs an aggregate");
     }
 
     #[test]

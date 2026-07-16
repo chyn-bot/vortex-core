@@ -120,6 +120,9 @@ pub fn column_type(field_type: &str) -> Result<&'static str, BlueprintError> {
     Ok(match field_type {
         "string" | "char" => "VARCHAR(255)",
         "selection" => "VARCHAR(64)",
+        // Auto-number: a generated reference string (e.g. "VIS-2026-0001") is
+        // written on create, so the column is a short text field.
+        "autonumber" => "VARCHAR(64)",
         "text" => "TEXT",
         "boolean" => "BOOLEAN",
         "integer" => "INTEGER",

@@ -81,22 +81,22 @@ pub fn contacts_routes() -> Router<Arc<AppState>> {
 fn page_shell(sidebar: &str, title: &str, content: &str) -> String {
     format!(
         r##"<!DOCTYPE html><html data-theme="dark"><head>
-<script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script>
+<script src="/static/theme-init.js?v=20"></script>
 <title>{title} - Vortex</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=19" rel="stylesheet"/>
-<script src="/static/vortex.js?v=19" defer></script>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script>
 <script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
 <div class="sticky top-0 z-30 flex items-center bg-base-100 px-4 py-2 shadow lg:hidden">
-<button onclick="document.getElementById('sidebar').classList.toggle('-translate-x-full');document.getElementById('sidebar-overlay').classList.toggle('hidden')" class="btn btn-ghost btn-sm btn-square">
+<button type="button" data-sidebar-toggle class="btn btn-ghost btn-sm btn-square">
 <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/></svg>
 </button>
 <a href="/home" class="ml-2 text-lg font-bold"><span class="text-success">vor</span><span class="opacity-60">tex</span></a>
 </div>
-<div id="sidebar-overlay" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" onclick="document.getElementById('sidebar').classList.add('-translate-x-full');this.classList.add('hidden')"></div>
+<div id="sidebar-overlay" class="fixed inset-0 z-30 bg-black/50 hidden lg:hidden" data-sidebar-close></div>
 <div class="flex">{sidebar}
 <main class="flex-1 p-4 lg:p-6 min-w-0">
 {content}
@@ -105,6 +105,26 @@ fn page_shell(sidebar: &str, title: &str, content: &str) -> String {
         sidebar = sidebar,
         content = content,
     )
+}
+
+/// Wrap a fully-rendered page in a Response carrying a *strict* CSP —
+/// `script-src 'self'` with NO `'unsafe-inline'`. Use only for pages proven
+/// free of inline `<script>` and inline `on*=` handlers: all behaviour is
+/// delegated through `/static/vortex.js` (see the CSP-safe delegated handlers
+/// there). `security_headers_middleware` preserves this handler-set CSP
+/// instead of applying the permissive global default.
+fn strict_csp_page(html: String) -> Response {
+    use vortex_plugin_sdk::axum::http::{header, HeaderValue};
+    let mut resp = Html(html).into_response();
+    resp.headers_mut().insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(
+            "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; \
+             connect-src 'self'; img-src 'self' data: https://*.tile.openstreetmap.org; \
+             font-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'",
+        ),
+    );
+    resp
 }
 
 /// GET /contacts — list all contacts with search, filter, sort, pagination.
@@ -385,40 +405,10 @@ async fn new_contact_form(
 <div class="form-control mb-3">
 <label class="label"><span class="label-text">Country</span></label>
 <select name="country_id" id="country-select" class="select select-bordered select-sm"
-  onchange="loadStates(this.value)">
+  data-load-states data-states-target="state-select">
 {country_options}
 </select>
-</div>
-<script>
-async function loadStates(countryId) {{
-  var sel = document.getElementById('state-select');
-  sel.innerHTML = '<option value="">Loading...</option>';
-  if (!countryId) {{
-    sel.innerHTML = '<option value="">-- Select State --</option>';
-    return;
-  }}
-  try {{
-    var res = await fetch('/api/states/' + countryId);
-    if (!res.ok) {{
-      sel.innerHTML = '<option value="">Error loading states</option>';
-      return;
-    }}
-    var states = await res.json();
-    sel.innerHTML = '<option value="">-- Select State --</option>';
-    for (var i = 0; i < states.length; i++) {{
-      var opt = document.createElement('option');
-      opt.value = states[i].id;
-      opt.textContent = states[i].name + ' (' + states[i].code + ')';
-      sel.appendChild(opt);
-    }}
-    if (states.length === 0) {{
-      sel.innerHTML = '<option value="">No states available</option>';
-    }}
-  }} catch(e) {{
-    sel.innerHTML = '<option value="">Error: ' + e.message + '</option>';
-  }}
-}}
-</script>"#,
+</div>"#,
     );
 
     let notes = format!(
@@ -453,7 +443,7 @@ async function loadStates(countryId) {{
         below: "",
     });
 
-    Html(page_shell(&sidebar, "New Contact", &content)).into_response()
+    strict_csp_page(page_shell(&sidebar, "New Contact", &content))
 }
 
 /// POST /contacts/create — create a new contact with auto-generated
@@ -739,7 +729,7 @@ async fn edit_contact(
     // already-archived records get an Un-archive button that restores them.
     let archive_button = if active {
         format!(
-            r#"<form method="POST" action="/contacts/{id}/archive" onsubmit="return confirm('Archive this contact?')">
+            r#"<form method="POST" action="/contacts/{id}/archive" data-confirm="Archive this contact?">
 <button class="btn btn-warning btn-sm btn-outline">Archive</button>
 </form>"#,
             id = id,
@@ -890,40 +880,10 @@ async fn edit_contact(
 <div class="form-control mb-3">
 <label class="label"><span class="label-text">Country</span></label>
 <select name="country_id" id="country-select" class="select select-bordered select-sm"
-  onchange="loadStates(this.value)">
+  data-load-states data-states-target="state-select">
 {country_options}
 </select>
-</div>
-<script>
-async function loadStates(countryId) {{
-  var sel = document.getElementById('state-select');
-  sel.innerHTML = '<option value="">Loading...</option>';
-  if (!countryId) {{
-    sel.innerHTML = '<option value="">-- Select State --</option>';
-    return;
-  }}
-  try {{
-    var res = await fetch('/api/states/' + countryId);
-    if (!res.ok) {{
-      sel.innerHTML = '<option value="">Error loading states</option>';
-      return;
-    }}
-    var states = await res.json();
-    sel.innerHTML = '<option value="">-- Select State --</option>';
-    for (var i = 0; i < states.length; i++) {{
-      var opt = document.createElement('option');
-      opt.value = states[i].id;
-      opt.textContent = states[i].name + ' (' + states[i].code + ')';
-      sel.appendChild(opt);
-    }}
-    if (states.length === 0) {{
-      sel.innerHTML = '<option value="">No states available</option>';
-    }}
-  }} catch(e) {{
-    sel.innerHTML = '<option value="">Error: ' + e.message + '</option>';
-  }}
-}}
-</script>"#,
+</div>"#,
         street_val = esc(street.as_deref().unwrap_or("")),
         street2_val = esc(street2.as_deref().unwrap_or("")),
         street3_val = esc(street3.as_deref().unwrap_or("")),
@@ -1008,7 +968,7 @@ async function loadStates(countryId) {{
         portal_button = portal_button,
     );
 
-    Html(page_shell(&sidebar, &format!("Edit {}", name), &content)).into_response()
+    strict_csp_page(page_shell(&sidebar, &format!("Edit {}", name), &content))
 }
 
 /// The contact model's tracked fields — Vortex's `tracking=True` analogue.

@@ -36,9 +36,10 @@ pub fn render_app_shell_with(
     format!(
         r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style><title>{title}</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="vortex-idle" content="1800">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=19" rel="stylesheet"/>
-<script src="/static/vortex.js?v=19" defer></script>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script>
 <script src="/static/vendor/tailwind.js"></script>
 {head_extra}</head>
 <body class="min-h-screen bg-base-200">

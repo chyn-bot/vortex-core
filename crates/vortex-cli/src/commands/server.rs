@@ -241,13 +241,22 @@ async fn auth_middleware(
                 .await;
             }
 
-            // Fetch user roles
+            // Fetch user roles. A role owned by a plugin (owning_module set) only
+            // counts while that module is installed here — so a leftover grant to
+            // an uninstalled module's role (e.g. "EAM Admin" in a plain
+            // accounting tenant) grants nothing, and reactivates automatically if
+            // the module is ever installed. Core roles (owning_module NULL) always
+            // apply.
             let roles: Vec<String> = sqlx::query_scalar(
                 r#"
                 SELECT r.name
                 FROM roles r
                 JOIN user_roles ur ON ur.role_id = r.id
                 WHERE ur.user_id = $1
+                  AND (r.owning_module IS NULL
+                       OR r.owning_module IN (
+                           SELECT technical_name FROM installed_modules WHERE state = 'installed'
+                       ))
                 "#
             )
             .bind(session.user_id)
@@ -1409,8 +1418,8 @@ fn module_not_installed_page(module_name: &str) -> String {
     format!(r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style><title>Module Not Installed</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=19" rel="stylesheet"/>
-<script src="/static/vortex.js?v=19" defer></script>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script>
 <script src="/static/vendor/tailwind.js"></script></head>
 <body class="min-h-screen bg-base-200 flex items-center justify-center">
 <div class="card bg-base-100 shadow-xl max-w-md w-full">
@@ -2272,6 +2281,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         // keeps old bookmarks and stray links working.
         .route("/dashboard", get(|| async { Redirect::to("/home") }))
         .route("/auth/logout", post(logout).get(logout))
+        .route("/auth/ping", post(session_ping).get(session_ping))
         .route("/partials/recent-activity", get(recent_activity))
         .route("/partials/system-status", get(system_status))
         // Home partials
@@ -2305,6 +2315,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/blueprints/{model}/history", get(blueprint_history))
         .route("/blueprints/{model}/restore", post(blueprint_restore))
         .route("/blueprints/{model}/layout", post(blueprint_set_layout))
+        .route("/blueprints/{model}/sections", post(blueprint_set_sections))
         .route("/blueprints/{model}/fields", post(blueprint_add_field))
         .route("/blueprints/{model}/fields/{name}/rename", post(blueprint_rename_field))
         .route("/blueprints/{model}/fields/{name}/delete", post(blueprint_remove_field))
@@ -2749,7 +2760,11 @@ async fn api_notifications(
     }))
 }
 
-async fn login_page(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Html<String> {
+async fn login_page(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Html<String> {
     // Host-scoped: on gaia.vortex.com this is just ["gaia"], so the
     // picker disappears and other tenants' names never reach the page.
     let databases = login_databases(&state, &headers).await;
@@ -2771,11 +2786,22 @@ async fn login_page(State(state): State<Arc<AppState>>, headers: HeaderMap) -> H
         String::new()
     };
 
+    // An inactivity sign-out (from the idle-timeout client) lands here with
+    // `?reason=timeout` — explain why they're back at login instead of leaving
+    // them guessing. Any other reason value is ignored.
+    let notice_html = if q.get("reason").map(|r| r == "timeout").unwrap_or(false) {
+        r#"<div class="alert alert-info mb-4 text-sm"><span>You were signed out due to inactivity. Please sign in again.</span></div>"#
+    } else {
+        ""
+    };
+
     let template = include_str!("../../templates/login_standalone.html");
     // Inject the database selector at the `<!-- DB_SELECTOR -->` placeholder in
     // the form (above the username field). A plain string swap keeps the
     // template free to be restyled without touching this handler.
-    let html = template.replace("<!-- DB_SELECTOR -->", &db_selector_html);
+    let html = template
+        .replace("<!-- DB_SELECTOR -->", &db_selector_html)
+        .replace("<!-- NOTICE -->", notice_html);
     Html(html)
 }
 
@@ -3114,7 +3140,7 @@ fn portal_shell(title: &str, who: &str, active: &str, body: &str) -> String {
 <title>{title} · Portal</title>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=19" rel="stylesheet"/>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
 <script src="/static/vendor/tailwind.js"></script>
 <style>
 body {{ background: oklch(var(--b2)); color: oklch(var(--bc)); }}
@@ -3698,8 +3724,8 @@ fn intake_admin_shell(user: &AuthUser, title: &str, inner: &str) -> Html<String>
 <script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>{title} - Settings</title>
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=19" rel="stylesheet"/>
-<script src="/static/vortex.js?v=19" defer></script><script src="/static/vendor/tailwind.js"></script></head>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script><script src="/static/vendor/tailwind.js"></script></head>
 <body class="min-h-screen bg-base-200">
 <div class="navbar bg-base-100 shadow-lg"><div class="flex-1"><a href="/" class="btn btn-ghost text-xl">remicle</a></div><div class="flex-none"><span class="text-sm">@{user}</span></div></div>
 <div class="container mx-auto p-6 max-w-4xl">{inner}</div></body></html>"##,
@@ -4848,8 +4874,8 @@ fn portal_admin_shell(user: &AuthUser, title: &str, inner: &str) -> Html<String>
 <script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>{title} - Settings</title>
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=19" rel="stylesheet"/>
-<script src="/static/vortex.js?v=19" defer></script><script src="/static/vendor/tailwind.js"></script></head>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script><script src="/static/vendor/tailwind.js"></script></head>
 <body class="min-h-screen bg-base-200">
 <div class="navbar bg-base-100 shadow-lg"><div class="flex-1"><a href="/settings" class="btn btn-ghost text-xl">remicle</a></div><div class="flex-none"><span class="text-sm">@{user}</span></div></div>
 <div class="container mx-auto p-6 max-w-5xl">{inner}</div></body></html>"##,
@@ -5671,6 +5697,13 @@ async fn security_headers_middleware(
         .map(|c| c.contains("frame-ancestors"))
         .unwrap_or(false);
 
+    // A handler may set its own CSP (e.g. a page migrated to a strict,
+    // no-'unsafe-inline' policy). Honour it: don't slam the permissive
+    // global default on top. Pages that set nothing still get the default.
+    let has_own_csp = response
+        .headers()
+        .contains_key(header::CONTENT_SECURITY_POLICY);
+
     let headers = response.headers_mut();
     if is_html {
         headers.insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
@@ -5682,7 +5715,7 @@ async fn security_headers_middleware(
     headers.insert("X-XSS-Protection", "1; mode=block".parse().unwrap());
     headers.insert("Referrer-Policy", "strict-origin-when-cross-origin".parse().unwrap());
     headers.insert("Permissions-Policy", "camera=(), microphone=(), geolocation=()".parse().unwrap());
-    if !embeddable {
+    if !embeddable && !has_own_csp {
         headers.insert(
             "Content-Security-Policy",
             // Self-contained by policy: all CSS/JS is vendored under
@@ -5690,6 +5723,11 @@ async fn security_headers_middleware(
             // correctly). The one external allowance is OpenStreetMap
             // tiles, which are runtime map data, not page assets; fully
             // air-gapped sites point Leaflet at a local tile server.
+            //
+            // NOTE: this default still carries script-src 'unsafe-inline'
+            // because most pages still ship inline handlers/scripts. Pages
+            // migrated off inline JS set their own strict CSP header on the
+            // response, which the `has_own_csp` guard above preserves.
             "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data: https://*.tile.openstreetmap.org; font-src 'self'".parse().unwrap(),
         );
     }
@@ -5723,10 +5761,21 @@ fn hash_token(token: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// Keep-alive for the idle-timeout client. The auth middleware slides the
+/// session's expiry on every authenticated request (throttled to once a
+/// minute), so this endpoint's whole job is to *be* such a request — letting an
+/// actively-typing user (who makes no other request) hold their session open.
+/// Returns 204; if the session has already lapsed the middleware bounces it to
+/// login before this runs.
+async fn session_ping() -> Response {
+    StatusCode::NO_CONTENT.into_response()
+}
+
 async fn logout(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
     Extension(user): Extension<AuthUser>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     // Revoke the session in database
     let _ = sqlx::query(
@@ -5755,15 +5804,22 @@ async fn logout(
     // Use a real HTTP 302 redirect so it works both from HTMX
     // (sidebar logout button) and from a direct browser hit
     // (typing /auth/logout in the address bar).
+    // Carry an inactivity reason through to the login screen so it can explain
+    // why the user landed back there (vs. a deliberate logout).
+    let dest = if q.get("reason").map(|r| r == "timeout").unwrap_or(false) {
+        "/login?reason=timeout"
+    } else {
+        "/login"
+    };
     let mut headers = HeaderMap::new();
     headers.insert(
         header::SET_COOKIE,
         "session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0".parse().unwrap(),
     );
-    headers.insert(header::LOCATION, "/login".parse().unwrap());
+    headers.insert(header::LOCATION, dest.parse().unwrap());
     // Also send HX-Redirect so HTMX callers do a full-page
     // navigation instead of trying to swap into the current page.
-    headers.insert("HX-Redirect", "/login".parse().unwrap());
+    headers.insert("HX-Redirect", dest.parse().unwrap());
     (StatusCode::FOUND, headers).into_response()
 }
 
@@ -6514,6 +6570,15 @@ struct BlueprintFieldForm {
     required: Option<String>,
     #[serde(default)]
     unique: Option<String>,
+    // Auto-number settings — only read when field_type == "autonumber".
+    #[serde(default)]
+    seq_prefix: Option<String>,
+    #[serde(default)]
+    seq_padding: Option<String>,
+    #[serde(default)]
+    seq_scope: Option<String>,
+    #[serde(default)]
+    seq_separator: Option<String>,
 }
 
 /// A checkbox is "on" when the browser submits it (unticked boxes are absent).
@@ -6539,6 +6604,7 @@ const BLUEPRINT_FIELD_TYPES: &[(&str, &str)] = &[
     ("date", "Date"),
     ("datetime", "Date & time"),
     ("selection", "Dropdown"),
+    ("autonumber", "Auto number (with prefix)"),
     ("many2one", "Link to a record"),
     ("many2many", "Link to many records"),
     ("one2many", "Related records list"),
@@ -6799,6 +6865,36 @@ async fn blueprint_designer(
     })
     .unwrap_or_default();
 
+    // Per-section width ("half" | "full"), keyed by section label. Best-effort
+    // like the maps above so a DB predating migration 156 just shows every
+    // section as full width.
+    let section_width: std::collections::HashMap<String, String> = sqlx::query_scalar::<_, serde_json::Value>(
+        "SELECT section_config FROM ir_model WHERE id = $1",
+    )
+    .bind(model_id)
+    .fetch_one(&db)
+    .await
+    .ok()
+    .and_then(|v| v.as_object().map(|o| {
+        o.iter()
+            .filter_map(|(k, val)| val.get("width").and_then(|w| w.as_str()).map(|w| (k.clone(), w.to_string())))
+            .collect()
+    }))
+    .unwrap_or_default();
+
+    // Distinct section labels in field order (blank/"General" is the ungrouped
+    // flow, not a configurable section) — drives the Section layout card below.
+    let mut distinct_sections: Vec<String> = Vec::new();
+    for f in &fields {
+        let fname: String = f.get("name");
+        if let Some(s) = section_map.get(&fname) {
+            let s = s.trim();
+            if !s.is_empty() && s != "General" && !distinct_sections.iter().any(|d| d == s) {
+                distinct_sections.push(s.to_string());
+            }
+        }
+    }
+
     // Layout rows: an order box, a form-width picker, a section name, and a
     // "list column" checkbox per field, submitted as one form (order__<f> /
     // width__<f> / section__<f> / list__<f>). Sequence drives order in both the
@@ -6885,6 +6981,37 @@ async fn blueprint_designer(
         )
     };
 
+    // Section layout card: give each named section a form width. Two Half
+    // sections sit side by side; a Full section spans the row (the page break).
+    let section_card = if distinct_sections.is_empty() {
+        String::new()
+    } else {
+        let mut rows = String::new();
+        for s in &distinct_sections {
+            let half = section_width.get(s).map(|w| w == "half").unwrap_or(false);
+            rows.push_str(&format!(
+                r#"<tr class="hover"><td>{label}</td>
+<td><select name="secw__{label_attr}" class="select select-bordered select-xs"><option value="full"{full}>Full row</option><option value="half"{half}>Half (side by side)</option></select></td></tr>"#,
+                label = html_escape(s),
+                label_attr = html_escape(s),
+                full = if half { "" } else { " selected" },
+                half = if half { " selected" } else { "" },
+            ));
+        }
+        format!(
+            r#"<div class="card bg-base-100 shadow mb-6 max-w-2xl"><div class="card-body p-4">
+<h2 class="card-title text-base mb-1">Section layout</h2>
+<p class="text-sm opacity-60 mb-3">Arrange your sections across the form. <em>Half</em> sections pack two-up side by side; a <em>Full row</em> section spans the width and breaks the row — so <code>[Half][Half]</code> then a <code>[Full]</code> gives you two columns above a full-width block.</p>
+<form action="/blueprints/{model}/sections" method="POST">
+<table class="table table-sm"><thead><tr><th>Section</th><th>Width</th></tr></thead>
+<tbody>{rows}</tbody></table>
+<div class="mt-3"><button class="btn btn-primary btn-sm">Save section layout</button></div>
+</form></div></div>"#,
+            model = html_escape(&model),
+            rows = rows,
+        )
+    };
+
     // The "Links to" picker only appears when there's at least one valid target
     // (a Blueprint with a Name field); otherwise a hidden empty value keeps the
     // form well-formed and a many2one submission fails loud with guidance.
@@ -6918,6 +7045,7 @@ async fn blueprint_designer(
 <tbody>{field_rows}</tbody></table>
 </div></div>
 {layout_card}
+{section_card}
 <div class="card bg-base-100 shadow max-w-2xl"><div class="card-body p-4">
 <h2 class="card-title text-base mb-2">Add a field</h2>
 <form action="/blueprints/{model}/fields" method="POST" class="flex flex-col gap-3">
@@ -6930,6 +7058,14 @@ async fn blueprint_designer(
 <button class="btn btn-primary btn-sm">Add field</button>
 </div>
 <div class="form-control w-full"><label class="label py-1"><span class="label-text">Options <span class="opacity-50">(for Dropdown — one per line)</span></span></label><textarea name="options" rows="3" class="textarea textarea-bordered textarea-sm" placeholder="Open&#10;In Progress&#10;Closed"></textarea></div>
+<div class="flex flex-wrap gap-3 items-end pt-2 border-t border-base-300">
+<div class="text-xs opacity-50 w-full -mb-1">Auto number settings <span class="opacity-70">(for the Auto number type)</span></div>
+<div class="form-control"><label class="label py-1"><span class="label-text">Prefix</span></label><input name="seq_prefix" class="input input-bordered input-sm w-24" placeholder="VIS"/></div>
+<div class="form-control"><label class="label py-1"><span class="label-text">Separator</span></label><input name="seq_separator" class="input input-bordered input-sm w-16" value="-"/></div>
+<div class="form-control"><label class="label py-1"><span class="label-text">Digits</span></label><input name="seq_padding" type="number" min="1" max="12" class="input input-bordered input-sm w-20" value="4"/></div>
+<div class="form-control"><label class="label py-1"><span class="label-text">Reset</span></label><select name="seq_scope" class="select select-bordered select-sm"><option value="global">Never</option><option value="yearly">Yearly</option><option value="monthly">Monthly</option></select></div>
+<div class="text-xs opacity-50">e.g. <code>VIS-2026-0001</code></div>
+</div>
 </form>
 <div class="text-sm text-base-content/60 mt-3 pt-3 border-t border-base-300">Need a field that derives its value automatically (a total, or a value pulled from a linked record)? Add a <a href="/settings/computed-fields?model={model}" class="link link-primary">computed field</a> — it shows read-only on the record.</div>
 </div></div>"#,
@@ -6938,6 +7074,7 @@ async fn blueprint_designer(
         model = html_escape(&model),
         field_rows = field_rows,
         layout_card = layout_card,
+        section_card = section_card,
         type_options = blueprint_type_options(),
         target_field = target_field,
         menu_btn = if show_in_menu {
@@ -6972,6 +7109,19 @@ async fn blueprint_add_field(
         return blueprint_forbidden();
     }
     use vortex_framework::blueprint::{BlueprintOp, SubmitOutcome};
+    // An auto-number field carries its prefix/width/reset/separator as a JSON
+    // options blob (the framework validates + normalises it); every other type
+    // uses the plain Options textarea unchanged.
+    let options = if form.field_type == "autonumber" {
+        Some(serde_json::json!({
+            "prefix": form.seq_prefix.clone().unwrap_or_default(),
+            "padding": form.seq_padding.as_deref().and_then(|s| s.trim().parse::<i64>().ok()).unwrap_or(4),
+            "scope": form.seq_scope.clone().unwrap_or_else(|| "global".to_string()),
+            "separator": form.seq_separator.clone().unwrap_or_else(|| "-".to_string()),
+        }).to_string())
+    } else {
+        form.options.clone()
+    };
     match vortex_framework::blueprint::submit(
         &state,
         &db,
@@ -6982,7 +7132,7 @@ async fn blueprint_add_field(
             label: form.label.clone(),
             field_type: form.field_type.clone(),
             related_model: form.related_model.clone(),
-            options: form.options.clone(),
+            options,
             required: checkbox_on(&form.required),
             unique: checkbox_on(&form.unique),
         },
@@ -7630,6 +7780,52 @@ async fn blueprint_set_layout(
     {
         Ok(()) => Redirect::to(&format!("/blueprints/{model}")).into_response(),
         Err(e) => error_response(&e),
+    }
+}
+
+/// POST /blueprints/{model}/sections — save per-section form width. The body is
+/// flat `secw__<label>=half|full` pairs (one per named section). Full is the
+/// implicit default (a section spanning its own row); Half packs a section
+/// side-by-side with the next Half section. Admin-only + audited.
+async fn blueprint_set_sections(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(model): Path<String>,
+    Form(pairs): Form<Vec<(String, String)>>,
+) -> Response {
+    if !user.is_admin() {
+        return blueprint_forbidden();
+    }
+    let mut cfg = serde_json::Map::new();
+    for (k, v) in &pairs {
+        if let Some(label) = k.strip_prefix("secw__") {
+            let label = label.trim();
+            if label.is_empty() {
+                continue;
+            }
+            let w = if v == "half" { "half" } else { "full" };
+            cfg.insert(label.to_string(), serde_json::json!({ "width": w }));
+        }
+    }
+    let cfg_val = serde_json::Value::Object(cfg);
+    match sqlx::query("UPDATE ir_model SET section_config = $1 WHERE name = $2")
+        .bind(&cfg_val)
+        .bind(&model)
+        .execute(&db)
+        .await
+    {
+        Ok(_) => {
+            api_audit(
+                &state, &db_ctx.db_name, &user,
+                AuditAction::Custom("blueprint_section_layout".into()), AuditSeverity::Info,
+                "ir_model", Some(&model),
+                serde_json::json!({ "sections": cfg_val }),
+            ).await;
+            Redirect::to(&format!("/blueprints/{model}")).into_response()
+        }
+        Err(e) => error_response(&format!("Could not save section layout: {e}")),
     }
 }
 
@@ -8682,8 +8878,14 @@ struct RoleRow {
 /// any number of roles (e.g. System Administrator *and* EAM Manager); the
 /// `user_roles` table is many-to-many and the login path aggregates them all.
 async fn generate_role_checkboxes(db: &PgPool, selected_roles: &[uuid::Uuid]) -> String {
+    // Only offer core roles and roles whose owning module is installed here — an
+    // uninstalled plugin's roles must not be assignable (they'd grant nothing
+    // anyway; see the auth middleware's role filter).
     let roles = sqlx::query_as::<_, RoleRow>(
-        "SELECT id, name, description FROM roles ORDER BY name"
+        "SELECT id, name, description FROM roles \
+         WHERE owning_module IS NULL \
+            OR owning_module IN (SELECT technical_name FROM installed_modules WHERE state = 'installed') \
+         ORDER BY name"
     )
     .fetch_all(db)
     .await
@@ -8906,8 +9108,8 @@ async fn access_control_page(
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Access Control - Remicle</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=19" rel="stylesheet"/>
-<script src="/static/vortex.js?v=19" defer></script>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script>
     <script src="/static/vendor/tailwind.js"></script>
     <script src="/static/vendor/htmx.min.js"></script>
     <script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style>
@@ -9396,8 +9598,8 @@ async fn modules_list_with_filter(
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Apps & Modules - Remicle</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet" type="text/css" />
-<link href="/static/vortex.css?v=19" rel="stylesheet"/>
-<script src="/static/vortex.js?v=19" defer></script>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script>
     <script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
@@ -9742,8 +9944,8 @@ async fn modules_detail(
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>{name} - Apps & Modules</title>
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet" type="text/css"/>
-<link href="/static/vortex.css?v=19" rel="stylesheet"/>
-<script src="/static/vortex.js?v=19" defer></script>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script>
 <script src="/static/vendor/tailwind.js"></script></head>
 <body class="min-h-screen bg-base-200"><main class="max-w-4xl mx-auto p-4 lg:p-8">
 <a href="/modules" class="btn btn-ghost btn-sm mb-4 gap-2">← Back to Apps &amp; Modules</a>
@@ -10037,6 +10239,46 @@ async fn module_install(
     axum::Json(ModuleOperationResponse { success: true, message, error: None }).into_response()
 }
 
+/// Extract the base-table names targeted by `DROP TABLE [IF EXISTS] <name>`
+/// statements in a migration's down SQL, so uninstall can re-drop them with
+/// CASCADE (FK-ordering-proof). Schema qualifiers and quotes are stripped; the
+/// caller validates each name as an identifier before it reaches SQL.
+fn collect_drop_table_names(sql: &str) -> Vec<String> {
+    let lower = sql.to_ascii_lowercase();
+    let bytes = sql.as_bytes();
+    let mut names = Vec::new();
+    let mut from = 0usize;
+    while let Some(rel) = lower[from..].find("drop table") {
+        let mut cur = from + rel + "drop table".len();
+        // optional "if exists"
+        let tail = lower[cur..].trim_start();
+        cur += lower[cur..].len() - tail.len();
+        if lower[cur..].starts_with("if exists") {
+            cur += "if exists".len();
+        }
+        while cur < bytes.len() && bytes[cur].is_ascii_whitespace() {
+            cur += 1;
+        }
+        let start = cur;
+        while cur < bytes.len() {
+            let c = bytes[cur];
+            if c.is_ascii_alphanumeric() || c == b'_' || c == b'.' || c == b'"' {
+                cur += 1;
+            } else {
+                break;
+            }
+        }
+        let raw = &sql[start..cur];
+        // last dotted segment (drop schema qualifier), unquoted
+        let name = raw.rsplit('.').next().unwrap_or(raw).trim_matches('"').to_string();
+        if !name.is_empty() {
+            names.push(name);
+        }
+        from = start.max(from + rel + "drop table".len());
+    }
+    names
+}
+
 async fn module_uninstall(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
@@ -10112,7 +10354,73 @@ async fn module_uninstall(
         }).into_response();
     }
 
-    // Update state to uninstalled
+    // Full teardown: remove everything the module put in this tenant DB, so an
+    // uninstalled module leaves nothing behind (schema, roles, grants, registry
+    // metadata, i18n, migration records). The migration records are deleted so a
+    // future reinstall re-runs the ups; `vortex db migrate` won't recreate the
+    // schema in the meantime because it now skips uninstalled modules.
+
+    // 1) Clear this module's role grants first, so deleting the roles (below, or
+    //    inside a down-migration) can't trip a user_roles foreign key.
+    let _ = sqlx::query(
+        "DELETE FROM user_roles ur USING roles r \
+         WHERE ur.role_id = r.id AND r.owning_module = $1",
+    )
+    .bind(&module_id)
+    .execute(&db)
+    .await;
+
+    // 2) Run the plugin's own down-migrations in reverse order to drop its
+    //    tables (and any roles/policies those migrations seed). Best-effort:
+    //    the down SQL uses IF EXISTS and is idempotent, so a re-run completes a
+    //    partial teardown; a failure is logged, not fatal.
+    if let Some(plugin) = state
+        .plugin_registry
+        .plugins_iter()
+        .find(|p| p.technical_name() == module_id)
+    {
+        let mut migs = plugin.migrations();
+        migs.reverse();
+        let mut drop_tables: Vec<String> = Vec::new();
+        for m in &migs {
+            if let Some(down) = m.down_sql {
+                // Run statements individually (best-effort): a single failing
+                // statement — e.g. a DROP blocked by a not-yet-dropped FK — must
+                // not roll back the rest of the file (which `raw_sql`'s implicit
+                // batch transaction would). This also runs the non-table cleanup
+                // (role deletes, dropped constraints, sequences) the downs carry.
+                for stmt in crate::commands::db::split_sql_statements(down) {
+                    if let Err(e) = sqlx::raw_sql(&stmt).execute(&db).await {
+                        tracing::warn!(module = %module_id, migration = %m.name, error = %e, "down-migration statement failed during uninstall");
+                    }
+                }
+                drop_tables.extend(collect_drop_table_names(down));
+            }
+        }
+        // Guarantee the tables are gone: re-drop every table the downs target
+        // with CASCADE, so a foreign-key dependency the plain DROPs couldn't
+        // resolve (a referencing table dropped later, or a cycle) can't leave
+        // orphaned tables behind. CASCADE removes only inbound FK constraints +
+        // dependent views, never other base tables.
+        for t in drop_tables {
+            if validate_identifier(&t) {
+                let _ = sqlx::raw_sql(&format!("DROP TABLE IF EXISTS \"{}\" CASCADE", t)).execute(&db).await;
+            }
+        }
+    }
+
+    // 3) Sweep residual metadata the down-migrations don't own.
+    let _ = sqlx::query("DELETE FROM roles WHERE owning_module = $1").bind(&module_id).execute(&db).await;
+    let _ = sqlx::query(
+        "DELETE FROM ir_model_field f USING ir_model m \
+         WHERE f.model_id = m.id AND m.module = $1",
+    ).bind(&module_id).execute(&db).await;
+    let _ = sqlx::query("DELETE FROM ir_model WHERE module = $1").bind(&module_id).execute(&db).await;
+    let _ = sqlx::query("DELETE FROM translations WHERE module = $1").bind(&module_id).execute(&db).await;
+    // 4) Forget the migration records so reinstall re-applies the ups.
+    let _ = sqlx::query("DELETE FROM vortex_migrations WHERE module = $1").bind(&module_id).execute(&db).await;
+
+    // 5) Flip the flag last.
     let result = sqlx::query(
         "UPDATE installed_modules SET state = 'uninstalled', updated_at = NOW() WHERE technical_name = $1"
     )
@@ -13086,8 +13394,8 @@ async fn contacts_new(State(state): State<Arc<AppState>>, Db(db): Db, Extension(
     }
 
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style><title>New Contact</title><meta name="viewport" content="width=device-width, initial-scale=1.0"><link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=19" rel="stylesheet"/>
-<script src="/static/vortex.js?v=19" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script><script src="/static/vendor/tailwind.js"></script>
 <style>
 .country-dropdown {{ position: relative; }}
 .country-dropdown .dropdown-content {{ max-height: 300px; overflow-y: auto; width: 100%; }}
@@ -13390,8 +13698,8 @@ async fn contacts_edit(
     };
 
     Html(format!(r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style><title>Edit Contact</title><meta name="viewport" content="width=device-width, initial-scale=1.0"><link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=19" rel="stylesheet"/>
-<script src="/static/vortex.js?v=19" defer></script><script src="/static/vendor/tailwind.js"></script><script src="/static/vendor/htmx.min.js"></script>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script><script src="/static/vendor/tailwind.js"></script><script src="/static/vendor/htmx.min.js"></script>
 <style>
 .country-dropdown {{ position: relative; }}
 .country-dropdown .dropdown-content {{ max-height: 300px; overflow-y: auto; width: 100%; }}
@@ -14688,8 +14996,8 @@ async fn notifications_page(
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Notifications - Remicle</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=19" rel="stylesheet"/>
-<script src="/static/vortex.js?v=19" defer></script>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script>
     <script src="/static/vendor/tailwind.js"></script>
     <style>
         body {{ background: oklch(var(--b2)); color: oklch(var(--bc)); }}
@@ -14806,8 +15114,8 @@ async fn settings_index(
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Settings - Remicle</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=19" rel="stylesheet"/>
-<script src="/static/vortex.js?v=19" defer></script>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script>
     <script src="/static/vendor/tailwind.js"></script>
     <style>
         body {{ background: oklch(var(--b2)); color: oklch(var(--bc)); }}
@@ -15591,8 +15899,8 @@ async fn render_custom_fields_page(db: &sqlx::PgPool, username: &str, error: Opt
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Custom Fields - Settings</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-    <link href="/static/vortex.css?v=19" rel="stylesheet"/>
-    <script src="/static/vortex.js?v=19" defer></script>
+    <link href="/static/vortex.css?v=20" rel="stylesheet"/>
+    <script src="/static/vortex.js?v=20" defer></script>
     <script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
@@ -15937,7 +16245,7 @@ async fn render_automation_rules_page(db: &sqlx::PgPool, username: &str, error: 
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Automation Rules - Settings</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-    <link href="/static/vortex.css?v=19" rel="stylesheet"/>
+    <link href="/static/vortex.css?v=20" rel="stylesheet"/>
     <script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
@@ -16100,7 +16408,11 @@ async fn render_computed_fields_page(
     let fields = vortex_framework::computed_fields::list_all(db).await;
     let mut rows_html = String::new();
     for (model, model_label, f) in &fields {
-        let kind_badge = if f.kind == "related" { "related" } else { "formula" };
+        let kind_badge = match f.kind.as_str() {
+            "related" => "related",
+            "rollup" => "rollup",
+            _ => "formula",
+        };
         rows_html.push_str(&format!(
             r##"<tr>
                 <td>{model_label} <code class="text-xs opacity-60">{model}</code></td>
@@ -16134,7 +16446,7 @@ async fn render_computed_fields_page(
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Computed Fields - Settings</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-    <link href="/static/vortex.css?v=19" rel="stylesheet"/>
+    <link href="/static/vortex.css?v=20" rel="stylesheet"/>
     <script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
@@ -16167,8 +16479,8 @@ async fn render_computed_fields_page(
             <div class="form-control mb-3"><label class="label"><span class="label-text">Kind</span></label>
                 <select name="kind" class="select select-bordered">{kind_options}</select></div>
             <div class="form-control mb-3"><label class="label"><span class="label-text">Definition</span></label>
-                <input type="text" name="expr" class="input input-bordered font-mono" placeholder="qty * unit_price   —or—   partner_id.email" required/>
-                <span class="label-text-alt opacity-60 mt-1">Formula: arithmetic on number fields (+ - * / and parentheses). Related: link_field.target_field</span></div>
+                <input type="text" name="expr" class="input input-bordered font-mono" placeholder="qty * unit_price   —or—   partner_id.email   —or—   lines | sum | qty * unit_price" required/>
+                <span class="label-text-alt opacity-60 mt-1"><b>Formula:</b> arithmetic on number fields (+ - * / and parentheses), e.g. <code>qty * unit_price</code>. <b>Related:</b> <code>link_field.target_field</code>. <b>Rollup:</b> <code>list_field | sum | formula</code> — aggregate (sum, count, avg, min, max) over a related list; <code>count</code> needs no formula.</span></div>
             <div class="form-control mb-3"><label class="label"><span class="label-text">Help text (optional)</span></label>
                 <input type="text" name="help" class="input input-bordered" placeholder="Shown under the field"/></div>
             <div class="modal-action">
@@ -16592,8 +16904,8 @@ async fn activity_types_list(
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Activity Types - Settings</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=19" rel="stylesheet"/>
-<script src="/static/vortex.js?v=19" defer></script>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script>
     <script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
@@ -16755,8 +17067,8 @@ async fn activity_type_edit(
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{} - Activity Type</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=19" rel="stylesheet"/>
-<script src="/static/vortex.js?v=19" defer></script>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script>
     <script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
@@ -16889,8 +17201,8 @@ fn settings_write_error(back: &str, msg: &str) -> Response {
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Error</title>
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=19" rel="stylesheet"/>
-<script src="/static/vortex.js?v=19" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script><script src="/static/vendor/tailwind.js"></script>
 </head><body class="min-h-screen bg-base-200"><div class="container mx-auto p-6 max-w-xl">
 <div class="alert alert-error mb-4"><span>{}</span></div>
 <a href="{}" class="btn btn-ghost btn-sm">← Back</a>
@@ -16908,8 +17220,8 @@ fn settings_write_ok(back: &str, msg: &str) -> Response {
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Done</title>
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=19" rel="stylesheet"/>
-<script src="/static/vortex.js?v=19" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script><script src="/static/vendor/tailwind.js"></script>
 </head><body class="min-h-screen bg-base-200"><div class="container mx-auto p-6 max-w-xl">
 <div class="alert alert-success mb-4"><span>{}</span></div>
 <a href="{}" class="btn btn-ghost btn-sm">← Back</a>
@@ -16979,8 +17291,8 @@ async fn countries_list(
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Countries - Settings</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=19" rel="stylesheet"/>
-<script src="/static/vortex.js?v=19" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script><script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg">
@@ -17133,8 +17445,8 @@ async fn country_edit(
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{name} - Country</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=19" rel="stylesheet"/>
-<script src="/static/vortex.js?v=19" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script><script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg">
@@ -17312,8 +17624,8 @@ async fn states_list(
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>States - Settings</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=19" rel="stylesheet"/>
-<script src="/static/vortex.js?v=19" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script><script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg">
@@ -17459,8 +17771,8 @@ async fn state_edit(
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{name} - State</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=19" rel="stylesheet"/>
-<script src="/static/vortex.js?v=19" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script><script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg">
@@ -17658,8 +17970,8 @@ async fn stages_list(
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Stages - Settings</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=19" rel="stylesheet"/>
-<script src="/static/vortex.js?v=19" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script><script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg">
@@ -17818,8 +18130,8 @@ async fn stage_edit(
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{label} - Stage</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=19" rel="stylesheet"/>
-<script src="/static/vortex.js?v=19" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script><script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg">
@@ -17978,7 +18290,7 @@ fn button_color_options(selected: &str) -> String {
 }
 
 async fn role_options(db: &sqlx::PgPool, selected: &str) -> String {
-    let roles: Vec<String> = sqlx::query_scalar("SELECT name FROM roles ORDER BY name")
+    let roles: Vec<String> = sqlx::query_scalar("SELECT name FROM roles WHERE owning_module IS NULL OR owning_module IN (SELECT technical_name FROM installed_modules WHERE state = 'installed') ORDER BY name")
         .fetch_all(db)
         .await
         .unwrap_or_default();
@@ -18070,8 +18382,8 @@ async fn stage_buttons_list(
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Stage Buttons - Settings</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=19" rel="stylesheet"/>
-<script src="/static/vortex.js?v=19" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script><script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg">
@@ -18239,8 +18551,8 @@ async fn stage_button_edit(
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{label} - Stage Button</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=19" rel="stylesheet"/>
-<script src="/static/vortex.js?v=19" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script><script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg">
@@ -18491,8 +18803,8 @@ async fn approval_rules_list(Db(db): Db, Extension(user): Extension<AuthUser>) -
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Approval Rules - Settings</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=19" rel="stylesheet"/>
-<script src="/static/vortex.js?v=19" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script><script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg">
@@ -18861,8 +19173,8 @@ async fn email_servers_list(Db(db): Db, Extension(user): Extension<AuthUser>) ->
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Email / SMTP - Settings</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=19" rel="stylesheet"/>
-<script src="/static/vortex.js?v=19" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script><script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg">
@@ -19067,8 +19379,8 @@ async fn email_server_edit(
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{name} - Mail Server</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=19" rel="stylesheet"/>
-<script src="/static/vortex.js?v=19" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script><script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg">
@@ -19333,8 +19645,8 @@ async fn jobs_list(
 <script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Jobs - Settings</title>
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=19" rel="stylesheet"/>
-<script src="/static/vortex.js?v=19" defer></script><script src="/static/vendor/tailwind.js"></script></head>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script><script src="/static/vendor/tailwind.js"></script></head>
 <body class="min-h-screen bg-base-200">
 <div class="navbar bg-base-100 shadow-lg"><div class="flex-1"><a href="/" class="btn btn-ghost text-xl">remicle</a></div><div class="flex-none"><span class="text-sm">@{user}</span></div></div>
 <div class="container mx-auto p-6 max-w-5xl">
@@ -19379,8 +19691,8 @@ fn api_tokens_page_shell(user: &AuthUser, inner: &str) -> Html<String> {
 <script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>API Tokens - Settings</title>
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=19" rel="stylesheet"/>
-<script src="/static/vortex.js?v=19" defer></script><script src="/static/vendor/tailwind.js"></script></head>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script><script src="/static/vendor/tailwind.js"></script></head>
 <body class="min-h-screen bg-base-200">
 <div class="navbar bg-base-100 shadow-lg"><div class="flex-1"><a href="/" class="btn btn-ghost text-xl">remicle</a></div><div class="flex-none"><span class="text-sm">@{user}</span></div></div>
 <div class="container mx-auto p-6 max-w-5xl">{inner}</div></body></html>"##,
@@ -19559,8 +19871,8 @@ fn webhooks_page_shell(user: &AuthUser, title: &str, inner: &str) -> Html<String
 <script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>{title} - Settings</title>
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=19" rel="stylesheet"/>
-<script src="/static/vortex.js?v=19" defer></script><script src="/static/vendor/tailwind.js"></script></head>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script><script src="/static/vendor/tailwind.js"></script></head>
 <body class="min-h-screen bg-base-200">
 <div class="navbar bg-base-100 shadow-lg"><div class="flex-1"><a href="/" class="btn btn-ghost text-xl">remicle</a></div><div class="flex-none"><span class="text-sm">@{user}</span></div></div>
 <div class="container mx-auto p-6 max-w-4xl">{inner}</div></body></html>"##,
@@ -20410,8 +20722,8 @@ async fn sequences_list(
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Sequences - Settings</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=19" rel="stylesheet"/>
-<script src="/static/vortex.js?v=19" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script><script src="/static/vendor/tailwind.js"></script>
     <script src="/static/vendor/htmx.min.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
@@ -20615,8 +20927,8 @@ async fn sequence_edit(
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{} - Sequence</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=19" rel="stylesheet"/>
-<script src="/static/vortex.js?v=19" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script><script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg">
@@ -20807,8 +21119,8 @@ async fn cron_list(
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Scheduled Jobs - Settings</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=19" rel="stylesheet"/>
-<script src="/static/vortex.js?v=19" defer></script>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script>
     <script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
@@ -21029,8 +21341,8 @@ async fn cron_edit(
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{} - Scheduled Job</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=19" rel="stylesheet"/>
-<script src="/static/vortex.js?v=19" defer></script>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script>
     <script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
@@ -21605,8 +21917,8 @@ async fn reports_list(Db(db): Db, Extension(user): Extension<AuthUser>) -> Respo
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Reports - Settings</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=19" rel="stylesheet"/>
-<script src="/static/vortex.js?v=19" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script><script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg"><div class="flex-1"><a href="/" class="btn btn-ghost text-xl">remicle</a></div><div class="flex-none"><span class="text-sm">@{user}</span></div></div>
@@ -21734,7 +22046,7 @@ async fn report_edit(Db(db): Db, Extension(user): Extension<AuthUser>, Path(id):
     let field_opts_filter = report_field_options(&db, &def.model_name, "", None).await;
     let group_opts = report_field_options(&db, &def.model_name, def.group_field.as_deref().unwrap_or(""), Some("— No grouping —")).await;
     let sort_opts = report_field_options(&db, &def.model_name, def.sort_field.as_deref().unwrap_or(""), Some("— Default —")).await;
-    let roles: Vec<String> = sqlx::query_scalar("SELECT name FROM roles ORDER BY name").fetch_all(&db).await.unwrap_or_default();
+    let roles: Vec<String> = sqlx::query_scalar("SELECT name FROM roles WHERE owning_module IS NULL OR owning_module IN (SELECT technical_name FROM installed_modules WHERE state = 'installed') ORDER BY name").fetch_all(&db).await.unwrap_or_default();
     let role_opts: String = {
         let mut o = format!(r#"<option value=""{}>— Any user —</option>"#, if def.required_role.is_none() { " selected" } else { "" });
         for r in &roles {
@@ -21799,8 +22111,8 @@ async fn report_edit(Db(db): Db, Extension(user): Extension<AuthUser>, Path(id):
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{name} - Report</title>
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
-<link href="/static/vortex.css?v=19" rel="stylesheet"/>
-<script src="/static/vortex.js?v=19" defer></script><script src="/static/vendor/tailwind.js"></script>
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<script src="/static/vortex.js?v=20" defer></script><script src="/static/vendor/tailwind.js"></script>
 </head>
 <body class="min-h-screen bg-base-200">
     <div class="navbar bg-base-100 shadow-lg"><div class="flex-1"><a href="/" class="btn btn-ghost text-xl">remicle</a></div><div class="flex-none"><span class="text-sm">@{user}</span></div></div>
@@ -22472,6 +22784,26 @@ async fn render_dynamic_form(
     })
     .unwrap_or_default();
 
+    // Per-section width ("half" | "full"), keyed by section label. Read
+    // best-effort like the other layout maps — a DB predating migration 156 has
+    // no section_config column, so the query fails and every section defaults to
+    // full width (its own row), i.e. the old stacked layout.
+    let section_width: std::collections::HashMap<String, String> = sqlx::query_scalar::<_, serde_json::Value>(
+        "SELECT section_config FROM ir_model WHERE id = $1",
+    )
+    .bind(model_id)
+    .fetch_one(db)
+    .await
+    .ok()
+    .and_then(|v| v.as_object().map(|o| {
+        o.iter()
+            .filter_map(|(k, val)| {
+                val.get("width").and_then(|w| w.as_str()).map(|w| (k.clone(), w.to_string()))
+            })
+            .collect()
+    }))
+    .unwrap_or_default();
+
     // Per-field "required" flag, read best-effort like col_span/section so a DB
     // predating migration 155 (no is_required column) simply treats every field
     // as optional rather than blanking the form.
@@ -22530,12 +22862,40 @@ async fn render_dynamic_form(
             .collect()
     };
 
-    // Build form fields HTML, grouped into sections (cards). Section order is
-    // first-appearance in field order; a field with no section lands in
-    // "General". Each section's fields are accumulated as a string of field
-    // divs, later wrapped in a card + inner 2-col grid.
-    let mut section_order: Vec<String> = Vec::new();
-    let mut section_bodies: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    // Build form fields HTML in the user's configured field order, opening a new
+    // section block only when the section label CHANGES from the previous field.
+    // Grouping used to bucket every field of a section together, which yanked a
+    // mid-form field out of order (a field set to a section jumped above/below
+    // where its Order put it). Streaming by consecutive runs keeps strict field
+    // order; a blank / "General" label is treated as ungrouped and renders with
+    // no heading so plain fields flow inline like an unsectioned form.
+    let mut sections_html = String::new();
+    let mut cur_label = String::new();
+    let mut cur_body = String::new();
+    let mut started = false;
+    // Wrap one completed run in the shared sheet-section chrome. A "General" /
+    // blank label means ungrouped → no heading; a named section gets its rule.
+    // Width comes from section_config: a "half" section takes one grid column
+    // (and lays its own fields out in a single column so they don't cramp); any
+    // other value — including the default — spans the full row. Two half sections
+    // pack side by side; a full section between them is the page break.
+    let render_block = |label: &str, body: &str| -> String {
+        if body.is_empty() {
+            return String::new();
+        }
+        let heading = if !label.trim().is_empty() && label != "General" { label } else { "" };
+        let half = section_width.get(label).map(|w| w == "half").unwrap_or(false);
+        let (span_cls, inner_grid) = if half {
+            ("lg:col-span-1", format!(r#"<div class="grid grid-cols-1 gap-x-6">{}</div>"#, body))
+        } else {
+            ("lg:col-span-2", format!(r#"<div class="grid grid-cols-1 md:grid-cols-2 gap-x-6">{}</div>"#, body))
+        };
+        format!(
+            r#"<div class="{span}">{section}</div>"#,
+            span = span_cls,
+            section = vortex_framework::form::form_section_raw(heading, &inner_grid),
+        )
+    };
     for field in &fields {
         let field_name: String = field.get("name");
         let display_name: String = field.get("display_name");
@@ -22702,56 +23062,34 @@ async fn render_dynamic_form(
                 }
             },
             "one2many" => {
-                // Read-only list of child records that link back here via the
-                // auto-detected inverse many2one. Not an input — nothing to save.
-                match record_id {
-                    Some(rid) => {
-                        let meta = selection_options.as_ref().and_then(|o| {
-                            let ct = o.get("child_table").and_then(|v| v.as_str())?.to_string();
-                            let inv = o.get("inverse_field").and_then(|v| v.as_str())?.to_string();
-                            Some((ct, inv))
-                        });
-                        match meta {
-                            Some((child_table, inverse)) if validate_identifier(&child_table) && validate_identifier(&inverse) => {
-                                let child_model = relation_model.clone().unwrap_or_default();
-                                let rows = sqlx::query(&format!(
-                                    "SELECT id, COALESCE(name, id::text) as name FROM {} WHERE {} = $1 ORDER BY name LIMIT 200",
-                                    child_table, inverse
-                                )).bind(rid).fetch_all(db).await.unwrap_or_default();
-                                let list_html = if rows.is_empty() {
-                                    r#"<div class="text-sm opacity-60 px-3 py-3">No lines yet — use “+ Add” to create one.</div>"#.to_string()
-                                } else {
-                                    let mut items = String::new();
-                                    for r in &rows {
-                                        let cid: uuid::Uuid = r.get("id");
-                                        let cnm: String = r.get("name");
-                                        items.push_str(&format!(
-                                            r#"<a href="/form/{m}/{id}?_return=/form/{owner}/{pid}" class="flex items-center justify-between px-3 py-2 hover:bg-base-200 border-b border-base-200 last:border-0"><span>{nm}</span><span class="opacity-40">→</span></a>"#,
-                                            m = html_escape(&child_model), id = cid,
-                                            owner = html_escape(model_name), pid = rid,
-                                            nm = html_escape(&cnm)
-                                        ));
-                                    }
-                                    items
-                                };
-                                // "+ Add" deep-links to the child form with the
-                                // inverse link pre-filled and a return path back
-                                // to this record, so adding lines loops home.
-                                let add_url = format!(
-                                    "/form/{child}/new?{inv}={pid}&_return=/form/{owner}/{pid}",
-                                    child = html_escape(&child_model), inv = html_escape(&inverse),
-                                    pid = rid, owner = html_escape(model_name),
-                                );
-                                format!(
-                                    r#"<div class="border border-base-300 rounded-lg overflow-hidden">{list}</div><a href="{add}" class="btn btn-sm btn-ghost mt-2">+ Add</a>"#,
-                                    list = list_html, add = add_url,
-                                )
-                            }
-                            _ => r#"<div class="text-sm opacity-60">This related list isn't configured correctly.</div>"#.to_string(),
-                        }
+                // Inline editable line grid: a spreadsheet of the child model's
+                // cell fields, added/removed client-side and saved together with
+                // the parent (see render_o2m_grid / sync_blueprint_o2m). Works on
+                // a brand-new parent too — the rows are written straight after the
+                // parent INSERT.
+                let meta = selection_options.as_ref().and_then(|o| {
+                    let ct = o.get("child_table").and_then(|v| v.as_str())?.to_string();
+                    let inv = o.get("inverse_field").and_then(|v| v.as_str())?.to_string();
+                    Some((ct, inv))
+                });
+                match meta {
+                    Some((child_table, inverse)) if validate_identifier(&child_table) && validate_identifier(&inverse) => {
+                        let child_model = relation_model.clone().unwrap_or_default();
+                        render_o2m_grid(db, &field_name, &child_model, &child_table, &inverse, record_id).await
                     }
-                    None => r#"<div class="text-sm opacity-60 border border-base-300 rounded-lg p-3">Save this record first to see and add related records.</div>"#.to_string(),
+                    _ => r#"<div class="text-sm opacity-60">This related list isn't configured correctly.</div>"#.to_string(),
                 }
+            },
+            "autonumber" => {
+                // Generated on create by dynamic_form_create — never user-editable.
+                // Rendered `disabled` (so it doesn't submit; the value is minted
+                // server-side, not trusted from the form) with the existing value
+                // for a saved record or a placeholder for a new one.
+                let ph = if record_id.is_some() { "" } else { "Auto-assigned on save" };
+                format!(
+                    r#"<input type="text" class="input input-bordered w-full bg-base-200 text-base-content/70" value="{}" placeholder="{}" disabled />"#,
+                    current_value, ph
+                )
             },
             _ => {
                 // Default to text input
@@ -22776,33 +23114,27 @@ async fn render_dynamic_form(
             span_class, display_name, required_badge, input_html
         );
 
-        let section = section_map
+        let label = section_map
             .get(&field_name)
-            .cloned()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "General".to_string());
-        if !section_bodies.contains_key(&section) {
-            section_order.push(section.clone());
+        // Section changed → close the run so far, then start the new one. The
+        // field itself always lands in the run for its own label, so order holds.
+        if started && label != cur_label {
+            sections_html.push_str(&render_block(&cur_label, &cur_body));
+            cur_body.clear();
         }
-        section_bodies.entry(section).or_default().push_str(&field_html);
+        cur_label = label;
+        started = true;
+        cur_body.push_str(&field_html);
     }
-
-    // Wrap each section's fields in a card (title + inner 2-col field grid). The
-    // cards flow into a 2-column masonry in the body, so the form uses the full
-    // width like the Contacts form instead of one narrow column.
-    // Sections render as flat labeled groups (an uppercase heading + a rule),
-    // NOT elevated cards — so inside the single form "sheet" they read as one
-    // tidy document (Odoo-style) instead of cards floating on the background.
-    let mut sections_html = String::new();
-    let single_section = section_order.len() <= 1;
-    for section in &section_order {
-        // With only one section, the section heading is redundant with the form
-        // title, so suppress it. `form_section` is the shared sheet primitive so
-        // the generic form and core forms render identical field groups.
-        let heading = if single_section { "" } else { section.as_str() };
-        sections_html.push_str(&vortex_framework::form::form_section(
-            heading,
-            section_bodies.get(section).map(String::as_str).unwrap_or(""),
-        ));
+    // Flush the final run. Sections render as flat labelled groups (uppercase
+    // heading + rule) inside the one form "sheet", Odoo-style, not floating
+    // cards; `form_section` is the shared sheet primitive so the generic form
+    // and core forms render identical field groups.
+    if started {
+        sections_html.push_str(&render_block(&cur_label, &cur_body));
     }
 
     let (action_url, submit_text, title) = if let Some(rid) = record_id {
@@ -22900,8 +23232,12 @@ async fn render_dynamic_form(
         record_id.map(|r| r.to_string()).as_deref(),
     )
     .await;
+    // Sections lay out on a deterministic two-column grid (not CSS columns, which
+    // auto-balance and can't pin a section side-by-side or span it full-width).
+    // Each block carries its own lg:col-span-{1,2} from render_block; items-start
+    // keeps a short section from stretching to its neighbour's height.
     let inner = format!(
-        r#"{return_hidden}<div class="columns-1 lg:columns-2 gap-x-10">{fields}</div>{computed}"#,
+        r#"{return_hidden}<div class="grid grid-cols-1 lg:grid-cols-2 gap-x-10 items-start">{fields}</div>{computed}"#,
         return_hidden = return_hidden,
         fields = sections_html,
         computed = computed_html,
@@ -22999,6 +23335,409 @@ async fn sync_blueprint_m2m(
     }
 }
 
+/// One editable column in a one2many inline grid — a child-model field that can
+/// be typed straight into the parent's line table.
+struct O2mGridCol {
+    name: String,
+    label: String,
+    field_type: String,
+    options: Option<serde_json::Value>,
+}
+
+/// The child-model fields that become editable columns in the inline line grid.
+/// Only plain, cell-editable types are included — the inverse many2one back to
+/// the parent, computed fields, and nested relations are left off (they belong
+/// on the child's own form, not a spreadsheet cell).
+async fn o2m_grid_columns(db: &sqlx::PgPool, child_model: &str, inverse: &str) -> Vec<O2mGridCol> {
+    sqlx::query(
+        "SELECT f.name, f.display_name, f.field_type, f.selection_options \
+         FROM ir_model_field f JOIN ir_model m ON m.id = f.model_id \
+         WHERE m.name = $1 AND f.is_visible = true \
+           AND COALESCE(f.is_computed, false) = false \
+           AND f.field_type IN ('string','char','text','integer','float','decimal','monetary','number','date','datetime','boolean','selection') \
+           AND f.name <> $2 \
+           AND f.name NOT IN ('id','created_at','updated_at','active','record_state') \
+         ORDER BY f.sequence, f.display_name",
+    )
+    .bind(child_model)
+    .bind(inverse)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default()
+    .iter()
+    .map(|r| O2mGridCol {
+        name: r.get("name"),
+        label: r.get("display_name"),
+        field_type: r.get("field_type"),
+        options: r.try_get::<Option<serde_json::Value>, _>("selection_options").ok().flatten(),
+    })
+    .collect()
+}
+
+/// Render one editable grid cell for the given child column and current value.
+fn o2m_cell_input(c: &O2mGridCol, v: &str) -> String {
+    let name = html_escape(&c.name);
+    match c.field_type.as_str() {
+        "boolean" => format!(
+            r#"<input type="checkbox" data-col="{n}" class="o2mc checkbox checkbox-sm"{chk}/>"#,
+            n = name, chk = if v == "true" { " checked" } else { "" }
+        ),
+        "integer" | "float" | "decimal" | "monetary" | "number" => format!(
+            r#"<input type="number" step="any" data-col="{n}" class="o2mc input input-bordered input-sm w-full" value="{v}"/>"#,
+            n = name, v = html_escape(v)
+        ),
+        "date" => format!(
+            r#"<input type="date" data-col="{n}" class="o2mc input input-bordered input-sm w-full" value="{v}"/>"#,
+            n = name, v = html_escape(v)
+        ),
+        "datetime" => format!(
+            r#"<input type="datetime-local" data-col="{n}" class="o2mc input input-bordered input-sm w-full" value="{v}"/>"#,
+            n = name, v = html_escape(&v.replace(' ', "T"))
+        ),
+        "selection" => {
+            let mut opts = String::from(r#"<option value=""></option>"#);
+            if let Some(serde_json::Value::Array(arr)) = &c.options {
+                for it in arr {
+                    let (val, lab) = match it {
+                        serde_json::Value::Object(o) => (
+                            o.get("value").and_then(|x| x.as_str()).unwrap_or(""),
+                            o.get("label").and_then(|x| x.as_str())
+                                .or_else(|| o.get("value").and_then(|x| x.as_str())).unwrap_or(""),
+                        ),
+                        serde_json::Value::String(s) => (s.as_str(), s.as_str()),
+                        _ => ("", ""),
+                    };
+                    if val.is_empty() { continue; }
+                    let sel = if val == v { " selected" } else { "" };
+                    opts.push_str(&format!(
+                        r#"<option value="{}"{}>{}</option>"#,
+                        html_escape(val), sel, html_escape(lab)
+                    ));
+                }
+            }
+            format!(
+                r#"<select data-col="{n}" class="o2mc select select-bordered select-sm w-full">{o}</select>"#,
+                n = name, o = opts
+            )
+        }
+        _ => format!(
+            r#"<input type="text" data-col="{n}" class="o2mc input input-bordered input-sm w-full" value="{v}"/>"#,
+            n = name, v = html_escape(v)
+        ),
+    }
+}
+
+/// One grid row `<tr>` for the inline editor. `id` is the child record's uuid
+/// (empty for a not-yet-saved new row); `vals` maps column name → current text.
+fn o2m_row_html(
+    field: &str,
+    cols: &[O2mGridCol],
+    id: &str,
+    vals: &std::collections::HashMap<String, String>,
+) -> String {
+    let mut cells = String::new();
+    for c in cols {
+        let v = vals.get(&c.name).map(String::as_str).unwrap_or("");
+        cells.push_str(&format!(r#"<td class="p-1 align-top">{}</td>"#, o2m_cell_input(c, v)));
+    }
+    cells.push_str(&format!(
+        r#"<td class="p-1 align-top text-center"><button type="button" class="btn btn-ghost btn-xs text-error" title="Remove line" onclick="o2mDel_{f}(this)">✕</button></td>"#,
+        f = field
+    ));
+    format!(r#"<tr data-id="{id}">{cells}</tr>"#, id = html_escape(id), cells = cells)
+}
+
+/// The inline editable line grid for a Blueprint one2many field — a spreadsheet
+/// of the child model's cell fields with add/remove rows that all save together
+/// with the parent (serialised into the hidden `__o2m_{field}` JSON input and
+/// applied by [`sync_blueprint_o2m`]). Works for a brand-new parent too: the
+/// rows are held client-side and written straight after the parent INSERT.
+async fn render_o2m_grid(
+    db: &sqlx::PgPool,
+    field: &str,
+    child_model: &str,
+    child_table: &str,
+    inverse: &str,
+    record_id: Option<uuid::Uuid>,
+) -> String {
+    let cols = o2m_grid_columns(db, child_model, inverse).await;
+    if cols.is_empty() {
+        return r#"<div class="text-sm opacity-60">This related list has no editable line fields yet — add fields to the linked model first.</div>"#.to_string();
+    }
+
+    // Existing lines (edit mode): pull every grid column as text so one decode
+    // path covers strings, numbers, dates and booleans alike.
+    let mut body = String::new();
+    if let Some(rid) = record_id {
+        let select_cols: String = cols
+            .iter()
+            .map(|c| format!("\"{c}\"::text AS \"{c}\"", c = c.name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let q = format!(
+            "SELECT id::text AS id, {cols} FROM {tbl} WHERE \"{inv}\" = $1 ORDER BY created_at",
+            cols = select_cols, tbl = child_table, inv = inverse
+        );
+        let rows = sqlx::query(&q).bind(rid).fetch_all(db).await.unwrap_or_default();
+        for r in &rows {
+            let id: String = r.try_get("id").unwrap_or_default();
+            let mut vals = std::collections::HashMap::new();
+            for c in &cols {
+                let v: Option<String> = r.try_get(c.name.as_str()).ok().flatten();
+                vals.insert(c.name.clone(), v.unwrap_or_default());
+            }
+            body.push_str(&o2m_row_html(field, &cols, &id, &vals));
+        }
+    }
+
+    // Column headers.
+    let mut thead = String::new();
+    for c in &cols {
+        thead.push_str(&format!(
+            r#"<th class="text-xs font-semibold text-left px-1">{}</th>"#,
+            html_escape(&c.label)
+        ));
+    }
+    thead.push_str(r#"<th class="w-8"></th>"#);
+
+    // A blank row, embedded as a JS string literal (serde gives correct escaping)
+    // so "+ Add line" can clone it client-side without a round-trip.
+    let empty_row = o2m_row_html(field, &cols, "", &std::collections::HashMap::new());
+    let empty_row_js = serde_json::to_string(&empty_row).unwrap_or_else(|_| "\"\"".to_string());
+
+    format!(
+        r##"<div class="border border-base-300 rounded-lg overflow-x-auto">
+<table class="table table-sm w-full m-0">
+<thead><tr class="bg-base-200">{thead}</tr></thead>
+<tbody id="o2mbody_{f}">{body}</tbody>
+</table>
+</div>
+<button type="button" class="btn btn-sm btn-ghost mt-2" onclick="o2mAdd_{f}()">+ Add line</button>
+<input type="hidden" name="__o2m_{f}" id="__o2m_{f}"/>
+<script>
+(function(){{
+  var ROW = {row};
+  window.o2mSync_{f} = function(){{
+    var b = document.getElementById('o2mbody_{f}');
+    if(!b) return;
+    var out = [];
+    b.querySelectorAll(':scope > tr').forEach(function(tr){{
+      var o = {{ _id: tr.getAttribute('data-id') || '' }};
+      tr.querySelectorAll('[data-col]').forEach(function(el){{
+        o[el.getAttribute('data-col')] = (el.type === 'checkbox') ? (el.checked ? 'true' : 'false') : el.value;
+      }});
+      out.push(o);
+    }});
+    document.getElementById('__o2m_{f}').value = JSON.stringify(out);
+  }};
+  window.o2mAdd_{f} = function(){{
+    document.getElementById('o2mbody_{f}').insertAdjacentHTML('beforeend', ROW);
+    window.o2mSync_{f}();
+  }};
+  window.o2mDel_{f} = function(btn){{
+    var tr = btn.closest('tr'); if(tr) tr.remove();
+    window.o2mSync_{f}();
+  }};
+  var b = document.getElementById('o2mbody_{f}');
+  if(b){{ b.addEventListener('input', window.o2mSync_{f}); b.addEventListener('change', window.o2mSync_{f}); }}
+  window.o2mSync_{f}();
+}})();
+</script>"##,
+        thead = thead, body = body, f = field, row = empty_row_js
+    )
+}
+
+/// Apply the inline line-grid edits for a Blueprint record. Each one2many field
+/// arrives as a hidden `__o2m_{field}` JSON array of line objects (`_id` plus
+/// the child's cell columns). We upsert every submitted line against the child
+/// table — pinning the inverse many2one to this parent — and delete any child
+/// row the user removed from the grid. Best-effort per field; a malformed or
+/// absent payload is skipped so lines are never silently wiped.
+async fn sync_blueprint_o2m(
+    db: &sqlx::PgPool,
+    model_name: &str,
+    record_id: uuid::Uuid,
+    form_data: &std::collections::HashMap<String, String>,
+) {
+    let fields = sqlx::query(
+        "SELECT f.name, f.related_model, f.selection_options \
+         FROM ir_model_field f JOIN ir_model m ON m.id = f.model_id \
+         WHERE m.name = $1 AND f.field_type = 'one2many'",
+    )
+    .bind(model_name)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+
+    for f in &fields {
+        let field: String = f.get("name");
+        let child_model: String = f.try_get::<Option<String>, _>("related_model").ok().flatten().unwrap_or_default();
+        let opts: Option<serde_json::Value> = f.try_get::<Option<serde_json::Value>, _>("selection_options").ok().flatten();
+        let (child_table, inverse) = match opts.as_ref().and_then(|o| {
+            Some((
+                o.get("child_table")?.as_str()?.to_string(),
+                o.get("inverse_field")?.as_str()?.to_string(),
+            ))
+        }) {
+            Some(v) => v,
+            None => continue,
+        };
+        if !validate_identifier(&child_table) || !validate_identifier(&inverse) {
+            continue;
+        }
+
+        // Payload present? A form without this grid (e.g. an API submit or a
+        // no-JS client) leaves the lines untouched rather than deleting them.
+        let payload = match form_data.get(&format!("__o2m_{}", field)) {
+            Some(p) => p,
+            None => continue,
+        };
+        let lines = match serde_json::from_str::<serde_json::Value>(payload) {
+            Ok(serde_json::Value::Array(a)) => a,
+            _ => continue,
+        };
+
+        // Accepted child columns (the grid columns) + their catalog types.
+        let allowed: std::collections::HashSet<String> =
+            o2m_grid_columns(db, &child_model, &inverse).await
+                .into_iter().map(|c| c.name).collect();
+        if allowed.is_empty() {
+            continue;
+        }
+        let udt: std::collections::HashMap<String, String> = sqlx::query(
+            "SELECT column_name, udt_name FROM information_schema.columns WHERE table_name = $1",
+        )
+        .bind(&child_table)
+        .fetch_all(db)
+        .await
+        .unwrap_or_default()
+        .iter()
+        .map(|r| (r.get::<String, _>("column_name"), r.get::<String, _>("udt_name")))
+        .collect();
+
+        // Every child id that survives this save (existing rows kept + new rows
+        // inserted); anything else linked to this parent was removed in the grid.
+        let mut keep: Vec<uuid::Uuid> = Vec::new();
+        for line in &lines {
+            let obj = match line.as_object() { Some(o) => o, None => continue };
+            let id = obj.get("_id").and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .and_then(|s| s.parse::<uuid::Uuid>().ok());
+
+            // Collect (col, udt) + value for the accepted columns in this line.
+            let mut cols: Vec<(String, String)> = Vec::new();
+            let mut vals: Vec<Option<String>> = Vec::new();
+            for (k, v) in obj {
+                if k == "_id" || !allowed.contains(k) || !validate_identifier(k) { continue; }
+                let Some(u) = udt.get(k) else { continue };
+                let s = v.as_str().unwrap_or("").trim().to_string();
+                cols.push((k.clone(), u.clone()));
+                vals.push(if s.is_empty() { None } else { Some(s) });
+            }
+
+            match id {
+                Some(cid) => {
+                    if !cols.is_empty() {
+                        let set: Vec<String> = cols.iter().enumerate()
+                            .map(|(i, (c, u))| format!("\"{}\" = ${}::{}", c, i + 1, u))
+                            .collect();
+                        let q = format!(
+                            "UPDATE {tbl} SET {set}, updated_at = NOW() WHERE id = ${idp} AND \"{inv}\" = ${invp}",
+                            tbl = child_table, set = set.join(", "),
+                            idp = cols.len() + 1, inv = inverse, invp = cols.len() + 2
+                        );
+                        let mut query = sqlx::query(&q);
+                        for val in &vals { query = query.bind(val); }
+                        query = query.bind(cid).bind(record_id);
+                        let _ = query.execute(db).await;
+                    }
+                    keep.push(cid);
+                }
+                None => {
+                    // Skip an all-blank new row (a spare row the user never typed in).
+                    if vals.iter().all(|v| v.is_none()) { continue; }
+                    let mut colnames: Vec<String> = cols.iter().map(|(c, _)| format!("\"{}\"", c)).collect();
+                    let mut phs: Vec<String> = cols.iter().enumerate()
+                        .map(|(i, (_, u))| format!("${}::{}", i + 1, u)).collect();
+                    colnames.push(format!("\"{}\"", inverse));
+                    phs.push(format!("${}", cols.len() + 1));
+                    let q = format!(
+                        "INSERT INTO {tbl} ({cols}) VALUES ({phs}) RETURNING id",
+                        tbl = child_table, cols = colnames.join(", "), phs = phs.join(", ")
+                    );
+                    let mut query = sqlx::query(&q);
+                    for val in &vals { query = query.bind(val); }
+                    query = query.bind(record_id);
+                    if let Ok(row) = query.fetch_one(db).await {
+                        keep.push(row.get::<uuid::Uuid, _>("id"));
+                    }
+                }
+            }
+        }
+
+        // Delete lines the user removed from the grid (everything linked to this
+        // parent that isn't in the kept set — an empty set clears them all).
+        let _ = sqlx::query(&format!(
+            "DELETE FROM {tbl} WHERE \"{inv}\" = $1 AND NOT (id = ANY($2::uuid[]))",
+            tbl = child_table, inv = inverse
+        ))
+        .bind(record_id)
+        .bind(&keep)
+        .execute(db)
+        .await;
+    }
+}
+
+/// Mint the next value of a Blueprint auto-number field, e.g. `VIS-2026-0001`.
+/// Runtime analogue of `vortex_orm::sequence::next` (whose spec is `&'static`,
+/// so it can't take user-chosen prefixes): one atomic UPSERT against the shared
+/// `sequences` table claims the next counter for `(code, period)`, then the
+/// prefix / period / zero-padded number / suffix are formatted from the field's
+/// stored config. `cfg` is the field's `selection_options` object. Returns None
+/// (skip, leave the column NULL) if the counter can't be claimed.
+async fn blueprint_next_sequence(
+    db: &sqlx::PgPool,
+    code: &str,
+    cfg: Option<&serde_json::Value>,
+) -> Option<String> {
+    let prefix = cfg.and_then(|c| c.get("prefix")).and_then(|v| v.as_str()).unwrap_or("");
+    let padding = cfg.and_then(|c| c.get("padding")).and_then(|v| v.as_i64()).unwrap_or(4).clamp(1, 12) as usize;
+    let scope = cfg.and_then(|c| c.get("scope")).and_then(|v| v.as_str()).unwrap_or("global");
+    let separator = cfg.and_then(|c| c.get("separator")).and_then(|v| v.as_str()).unwrap_or("-");
+    let suffix = cfg.and_then(|c| c.get("suffix")).and_then(|v| v.as_str()).unwrap_or("");
+
+    let now = chrono::Utc::now();
+    let period = match scope {
+        "yearly" => now.format("%Y").to_string(),
+        "monthly" => now.format("%Y-%m").to_string(),
+        _ => String::new(),
+    };
+    // Atomic claim: first call for (code, period) inserts at 1, later calls bump
+    // by 1 — two concurrent creates always get two distinct numbers.
+    let next_val: i64 = sqlx::query_scalar(
+        "INSERT INTO sequences (code, scope, current_value, updated_at) VALUES ($1, $2, 1, NOW()) \
+         ON CONFLICT (code, scope) DO UPDATE SET current_value = sequences.current_value + 1, updated_at = NOW() \
+         RETURNING current_value",
+    )
+    .bind(code)
+    .bind(&period)
+    .fetch_one(db)
+    .await
+    .ok()?;
+
+    let number = format!("{:0width$}", next_val, width = padding);
+    let mut out = String::new();
+    out.push_str(prefix);
+    if !period.is_empty() {
+        out.push_str(separator);
+        out.push_str(&period);
+    }
+    out.push_str(separator);
+    out.push_str(&number);
+    out.push_str(suffix);
+    Some(out)
+}
+
 /// Turn a write error into a user-facing message — a unique-index violation
 /// (SQLSTATE 23505, from a Blueprint "Unique" field) reads as a plain
 /// duplicate-value message instead of a raw Postgres error.
@@ -23070,12 +23809,48 @@ async fn dynamic_form_create(
         let Some(udt) = col_types.get(key) else {
             continue; // not a real column — ignore
         };
+        // A uuid column (a many2one) with a non-uuid value — e.g. a mis-entered
+        // relation — is skipped (left NULL) rather than casting `''::uuid` and
+        // failing the whole INSERT.
+        if udt == "uuid" && uuid::Uuid::parse_str(value.trim()).is_err() {
+            continue;
+        }
         let n = values.len() + 1;
         columns.push(format!("\"{}\"", key));
         placeholders.push(format!("${}::{}", n, udt));
         // Handle checkbox values
         let val = if value == "on" { "true".to_string() } else { value.clone() };
         values.push(val);
+    }
+
+    // Mint auto-number references. These fields render disabled (never submitted),
+    // so their value is generated here from the field's stored config and added
+    // to the INSERT. Sequence code is namespaced by table + column so two fields
+    // (or two Blueprints) never share a counter.
+    let autonum = sqlx::query(
+        "SELECT f.name, f.selection_options FROM ir_model_field f \
+         JOIN ir_model m ON m.id = f.model_id \
+         WHERE m.name = $1 AND f.field_type = 'autonumber'",
+    )
+    .bind(&model_name)
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default();
+    for r in &autonum {
+        let fname: String = r.get("name");
+        // Only a real column, and only if the form didn't already carry a value.
+        let Some(udt) = col_types.get(&fname) else { continue };
+        if columns.iter().any(|c| c.trim_matches('"') == fname) {
+            continue;
+        }
+        let cfg: Option<serde_json::Value> = r.try_get::<Option<serde_json::Value>, _>("selection_options").ok().flatten();
+        let code = format!("bp:{}:{}", table_name, fname);
+        if let Some(val) = blueprint_next_sequence(&db, &code, cfg.as_ref()).await {
+            let n = values.len() + 1;
+            columns.push(format!("\"{}\"", fname));
+            placeholders.push(format!("${}::{}", n, udt));
+            values.push(val);
+        }
     }
 
     if columns.is_empty() {
@@ -23107,13 +23882,16 @@ async fn dynamic_form_create(
                 &model_name, Some(&new_id.to_string()),
                 serde_json::json!({ "fields": columns.len() }),
             ).await;
-            // Recompute any computed fields for the new record so they display
-            // immediately. Best-effort — a formula problem shouldn't fail the save.
+            // Sync many2many links (hidden CSV inputs — not physical columns).
+            sync_blueprint_m2m(&db, &table_name, &model_name, new_id, &form_data).await;
+            // Sync one2many inline-grid lines (hidden `__o2m_*` JSON payloads).
+            sync_blueprint_o2m(&db, &model_name, new_id, &form_data).await;
+            // Recompute computed fields AFTER the lines are written, so a rollup
+            // (sum/count over the one2many) sees the rows just synced. Best-effort
+            // — a formula problem shouldn't fail the save.
             if let Err(e) = vortex_framework::computed_fields::store_values(&db, &model_name, new_id).await {
                 tracing::warn!(model = %model_name, error = %e, "computed field store after create failed");
             }
-            // Sync many2many links (hidden CSV inputs — not physical columns).
-            sync_blueprint_m2m(&db, &table_name, &model_name, new_id, &form_data).await;
             // Return to the parent record when this was a one2many "+ Add" line.
             let dest = form_data
                 .get("_return")
@@ -23177,6 +23955,17 @@ async fn dynamic_form_update(
         let Some(udt) = col_types.get(key) else {
             continue; // not a real column — ignore
         };
+        // Empty input clears the column (NULL). Critically, never bind "" and
+        // cast it — `''::date` / `''::uuid` / `''::numeric` all raise a cast
+        // error that used to fail the whole save (the "white page" on edit when
+        // any typed field — an unselected relation, a blank date/number — was
+        // left empty). A uuid column with a non-uuid value is likewise cleared.
+        if value.trim().is_empty()
+            || (udt == "uuid" && uuid::Uuid::parse_str(value.trim()).is_err())
+        {
+            set_clauses.push(format!("\"{}\" = NULL", key));
+            continue;
+        }
         let n = values.len() + 1;
         set_clauses.push(format!("\"{}\" = ${}::{}", key, n, udt));
         // Handle checkbox values - if checkbox is unchecked, it won't be in form_data
@@ -23185,9 +23974,15 @@ async fn dynamic_form_update(
     }
 
     if set_clauses.is_empty() {
-        // No scalar columns changed, but many2many links still may have.
+        // No scalar columns changed, but many2many links / one2many lines may have.
         sync_blueprint_m2m(&db, &table_name, &model_name, record_id, &form_data).await;
-        return Redirect::to(&format!("/form/{}/{}", model_name, record_id)).into_response();
+        sync_blueprint_o2m(&db, &model_name, record_id, &form_data).await;
+        let dest = form_data
+            .get("_return")
+            .filter(|r| r.starts_with('/') && !r.starts_with("//"))
+            .cloned()
+            .unwrap_or_else(|| format!("/form/{}/{}", model_name, record_id));
+        return Redirect::to(&dest).into_response();
     }
 
     let query = format!(
@@ -23213,11 +24008,13 @@ async fn dynamic_form_update(
                 &model_name, Some(&record_id.to_string()),
                 serde_json::json!({ "fields": set_clauses.len() }),
             ).await;
-            // Recompute computed fields against the updated row.
+            sync_blueprint_m2m(&db, &table_name, &model_name, record_id, &form_data).await;
+            sync_blueprint_o2m(&db, &model_name, record_id, &form_data).await;
+            // Recompute computed fields AFTER the lines are written so a rollup
+            // over the one2many reflects the rows just synced.
             if let Err(e) = vortex_framework::computed_fields::store_values(&db, &model_name, record_id).await {
                 tracing::warn!(model = %model_name, error = %e, "computed field store after update failed");
             }
-            sync_blueprint_m2m(&db, &table_name, &model_name, record_id, &form_data).await;
             let dest = form_data
                 .get("_return")
                 .filter(|r| r.starts_with('/') && !r.starts_with("//"))
