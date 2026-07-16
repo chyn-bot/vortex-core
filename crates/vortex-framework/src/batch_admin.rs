@@ -310,9 +310,19 @@ async fn retry_all(
     if !user.is_admin() {
         return (axum::http::StatusCode::FORBIDDEN, Html(forbidden_page("Batch Runs"))).into_response();
     }
-    if let Err(e) = crate::batch::retry_exceptions(&state, &db, id, None).await {
-        return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
-    }
+    let dispatched = match crate::batch::retry_exceptions(&state, &db, id, None).await {
+        Ok(n) => n,
+        Err(e) => return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    };
+    crate::audit_events::emit(
+        &state,
+        &user,
+        "batch.run.retried",
+        "batch_run",
+        id.to_string(),
+        serde_json::json!({ "scope": "all", "chunks_dispatched": dispatched }),
+    )
+    .await;
     Redirect::to(&format!("/batch/runs/{id}")).into_response()
 }
 
@@ -328,5 +338,14 @@ async fn retry_one(
     if let Err(e) = crate::batch::retry_exceptions(&state, &db, id, Some(&[item_id])).await {
         return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
     }
+    crate::audit_events::emit(
+        &state,
+        &user,
+        "batch.run.retried",
+        "batch_run",
+        id.to_string(),
+        serde_json::json!({ "scope": "item", "item_id": item_id.to_string() }),
+    )
+    .await;
     Redirect::to(&format!("/batch/runs/{id}/exceptions")).into_response()
 }

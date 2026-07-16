@@ -185,6 +185,14 @@ impl JobWorker {
         self
     }
 
+    /// Max jobs claimed (and run concurrently) per poll tick. The default (10)
+    /// suits light background work; raise it for high-throughput batch runs
+    /// where many `batch.chunk` jobs are queued at once. Floored at 1.
+    pub fn with_batch_size(mut self, n: i64) -> Self {
+        self.batch = n.max(1);
+        self
+    }
+
     /// Spawn the poll loop (mirrors `Scheduler::start`). Polls the primary pool.
     pub fn start(self, state: Arc<AppState>) {
         tokio::spawn(async move {

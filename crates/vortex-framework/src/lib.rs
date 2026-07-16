@@ -37,6 +37,7 @@ pub mod api;
 pub mod captcha;
 pub mod approval;
 pub mod assembly;
+pub mod audit_events;
 pub mod audit_trail;
 pub mod automation;
 pub mod batch;
