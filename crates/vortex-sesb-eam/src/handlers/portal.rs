@@ -39,7 +39,7 @@ fn portal_shell(title: &str, body: &str) -> String {
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
 <link href="/static/vortex.css?v=20" rel="stylesheet"/>
 <script src="/static/vortex.js?v=20" defer></script>
-<script src="/static/vendor/tailwind.js"></script></head>
+<link href="/static/tailwind.css?v=21" rel="stylesheet"/></head>
 <body class="min-h-screen bg-base-200">
 <div class="navbar bg-base-100 shadow sticky top-0 z-30">
 <a href="/sesb-eam/my/dashboard" class="btn btn-ghost text-lg"><span class="text-success">SESB</span> Field</a>

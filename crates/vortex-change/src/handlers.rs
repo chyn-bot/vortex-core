@@ -146,7 +146,7 @@ fn page_shell(title: &str, sidebar: &str) -> (String, &'static str) {
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
 <link href="/static/vortex.css?v=20" rel="stylesheet"/>
 <script src="/static/vortex.js?v=20" defer></script>
-<script src="/static/vendor/tailwind.js"></script></head>
+<link href="/static/tailwind.css?v=21" rel="stylesheet"/></head>
 <body class="min-h-screen bg-base-200">
 <div class="flex">{}<main class="flex-1 p-4 lg:p-6 min-w-0">"#,
         html_escape(title),

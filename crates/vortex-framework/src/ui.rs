@@ -172,7 +172,7 @@ pub fn error_response(message: &str) -> Response {
 <script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script>
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
 <link href="/static/vortex.css?v=20" rel="stylesheet"/>
-<script src="/static/vendor/tailwind.js"></script>
+<link href="/static/tailwind.css?v=21" rel="stylesheet"/>
 </head>
 <body class="min-h-screen bg-base-200 flex items-center justify-center p-6">
 <div class="card bg-base-100 shadow-xl max-w-lg w-full"><div class="card-body">
@@ -307,7 +307,7 @@ pub fn forbidden_page(action: &str) -> String {
     <link href="/static/vendor/daisyui.min.css" rel="stylesheet">
     <link href="/static/vortex.css?v=20" rel="stylesheet">
     <script src="/static/vortex.js?v=20" defer></script>
-    <script src="/static/vendor/tailwind.js"></script>
+    <link href="/static/tailwind.css?v=21" rel="stylesheet"/>
 </head>
 <body class="min-h-screen bg-base-200 flex items-center justify-center">
     <div class="card bg-base-100 shadow-xl max-w-md">
