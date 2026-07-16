@@ -1,0 +1,5 @@
+[migration]
+module = "core"
+description = "Generic batch run engine (batch_run, batch_run_item): partitioned mass processing with fail-item isolation and idempotent restart"
+reversible = true
+dependencies = ["158_role_owning_module"]

@@ -1,0 +1,5 @@
+[migration]
+module = "core"
+description = "Versioned rules & adjustment engine (rule_set, rule): data-authored rules, immutable published versions, typed adjustment outputs, historical reproducibility"
+reversible = true
+dependencies = ["161_snapshot"]
