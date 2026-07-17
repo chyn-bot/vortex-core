@@ -77,14 +77,15 @@ pub(crate) fn build_list_sql(config: &ListConfig, params: &ListParams) -> ListSq
         .map(String::from)
         .unwrap_or_else(|| config.select_fields());
 
-    let where_clause = assemble_where(config, &parts);
+    let (cte_prefix, where_clause) = assemble_where(config, &parts);
 
-    let count_sql = format!("SELECT COUNT(*) FROM {} {}", from_clause, where_clause);
+    let count_sql = format!("{}SELECT COUNT(*) FROM {} {}", cte_prefix, from_clause, where_clause);
 
     let order_clause = build_order_clause(config, params);
 
     let data_sql = format!(
-        "SELECT {} FROM {} {} ORDER BY {} LIMIT {} OFFSET {}",
+        "{}SELECT {} FROM {} {} ORDER BY {} LIMIT {} OFFSET {}",
+        cte_prefix,
         select_fields,
         from_clause,
         where_clause,
@@ -96,32 +97,45 @@ pub(crate) fn build_list_sql(config: &ListConfig, params: &ListParams) -> ListSq
     ListSql { count_sql, data_sql, binds: parts.binds }
 }
 
-/// Assemble the final `WHERE` clause from the decomposed [`Conditions`].
+/// Assemble the query's leading CTE (if any) and its final `WHERE` clause
+/// from the decomposed [`Conditions`]. Returns `(cte_prefix, where_clause)`;
+/// `cte_prefix` is either empty or a `WITH … ` string the caller prepends to
+/// **both** the count and data statements.
 ///
 /// Two shapes, depending on `search_prefilter`:
 /// - **Default:** base filter, search, and column filters are AND-ed inline
 ///   (`WHERE base AND (…ILIKE $1…) AND col = $2`) — the historical shape.
 /// - **Prefiltered:** when a search is active *and* `search_prefilter` is
-///   set, the search moves into a subquery so a trigram index can drive it:
-///   `WHERE base AND col = $2 AND <alias>.id IN (SELECT id FROM <base>
-///   WHERE …ILIKE $1…)`. The parameter numbering is unchanged (search is
-///   still `$1`), so `binds` order is identical either way.
-fn assemble_where(config: &ListConfig, parts: &Conditions) -> String {
+///   set, the search moves into a `MATERIALIZED` CTE so a trigram index can
+///   drive it and — crucially — the planner sorts the *materialized match
+///   set* for `ORDER BY … LIMIT`, rather than walking the sort-column index
+///   across the whole table hunting for a page of matches:
+///   `WITH _list_match AS MATERIALIZED (SELECT id FROM <base> WHERE …ILIKE $1…)
+///    … WHERE base AND col = $2 AND <alias>.id IN (SELECT id FROM _list_match)`.
+///   `MATERIALIZED` is load-bearing: without the fence, a search whose matches
+///   sort *late* (e.g. `PreCustomer…` names in a table dominated by
+///   `Customer…`) makes the planner scan millions of index rows and time out.
+///   The parameter numbering is unchanged (search is still `$1`), so `binds`
+///   order is identical either way.
+fn assemble_where(config: &ListConfig, parts: &Conditions) -> (String, String) {
     let mut conds: Vec<String> = Vec::new();
+    let mut cte_prefix = String::new();
     if let Some(base) = &parts.base_filter {
         conds.push(base.clone());
     }
 
     match (&parts.search, config.search_prefilter, config.prefilter_alias()) {
-        // Prefiltered search: base + column filters inline, search via IN.
+        // Prefiltered search: base + column filters inline, search via a
+        // materialized CTE referenced by `id IN (SELECT id FROM _list_match)`.
         (Some(search), Some(prefilter_from), Some(alias)) => {
             conds.extend(parts.filters.iter().cloned());
-            conds.push(format!(
-                "{alias}.id IN (SELECT {alias}.id FROM {from} WHERE {search})",
+            cte_prefix = format!(
+                "WITH _list_match AS MATERIALIZED (SELECT {alias}.id FROM {from} WHERE {search}) ",
                 alias = alias,
                 from = prefilter_from,
                 search = search,
-            ));
+            );
+            conds.push(format!("{alias}.id IN (SELECT id FROM _list_match)", alias = alias));
         }
         // Default: inline search then column filters (historical order).
         _ => {
@@ -132,11 +146,12 @@ fn assemble_where(config: &ListConfig, parts: &Conditions) -> String {
         }
     }
 
-    if conds.is_empty() {
+    let where_clause = if conds.is_empty() {
         String::new()
     } else {
         format!("WHERE {}", conds.join(" AND "))
-    }
+    };
+    (cte_prefix, where_clause)
 }
 
 /// Build the `ORDER BY` body (without the `ORDER BY` keyword).
@@ -575,10 +590,12 @@ mod tests {
     }
 
     #[test]
-    fn search_prefilter_wraps_search_in_id_subquery() {
-        // With search_prefilter set, a search moves into an id IN (…)
-        // subquery on the base alias so a trigram index can drive it,
-        // while base/column filters stay inline. Search is still $1.
+    fn search_prefilter_wraps_search_in_materialized_cte() {
+        // With search_prefilter set, a search moves into a MATERIALIZED CTE
+        // (so a trigram index drives it AND the planner sorts the small match
+        // set for ORDER BY … LIMIT instead of walking the sort-column index),
+        // referenced by `id IN (SELECT id FROM _list_match)`. Base/column
+        // filters stay inline. Search is still $1.
         let config = contacts_config()
             .custom_from("contacts c LEFT JOIN countries co ON co.id = c.country_id")
             .custom_select("c.id, c.name")
@@ -592,18 +609,22 @@ mod tests {
         });
         let sql = build_list_sql(&config, &params);
 
-        // Search lives inside the subquery, keyed on c.id, using $1.
+        // The search lives in a leading MATERIALIZED CTE on the base alias,
+        // using $1; both statements start with it.
         assert!(
-            sql.data_sql.contains(
-                "c.id IN (SELECT c.id FROM contacts c WHERE (COALESCE(name::text, '') ILIKE $1"
+            sql.data_sql.starts_with(
+                "WITH _list_match AS MATERIALIZED (SELECT c.id FROM contacts c WHERE (COALESCE(name::text, '') ILIKE $1"
             ),
             "got: {}",
             sql.data_sql
         );
-        // Base filter and the column filter stay inline in the outer WHERE.
-        assert!(sql.data_sql.contains("WHERE c.active = true AND contact_type = $2 AND c.id IN"));
-        // Count shares the identical WHERE.
-        assert!(sql.count_sql.contains("c.id IN (SELECT c.id FROM contacts c WHERE"));
+        assert!(sql.count_sql.starts_with("WITH _list_match AS MATERIALIZED (SELECT c.id FROM contacts c WHERE"));
+        // Base filter and the column filter stay inline; the search is a
+        // cheap membership test against the materialized set.
+        assert!(sql.data_sql.contains(
+            "WHERE c.active = true AND contact_type = $2 AND c.id IN (SELECT id FROM _list_match)"
+        ), "got: {}", sql.data_sql);
+        assert!(sql.count_sql.contains("c.id IN (SELECT id FROM _list_match)"));
         // Binds: search first ($1), then the column filter ($2).
         assert_eq!(sql.binds, vec!["%acme%".to_string(), "customer".to_string()]);
     }
