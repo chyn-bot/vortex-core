@@ -2730,6 +2730,12 @@ fn build_router(state: Arc<AppState>) -> Router {
             .fallback(ServeDir::new("crates/vortex-server/static")
             .fallback(ServeDir::new("static"))))
 
+        // Favicon — browsers auto-request /favicon.ico at the root on every
+        // page (login included), so serve the brand mark here rather than
+        // 404. Embedded so it works regardless of the process CWD.
+        .route("/favicon.ico", get(favicon))
+        .route("/favicon.svg", get(favicon))
+
         // Auth pages (public)
         .route("/", get(|| async { Redirect::to("/login") }))
         .route("/login", get(login_page))
@@ -2769,6 +2775,21 @@ async fn health_check(State(state): State<Arc<AppState>>) -> Response {
         Ok(_) => (StatusCode::OK, "OK").into_response(),
         Err(_) => (StatusCode::SERVICE_UNAVAILABLE, "Database unavailable").into_response(),
     }
+}
+
+/// Serve the brand favicon (SVG) for both `/favicon.ico` and `/favicon.svg`.
+/// Modern browsers accept an SVG returned for the `.ico` request; embedding
+/// the asset keeps it independent of the process working directory.
+async fn favicon() -> Response {
+    const FAVICON_SVG: &str = include_str!("../../static/favicon.svg");
+    (
+        [
+            (header::CONTENT_TYPE, "image/svg+xml"),
+            (header::CACHE_CONTROL, "public, max-age=86400"),
+        ],
+        FAVICON_SVG,
+    )
+        .into_response()
 }
 
 async fn api_notifications(
@@ -5759,7 +5780,7 @@ async fn security_headers_middleware(
             // because most pages still ship inline handlers/scripts. Pages
             // migrated off inline JS set their own strict CSP header on the
             // response, which the `has_own_csp` guard above preserves.
-            "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data: https://*.tile.openstreetmap.org; font-src 'self'".parse().unwrap(),
+            "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data: https://*.tile.openstreetmap.org; font-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'self'".parse().unwrap(),
         );
     }
     response
