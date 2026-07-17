@@ -241,10 +241,14 @@ enum UserCommands {
         admin: bool,
     },
 
-    /// Reset user password
+    /// Reset user password (connects via DATABASE_URL)
     ResetPassword {
         /// Username
         username: String,
+
+        /// New password. If omitted, a strong one is generated and printed.
+        #[arg(long)]
+        password: Option<String>,
     },
 
     /// Lock a user account
