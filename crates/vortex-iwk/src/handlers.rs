@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use serde::Deserialize;
 use vortex_plugin_sdk::prelude::*;
 use vortex_plugin_sdk::sqlx::Row;
 use vortex_plugin_sdk::tracing::error;
@@ -20,6 +21,10 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/iwk/bills/{id}", get(bill_detail))
         .route("/iwk/gl", get(gl_page))
         .route("/iwk/gl/post/{run_id}", post(post_run))
+        .route("/iwk/accounts/new", get(register_form))
+        .route("/iwk/accounts/create", post(register_submit))
+        .route("/iwk/billing", get(billing_page))
+        .route("/iwk/billing/generate", post(generate_submit))
 }
 
 /// Platform HTML shell: sidebar, vendored assets, mobile layout.
@@ -498,6 +503,223 @@ async fn post_run(
         Err(e) => {
             error!("iwk GL post failed: {e}");
             (StatusCode::BAD_REQUEST, format!("Post failed: {e}")).into_response()
+        }
+    }
+}
+
+// ─── Customer registration → contract ────────────────────────────────────
+
+#[derive(Deserialize)]
+struct RegisterForm {
+    name: String,
+    #[serde(default)]
+    street: String,
+    #[serde(default)]
+    city: String,
+    #[serde(default)]
+    phone: String,
+    category: String,
+    system_type: String,
+    #[serde(default)]
+    units: String,
+    billing_cycle: String,
+    #[serde(default)]
+    connection_date: String,
+    #[serde(default)]
+    deposit: String,
+}
+
+/// GET /iwk/accounts/new — register a customer and open a contract.
+async fn register_form(
+    State(state): State<Arc<AppState>>,
+    Db(_db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let esc = vortex_plugin_sdk::framework::ui::html_escape;
+    let sidebar = sidebar_for(&state, &user, &db_ctx);
+    let today = chrono::Utc::now().date_naive();
+
+    let flash = match q.get("ok") {
+        Some(acct) => format!(
+            "<div class=\"alert alert-success mb-4\">Customer registered — sewerage account <span class=\"font-mono font-bold\">{}</span> opened. \
+             It will be billed on the next generation run.</div>",
+            esc(acct)
+        ),
+        None => String::new(),
+    };
+
+    let content = format!(
+        r##"<div class="max-w-2xl mx-auto">
+<div class="flex items-center justify-between mb-6">
+  <h1 class="text-2xl font-bold">Register Customer <span class="text-base-content/40 text-base font-normal">open a sewerage contract</span></h1>
+  <a href="/iwk" class="btn btn-ghost btn-sm">← Bills</a>
+</div>
+{flash}
+<form method="post" action="/iwk/accounts/create" class="card bg-base-100 shadow"><div class="card-body space-y-4">
+  <div class="text-xs uppercase opacity-60">Customer</div>
+  <label class="form-control"><span class="label-text">Name</span>
+    <input name="name" required class="input input-bordered" placeholder="Full name / company"></label>
+  <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+    <label class="form-control"><span class="label-text">Street</span><input name="street" class="input input-bordered"></label>
+    <label class="form-control"><span class="label-text">City</span><input name="city" class="input input-bordered"></label>
+  </div>
+  <label class="form-control"><span class="label-text">Phone</span><input name="phone" class="input input-bordered"></label>
+
+  <div class="divider my-1"></div>
+  <div class="text-xs uppercase opacity-60">Contract</div>
+  <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+    <label class="form-control"><span class="label-text">Category</span>
+      <select name="category" class="select select-bordered"><option value="domestic">Domestic</option><option value="commercial">Commercial</option></select></label>
+    <label class="form-control"><span class="label-text">System type</span>
+      <select name="system_type" class="select select-bordered"><option value="connected">Connected</option><option value="individual">Individual</option></select></label>
+    <label class="form-control"><span class="label-text">Billable units</span>
+      <input name="units" type="number" min="1" value="1" class="input input-bordered"></label>
+    <label class="form-control"><span class="label-text">Billing cycle</span>
+      <select name="billing_cycle" class="select select-bordered"><option value="semi_annual">Semi-annual (6 months)</option><option value="quarterly">Quarterly (3 months)</option><option value="monthly">Monthly</option></select></label>
+    <label class="form-control"><span class="label-text">Connection date</span>
+      <input name="connection_date" type="date" value="{today}" class="input input-bordered"></label>
+    <label class="form-control"><span class="label-text">Deposit (RM)</span>
+      <input name="deposit" type="number" step="0.01" min="0" value="0.00" class="input input-bordered"></label>
+  </div>
+  <div class="text-xs opacity-60">The tariff is applied automatically from the rate card at billing time. First bill is due on the connection date.</div>
+  <div class="flex justify-end"><button class="btn btn-primary" type="submit">Register &amp; open account</button></div>
+</div></form></div>"##,
+        flash = flash,
+        today = today,
+    );
+    Html(page_shell(&sidebar, "Register Customer", &content)).into_response()
+}
+
+/// POST /iwk/accounts/create — create the contact + contract.
+async fn register_submit(
+    Db(db): Db,
+    Extension(_user): Extension<AuthUser>,
+    Form(form): Form<RegisterForm>,
+) -> Response {
+    let units: i32 = form.units.trim().parse().unwrap_or(1).max(1);
+    let deposit = form.deposit.trim().parse::<rust_decimal::Decimal>().unwrap_or_default();
+    let connection_date = chrono::NaiveDate::parse_from_str(form.connection_date.trim(), "%Y-%m-%d")
+        .unwrap_or_else(|_| chrono::Utc::now().date_naive());
+
+    match crate::billing::register_customer(
+        &db,
+        form.name.trim(),
+        form.street.trim(),
+        form.city.trim(),
+        form.phone.trim(),
+        &form.category,
+        &form.system_type,
+        units,
+        &form.billing_cycle,
+        connection_date,
+        deposit,
+    )
+    .await
+    {
+        Ok(r) => Redirect::to(&format!("/iwk/accounts/new?ok={}", r.account_no)).into_response(),
+        Err(e) => {
+            error!("iwk register failed: {e}");
+            (StatusCode::BAD_REQUEST, format!("Registration failed: {e}")).into_response()
+        }
+    }
+}
+
+// ─── Recurring bill generation ───────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct GenerateForm {
+    #[serde(default)]
+    period_end: String,
+}
+
+/// GET /iwk/billing — run the recurring generator for a period.
+async fn billing_page(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let esc = vortex_plugin_sdk::framework::ui::html_escape;
+    let sidebar = sidebar_for(&state, &user, &db_ctx);
+    let today = chrono::Utc::now().date_naive();
+
+    let due = crate::billing::due_count(&db, today).await.unwrap_or(0);
+
+    let flash = match q.get("generated") {
+        Some(n) => format!(
+            "<div class=\"alert alert-success mb-4\">Generated <span class=\"font-bold\">{}</span> bill(s). \
+             <a href=\"/iwk/gl\" class=\"link\">Post to the GL →</a></div>",
+            esc(n)
+        ),
+        None => String::new(),
+    };
+
+    // Recent recurring runs (source = recurring; the bulk seed run has none).
+    let rows = vortex_plugin_sdk::sqlx::query(
+        "SELECT to_char(started_at,'DD/MM/YYYY HH24:MI') AS started, total_items, status, \
+                COALESCE(params->>'period_end','') AS period_end \
+         FROM batch_run WHERE run_kind = 'iwk.billing_run' ORDER BY started_at DESC LIMIT 10",
+    )
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default();
+    let mut run_rows = String::new();
+    for r in &rows {
+        let started: String = r.try_get("started").ok().flatten().unwrap_or_default();
+        let items: i64 = r.try_get("total_items").unwrap_or(0);
+        let status: String = r.try_get("status").unwrap_or_default();
+        let period: String = r.try_get("period_end").unwrap_or_default();
+        run_rows.push_str(&format!(
+            "<tr><td class=\"font-mono text-xs\">{}</td><td>{}</td><td class=\"text-right\">{}</td><td><span class=\"badge badge-ghost\">{}</span></td></tr>",
+            esc(&started), esc(&period), items, esc(&status),
+        ));
+    }
+    if run_rows.is_empty() {
+        run_rows.push_str("<tr><td colspan=\"4\" class=\"text-center opacity-60 py-4\">No runs yet.</td></tr>");
+    }
+
+    let content = format!(
+        r##"<div class="max-w-3xl mx-auto">
+<div class="flex items-center justify-between mb-6">
+  <h1 class="text-2xl font-bold">Generate Bills <span class="text-base-content/40 text-base font-normal">recurring billing run</span></h1>
+  <a href="/iwk" class="btn btn-ghost btn-sm">← Bills</a>
+</div>
+{flash}
+<div class="card bg-base-100 shadow mb-6"><div class="card-body">
+  <div class="text-sm opacity-70">Bills are generated from <b>active contracts</b> whose cycle is due on or before the period-end date — one bill each, priced from the current tariff. Safe to re-run: a contract-period is never billed twice.</div>
+  <div class="stats bg-base-200 my-2"><div class="stat"><div class="stat-title">Contracts due as of today</div><div class="stat-value text-primary">{due}</div></div></div>
+  <form method="post" action="/iwk/billing/generate" class="flex items-end gap-3">
+    <label class="form-control"><span class="label-text">Bill everything due on/before</span>
+      <input name="period_end" type="date" value="{today}" class="input input-bordered"></label>
+    <button class="btn btn-primary" type="submit">Generate bills</button>
+  </form>
+</div></div>
+
+<div class="card bg-base-100 shadow"><div class="card-body overflow-x-auto">
+  <h2 class="font-semibold mb-2">Recent runs</h2>
+  <table class="table table-sm"><thead><tr><th>Started</th><th>Period end</th><th class="text-right">Bills</th><th>Status</th></tr></thead>
+  <tbody>{run_rows}</tbody></table>
+</div></div></div>"##,
+        flash = flash,
+        due = due,
+        today = today,
+        run_rows = run_rows,
+    );
+    Html(page_shell(&sidebar, "Generate Bills", &content)).into_response()
+}
+
+/// POST /iwk/billing/generate — run the generator for the chosen period.
+async fn generate_submit(Db(db): Db, Extension(_user): Extension<AuthUser>, Form(form): Form<GenerateForm>) -> Response {
+    let period_end = chrono::NaiveDate::parse_from_str(form.period_end.trim(), "%Y-%m-%d")
+        .unwrap_or_else(|_| chrono::Utc::now().date_naive());
+    match crate::billing::generate_bills_for_period(&db, period_end).await {
+        Ok(s) => Redirect::to(&format!("/iwk/billing?generated={}", s.bill_count)).into_response(),
+        Err(e) => {
+            error!("iwk generate failed: {e}");
+            (StatusCode::BAD_REQUEST, format!("Generation failed: {e}")).into_response()
         }
     }
 }

@@ -2,13 +2,15 @@
 //! state what you have, the host wires it.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use vortex_plugin_sdk::prelude::*;
 
-use crate::handlers;
+use crate::{billing, handlers};
 
 const MIG_001_INIT: &str = include_str!("../migrations/001_init/postgres.sql");
 const MIG_002_GL: &str = include_str!("../migrations/002_gl/postgres.sql");
+const MIG_003_CONTRACTS: &str = include_str!("../migrations/003_contracts/postgres.sql");
 
 pub struct IwkPlugin;
 
@@ -57,6 +59,12 @@ impl Plugin for IwkPlugin {
 
     fn menu_entries(&self) -> Vec<MenuEntry> {
         vec![
+            MenuEntry::new("iwk.register", "Register Customer", "/iwk/accounts/new", MenuGroup::Operations)
+                .with_icon("user-plus")
+                .with_priority(48),
+            MenuEntry::new("iwk.billing", "Generate Bills", "/iwk/billing", MenuGroup::Operations)
+                .with_icon("refresh-cw")
+                .with_priority(49),
             MenuEntry::new("iwk.bills", "IWK Bills", "/iwk", MenuGroup::Operations)
                 .with_icon("file-text")
                 .with_priority(50),
@@ -64,6 +72,28 @@ impl Plugin for IwkPlugin {
                 .with_icon("book-open")
                 .with_priority(51),
         ]
+    }
+
+    /// Recurring billing. Disabled by default: enabling it starts generating
+    /// bills for every contract whose cycle is due, which is a financial
+    /// action operators should switch on deliberately (the /iwk/billing page
+    /// gives the same generator on a manual trigger meanwhile).
+    fn scheduled_actions(&self) -> Vec<ScheduledAction> {
+        vec![ScheduledAction::new(
+            ScheduledActionDef {
+                code: "iwk.generate_due_bills",
+                name: "IWK: generate bills for contracts due today",
+                schedule: Schedule::Every(Duration::from_secs(24 * 60 * 60)),
+                enabled_by_default: false,
+            },
+            |state| async move {
+                let today = chrono::Utc::now().date_naive();
+                billing::generate_bills_for_period(&state.db, today)
+                    .await
+                    .map(|_| ())
+                    .map_err(vortex_plugin_sdk::common::VortexError::QueryExecution)
+            },
+        )]
     }
 
     /// Plugin-owned schema, applied per tenant on install.
@@ -83,6 +113,14 @@ impl Plugin for IwkPlugin {
                 // so acc_account exists here.
                 name: "002_gl",
                 up_sql: MIG_002_GL,
+                down_sql: None,
+                requires_core_migration: Some("124_record_stages"),
+            },
+            PluginMigration {
+                // Contract lifecycle on iwk_account (status, cycle, next_bill
+                // cursor) + number sequences for the recurring generator.
+                name: "003_contracts",
+                up_sql: MIG_003_CONTRACTS,
                 down_sql: None,
                 requires_core_migration: Some("124_record_stages"),
             },

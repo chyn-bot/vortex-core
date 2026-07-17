@@ -17,6 +17,7 @@
 //!
 //! See `docs/CORE_FEATURES.md` for the full primitive toolbox.
 
+pub mod billing;
 pub mod gl;
 pub mod handlers;
 pub mod model;
