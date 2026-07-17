@@ -155,7 +155,7 @@ async fn bill_detail(
                   to_char(b.adjustments,'FM999990.00')    AS adjustments,
                   to_char(b.rounding,'FM999990.00')       AS rounding,
                   to_char(b.total,'FM999990.00')          AS total,
-                  b.jompay_biller, b.jompay_ref, b.record_state,
+                  b.jompay_biller, b.jompay_ref, b.record_state, b.contact_id,
                   c.name AS customer_name, c.street, c.street2, c.city, c.zip
            FROM iwk_bill b JOIN contacts c ON c.id = b.contact_id
            WHERE b.id = $1"#,
@@ -184,6 +184,12 @@ async fn bill_detail(
 
     let esc = vortex_plugin_sdk::framework::ui::html_escape;
     let g = |k: &str| -> String { row.try_get::<Option<String>, _>(k).ok().flatten().unwrap_or_default() };
+
+    // The customer is the core contact — link the bill back to its record.
+    let contact_href = row
+        .try_get::<Uuid, _>("contact_id")
+        .map(|cid| format!("/contacts/{cid}"))
+        .unwrap_or_else(|_| "/contacts".to_string());
 
     let bill_no = g("bill_no");
     let account_no = g("account_no");
@@ -237,6 +243,7 @@ async fn bill_detail(
 <div class="flex items-center justify-between mb-3 no-print">
   <a href="{back}" class="btn btn-ghost btn-sm">← Back to Bills</a>
   <div class="flex items-center gap-2">{bar}
+    <a href="{contact_href}" class="btn btn-sm btn-outline">View customer</a>
     <button onclick="window.print()" class="btn btn-sm btn-outline">Print</button></div>
 </div>
 
@@ -260,7 +267,7 @@ async fn bill_detail(
   <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mt-4 text-sm">
     <div>
       <div class="text-[11px] uppercase text-slate-400">Nama & Alamat</div>
-      <div class="font-semibold">{customer}</div>
+      <a href="{contact_href}" class="font-semibold text-[#0a7c6a] hover:underline no-print-plain">{customer}</a>
       <div class="text-xs text-slate-600">{addr}</div>
     </div>
     <div class="md:text-right space-y-0.5">
@@ -306,6 +313,7 @@ async fn bill_detail(
   </div>
 </div></div>"##,
         back = esc(&back_href),
+        contact_href = esc(&contact_href),
         bar = bar,
         bill_no = esc(&bill_no),
         bill_date = money("bill_date"),
