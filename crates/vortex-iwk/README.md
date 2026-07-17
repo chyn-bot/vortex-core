@@ -1,0 +1,32 @@
+# Iwk (vortex-iwk)
+
+Scaffolded by `vortex scaffold plugin iwk`. Already registered
+in the workspace and the host — build and it runs:
+
+```
+cargo build -p vortex-cli
+DATABASE_URL=<tenant-url> ./target/debug/vortex db migrate       # applies migrations/001_init per tenant
+DATABASE_URL=<tenant-url> ./target/debug/vortex module install iwk   # install is an operator decision
+```
+
+(Or install from the UI: Settings ▸ Modules ▸ Update Apps List ▸
+Install.) Then open `/iwk`; the anonymous public board is at
+`/p/iwk` and 404s for tenants without the module installed.
+
+## What you got
+
+- **List view** with search/sort/filter/pagination (`handlers.rs::list_items`)
+- **Create form** with sequence-generated codes (`IWK/000001`)
+- **Record page** with the status bar (stages editable in Settings ▸
+  Stages), chatter (messages/activities/attachments), and
+  WORM-audited status transitions
+- **Model registry entries** — your model is already visible to the
+  user report builder and the public REST API (`/api/v1`)
+
+## Where to go next
+
+- Extend the schema in `migrations/` (add `002_...`, never edit an
+  applied migration)
+- Add scheduled actions, reports, translations in `plugin.rs`
+- Compose the base modules: inventory (`post_move`), accounting
+  (`create_and_post`), approvals — see `docs/CORE_FEATURES.md`

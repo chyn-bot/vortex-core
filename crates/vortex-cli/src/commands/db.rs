@@ -20,6 +20,7 @@ use crate::DbCommands;
 fn build_migration_registry() -> PluginRegistry {
     let mut registry = PluginRegistry::new();
     registry.register(Arc::new(vortex_contacts::ContactsPlugin::new()));
+    registry.register(Arc::new(vortex_iwk::IwkPlugin::new()));
     registry.register(Arc::new(vortex_accounting::AccountingPlugin::new()));
     registry.register(Arc::new(vortex_inventory::InventoryPlugin::new()));
     registry.register(Arc::new(vortex_purchase::PurchasePlugin::new()));

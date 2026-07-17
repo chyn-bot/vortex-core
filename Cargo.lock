@@ -4508,6 +4508,7 @@ dependencies = [
  "vortex-contacts",
  "vortex-framework",
  "vortex-inventory",
+ "vortex-iwk",
  "vortex-maintenance",
  "vortex-module",
  "vortex-orm",
@@ -4576,6 +4577,17 @@ dependencies = [
 
 [[package]]
 name = "vortex-inventory"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "uuid",
+ "vortex-common",
+ "vortex-orm",
+ "vortex-plugin-sdk",
+]
+
+[[package]]
+name = "vortex-iwk"
 version = "0.1.0"
 dependencies = [
  "serde",

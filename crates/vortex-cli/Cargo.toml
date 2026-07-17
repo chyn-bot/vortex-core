@@ -25,6 +25,7 @@ vortex-change = { workspace = true, optional = true }
 # Contacts plugin — always enabled; it's the platform smoke-test
 # vertical and the universal "res.partner" equivalent.
 vortex-contacts = { workspace = true }
+vortex-iwk = { workspace = true }
 # Inventory plugin — a generic, always-on stock primitive (products,
 # locations, double-entry moves, on-hand) that maintenance and
 # procurement verticals build on.

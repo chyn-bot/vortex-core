@@ -1985,6 +1985,7 @@ pub async fn run(host: String, port: u16, _workers: Option<usize>) -> Result<()>
     // (migrations, sequences, translations, scheduled actions,
     // reports, audit logging).
     plugin_registry.register(Arc::new(vortex_contacts::ContactsPlugin::new()));
+    plugin_registry.register(Arc::new(vortex_iwk::IwkPlugin::new()));
     // Accounting — the double-entry base (chart of accounts, journals,
     // posting engine). Registered early: it is a primitive-style plugin
     // other modules adopt via its service API; its migrations only need
