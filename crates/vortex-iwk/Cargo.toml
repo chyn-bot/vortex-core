@@ -14,5 +14,10 @@ vortex-plugin-sdk = { workspace = true }
 # re-exported through `vortex_orm::prelude`.
 vortex-orm = { workspace = true }
 vortex-common = { workspace = true }
+# GL integration: post summarized journals through the accounting service
+# (subledger detail stays in iwk_bill; the ledger sees period totals).
+vortex-accounting = { workspace = true }
 uuid = { workspace = true }
 serde = { workspace = true }
+rust_decimal = { workspace = true }
+chrono = { workspace = true }

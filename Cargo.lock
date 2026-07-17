@@ -4590,8 +4590,11 @@ dependencies = [
 name = "vortex-iwk"
 version = "0.1.0"
 dependencies = [
+ "chrono",
+ "rust_decimal",
  "serde",
  "uuid",
+ "vortex-accounting",
  "vortex-common",
  "vortex-orm",
  "vortex-plugin-sdk",

@@ -8,6 +8,7 @@ use vortex_plugin_sdk::prelude::*;
 use crate::handlers;
 
 const MIG_001_INIT: &str = include_str!("../migrations/001_init/postgres.sql");
+const MIG_002_GL: &str = include_str!("../migrations/002_gl/postgres.sql");
 
 pub struct IwkPlugin;
 
@@ -55,25 +56,36 @@ impl Plugin for IwkPlugin {
     }
 
     fn menu_entries(&self) -> Vec<MenuEntry> {
-        vec![MenuEntry::new(
-            "iwk.bills",
-            "IWK Bills",
-            "/iwk",
-            MenuGroup::Operations,
-        )
-        .with_icon("file-text")
-        .with_priority(50)]
+        vec![
+            MenuEntry::new("iwk.bills", "IWK Bills", "/iwk", MenuGroup::Operations)
+                .with_icon("file-text")
+                .with_priority(50),
+            MenuEntry::new("iwk.gl", "GL & Reconciliation", "/iwk/gl", MenuGroup::Operations)
+                .with_icon("book-open")
+                .with_priority(51),
+        ]
     }
 
     /// Plugin-owned schema, applied per tenant on install.
     fn migrations(&self) -> Vec<PluginMigration> {
-        vec![PluginMigration {
-            name: "001_init",
-            up_sql: MIG_001_INIT,
-            down_sql: None,
-            // record_stages (status bar) and the model registry are
-            // core features this migration seeds rows into.
-            requires_core_migration: Some("124_record_stages"),
-        }]
+        vec![
+            PluginMigration {
+                name: "001_init",
+                up_sql: MIG_001_INIT,
+                down_sql: None,
+                // record_stages (status bar) and the model registry are
+                // core features this migration seeds rows into.
+                requires_core_migration: Some("124_record_stages"),
+            },
+            PluginMigration {
+                // Seeds dedicated GL accounts (guarded on acc_account) and the
+                // iwk_gl_batch posting ledger. IWK registers after accounting
+                // so acc_account exists here.
+                name: "002_gl",
+                up_sql: MIG_002_GL,
+                down_sql: None,
+                requires_core_migration: Some("124_record_stages"),
+            },
+        ]
     }
 }

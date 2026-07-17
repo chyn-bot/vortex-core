@@ -18,6 +18,8 @@ pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/iwk", get(list_bills))
         .route("/iwk/bills/{id}", get(bill_detail))
+        .route("/iwk/gl", get(gl_page))
+        .route("/iwk/gl/post/{run_id}", post(post_run))
 }
 
 /// Platform HTML shell: sidebar, vendored assets, mobile layout.
@@ -339,4 +341,163 @@ async fn bill_detail(
 
     let sidebar = sidebar_for(&state, &user, &db_ctx);
     Html(page_shell(&sidebar, &format!("Bill {bill_no}"), &bill)).into_response()
+}
+
+/// Format a `Decimal` as `1,234,567.89` (thousands-grouped, 2dp) for the
+/// finance panels. Kept local so the GL page reads like the printed bill.
+fn fmt_rm(d: rust_decimal::Decimal) -> String {
+    let s = format!("{:.2}", d.round_dp(2));
+    let (sign, s) = match s.strip_prefix('-') {
+        Some(rest) => ("-", rest.to_string()),
+        None => ("", s),
+    };
+    let (int_part, frac) = s.split_once('.').unwrap_or((s.as_str(), "00"));
+    let mut grouped = String::new();
+    let bytes = int_part.as_bytes();
+    for (i, ch) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i) % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(*ch as char);
+    }
+    format!("{sign}{grouped}.{frac}")
+}
+
+/// GET /iwk/gl — GL posting + subledger↔ledger reconciliation.
+/// The reconciliation card is the control: subledger AR must equal the GL
+/// Sewerage Receivables balance (variance 0). Below it, each billing run can
+/// be posted once as a single summarized journal.
+async fn gl_page(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+) -> Response {
+    let esc = vortex_plugin_sdk::framework::ui::html_escape;
+    let sidebar = sidebar_for(&state, &user, &db_ctx);
+
+    let recon = match crate::gl::reconciliation(&db, None).await {
+        Ok(r) => r,
+        Err(e) => {
+            error!("iwk reconciliation failed: {e}");
+            let body = format!("<div class=\"alert alert-error\">Reconciliation error: {}</div>", esc(&e));
+            return Html(page_shell(&sidebar, "IWK GL", &body)).into_response();
+        }
+    };
+
+    let reconciled = recon.variance.is_zero();
+    let (variance_class, variance_note) = if reconciled {
+        ("text-success", "Reconciled — subledger matches the ledger.")
+    } else {
+        ("text-error", "Out of balance — some billing runs are not yet posted to the GL.")
+    };
+
+    // Billing runs with their posted state.
+    let rows = vortex_plugin_sdk::sqlx::query(
+        "SELECT br.id, \
+                to_char(br.started_at,'DD/MM/YYYY HH24:MI') AS started, \
+                br.total_items, \
+                gb.move_number, \
+                to_char(gb.ar_total,'FM999,999,990.00') AS ar_total, \
+                to_char(gb.posted_at,'DD/MM/YYYY') AS posted_at, \
+                (gb.run_id IS NOT NULL) AS posted \
+         FROM batch_run br LEFT JOIN iwk_gl_batch gb ON gb.run_id = br.id \
+         WHERE br.run_kind = 'iwk.billing_run' \
+         ORDER BY br.started_at DESC",
+    )
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default();
+
+    let mut run_rows = String::new();
+    for r in &rows {
+        let id: Uuid = match r.try_get("id") { Ok(v) => v, Err(_) => continue };
+        let started: String = r.try_get("started").ok().flatten().unwrap_or_default();
+        let items: i64 = r.try_get("total_items").unwrap_or(0);
+        let posted: bool = r.try_get("posted").unwrap_or(false);
+        let action = if posted {
+            let num: String = r.try_get("move_number").ok().flatten().unwrap_or_default();
+            let amt: String = r.try_get("ar_total").ok().flatten().unwrap_or_default();
+            let on: String = r.try_get("posted_at").ok().flatten().unwrap_or_default();
+            format!(
+                "<td><span class=\"badge badge-success\">Posted</span></td>\
+                 <td class=\"font-mono\">{num}</td><td class=\"text-right font-mono\">RM {amt}</td><td>{on}</td>",
+                num = esc(&num), amt = esc(&amt), on = esc(&on),
+            )
+        } else {
+            format!(
+                "<td><span class=\"badge badge-warning\">Not posted</span></td>\
+                 <td colspan=\"2\"></td>\
+                 <td><form method=\"post\" action=\"/iwk/gl/post/{id}\">\
+                 <button class=\"btn btn-primary btn-xs\" type=\"submit\">Post to GL</button></form></td>",
+            )
+        };
+        run_rows.push_str(&format!(
+            "<tr><td class=\"font-mono text-xs\">{started}</td><td class=\"text-right\">{items}</td>{action}</tr>",
+            started = esc(&started), items = items, action = action,
+        ));
+    }
+    if run_rows.is_empty() {
+        run_rows.push_str("<tr><td colspan=\"6\" class=\"text-center opacity-60 py-4\">No billing runs yet.</td></tr>");
+    }
+
+    let content = format!(
+        r##"<div class="flex items-center justify-between mb-6">
+  <h1 class="text-2xl font-bold">General Ledger <span class="text-base-content/40 text-base font-normal">Summarized posting &amp; reconciliation</span></h1>
+  <a href="/iwk" class="btn btn-ghost btn-sm">← Bills</a>
+</div>
+
+<div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
+  <div class="card bg-base-100 shadow"><div class="card-body">
+    <div class="text-xs uppercase opacity-60">Subledger AR (iwk_bill)</div>
+    <div class="text-2xl font-bold font-mono">RM {subledger}</div>
+    <div class="text-xs opacity-60">Outstanding on issued bills</div>
+  </div></div>
+  <div class="card bg-base-100 shadow"><div class="card-body">
+    <div class="text-xs uppercase opacity-60">GL control (Sewerage Receivables)</div>
+    <div class="text-2xl font-bold font-mono">RM {gl}</div>
+    <div class="text-xs opacity-60">Posted journal balance</div>
+  </div></div>
+  <div class="card bg-base-100 shadow"><div class="card-body">
+    <div class="text-xs uppercase opacity-60">Variance</div>
+    <div class="text-2xl font-bold font-mono {vclass}">RM {variance}</div>
+    <div class="text-xs opacity-60">{vnote}</div>
+  </div></div>
+</div>
+
+<div class="text-sm mb-2 opacity-70">{posted_runs} of {total_runs} billing runs posted to the GL. Each run posts one balanced journal (Dr Sewerage Receivables / Cr Sewerage Revenue); per-customer detail stays in the bill subledger.</div>
+
+<div class="card bg-base-100 shadow"><div class="card-body overflow-x-auto">
+  <table class="table table-sm">
+    <thead><tr><th>Run</th><th class="text-right">Bills</th><th>State</th><th>Journal</th><th class="text-right">Amount</th><th>Posted / Action</th></tr></thead>
+    <tbody>{run_rows}</tbody>
+  </table>
+</div></div>"##,
+        subledger = fmt_rm(recon.subledger_ar),
+        gl = fmt_rm(recon.gl_ar),
+        variance = fmt_rm(recon.variance),
+        vclass = variance_class,
+        vnote = variance_note,
+        posted_runs = recon.runs_posted,
+        total_runs = recon.runs_total,
+        run_rows = run_rows,
+    );
+
+    Html(page_shell(&sidebar, "IWK GL", &content)).into_response()
+}
+
+/// POST /iwk/gl/post/{run_id} — post one billing run's totals to the GL.
+async fn post_run(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Path(run_id): Path<Uuid>,
+) -> Response {
+    match crate::gl::post_run_to_gl(&db, &state.pool, user.id, None, run_id).await {
+        Ok(_) => Redirect::to("/iwk/gl").into_response(),
+        Err(e) => {
+            error!("iwk GL post failed: {e}");
+            (StatusCode::BAD_REQUEST, format!("Post failed: {e}")).into_response()
+        }
+    }
 }
