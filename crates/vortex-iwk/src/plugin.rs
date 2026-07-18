@@ -59,6 +59,9 @@ impl Plugin for IwkPlugin {
 
     fn menu_entries(&self) -> Vec<MenuEntry> {
         vec![
+            MenuEntry::new("iwk.contracts", "Contracts", "/iwk/accounts", MenuGroup::Operations)
+                .with_icon("clipboard-list")
+                .with_priority(47),
             MenuEntry::new("iwk.register", "Register Customer", "/iwk/accounts/new", MenuGroup::Operations)
                 .with_icon("user-plus")
                 .with_priority(48),

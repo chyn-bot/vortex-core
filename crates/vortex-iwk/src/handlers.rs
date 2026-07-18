@@ -21,8 +21,10 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/iwk/bills/{id}", get(bill_detail))
         .route("/iwk/gl", get(gl_page))
         .route("/iwk/gl/post/{run_id}", post(post_run))
+        .route("/iwk/accounts", get(list_accounts))
         .route("/iwk/accounts/new", get(register_form))
         .route("/iwk/accounts/create", post(register_submit))
+        .route("/iwk/accounts/{id}", get(account_detail))
         .route("/iwk/billing", get(billing_page))
         .route("/iwk/billing/generate", post(generate_submit))
 }
@@ -624,6 +626,205 @@ async fn register_submit(
             (StatusCode::BAD_REQUEST, format!("Registration failed: {e}")).into_response()
         }
     }
+}
+
+/// GET /iwk/accounts — the contract register (list of sewerage accounts).
+async fn list_accounts(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Query(query): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    use vortex_plugin_sdk::framework::list::{
+        execute_list, render_list, ListColumn, ListConfig, ListParams,
+    };
+
+    let config = ListConfig::new("Contracts", "iwk_account")
+        .custom_from("iwk_account a JOIN contacts c ON c.id = a.contact_id")
+        .custom_select(
+            "a.id, a.account_no, c.name AS customer_name, a.category, a.system_type, \
+             a.billing_cycle, a.status, to_char(a.next_bill_date, 'DD/MM/YYYY') AS next_bill_date",
+        )
+        .column(ListColumn::new("account_no", "Account No").sortable().searchable().code().sql_expr("a.account_no"))
+        .column(ListColumn::new("customer_name", "Customer").sql_expr("c.name"))
+        .column(
+            ListColumn::new("category", "Category")
+                .filterable(&[("domestic", "Domestic"), ("commercial", "Commercial")])
+                .badge(&[("domestic", "Domestic", "badge-info"), ("commercial", "Commercial", "badge-secondary")])
+                .sql_expr("a.category"),
+        )
+        .column(ListColumn::new("system_type", "System").sql_expr("a.system_type"))
+        .column(ListColumn::new("billing_cycle", "Cycle").sql_expr("a.billing_cycle"))
+        .column(ListColumn::new("next_bill_date", "Next bill").sortable().sql_expr("a.next_bill_date"))
+        .column(
+            ListColumn::new("status", "Status")
+                .filterable(&[("active", "Active"), ("suspended", "Suspended"), ("terminated", "Terminated")])
+                .badge(&[
+                    ("active", "Active", "badge-success"),
+                    ("suspended", "Suspended", "badge-warning"),
+                    ("terminated", "Terminated", "badge-error"),
+                ])
+                .sql_expr("a.status"),
+        )
+        .detail_url("/iwk/accounts/{id}")
+        .default_sort("account_no")
+        .count_estimate_from("iwk_account")
+        .tiebreak("a.id")
+        .search_prefilter("iwk_account a");
+
+    let params = ListParams::from_query(&query);
+    let table = match execute_list(&db, &config, &params).await {
+        Ok(result) => render_list(&config, &result, &params, "/iwk/accounts"),
+        Err(e) => {
+            error!("iwk account list failed: {e}");
+            format!("<div class=\"alert alert-error\">List error: {e}</div>")
+        }
+    };
+
+    let content = format!(
+        r##"<div class="flex items-center justify-between mb-6">
+<h1 class="text-2xl font-bold">Contracts <span class="text-base-content/40 text-base font-normal">Sewerage accounts</span></h1>
+<a href="/iwk/accounts/new" class="btn btn-primary btn-sm">+ Register customer</a>
+</div>{table}"##,
+    );
+    let sidebar = sidebar_for(&state, &user, &db_ctx);
+    Html(page_shell(&sidebar, "Contracts", &content)).into_response()
+}
+
+/// GET /iwk/accounts/{id} — a contract: terms, customer, and its bills.
+async fn account_detail(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    headers: vortex_plugin_sdk::axum::http::HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Response {
+    let esc = vortex_plugin_sdk::framework::ui::html_escape;
+    let sidebar = sidebar_for(&state, &user, &db_ctx);
+    let back_href = vortex_plugin_sdk::framework::list_return_href(&headers, "/iwk/accounts");
+
+    let row = match vortex_plugin_sdk::sqlx::query(
+        "SELECT a.account_no, a.category, a.system_type, a.units, a.billing_cycle, a.status, \
+                to_char(a.deposit,'FM999,990.00') AS deposit, \
+                to_char(a.connection_date,'DD/MM/YYYY') AS connection_date, \
+                to_char(a.next_bill_date,'DD/MM/YYYY') AS next_bill_date, \
+                a.contact_id, c.name AS customer_name, c.street, c.city, c.phone \
+         FROM iwk_account a JOIN contacts c ON c.id = a.contact_id WHERE a.id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&db)
+    .await
+    {
+        Ok(Some(r)) => r,
+        Ok(None) => return (StatusCode::NOT_FOUND, "Contract not found").into_response(),
+        Err(e) => {
+            error!("iwk account fetch failed: {e}");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Load failed").into_response();
+        }
+    };
+
+    let g = |k: &str| -> String { row.try_get::<Option<String>, _>(k).ok().flatten().unwrap_or_default() };
+    let account_no = g("account_no");
+    let contact_id = row.try_get::<Uuid, _>("contact_id").map(|c| c.to_string()).unwrap_or_default();
+    let units: i32 = row.try_get("units").unwrap_or(1);
+    let status = g("status");
+    let status_badge = match status.as_str() {
+        "suspended" => "badge-warning",
+        "terminated" => "badge-error",
+        _ => "badge-success",
+    };
+
+    // Bills on this contract.
+    let bills = vortex_plugin_sdk::sqlx::query(
+        "SELECT id, bill_no, to_char(bill_date,'DD/MM/YYYY') AS bill_date, \
+                to_char(period_start,'DD/MM/YYYY') AS ps, to_char(period_end,'DD/MM/YYYY') AS pe, \
+                to_char(total,'FM999,990.00') AS total, record_state \
+         FROM iwk_bill WHERE account_id = $1 ORDER BY period_start DESC LIMIT 100",
+    )
+    .bind(id)
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default();
+
+    let mut bill_rows = String::new();
+    for b in &bills {
+        let bid: Uuid = match b.try_get("id") { Ok(v) => v, Err(_) => continue };
+        let no: String = b.try_get("bill_no").ok().flatten().unwrap_or_default();
+        let bd: String = b.try_get("bill_date").ok().flatten().unwrap_or_default();
+        let ps: String = b.try_get("ps").ok().flatten().unwrap_or_default();
+        let pe: String = b.try_get("pe").ok().flatten().unwrap_or_default();
+        let total: String = b.try_get("total").ok().flatten().unwrap_or_default();
+        let st: String = b.try_get("record_state").unwrap_or_default();
+        let st_badge = match st.as_str() { "paid" => "badge-success", "cancelled" => "badge-error", _ => "badge-info" };
+        bill_rows.push_str(&format!(
+            "<tr class=\"hover cursor-pointer\" onclick=\"location.href='/iwk/bills/{bid}'\">\
+             <td class=\"font-mono text-xs\">{no}</td><td>{ps} – {pe}</td><td>{bd}</td>\
+             <td class=\"text-right font-mono\">RM {total}</td><td><span class=\"badge {st_badge} badge-sm\">{st}</span></td></tr>",
+            bid = bid, no = esc(&no), ps = esc(&ps), pe = esc(&pe), bd = esc(&bd),
+            total = esc(&total), st_badge = st_badge, st = esc(&st),
+        ));
+    }
+    if bill_rows.is_empty() {
+        bill_rows.push_str("<tr><td colspan=\"5\" class=\"text-center opacity-60 py-4\">No bills yet — will be generated on the next billing run.</td></tr>");
+    }
+
+    let addr = [g("street"), g("city")].into_iter().filter(|s| !s.trim().is_empty()).map(|s| esc(&s)).collect::<Vec<_>>().join(", ");
+
+    let content = format!(
+        r##"<div class="max-w-4xl mx-auto">
+<div class="flex items-center justify-between mb-4">
+  <a href="{back}" class="btn btn-ghost btn-sm">← Contracts</a>
+  <span class="badge {status_badge}">{status}</span>
+</div>
+
+<div class="card bg-base-100 shadow mb-6"><div class="card-body">
+  <div class="flex items-start justify-between">
+    <div>
+      <h1 class="text-2xl font-bold font-mono">{account_no}</h1>
+      <div class="mt-1"><a href="/contacts/{contact_id}" class="link link-primary font-semibold">{customer}</a></div>
+      <div class="text-sm opacity-60">{addr} {phone}</div>
+    </div>
+    <a href="/iwk/billing" class="btn btn-sm btn-outline">Generate bills</a>
+  </div>
+  <div class="divider my-2"></div>
+  <div class="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
+    <div><div class="opacity-60 text-xs uppercase">Category</div>{category}</div>
+    <div><div class="opacity-60 text-xs uppercase">System</div>{system_type}</div>
+    <div><div class="opacity-60 text-xs uppercase">Units</div>{units}</div>
+    <div><div class="opacity-60 text-xs uppercase">Billing cycle</div>{cycle}</div>
+    <div><div class="opacity-60 text-xs uppercase">Connected</div>{connected}</div>
+    <div><div class="opacity-60 text-xs uppercase">Next bill</div>{next_bill}</div>
+    <div><div class="opacity-60 text-xs uppercase">Deposit</div>RM {deposit}</div>
+  </div>
+</div></div>
+
+<div class="card bg-base-100 shadow"><div class="card-body overflow-x-auto">
+  <h2 class="font-semibold mb-2">Bills</h2>
+  <table class="table table-sm">
+    <thead><tr><th>Bill No</th><th>Period</th><th>Date</th><th class="text-right">Total</th><th>Status</th></tr></thead>
+    <tbody>{bill_rows}</tbody>
+  </table>
+</div></div></div>"##,
+        back = esc(&back_href),
+        status_badge = status_badge,
+        status = esc(&status),
+        account_no = esc(&account_no),
+        contact_id = esc(&contact_id),
+        customer = esc(&g("customer_name")),
+        addr = addr,
+        phone = esc(&g("phone")),
+        category = esc(&g("category")),
+        system_type = esc(&g("system_type")),
+        units = units,
+        cycle = esc(&g("billing_cycle")),
+        connected = esc(&g("connection_date")),
+        next_bill = esc(&g("next_bill_date")),
+        deposit = esc(&g("deposit")),
+        bill_rows = bill_rows,
+    );
+    Html(page_shell(&sidebar, &format!("Contract {account_no}"), &content)).into_response()
 }
 
 // ─── Recurring bill generation ───────────────────────────────────────────
