@@ -5795,7 +5795,46 @@ async fn security_headers_middleware(
     request: Request,
     next: Next,
 ) -> Response {
+    // Whether to mark cookies `Secure`. Determined per request so local HTTP
+    // development still works (a `Secure` cookie is dropped by the browser over
+    // plain http). In production, TLS is terminated at the reverse proxy, which
+    // forwards `X-Forwarded-Proto: https`; `VORTEX_SECURE_COOKIES` forces it on
+    // for deployments where that header can't be relied on.
+    let secure_cookies = request
+        .headers()
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .map(|p| p.eq_ignore_ascii_case("https"))
+        .unwrap_or(false)
+        || std::env::var("VORTEX_SECURE_COOKIES")
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "always" | "yes"))
+            .unwrap_or(false);
+
     let mut response = next.run(request).await;
+
+    // Add `Secure` to every Set-Cookie that doesn't already carry it. Done once,
+    // centrally, so every cookie the app sets (session, MFA pre-auth, portal,
+    // logout-clears, …) is covered without threading a flag through each site.
+    if secure_cookies {
+        let cookies: Vec<_> = response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .cloned()
+            .collect();
+        if !cookies.is_empty() {
+            response.headers_mut().remove(header::SET_COOKIE);
+            for c in cookies {
+                let upgraded = match c.to_str() {
+                    Ok(s) if !s.to_ascii_lowercase().split(';').any(|p| p.trim() == "secure") => {
+                        header::HeaderValue::from_str(&format!("{s}; Secure")).ok()
+                    }
+                    _ => None,
+                };
+                response.headers_mut().append(header::SET_COOKIE, upgraded.unwrap_or(c));
+            }
+        }
+    }
     // Dynamic HTML must never be reused from the browser cache: these pages are
     // per-tenant, per-session and data-dependent, so a cached copy shows stale
     // or empty content until a manual refresh (and would leak ERP data left in
