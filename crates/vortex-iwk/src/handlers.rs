@@ -27,26 +27,19 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/iwk/accounts/{id}", get(account_detail))
         .route("/iwk/billing", get(billing_page))
         .route("/iwk/billing/generate", post(generate_submit))
+        .route("/iwk/payments", get(payments_page))
+        .route("/iwk/payments/register", post(payment_register))
+        .route("/iwk/payments/import", post(payment_import))
+        .route("/iwk/payments/post", post(payment_post))
 }
 
-/// Platform HTML shell: sidebar, vendored assets, mobile layout.
-/// (Uses the static `tailwind.css` — the runtime Play-CDN was retired.)
+/// Platform HTML shell. Delegates to the canonical `render_app_shell` so IWK
+/// pages get the *same* chrome as the rest of the app — crucially the mobile
+/// top bar + hamburger + overlay that toggle the sidebar. The previous
+/// hand-rolled shell omitted them, so on a narrow/mobile viewport the sidebar
+/// was off-screen with no way to open it (couldn't navigate or reach Home).
 fn page_shell(sidebar: &str, title: &str, content: &str) -> String {
-    format!(
-        r##"<!DOCTYPE html><html data-theme="dark"><head>
-<script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script>
-<title>{title} - Vortex</title>
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
-<link href="/static/vortex.css?v=21" rel="stylesheet"/>
-<script src="/static/vortex.js?v=21" defer></script>
-<link href="/static/tailwind.css?v=21" rel="stylesheet"/>
-</head>
-<body class="min-h-screen bg-base-200"><div class="flex">{sidebar}
-<main class="flex-1 p-4 lg:p-6 min-w-0">{content}</main>
-</div></body></html>"##,
-        title = title, sidebar = sidebar, content = content,
-    )
+    vortex_plugin_sdk::framework::render_app_shell(&format!("{title} - Vortex"), sidebar, content)
 }
 
 fn sidebar_for(state: &AppState, user: &AuthUser, db_ctx: &DatabaseContext) -> String {
@@ -921,6 +914,235 @@ async fn generate_submit(Db(db): Db, Extension(_user): Extension<AuthUser>, Form
         Err(e) => {
             error!("iwk generate failed: {e}");
             (StatusCode::BAD_REQUEST, format!("Generation failed: {e}")).into_response()
+        }
+    }
+}
+
+// ─── Payments (capture → allocate → summarized GL) ───────────────────────
+
+#[derive(Deserialize)]
+struct PaymentForm {
+    account_no: String,
+    amount: String,
+    #[serde(default)]
+    payment_date: String,
+    #[serde(default)]
+    method: String,
+    #[serde(default)]
+    reference: String,
+}
+
+#[derive(Deserialize)]
+struct ImportForm {
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    payment_date: String,
+    #[serde(default)]
+    method: String,
+}
+
+/// GET /iwk/payments — register/import payments, post collections to the GL.
+async fn payments_page(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let esc = vortex_plugin_sdk::framework::ui::html_escape;
+    let sidebar = sidebar_for(&state, &user, &db_ctx);
+    let today = chrono::Utc::now().date_naive();
+
+    let recon = crate::gl::reconciliation(&db, None).await.ok();
+    let (unposted, advances) = recon
+        .as_ref()
+        .map(|r| (r.unposted_payments, fmt_rm(r.advances)))
+        .unwrap_or((0, "0.00".into()));
+
+    let mut flash = String::new();
+    if let Some(no) = q.get("ok") {
+        let credit = q.get("credit").map(|s| s.as_str()).unwrap_or("0");
+        flash = format!(
+            "<div class=\"alert alert-success mb-4\">Payment <span class=\"font-mono font-bold\">{}</span> recorded.{}</div>",
+            esc(no),
+            if credit != "0" && !credit.is_empty() { format!(" RM {} went to account credit.", esc(credit)) } else { String::new() },
+        );
+    } else if let Some(n) = q.get("imported") {
+        let errs = q.get("errors").map(|s| s.as_str()).unwrap_or("0");
+        flash = format!(
+            "<div class=\"alert alert-info mb-4\">Imported <b>{}</b> payment(s), <b>{}</b> error(s).</div>",
+            esc(n), esc(errs),
+        );
+    } else if let Some(mv) = q.get("posted") {
+        flash = format!(
+            "<div class=\"alert alert-success mb-4\">Collections posted to the GL as <span class=\"font-mono\">{}</span> (Dr Bank / Cr Receivables).</div>",
+            esc(mv),
+        );
+    }
+
+    // Recent payments.
+    let rows = vortex_plugin_sdk::sqlx::query(
+        "SELECT p.payment_no, a.account_no, c.name AS customer, \
+                to_char(p.amount,'FM999,990.00') AS amount, to_char(p.allocated,'FM999,990.00') AS allocated, \
+                to_char(p.credit,'FM999,990.00') AS credit, p.method, \
+                to_char(p.payment_date,'DD/MM/YYYY') AS pdate, p.posted \
+         FROM iwk_payment p JOIN iwk_account a ON a.id = p.account_id JOIN contacts c ON c.id = p.contact_id \
+         ORDER BY p.created_at DESC LIMIT 20",
+    )
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default();
+    let mut pay_rows = String::new();
+    for r in &rows {
+        let no: String = r.try_get("payment_no").ok().flatten().unwrap_or_default();
+        let acct: String = r.try_get("account_no").unwrap_or_default();
+        let cust: String = r.try_get("customer").ok().flatten().unwrap_or_default();
+        let amt: String = r.try_get("amount").ok().flatten().unwrap_or_default();
+        let alloc: String = r.try_get("allocated").ok().flatten().unwrap_or_default();
+        let cr: String = r.try_get("credit").ok().flatten().unwrap_or_default();
+        let method: String = r.try_get("method").unwrap_or_default();
+        let pdate: String = r.try_get("pdate").ok().flatten().unwrap_or_default();
+        let posted: bool = r.try_get("posted").unwrap_or(false);
+        let badge = if posted { "<span class=\"badge badge-success badge-sm\">Posted</span>" } else { "<span class=\"badge badge-warning badge-sm\">Unposted</span>" };
+        pay_rows.push_str(&format!(
+            "<tr><td class=\"font-mono text-xs\">{no}</td><td class=\"font-mono text-xs\">{acct}</td><td>{cust}</td>\
+             <td class=\"text-right font-mono\">{amt}</td><td class=\"text-right font-mono\">{alloc}</td>\
+             <td class=\"text-right font-mono\">{cr}</td><td>{method}</td><td>{pdate}</td><td>{badge}</td></tr>",
+            no = esc(&no), acct = esc(&acct), cust = esc(&cust), amt = esc(&amt),
+            alloc = esc(&alloc), cr = esc(&cr), method = esc(&method), pdate = esc(&pdate), badge = badge,
+        ));
+    }
+    if pay_rows.is_empty() {
+        pay_rows.push_str("<tr><td colspan=\"9\" class=\"text-center opacity-60 py-4\">No payments yet.</td></tr>");
+    }
+
+    let post_btn = if unposted > 0 {
+        format!(
+            "<form method=\"post\" action=\"/iwk/payments/post\"><button class=\"btn btn-primary btn-sm\" type=\"submit\">Post {} collection(s) to GL</button></form>",
+            unposted
+        )
+    } else {
+        "<span class=\"text-sm opacity-60\">No unposted collections.</span>".to_string()
+    };
+
+    let content = format!(
+        r##"<div class="max-w-5xl mx-auto">
+<div class="flex items-center justify-between mb-6">
+  <h1 class="text-2xl font-bold">Payments <span class="text-base-content/40 text-base font-normal">collections &amp; allocation</span></h1>
+  <a href="/iwk/gl" class="btn btn-ghost btn-sm">GL →</a>
+</div>
+{flash}
+<div class="flex items-center justify-between bg-base-100 rounded p-3 shadow mb-6">
+  <div class="flex gap-6 text-sm">
+    <div><span class="opacity-60">Unposted collections:</span> <b>{unposted}</b></div>
+    <div><span class="opacity-60">Customer advances:</span> <b>RM {advances}</b></div>
+  </div>
+  {post_btn}
+</div>
+
+<div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-6">
+  <div class="card bg-base-100 shadow"><div class="card-body">
+    <h2 class="font-semibold">Register a payment</h2>
+    <form method="post" action="/iwk/payments/register" class="space-y-3">
+      <label class="form-control"><span class="label-text">Account no</span><input name="account_no" required class="input input-bordered" placeholder="PB0000400001"></label>
+      <div class="grid grid-cols-2 gap-3">
+        <label class="form-control"><span class="label-text">Amount (RM)</span><input name="amount" type="number" step="0.01" min="0" required class="input input-bordered"></label>
+        <label class="form-control"><span class="label-text">Date</span><input name="payment_date" type="date" value="{today}" class="input input-bordered"></label>
+      </div>
+      <div class="grid grid-cols-2 gap-3">
+        <label class="form-control"><span class="label-text">Method</span><select name="method" class="select select-bordered"><option value="counter">Counter</option><option value="jompay">JomPAY</option><option value="bank">Bank</option><option value="cash">Cash</option></select></label>
+        <label class="form-control"><span class="label-text">Reference</span><input name="reference" class="input input-bordered"></label>
+      </div>
+      <button class="btn btn-primary" type="submit">Register payment</button>
+    </form>
+  </div></div>
+
+  <div class="card bg-base-100 shadow"><div class="card-body">
+    <h2 class="font-semibold">Bulk import (collection file)</h2>
+    <form method="post" action="/iwk/payments/import" class="space-y-3">
+      <label class="form-control"><span class="label-text">One per line: <span class="font-mono">account_no,amount,reference</span></span>
+        <textarea name="body" rows="6" class="textarea textarea-bordered font-mono text-xs" placeholder="PB0000400001,252.00,JMP-9931&#10;PB0000400002,60.00,JMP-9932"></textarea></label>
+      <div class="grid grid-cols-2 gap-3">
+        <label class="form-control"><span class="label-text">Date</span><input name="payment_date" type="date" value="{today}" class="input input-bordered"></label>
+        <label class="form-control"><span class="label-text">Method</span><select name="method" class="select select-bordered"><option value="jompay">JomPAY</option><option value="bank">Bank</option><option value="import">Import</option></select></label>
+      </div>
+      <button class="btn btn-outline" type="submit">Import batch</button>
+    </form>
+  </div></div>
+</div>
+
+<div class="card bg-base-100 shadow"><div class="card-body overflow-x-auto">
+  <h2 class="font-semibold mb-2">Recent payments</h2>
+  <table class="table table-sm">
+    <thead><tr><th>Payment</th><th>Account</th><th>Customer</th><th class="text-right">Amount</th><th class="text-right">Allocated</th><th class="text-right">Credit</th><th>Method</th><th>Date</th><th>GL</th></tr></thead>
+    <tbody>{pay_rows}</tbody>
+  </table>
+</div></div></div>"##,
+        flash = flash,
+        unposted = unposted,
+        advances = advances,
+        post_btn = post_btn,
+        today = today,
+        pay_rows = pay_rows,
+    );
+    Html(page_shell(&sidebar, "Payments", &content)).into_response()
+}
+
+/// POST /iwk/payments/register — capture one payment.
+async fn payment_register(Db(db): Db, Extension(_user): Extension<AuthUser>, Form(form): Form<PaymentForm>) -> Response {
+    let account_id: Option<Uuid> =
+        vortex_plugin_sdk::sqlx::query_scalar("SELECT id FROM iwk_account WHERE account_no = $1")
+            .bind(form.account_no.trim())
+            .fetch_optional(&db)
+            .await
+            .ok()
+            .flatten();
+    let Some(account_id) = account_id else {
+        return (StatusCode::BAD_REQUEST, format!("Unknown account '{}'", form.account_no)).into_response();
+    };
+    let amount = match form.amount.trim().parse::<rust_decimal::Decimal>() {
+        Ok(a) => a,
+        Err(_) => return (StatusCode::BAD_REQUEST, "Invalid amount").into_response(),
+    };
+    let date = chrono::NaiveDate::parse_from_str(form.payment_date.trim(), "%Y-%m-%d")
+        .unwrap_or_else(|_| chrono::Utc::now().date_naive());
+    let method = if form.method.trim().is_empty() { "counter" } else { form.method.trim() };
+
+    match crate::payment::register_payment(&db, account_id, amount, date, method, form.reference.trim(), None).await {
+        Ok(r) => Redirect::to(&format!("/iwk/payments?ok={}&credit={}", r.payment_no, r.credit)).into_response(),
+        Err(e) => {
+            error!("iwk payment register failed: {e}");
+            (StatusCode::BAD_REQUEST, format!("Payment failed: {e}")).into_response()
+        }
+    }
+}
+
+/// POST /iwk/payments/import — bulk import a collection file.
+async fn payment_import(Db(db): Db, Extension(_user): Extension<AuthUser>, Form(form): Form<ImportForm>) -> Response {
+    let date = chrono::NaiveDate::parse_from_str(form.payment_date.trim(), "%Y-%m-%d")
+        .unwrap_or_else(|_| chrono::Utc::now().date_naive());
+    let method = if form.method.trim().is_empty() { "import" } else { form.method.trim() };
+    match crate::payment::import_payments(&db, &form.body, date, method).await {
+        Ok(s) => Redirect::to(&format!("/iwk/payments?imported={}&errors={}", s.count, s.errors.len())).into_response(),
+        Err(e) => {
+            error!("iwk payment import failed: {e}");
+            (StatusCode::BAD_REQUEST, format!("Import failed: {e}")).into_response()
+        }
+    }
+}
+
+/// POST /iwk/payments/post — post all unposted collections to the GL.
+async fn payment_post(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+) -> Response {
+    match crate::payment::post_payments_to_gl(&db, &state.pool, user.id, None).await {
+        Ok(s) => Redirect::to(&format!("/iwk/payments?posted={}", s.move_number)).into_response(),
+        Err(e) => {
+            error!("iwk payment post failed: {e}");
+            (StatusCode::BAD_REQUEST, format!("Post failed: {e}")).into_response()
         }
     }
 }

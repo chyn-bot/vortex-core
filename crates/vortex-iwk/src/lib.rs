@@ -20,6 +20,7 @@
 pub mod billing;
 pub mod gl;
 pub mod handlers;
+pub mod payment;
 pub mod model;
 pub mod plugin;
 

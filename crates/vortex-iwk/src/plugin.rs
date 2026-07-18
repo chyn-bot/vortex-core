@@ -11,6 +11,7 @@ use crate::{billing, handlers};
 const MIG_001_INIT: &str = include_str!("../migrations/001_init/postgres.sql");
 const MIG_002_GL: &str = include_str!("../migrations/002_gl/postgres.sql");
 const MIG_003_CONTRACTS: &str = include_str!("../migrations/003_contracts/postgres.sql");
+const MIG_004_PAYMENTS: &str = include_str!("../migrations/004_payments/postgres.sql");
 
 pub struct IwkPlugin;
 
@@ -71,6 +72,9 @@ impl Plugin for IwkPlugin {
             MenuEntry::new("iwk.bills", "IWK Bills", "/iwk", MenuGroup::Operations)
                 .with_icon("file-text")
                 .with_priority(50),
+            MenuEntry::new("iwk.payments", "Payments", "/iwk/payments", MenuGroup::Operations)
+                .with_icon("credit-card")
+                .with_priority(50),
             MenuEntry::new("iwk.gl", "GL & Reconciliation", "/iwk/gl", MenuGroup::Operations)
                 .with_icon("book-open")
                 .with_priority(51),
@@ -124,6 +128,14 @@ impl Plugin for IwkPlugin {
                 // cursor) + number sequences for the recurring generator.
                 name: "003_contracts",
                 up_sql: MIG_003_CONTRACTS,
+                down_sql: None,
+                requires_core_migration: Some("124_record_stages"),
+            },
+            PluginMigration {
+                // Payment subledger + allocation + Customer Advances account +
+                // summarized collection-posting ledger.
+                name: "004_payments",
+                up_sql: MIG_004_PAYMENTS,
                 down_sql: None,
                 requires_core_migration: Some("124_record_stages"),
             },

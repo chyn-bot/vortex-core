@@ -38,6 +38,12 @@ pub struct Recon {
     pub variance: Decimal,
     pub runs_total: i64,
     pub runs_posted: i64,
+    /// Σ collections posted to the GL (Dr Bank).
+    pub collected: Decimal,
+    /// Σ unconsumed customer credit (advances liability).
+    pub advances: Decimal,
+    /// Payments captured but not yet posted to the GL.
+    pub unposted_payments: i64,
 }
 
 /// Resolve an account by code, falling back to the company default for `role`
@@ -209,11 +215,31 @@ pub async fn reconciliation(db: &PgPool, company_id: Option<Uuid>) -> Result<Rec
         (row.try_get::<i64, _>("total").unwrap_or(0), row.try_get::<i64, _>("posted").unwrap_or(0))
     };
 
+    // Collections posted + customer advances outstanding + unposted payments.
+    let collected: Decimal =
+        vortex_plugin_sdk::sqlx::query_scalar("SELECT COALESCE(SUM(bank_total), 0) FROM iwk_gl_payment_batch")
+            .fetch_one(db)
+            .await
+            .map_err(|e| e.to_string())?;
+    let advances: Decimal =
+        vortex_plugin_sdk::sqlx::query_scalar("SELECT COALESCE(SUM(credit_balance), 0) FROM iwk_account")
+            .fetch_one(db)
+            .await
+            .map_err(|e| e.to_string())?;
+    let unposted_payments: i64 =
+        vortex_plugin_sdk::sqlx::query_scalar("SELECT COUNT(*) FROM iwk_payment WHERE NOT posted")
+            .fetch_one(db)
+            .await
+            .map_err(|e| e.to_string())?;
+
     Ok(Recon {
         subledger_ar,
         gl_ar,
         variance: subledger_ar - gl_ar,
         runs_total,
         runs_posted,
+        collected,
+        advances,
+        unposted_payments,
     })
 }
