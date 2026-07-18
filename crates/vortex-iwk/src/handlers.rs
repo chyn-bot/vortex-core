@@ -28,9 +28,11 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/iwk/billing", get(billing_page))
         .route("/iwk/billing/generate", post(generate_submit))
         .route("/iwk/payments", get(payments_page))
+        .route("/iwk/payments/history", get(payments_history))
         .route("/iwk/payments/register", post(payment_register))
         .route("/iwk/payments/import", post(payment_import))
         .route("/iwk/payments/post", post(payment_post))
+        .route("/iwk/customers/{id}", get(customer_ledger_page))
 }
 
 /// Platform HTML shell. Delegates to the canonical `render_app_shell` so IWK
@@ -763,6 +765,40 @@ async fn account_detail(
         bill_rows.push_str("<tr><td colspan=\"5\" class=\"text-center opacity-60 py-4\">No bills yet — will be generated on the next billing run.</td></tr>");
     }
 
+    // Payment history on this contract.
+    let payments = vortex_plugin_sdk::sqlx::query(
+        "SELECT payment_no, to_char(payment_date,'DD/MM/YYYY') AS pdate, method, reference, \
+                to_char(amount,'FM999,990.00') AS amount, to_char(allocated,'FM999,990.00') AS allocated, \
+                to_char(credit,'FM999,990.00') AS credit, posted \
+         FROM iwk_payment WHERE account_id = $1 ORDER BY created_at DESC LIMIT 100",
+    )
+    .bind(id)
+    .fetch_all(&db)
+    .await
+    .unwrap_or_default();
+    let mut pay_rows = String::new();
+    for p in &payments {
+        let no: String = p.try_get("payment_no").ok().flatten().unwrap_or_default();
+        let pdate: String = p.try_get("pdate").ok().flatten().unwrap_or_default();
+        let method: String = p.try_get("method").unwrap_or_default();
+        let reference: String = p.try_get("reference").ok().flatten().unwrap_or_default();
+        let amount: String = p.try_get("amount").ok().flatten().unwrap_or_default();
+        let alloc: String = p.try_get("allocated").ok().flatten().unwrap_or_default();
+        let credit: String = p.try_get("credit").ok().flatten().unwrap_or_default();
+        let posted: bool = p.try_get("posted").unwrap_or(false);
+        let badge = if posted { "<span class=\"badge badge-success badge-sm\">Posted</span>" } else { "<span class=\"badge badge-warning badge-sm\">Unposted</span>" };
+        pay_rows.push_str(&format!(
+            "<tr><td class=\"font-mono text-xs\">{no}</td><td>{pdate}</td><td>{method}</td>\
+             <td class=\"font-mono text-xs\">{reference}</td><td class=\"text-right font-mono\">RM {amount}</td>\
+             <td class=\"text-right font-mono\">{alloc}</td><td class=\"text-right font-mono\">{credit}</td><td>{badge}</td></tr>",
+            no = esc(&no), pdate = esc(&pdate), method = esc(&method), reference = esc(&reference),
+            amount = esc(&amount), alloc = esc(&alloc), credit = esc(&credit), badge = badge,
+        ));
+    }
+    if pay_rows.is_empty() {
+        pay_rows.push_str("<tr><td colspan=\"8\" class=\"text-center opacity-60 py-4\">No payments recorded.</td></tr>");
+    }
+
     let addr = [g("street"), g("city")].into_iter().filter(|s| !s.trim().is_empty()).map(|s| esc(&s)).collect::<Vec<_>>().join(", ");
 
     let content = format!(
@@ -799,8 +835,20 @@ async fn account_detail(
     <thead><tr><th>Bill No</th><th>Period</th><th>Date</th><th class="text-right">Total</th><th>Status</th></tr></thead>
     <tbody>{bill_rows}</tbody>
   </table>
+</div></div>
+
+<div class="card bg-base-100 shadow mt-6"><div class="card-body overflow-x-auto">
+  <div class="flex items-center justify-between mb-2">
+    <h2 class="font-semibold">Payments</h2>
+    <a href="/iwk/payments" class="btn btn-xs btn-outline">Register payment</a>
+  </div>
+  <table class="table table-sm">
+    <thead><tr><th>Payment</th><th>Date</th><th>Method</th><th>Ref</th><th class="text-right">Amount</th><th class="text-right">Allocated</th><th class="text-right">Credit</th><th>GL</th></tr></thead>
+    <tbody>{pay_rows}</tbody>
+  </table>
 </div></div></div>"##,
         back = esc(&back_href),
+        pay_rows = pay_rows,
         status_badge = status_badge,
         status = esc(&status),
         account_no = esc(&account_no),
@@ -1073,7 +1121,7 @@ async fn payments_page(
 </div>
 
 <div class="card bg-base-100 shadow"><div class="card-body overflow-x-auto">
-  <h2 class="font-semibold mb-2">Recent payments</h2>
+  <div class="flex items-center justify-between mb-2"><h2 class="font-semibold">Recent payments</h2><a href="/iwk/payments/history" class="btn btn-xs btn-outline">View all history →</a></div>
   <table class="table table-sm">
     <thead><tr><th>Payment</th><th>Account</th><th>Customer</th><th class="text-right">Amount</th><th class="text-right">Allocated</th><th class="text-right">Credit</th><th>Method</th><th>Date</th><th>GL</th></tr></thead>
     <tbody>{pay_rows}</tbody>
@@ -1145,4 +1193,141 @@ async fn payment_post(
             (StatusCode::BAD_REQUEST, format!("Post failed: {e}")).into_response()
         }
     }
+}
+
+/// GET /iwk/payments/history — full, searchable payment history.
+async fn payments_history(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Query(query): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    use vortex_plugin_sdk::framework::list::{
+        execute_list, render_list, ListColumn, ListConfig, ListParams,
+    };
+
+    let config = ListConfig::new("Payment History", "iwk_payment")
+        .custom_from("iwk_payment p JOIN iwk_account a ON a.id = p.account_id JOIN contacts c ON c.id = p.contact_id")
+        .custom_select(
+            "p.id, p.payment_no, a.account_no, c.name AS customer, \
+             to_char(p.amount,'FM999,990.00') AS amount, to_char(p.allocated,'FM999,990.00') AS allocated, \
+             to_char(p.credit,'FM999,990.00') AS credit, p.method, \
+             to_char(p.payment_date,'DD/MM/YYYY') AS payment_date, \
+             CASE WHEN p.posted THEN 'posted' ELSE 'unposted' END AS posted",
+        )
+        .column(ListColumn::new("payment_no", "Payment No").sortable().searchable().code().sql_expr("p.payment_no"))
+        .column(ListColumn::new("account_no", "Account").code().sql_expr("a.account_no"))
+        .column(ListColumn::new("customer", "Customer").sql_expr("c.name"))
+        .column(ListColumn::new("amount", "Amount (RM)").sql_expr("p.amount"))
+        .column(ListColumn::new("allocated", "Allocated").sql_expr("p.allocated"))
+        .column(ListColumn::new("credit", "Credit").sql_expr("p.credit"))
+        .column(
+            ListColumn::new("method", "Method")
+                .filterable(&[
+                    ("jompay", "JomPAY"), ("counter", "Counter"), ("bank", "Bank"),
+                    ("cash", "Cash"), ("import", "Import"),
+                ])
+                .sql_expr("p.method"),
+        )
+        .column(ListColumn::new("payment_date", "Date").sortable().sql_expr("p.payment_date"))
+        .column(
+            ListColumn::new("posted", "GL")
+                .filterable(&[("posted", "Posted"), ("unposted", "Unposted")])
+                .badge(&[("posted", "Posted", "badge-success"), ("unposted", "Unposted", "badge-warning")])
+                .sql_expr("(CASE WHEN p.posted THEN 'posted' ELSE 'unposted' END)"),
+        )
+        .default_sort("payment_no")
+        .count_estimate_from("iwk_payment")
+        .tiebreak("p.id")
+        .search_prefilter("iwk_payment p");
+
+    let params = ListParams::from_query(&query);
+    let table = match execute_list(&db, &config, &params).await {
+        Ok(result) => render_list(&config, &result, &params, "/iwk/payments/history"),
+        Err(e) => {
+            error!("iwk payment history failed: {e}");
+            format!("<div class=\"alert alert-error\">List error: {e}</div>")
+        }
+    };
+    let content = format!(
+        r##"<div class="flex items-center justify-between mb-6">
+<h1 class="text-2xl font-bold">Payment History <span class="text-base-content/40 text-base font-normal">all collections</span></h1>
+<a href="/iwk/payments" class="btn btn-primary btn-sm">Register / import</a>
+</div>{table}"##,
+    );
+    let sidebar = sidebar_for(&state, &user, &db_ctx);
+    Html(page_shell(&sidebar, "Payment History", &content)).into_response()
+}
+
+/// GET /iwk/customers/{id} — the customer ledger: every account and every
+/// transaction (bills debit, payments credit) with a running balance.
+async fn customer_ledger_page(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<Uuid>,
+) -> Response {
+    let esc = vortex_plugin_sdk::framework::ui::html_escape;
+    let sidebar = sidebar_for(&state, &user, &db_ctx);
+
+    let name: String =
+        vortex_plugin_sdk::sqlx::query_scalar("SELECT name FROM contacts WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&db)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+    if name.is_empty() {
+        return (StatusCode::NOT_FOUND, "Customer not found").into_response();
+    }
+
+    let entries = crate::ledger::customer_ledger(&db, id).await.unwrap_or_default();
+    let mut rows = String::new();
+    for e in &entries {
+        let (dr, cr) = (
+            if e.debit.is_zero() { String::new() } else { format!("RM {}", fmt_rm(e.debit)) },
+            if e.credit.is_zero() { String::new() } else { format!("RM {}", fmt_rm(e.credit)) },
+        );
+        let label = if e.kind == "bill" { format!("Bill {}", e.reference) } else { format!("Payment {}", e.reference) };
+        let bal_cls = if e.balance.is_sign_negative() { "text-success" } else { "" };
+        rows.push_str(&format!(
+            "<tr><td>{date}</td><td>{label}</td><td class=\"font-mono text-xs\">{acct}</td>\
+             <td class=\"text-right font-mono\">{dr}</td><td class=\"text-right font-mono\">{cr}</td>\
+             <td class=\"text-right font-mono {bal_cls}\">RM {bal}</td></tr>",
+            date = esc(&e.date), label = esc(&label), acct = esc(&e.account_no),
+            dr = esc(&dr), cr = esc(&cr), bal_cls = bal_cls, bal = fmt_rm(e.balance),
+        ));
+    }
+    if rows.is_empty() {
+        rows.push_str("<tr><td colspan=\"6\" class=\"text-center opacity-60 py-4\">No transactions.</td></tr>");
+    }
+    let closing = entries.last().map(|e| e.balance).unwrap_or_default();
+
+    let content = format!(
+        r##"<div class="max-w-4xl mx-auto">
+<div class="flex items-center justify-between mb-4 no-print">
+  <a href="/contacts/{id}" class="btn btn-ghost btn-sm">← Customer</a>
+  <button onclick="window.print()" class="btn btn-sm btn-outline">Print</button>
+</div>
+<div class="card bg-base-100 shadow"><div class="card-body">
+  <div class="flex items-start justify-between">
+    <div><h1 class="text-2xl font-bold">{name}</h1><div class="text-sm opacity-60">Sewerage account statement</div></div>
+    <div class="text-right"><div class="text-xs uppercase opacity-60">Balance due</div><div class="text-2xl font-bold font-mono">RM {closing}</div></div>
+  </div>
+  <div class="divider my-2"></div>
+  <table class="table table-sm">
+    <thead><tr><th>Date</th><th>Transaction</th><th>Account</th><th class="text-right">Debit</th><th class="text-right">Credit</th><th class="text-right">Balance</th></tr></thead>
+    <tbody>{rows}</tbody>
+  </table>
+  <div class="text-xs opacity-60 mt-2">Debit = billed · Credit = paid · a negative balance is customer credit in advance.</div>
+</div></div></div>"##,
+        id = esc(&id.to_string()),
+        name = esc(&name),
+        closing = fmt_rm(closing),
+        rows = rows,
+    );
+    Html(page_shell(&sidebar, &format!("Ledger — {name}"), &content)).into_response()
 }

@@ -188,6 +188,10 @@ pub async fn render_record_panels(
     let mut out = String::new();
     for panel in panels {
         match (panel.handler)(state.clone(), db.clone(), record_id).await {
+            // An empty body means the panel opts out for *this* record (e.g.
+            // a cross-plugin card that only applies to some contacts) — render
+            // nothing rather than an empty titled card.
+            Ok(body) if body.trim().is_empty() => {}
             Ok(body) => out.push_str(&format!(
                 r#"<div class="card bg-base-100 shadow mt-4"><div class="card-body p-4">
 <h2 class="font-bold mb-2">{}</h2>{body}</div></div>"#,

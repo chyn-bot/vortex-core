@@ -103,6 +103,20 @@ impl Plugin for IwkPlugin {
         )]
     }
 
+    /// Cross-plugin card on the contact record: the customer's sewerage
+    /// accounts + billed/paid/outstanding + a link to their full ledger.
+    /// Returns "" (no card) for contacts that aren't IWK customers.
+    fn record_panels(&self) -> Vec<RecordPanel> {
+        vec![RecordPanel::new(
+            RecordPanelDef { model: "contacts", title: "Sewerage Accounts (IWK)", priority: 40 },
+            |_state, db, contact_id| async move {
+                crate::ledger::contact_panel(&db, contact_id)
+                    .await
+                    .map_err(vortex_plugin_sdk::common::VortexError::QueryExecution)
+            },
+        )]
+    }
+
     /// Plugin-owned schema, applied per tenant on install.
     fn migrations(&self) -> Vec<PluginMigration> {
         vec![
