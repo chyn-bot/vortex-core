@@ -29,12 +29,19 @@ fn hash_password(password: &str) -> Result<String> {
 }
 
 /// Generate a readable-but-strong random password for the no-`--password` path.
+///
+/// The fixed `Vx-` prefix guarantees an uppercase, a lowercase and a symbol;
+/// the appended digit guarantees the fourth class — so the result always
+/// satisfies [`password_policy::validate`] regardless of the random body
+/// (the body's charset excludes ambiguous 0/O/1/l and has no symbols, so a
+/// digit is not otherwise guaranteed).
 fn generate_password() -> String {
     use rand::Rng;
     const CHARS: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
     let mut rng = rand::thread_rng();
-    let body: String = (0..14).map(|_| CHARS[rng.gen_range(0..CHARS.len())] as char).collect();
-    format!("Vx-{body}")
+    let body: String = (0..12).map(|_| CHARS[rng.gen_range(0..CHARS.len())] as char).collect();
+    let digit = rng.gen_range(2..=9);
+    format!("Vx-{body}{digit}")
 }
 
 pub async fn run(command: UserCommands) -> Result<()> {
@@ -52,6 +59,12 @@ pub async fn run(command: UserCommands) -> Result<()> {
         UserCommands::ResetPassword { username, password } => {
             let pool = connect().await?;
             let new_password = password.unwrap_or_else(generate_password);
+            // Enforce the same complexity policy the web set/reset paths use.
+            // A generated password always satisfies it (see `generate_password`),
+            // so this only ever rejects a weak operator-supplied `--password`.
+            if let Err(reason) = crate::commands::password_policy::validate(&new_password) {
+                anyhow::bail!("{reason}");
+            }
             let hash = hash_password(&new_password)?;
 
             let rows = sqlx::query(

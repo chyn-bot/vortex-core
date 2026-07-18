@@ -73,6 +73,13 @@ enum Commands {
         command: commands::audit::AuditCommands,
     },
 
+    /// Secure data erasure — crypto-shred a subject's PII or decommission a
+    /// tenant database, with WORM-audited events and signed certificates.
+    Erase {
+        #[command(subcommand)]
+        command: commands::erase::EraseCommands,
+    },
+
     /// Cedar policy engine inspection and dry-run
     Policy {
         #[command(subcommand)]
@@ -323,6 +330,9 @@ async fn main() -> Result<()> {
         }
         Commands::Audit { command } => {
             commands::audit::run(command).await
+        }
+        Commands::Erase { command } => {
+            commands::erase::run(command).await
         }
         Commands::Policy { command } => {
             commands::policy::run(command).await
