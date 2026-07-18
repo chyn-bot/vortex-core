@@ -3102,7 +3102,11 @@ async fn login_submit(
                 // deployment requires MFA but the user has not enrolled, refuse
                 // (they must enrol via the mobile app, or an admin helps).
                 if user.mfa_enabled && user.mfa_secret.is_some() {
-                    let token = sign_mfa_token(&db_name, user.id);
+                    let token = sign_mfa_token(
+                        &db_name,
+                        user.id,
+                        user.last_login_at.map(|t| t.timestamp()).unwrap_or(0),
+                    );
                     let mut headers = HeaderMap::new();
                     headers.insert(
                         header::SET_COOKIE,
@@ -5971,32 +5975,53 @@ fn mfa_hmac(msg: &str) -> String {
     hex::encode(outer)
 }
 
-/// Mint a signed, 5-minute MFA pre-auth token (`db|user_id|exp` + HMAC) that
-/// carries the password-verified identity to the TOTP step without a session.
-fn sign_mfa_token(db_name: &str, user_id: uuid::Uuid) -> String {
+/// Constant-time string equality — no early return on the first differing byte,
+/// so comparing an attacker-supplied MAC leaks no timing signal.
+fn ct_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for i in 0..a.len() {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
+}
+
+/// Mint a signed, 5-minute MFA pre-auth token that carries the
+/// password-verified identity to the TOTP step without a session. Payload is
+/// `db|user_id|last_login_epoch|exp` + HMAC. Binding `last_login_epoch` (the
+/// user's prior `last_login_at`) makes the token **single-use**: a successful
+/// MFA sets `last_login_at = NOW()`, so any replay of the same token no longer
+/// matches the stored value and is rejected — no server-side token store needed.
+fn sign_mfa_token(db_name: &str, user_id: uuid::Uuid, last_login_epoch: i64) -> String {
     let exp = chrono::Utc::now().timestamp() + 300;
-    let payload = format!("{db_name}|{user_id}|{exp}");
+    let payload = format!("{db_name}|{user_id}|{last_login_epoch}|{exp}");
     let sig = mfa_hmac(&payload);
     format!("{payload}|{sig}")
 }
 
-/// Validate an MFA pre-auth token; returns `(db_name, user_id)` when the
-/// signature matches and it hasn't expired.
-fn verify_mfa_token(token: &str) -> Option<(String, uuid::Uuid)> {
+/// Validate an MFA pre-auth token; returns `(db_name, user_id,
+/// last_login_epoch)` when the signature matches and it hasn't expired. The
+/// caller must additionally confirm `last_login_epoch` still matches the user's
+/// current `last_login_at` (single-use check).
+fn verify_mfa_token(token: &str) -> Option<(String, uuid::Uuid, i64)> {
     let parts: Vec<&str> = token.split('|').collect();
-    if parts.len() != 4 {
+    if parts.len() != 5 {
         return None;
     }
-    let payload = format!("{}|{}|{}", parts[0], parts[1], parts[2]);
-    if mfa_hmac(&payload) != parts[3] {
+    let payload = format!("{}|{}|{}|{}", parts[0], parts[1], parts[2], parts[3]);
+    if !ct_eq(&mfa_hmac(&payload), parts[4]) {
         return None;
     }
-    let exp: i64 = parts[2].parse().ok()?;
+    let exp: i64 = parts[3].parse().ok()?;
     if chrono::Utc::now().timestamp() > exp {
         return None;
     }
+    let last_login_epoch: i64 = parts[2].parse().ok()?;
     let uid = uuid::Uuid::parse_str(parts[1]).ok()?;
-    Some((parts[0].to_string(), uid))
+    Some((parts[0].to_string(), uid, last_login_epoch))
 }
 
 /// Whether this deployment requires a second factor for every interactive
@@ -6443,7 +6468,11 @@ async fn change_password_submit(
     // session here — route through the MFA challenge (otherwise the
     // forced-change flow would be an MFA bypass).
     if user.mfa_enabled && user.mfa_secret.is_some() {
-        let token = sign_mfa_token(&db_name, user.id);
+        let token = sign_mfa_token(
+            &db_name,
+            user.id,
+            user.last_login_at.map(|t| t.timestamp()).unwrap_or(0),
+        );
         let mut out = HeaderMap::new();
         out.insert(
             header::SET_COOKIE,
@@ -6562,7 +6591,7 @@ async fn mfa_submit(
 ) -> Response {
     let (client_ip, _ua) = request_fingerprint(&headers);
 
-    let Some((db_name, user_id)) =
+    let Some((db_name, user_id, token_last_login)) =
         cookie_value(&headers, "vortex_mfa").as_deref().and_then(verify_mfa_token)
     else {
         // Expired/forged/absent pending token → restart the login.
@@ -6597,6 +6626,13 @@ async fn mfa_submit(
     };
     if !user.active || user.locked {
         return error_response("Account is not available. Contact your administrator.");
+    }
+    // Single-use: the token embeds the `last_login_at` from the password step.
+    // A successful MFA advances `last_login_at`, so a replayed token no longer
+    // matches and is refused here (no server-side token store required).
+    let current_last_login = user.last_login_at.map(|t| t.timestamp()).unwrap_or(0);
+    if current_last_login != token_last_login {
+        return Html(render_mfa_page(Some("This sign-in has already been used or expired. Please sign in again."))).into_response();
     }
 
     // Verify the code against the (unsealed) TOTP secret.
