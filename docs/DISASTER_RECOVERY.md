@@ -30,6 +30,18 @@ cp deploy/vortex-backup.{service,timer} /etc/systemd/system/
 systemctl daemon-reload && systemctl enable --now vortex-backup.timer
 ```
 
+**Registry drift is tolerated, not fatal.** If a tenant was dropped but
+its `managed_databases` row is still `active`, the dump of that phantom
+database is skipped with a `WARNING` (and noted as `stale_registry_entries`
+in the `MANIFEST`) — the run still backs up every database that exists and
+exits `0`. Only a dump that fails against a database that *does* exist
+fails the run (non-zero exit → the systemd unit is marked failed).
+Deregister a dropped tenant with
+`DELETE FROM managed_databases WHERE name='<db>'` on the master registry to
+clear the warning. The master registry DB name defaults to `vortex_master`;
+override with `VORTEX_MASTER_DB` for multi-deployment hosts or isolated
+restore drills.
+
 **Off-site:** a backup on the same disk as the database protects
 against mistakes, not disasters. Sync `$BACKUP_DIR` off the machine —
 `rsync` to another host, or `aws s3 sync` / MinIO `mc mirror` to
@@ -99,6 +111,7 @@ the restored copy.
 | Date | Set | Result |
 |---|---|---|
 | 2026-07-04 | backup-20260704-033243 (5 DBs + FileStore, 12 MB) | ✅ checksums OK; WORM chains verified on vortex/gaia/remicle (126 entries, 0 failures); restored server booted; full smoke suite passed (200 pages crawled, all lifecycles green) |
+| 2026-07-18 | backup-20260718-172319 (3 DBs + FileStore, 2.1 MB) | ✅ registry-drift regression: run included a stale `active` entry (`sv_ghost_dropped`) → skipped with warning, backup completed exit 0; checksums OK; prefixed restore of all 3 DBs; WORM chains verified on `drill_remicle` (40) + `drill_acc_dev` (979) — 0 failures; source/restore row counts matched. Proves the fix for the pre-fix failure where one stale row aborted the whole backup. |
 
 Schedule: rerun the drill after any migration touching `audit_log`,
 `sessions`, or the FileStore, and at minimum quarterly.

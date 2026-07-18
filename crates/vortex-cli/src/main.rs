@@ -73,6 +73,13 @@ enum Commands {
         command: commands::audit::AuditCommands,
     },
 
+    /// Secure data erasure — crypto-shred a subject's PII or decommission a
+    /// tenant database, with WORM-audited events and signed certificates.
+    Erase {
+        #[command(subcommand)]
+        command: commands::erase::EraseCommands,
+    },
+
     /// Cedar policy engine inspection and dry-run
     Policy {
         #[command(subcommand)]
@@ -241,10 +248,14 @@ enum UserCommands {
         admin: bool,
     },
 
-    /// Reset user password
+    /// Reset user password (connects via DATABASE_URL)
     ResetPassword {
         /// Username
         username: String,
+
+        /// New password. If omitted, a strong one is generated and printed.
+        #[arg(long)]
+        password: Option<String>,
     },
 
     /// Lock a user account
@@ -319,6 +330,9 @@ async fn main() -> Result<()> {
         }
         Commands::Audit { command } => {
             commands::audit::run(command).await
+        }
+        Commands::Erase { command } => {
+            commands::erase::run(command).await
         }
         Commands::Policy { command } => {
             commands::policy::run(command).await

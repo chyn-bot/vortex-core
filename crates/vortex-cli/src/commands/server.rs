@@ -232,12 +232,19 @@ async fn auth_middleware(
                 .map_or(true, |t| chrono::Utc::now() - t > chrono::Duration::seconds(60));
             if refresh_due {
                 let _ = sqlx::query(
-                    "UPDATE sessions SET last_activity_at = NOW(), expires_at = NOW() + INTERVAL '30 minutes' WHERE id = $1"
+                    "UPDATE sessions SET last_activity_at = NOW(), \
+                     expires_at = NOW() + make_interval(mins => $2) WHERE id = $1"
                 )
                 .bind(&session.session_id)
+                .bind(SESSION_IDLE_MINUTES as i32)
                 .execute(db)
                 .await;
             }
+            // Canonical `db_name|token` cookie value for the sliding refresh
+            // below (captured before `db_name` is moved into DatabaseContext;
+            // a legacy plain-token cookie is upgraded to this form, which the
+            // parser above also accepts).
+            let session_cookie_value = format!("{db_name}|{token}");
 
             // Fetch user roles
             let roles: Vec<String> = sqlx::query_scalar(
@@ -285,7 +292,32 @@ async fn auth_middleware(
                 installed_modules: db_installed_modules,
             });
 
-            next.run(request).await
+            let mut response = next.run(request).await;
+            // True sliding idle-timeout: when a session was activity-refreshed,
+            // re-issue the cookie so its browser-side `Max-Age` tracks last
+            // activity rather than staying fixed at time-since-login. Without
+            // this the cookie expires a hard `SESSION_IDLE_MINUTES` after login
+            // regardless of activity. Skip if the handler already set a session
+            // cookie (e.g. logout clearing it) so a refresh never resurrects a
+            // just-cleared session.
+            if refresh_due {
+                let already_set = response
+                    .headers()
+                    .get_all(header::SET_COOKIE)
+                    .iter()
+                    .any(|v| v.to_str().map(|s| s.starts_with("session=")).unwrap_or(false));
+                if !already_set {
+                    if let Ok(v) = format!(
+                        "session={}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}",
+                        session_cookie_value, SESSION_COOKIE_MAX_AGE
+                    )
+                    .parse()
+                    {
+                        response.headers_mut().append(header::SET_COOKIE, v);
+                    }
+                }
+            }
+            response
         }
         Ok(None) => {
             warn!("Invalid session token");
@@ -653,6 +685,22 @@ async fn mobile_login(
     let (client_ip, _ua) = request_fingerprint(&headers);
 
     if !ok {
+        // A wrong password against a real, usable account feeds the same
+        // lock-out counter as the web login — otherwise the mobile endpoint
+        // would be a brute-force channel that never trips the lock.
+        if let Some(u) = user.as_ref() {
+            if u.active && !u.locked {
+                let _ = note_failed_login(
+                    &state,
+                    db,
+                    &db_name,
+                    u.id,
+                    &u.username,
+                    client_ip.as_deref(),
+                )
+                .await;
+            }
+        }
         // Audit the failure against the tenant chain (best-effort).
         let mut entry = AuditEntry::new(AuditAction::LoginFailure, AuditSeverity::Warning)
             .with_username(&body.username)
@@ -669,6 +717,27 @@ async fn mobile_login(
         );
     }
     let user = user.unwrap();
+
+    // ── password-policy gate ──────────────────────────────────────────────
+    // Credentials are valid, but a password that's admin-flagged for change or
+    // aged past the expiry window must not mint mobile tokens — otherwise the
+    // mobile API is a bypass of the web forced-change flow. Mobile can't drive
+    // an interactive change, so reject and point the user at the web app.
+    if let Ok(Some((changed_at, must_change))) = sqlx::query_as::<_, (chrono::DateTime<chrono::Utc>, bool)>(
+        "SELECT password_changed_at, must_change_password FROM users WHERE id = $1",
+    )
+    .bind(user.id)
+    .fetch_optional(db)
+    .await
+    {
+        if must_change || super::password_policy::is_expired(changed_at) {
+            return api_error(
+                StatusCode::FORBIDDEN,
+                "password_change_required",
+                "Your password must be changed before signing in. Please sign in on the web to set a new password.",
+            );
+        }
+    }
 
     // ── MFA gate ──────────────────────────────────────────────────────────
     // MFA is enforced at *device enrollment*: a brand-new device is challenged
@@ -2597,6 +2666,16 @@ fn build_router(state: Arc<AppState>) -> Router {
     // brute-force guard silently no-ops.
     let login_routes = Router::new()
         .route("/auth/login", post(login_submit))
+        // Self-service password change (public, reached from the login flow
+        // when a password is expired or admin-flagged). Shares the login
+        // limiter so it can't be used to sidestep the brute-force guard.
+        .route(
+            "/auth/change-password",
+            get(change_password_page).post(change_password_submit),
+        )
+        // Second-factor challenge (public, reached from login with a signed
+        // pending-MFA cookie). Shares the login limiter.
+        .route("/auth/mfa", get(mfa_page).post(mfa_submit))
         .layer(middleware::from_fn(vortex_server::middleware::rate_limit::rate_limit_middleware))
         .layer(Extension(login_limiter));
 
@@ -2762,6 +2841,31 @@ async fn login_page(State(state): State<Arc<AppState>>, headers: HeaderMap) -> H
         String::new()
     };
 
+    // Security/legal disclaimer banner (e.g. an authorized-use notice).
+    // Configured per deployment via the `login.disclaimer` system setting (a
+    // JSON string) so no regulator- or customer-specific text is baked into
+    // core. Read best-effort from the default database; absent/empty → no
+    // banner, and any read error never blocks the login page.
+    let banner_html = {
+        let mut b = String::new();
+        if let Ok(pool) = state.pool_manager.get_pool(&state.default_db).await {
+            if let Ok(Some(Some(text))) = sqlx::query_scalar::<_, Option<String>>(
+                "SELECT value #>> '{}' FROM system_settings WHERE key = 'login.disclaimer'",
+            )
+            .fetch_optional(pool.pool())
+            .await
+            {
+                if !text.trim().is_empty() {
+                    b = format!(
+                        r#"<div class="alert alert-warning text-sm mb-4"><span>{}</span></div>"#,
+                        html_escape(&text)
+                    );
+                }
+            }
+        }
+        b
+    };
+
     let template = include_str!("../../templates/login_standalone.html");
     // Inject database selector before the username field
     let html = template.replace(
@@ -2772,6 +2876,11 @@ async fn login_page(State(state): State<Arc<AppState>>, headers: HeaderMap) -> H
                     <div class="form-control mb-4">
                         <label class="label">
                             <span class="label-text">Username</span>"#),
+    );
+    // Inject the disclaimer banner just above the error slot / form.
+    let html = html.replace(
+        r#"<!-- Error message -->"#,
+        &format!("{banner_html}\n                <!-- Error message -->"),
     );
     Html(html)
 }
@@ -2890,6 +2999,30 @@ struct LoginForm {
     database: Option<String>,
 }
 
+/// Row for the interactive login path. Wider than [`UserRow`] because the
+/// web login enforces the full password policy — lock-out state and password
+/// age — not just credential validity.
+#[derive(sqlx::FromRow)]
+struct LoginUserRow {
+    id: uuid::Uuid,
+    username: String,
+    password_hash: String,
+    active: bool,
+    locked: bool,
+    locked_until: Option<chrono::DateTime<chrono::Utc>>,
+    password_changed_at: chrono::DateTime<chrono::Utc>,
+    must_change_password: bool,
+    // For the previous-logon notification (NIST AC-9 style): the prior
+    // successful login and the failed attempts accumulated since it. Both are
+    // read pre-reset in `login_submit`, then surfaced to the user on /home.
+    last_login_at: Option<chrono::DateTime<chrono::Utc>>,
+    failed_login_attempts: i32,
+    // MFA enforcement: whether the user has a TOTP factor enrolled, and the
+    // (AES-GCM-sealed) shared secret to verify a code against.
+    mfa_enabled: bool,
+    mfa_secret: Option<String>,
+}
+
 async fn login_submit(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -2913,9 +3046,12 @@ async fn login_submit(
     let db = pool.pool().clone();
 
     // Query user from database
-    let user = sqlx::query_as::<_, UserRow>(
+    let user = sqlx::query_as::<_, LoginUserRow>(
         r#"
-        SELECT id, username, password_hash, full_name, active, locked
+        SELECT id, username, password_hash, active, locked,
+               locked_until, password_changed_at, must_change_password,
+               last_login_at, failed_login_attempts,
+               mfa_enabled, mfa_secret
         FROM users
         WHERE username = $1
         "#
@@ -2930,86 +3066,87 @@ async fn login_submit(
             if !user.active {
                 return error_response("Account is disabled");
             }
-            if user.locked {
-                return error_response("Account is locked");
+            // Locked outright, or under a timed lock that hasn't yet elapsed
+            // (`locked_until` in the future). Either blocks login regardless of
+            // whether the supplied password is correct — no oracle for
+            // attackers, and the WORM ledger already recorded the lock event.
+            let timed_lock = user
+                .locked_until
+                .map_or(false, |t| t > chrono::Utc::now());
+            if user.locked || timed_lock {
+                return error_response("Account is locked. Contact your administrator.");
             }
 
             // Verify password
             if verify_password(&form.password, &user.password_hash) {
-                // Create session
-                let session_token = generate_session_token();
-                let token_hash = hash_token(&session_token);
-
-                // Store session in database
-                let session_result = sqlx::query(
-                    r#"
-                    INSERT INTO sessions (user_id, token_hash, expires_at, ip_address)
-                    VALUES ($1, $2, NOW() + INTERVAL '30 minutes', NULL)
-                    "#
-                )
-                .bind(&user.id)
-                .bind(&token_hash)
-                .execute(&db)
-                .await;
-
-                if let Err(e) = session_result {
-                    error!("Failed to create session: {}", e);
-                    return error_response("Login failed");
+                // Credentials are valid — but if the password must be changed
+                // (admin-flagged) or has aged past the expiry window, don't
+                // mint a session. Route the user through the change-password
+                // flow, which re-verifies the current password and rotates it.
+                if user.must_change_password
+                    || super::password_policy::is_expired(user.password_changed_at)
+                {
+                    let reason = if user.must_change_password { "must_change" } else { "expired" };
+                    let dest = format!(
+                        "/auth/change-password?db={}&user={}&reason={}",
+                        percent_encode(&db_name),
+                        percent_encode(&user.username),
+                        reason,
+                    );
+                    let mut headers = HeaderMap::new();
+                    headers.insert("HX-Redirect", dest.parse().unwrap());
+                    return (StatusCode::OK, headers, Html("")).into_response();
+                }
+                // MFA gate. An enrolled user is always challenged for a TOTP
+                // code here — a password alone is never sufficient. If the
+                // deployment requires MFA but the user has not enrolled, refuse
+                // (they must enrol via the mobile app, or an admin helps).
+                if user.mfa_enabled && user.mfa_secret.is_some() {
+                    let token = sign_mfa_token(
+                        &db_name,
+                        user.id,
+                        user.last_login_at.map(|t| t.timestamp()).unwrap_or(0),
+                    );
+                    let mut headers = HeaderMap::new();
+                    headers.insert(
+                        header::SET_COOKIE,
+                        format!("vortex_mfa={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=300")
+                            .parse()
+                            .unwrap(),
+                    );
+                    headers.insert("HX-Redirect", "/auth/mfa".parse().unwrap());
+                    return (StatusCode::OK, headers, Html("")).into_response();
+                }
+                if mfa_required(&db).await {
+                    return error_response(
+                        "Your administrator requires multi-factor authentication. Enrol using the Vortex mobile app, or contact your administrator.",
+                    );
                 }
 
-                // Update last login
-                let _ = sqlx::query(
-                    "UPDATE users SET last_login_at = NOW(), failed_login_attempts = 0 WHERE id = $1"
+                // Mint the session (cap enforcement, LoginSuccess audit,
+                // previous-logon feedback cookie — all in the shared issuer).
+                issue_web_session(
+                    &state,
+                    &db,
+                    &db_name,
+                    user.id,
+                    &user.username,
+                    user.last_login_at,
+                    user.failed_login_attempts,
+                    client_ip.as_deref(),
                 )
-                .bind(&user.id)
-                .execute(&db)
-                .await;
-
-                // Log successful login through the WORM ledger.
-                //
-                // Multi-DB: `.with_database(&db_name)` routes the audit
-                // entry to the tenant's database so each tenant's audit
-                // chain is self-contained. In single-DB mode, db_name
-                // matches the primary and the write goes there anyway.
-                let mut audit_entry = AuditEntry::new(
-                    AuditAction::LoginSuccess,
-                    AuditSeverity::Info,
-                )
-                .with_user(vortex_common::UserId(user.id))
-                .with_username(&user.username)
-                .with_database(&db_name)
-                .with_resource("session", user.id.to_string())
-                .with_details(serde_json::json!({
-                    "database": db_name,
-                    "session_id": token_hash,
-                }));
-                if let Some(ip) = &client_ip {
-                    audit_entry = audit_entry.with_source_ip(ip.clone());
-                }
-                if let Err(e) = state.audit.log(audit_entry).await {
-                    error!("WORM audit write failed for LoginSuccess: {}", e);
-                }
-
-                // Return success with session cookie (db_name|token format for multi-db)
-                let mut headers = HeaderMap::new();
-                headers.insert(
-                    header::SET_COOKIE,
-                    format!(
-                        "session={}|{}; Path=/; HttpOnly; SameSite=Strict; Max-Age=1800",
-                        db_name, session_token
-                    )
-                    .parse()
-                    .unwrap(),
-                );
-                headers.insert("HX-Redirect", "/home".parse().unwrap());
-                (StatusCode::OK, headers, Html("")).into_response()
+                .await
             } else {
-                // Increment failed attempts
-                let _ = sqlx::query(
-                    "UPDATE users SET failed_login_attempts = failed_login_attempts + 1 WHERE id = $1"
+                // Increment failed attempts and lock the account once the
+                // policy threshold is reached (audits UserLocked internally).
+                let locked_now = note_failed_login(
+                    &state,
+                    &db,
+                    &db_name,
+                    user.id,
+                    &user.username,
+                    client_ip.as_deref(),
                 )
-                .bind(&user.id)
-                .execute(&db)
                 .await;
 
                 // Log failed login — WORM ledger.
@@ -3032,6 +3169,11 @@ async fn login_submit(
                     error!("WORM audit write failed for LoginFailure: {}", e);
                 }
 
+                if locked_now {
+                    return error_response(
+                        "Account locked after too many failed attempts. Contact your administrator.",
+                    );
+                }
                 error_response("Invalid username or password")
             }
         }
@@ -4304,10 +4446,19 @@ async fn portal_login_submit(
                 return Html(portal_login_html(Some("This account is not active. Contact your account manager."))).into_response();
             }
             if !verify_password(&form.password, &hash) {
-                let _ = sqlx::query("UPDATE users SET failed_login_attempts = failed_login_attempts + 1 WHERE id = $1")
-                    .bind(uid).execute(&db).await;
+                // Same lock-out path as the internal + mobile logins: increment
+                // and lock at the policy threshold. The `!active || locked`
+                // guard above then refuses further attempts, so the external
+                // portal is not a brute-force bypass of the account lock-out.
+                let locked_now =
+                    note_failed_login(&state, &db, &db_name, uid, &form.username, client_ip.as_deref()).await;
                 audit_fail(&state, Some(uid), "invalid_password").await;
-                return Html(portal_login_html(Some(bad_creds))).into_response();
+                let msg = if locked_now {
+                    "Account locked after too many failed attempts. Contact your account manager."
+                } else {
+                    bad_creds
+                };
+                return Html(portal_login_html(Some(msg))).into_response();
             }
             if contact_id.is_none() {
                 // A portal user with no partner binding is a provisioning bug;
@@ -5644,7 +5795,46 @@ async fn security_headers_middleware(
     request: Request,
     next: Next,
 ) -> Response {
+    // Whether to mark cookies `Secure`. Determined per request so local HTTP
+    // development still works (a `Secure` cookie is dropped by the browser over
+    // plain http). In production, TLS is terminated at the reverse proxy, which
+    // forwards `X-Forwarded-Proto: https`; `VORTEX_SECURE_COOKIES` forces it on
+    // for deployments where that header can't be relied on.
+    let secure_cookies = request
+        .headers()
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .map(|p| p.eq_ignore_ascii_case("https"))
+        .unwrap_or(false)
+        || std::env::var("VORTEX_SECURE_COOKIES")
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "always" | "yes"))
+            .unwrap_or(false);
+
     let mut response = next.run(request).await;
+
+    // Add `Secure` to every Set-Cookie that doesn't already carry it. Done once,
+    // centrally, so every cookie the app sets (session, MFA pre-auth, portal,
+    // logout-clears, …) is covered without threading a flag through each site.
+    if secure_cookies {
+        let cookies: Vec<_> = response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .cloned()
+            .collect();
+        if !cookies.is_empty() {
+            response.headers_mut().remove(header::SET_COOKIE);
+            for c in cookies {
+                let upgraded = match c.to_str() {
+                    Ok(s) if !s.to_ascii_lowercase().split(';').any(|p| p.trim() == "secure") => {
+                        header::HeaderValue::from_str(&format!("{s}; Secure")).ok()
+                    }
+                    _ => None,
+                };
+                response.headers_mut().append(header::SET_COOKIE, upgraded.unwrap_or(c));
+            }
+        }
+    }
     // Dynamic HTML must never be reused from the browser cache: these pages are
     // per-tenant, per-session and data-dependent, so a cached copy shows stale
     // or empty content until a manual refresh (and would leak ERP data left in
@@ -5702,6 +5892,844 @@ fn verify_password(password: &str, hash: &str) -> bool {
         }
         Err(_) => false,
     }
+}
+
+/// Idle-timeout window (minutes) for interactive operator sessions (CSRA
+/// session control). A session's expiry slides forward by this much on each
+/// authenticated request; with no activity for the window it lapses and the
+/// next request is bounced to login. Kept as a single constant so the session
+/// INSERTs, the sliding refresh, and the cookie `Max-Age` can't drift apart.
+const SESSION_IDLE_MINUTES: i64 = 15;
+
+/// Maximum concurrent live sessions per operator (CSRA session control). A
+/// login beyond this evicts the oldest session rather than being rejected.
+const MAX_CONCURRENT_SESSIONS: i64 = 2;
+
+/// Cookie `Max-Age`, in seconds, matching the idle window.
+const SESSION_COOKIE_MAX_AGE: i64 = SESSION_IDLE_MINUTES * 60;
+
+/// Enforce the per-user concurrent-session cap. Call immediately after a new
+/// session row is inserted: keep the `MAX_CONCURRENT_SESSIONS` most-recent live
+/// sessions (which includes the one just created) and revoke any older ones, so
+/// a fresh login evicts the oldest device instead of being turned away. Returns
+/// the number of sessions revoked. Best-effort — a failure here never blocks
+/// the login that already succeeded.
+async fn enforce_session_cap(db: &PgPool, user_id: uuid::Uuid) -> u64 {
+    sqlx::query(
+        "UPDATE sessions \
+         SET revoked = true, revoked_at = NOW(), revoked_reason = 'Concurrent session limit' \
+         WHERE user_id = $1 AND revoked = false AND expires_at > NOW() \
+           AND id NOT IN ( \
+               SELECT id FROM sessions \
+               WHERE user_id = $1 AND revoked = false AND expires_at > NOW() \
+               ORDER BY created_at DESC \
+               LIMIT $2 \
+           )",
+    )
+    .bind(user_id)
+    .bind(MAX_CONCURRENT_SESSIONS)
+    .execute(db)
+    .await
+    .map(|r| r.rows_affected())
+    .unwrap_or(0)
+}
+
+/// Extract a single cookie value by name from the request headers.
+fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(header::COOKIE)?
+        .to_str()
+        .ok()?
+        .split(';')
+        .find_map(|c| {
+            let (k, v) = c.trim().split_once('=')?;
+            (k == name).then(|| v.to_string())
+        })
+}
+
+/// Build the previous-logon notification banner (NIST AC-9) from the
+/// `vortex_authfb` cookie value, encoded `{failed}.{epoch}`: `failed` = failed
+/// sign-ins since the last success, `epoch` = unix seconds of the prior
+/// successful login (0 = first-ever). Returns "" when absent/unparseable or
+/// when there's simply nothing worth telling the user (first login, no fails).
+fn auth_feedback_banner(raw: &str) -> String {
+    let mut parts = raw.splitn(2, '.');
+    let failed: i64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let epoch: i64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+
+    let last_login = (epoch > 0)
+        .then(|| chrono::DateTime::from_timestamp(epoch, 0))
+        .flatten()
+        .map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string());
+
+    if failed > 0 {
+        let since = last_login
+            .as_deref()
+            .map(|t| format!(" since your last sign-in on {t}"))
+            .unwrap_or_default();
+        format!(
+            r#"<div class="alert alert-warning shadow mb-6"><svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/></svg><span><strong>{failed}</strong> failed sign-in attempt{plural}{since}. If this wasn't you, change your password.</span></div>"#,
+            plural = if failed == 1 { "" } else { "s" },
+            since = html_escape(&since),
+        )
+    } else if let Some(t) = last_login {
+        format!(
+            r#"<div class="alert alert-info shadow mb-6"><svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg><span>Last sign-in: {t}</span></div>"#,
+            t = html_escape(&t),
+        )
+    } else {
+        String::new()
+    }
+}
+
+// ─── MFA (web second-factor challenge) ───────────────────────────────────
+
+/// HMAC-SHA256 (hex) of `msg` under the deployment master key, via the audited
+/// ring-backed helper (`vortex_security::crypto`). The pre-auth token is signed
+/// with the same `master_key()` that seals TOTP secrets — so the pending-MFA
+/// cookie can't be forged to skip the second factor. `master_key()` warns
+/// loudly (and uses a dev key) if `VORTEX_SECRET_KEY` is unset; there is no
+/// silent, source-visible fallback key here.
+fn mfa_hmac(msg: &str) -> String {
+    vortex_security::crypto::hmac_sha256_hex(&vortex_security::crypto::master_key(), msg.as_bytes())
+}
+
+/// Constant-time string equality — no early return on the first differing byte,
+/// so comparing an attacker-supplied MAC leaks no timing signal.
+fn ct_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for i in 0..a.len() {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
+}
+
+/// Mint a signed, 5-minute MFA pre-auth token that carries the
+/// password-verified identity to the TOTP step without a session. Payload is
+/// `db|user_id|last_login_epoch|exp` + HMAC. Binding `last_login_epoch` (the
+/// user's prior `last_login_at`) makes the token **single-use**: a successful
+/// MFA sets `last_login_at = NOW()`, so any replay of the same token no longer
+/// matches the stored value and is rejected — no server-side token store needed.
+fn sign_mfa_token(db_name: &str, user_id: uuid::Uuid, last_login_epoch: i64) -> String {
+    let exp = chrono::Utc::now().timestamp() + 300;
+    let payload = format!("{db_name}|{user_id}|{last_login_epoch}|{exp}");
+    let sig = mfa_hmac(&payload);
+    format!("{payload}|{sig}")
+}
+
+/// Validate an MFA pre-auth token; returns `(db_name, user_id,
+/// last_login_epoch)` when the signature matches and it hasn't expired. The
+/// caller must additionally confirm `last_login_epoch` still matches the user's
+/// current `last_login_at` (single-use check).
+fn verify_mfa_token(token: &str) -> Option<(String, uuid::Uuid, i64)> {
+    let parts: Vec<&str> = token.split('|').collect();
+    if parts.len() != 5 {
+        return None;
+    }
+    let payload = format!("{}|{}|{}|{}", parts[0], parts[1], parts[2], parts[3]);
+    if !ct_eq(&mfa_hmac(&payload), parts[4]) {
+        return None;
+    }
+    let exp: i64 = parts[3].parse().ok()?;
+    if chrono::Utc::now().timestamp() > exp {
+        return None;
+    }
+    let last_login_epoch: i64 = parts[2].parse().ok()?;
+    let uid = uuid::Uuid::parse_str(parts[1]).ok()?;
+    Some((parts[0].to_string(), uid, last_login_epoch))
+}
+
+/// Whether this deployment requires a second factor for every interactive
+/// login (system setting `mfa.required`, default false). Read best-effort.
+async fn mfa_required(db: &PgPool) -> bool {
+    sqlx::query_scalar::<_, Option<serde_json::Value>>(
+        "SELECT value FROM system_settings WHERE key = 'mfa.required'",
+    )
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
+    .flatten()
+    .map(|v| v == serde_json::json!(true) || v == serde_json::json!("true"))
+    .unwrap_or(false)
+}
+
+/// Mint an interactive web session for an already-authenticated user and return
+/// the `HX-Redirect(/home)` response: session cookie, concurrent-cap
+/// enforcement, last-login reset, `LoginSuccess` audit, and the previous-logon
+/// feedback cookie. Shared by the password login and the MFA-challenge success
+/// so the two never drift. Also clears any pending-MFA cookie.
+async fn issue_web_session(
+    state: &AppState,
+    db: &PgPool,
+    db_name: &str,
+    user_id: uuid::Uuid,
+    username: &str,
+    prev_last_login: Option<chrono::DateTime<chrono::Utc>>,
+    prev_failed: i32,
+    client_ip: Option<&str>,
+) -> Response {
+    let session_token = generate_session_token();
+    let token_hash = hash_token(&session_token);
+    if sqlx::query(
+        "INSERT INTO sessions (user_id, token_hash, expires_at, ip_address) \
+         VALUES ($1, $2, NOW() + make_interval(mins => $3), NULL)",
+    )
+    .bind(user_id)
+    .bind(&token_hash)
+    .bind(SESSION_IDLE_MINUTES as i32)
+    .execute(db)
+    .await
+    .is_err()
+    {
+        return error_response("Login failed");
+    }
+
+    let evicted = enforce_session_cap(db, user_id).await;
+    if evicted > 0 {
+        info!("Concurrent-session cap: revoked {} older session(s) for {}", evicted, username);
+    }
+    let _ = sqlx::query("UPDATE users SET last_login_at = NOW(), failed_login_attempts = 0 WHERE id = $1")
+        .bind(user_id)
+        .execute(db)
+        .await;
+
+    let mut audit_entry = AuditEntry::new(AuditAction::LoginSuccess, AuditSeverity::Info)
+        .with_user(vortex_common::UserId(user_id))
+        .with_username(username)
+        .with_database(db_name)
+        .with_resource("session", user_id.to_string())
+        .with_details(serde_json::json!({"database": db_name, "session_id": token_hash}));
+    if let Some(ip) = client_ip {
+        audit_entry = audit_entry.with_source_ip(ip.to_string());
+    }
+    if let Err(e) = state.audit.log(audit_entry).await {
+        error!("WORM audit write failed for LoginSuccess: {}", e);
+    }
+
+    let prev_epoch = prev_last_login.map(|t| t.timestamp()).unwrap_or(0);
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::SET_COOKIE,
+        format!(
+            "session={db_name}|{session_token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={SESSION_COOKIE_MAX_AGE}"
+        )
+        .parse()
+        .unwrap(),
+    );
+    headers.append(
+        header::SET_COOKIE,
+        format!("vortex_authfb={prev_failed}.{prev_epoch}; Path=/; HttpOnly; SameSite=Strict; Max-Age=60")
+            .parse()
+            .unwrap(),
+    );
+    headers.append(
+        header::SET_COOKIE,
+        "vortex_mfa=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0".parse().unwrap(),
+    );
+    headers.insert("HX-Redirect", "/home".parse().unwrap());
+    (StatusCode::OK, headers, Html("")).into_response()
+}
+
+/// Minimal percent-encoding for a URL query-string value. Encodes every byte
+/// outside the RFC 3986 unreserved set, which is enough to safely carry a
+/// username / database name in the change-password redirect.
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Record a failed login: increment the counter and, once it reaches the
+/// policy threshold, lock the account (idempotently) and write a `UserLocked`
+/// entry to the WORM ledger. Returns `true` only when *this* attempt tripped
+/// the lock, so the caller can surface the "account locked" message.
+///
+/// Shared by every credential-checking path (web + mobile) so a brute-force
+/// attempt can't dodge lock-out by hammering a different endpoint.
+async fn note_failed_login(
+    state: &AppState,
+    db: &PgPool,
+    db_name: &str,
+    user_id: uuid::Uuid,
+    username: &str,
+    client_ip: Option<&str>,
+) -> bool {
+    let attempts: i32 = sqlx::query_scalar(
+        "UPDATE users SET failed_login_attempts = failed_login_attempts + 1 \
+         WHERE id = $1 RETURNING failed_login_attempts",
+    )
+    .bind(user_id)
+    .fetch_one(db)
+    .await
+    .unwrap_or(0);
+
+    if attempts < super::password_policy::MAX_FAILED_ATTEMPTS {
+        return false;
+    }
+
+    // Threshold reached. Lock only if not already locked, so repeated failures
+    // after the lock don't rewrite `locked_at`/`locked_reason` or re-audit.
+    let newly_locked: bool = sqlx::query_scalar(
+        "UPDATE users \
+         SET locked = true, locked_at = COALESCE(locked_at, NOW()), \
+             locked_reason = COALESCE(locked_reason, $2) \
+         WHERE id = $1 AND locked = false \
+         RETURNING true",
+    )
+    .bind(user_id)
+    .bind("Exceeded maximum failed login attempts")
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or(false);
+
+    if newly_locked {
+        let mut entry = AuditEntry::new(AuditAction::UserLocked, AuditSeverity::Warning)
+            .with_user(vortex_common::UserId(user_id))
+            .with_username(username)
+            .with_database(db_name)
+            .with_resource("user", user_id.to_string())
+            .with_details(serde_json::json!({
+                "reason": "failed_login_threshold",
+                "threshold": super::password_policy::MAX_FAILED_ATTEMPTS,
+                "database": db_name,
+            }));
+        if let Some(ip) = client_ip {
+            entry = entry.with_source_ip(ip.to_string());
+        }
+        if let Err(e) = state.audit.log(entry).await {
+            error!("WORM audit write failed for UserLocked: {}", e);
+        }
+
+        // Failure-monitoring hook: a lock-out means a burst of failed attempts
+        // crossed the threshold — a brute-force signal. Emit a dedicated,
+        // Critical `SecurityAlert` (distinct from the authorization-category
+        // UserLocked) so SIEM alert rules and the CEF/LEEF export key on it.
+        // This is the alertable event; wiring it to email/paging is a
+        // deploy-time integration on top of the WORM feed.
+        let mut alert = AuditEntry::new(AuditAction::SecurityAlert, AuditSeverity::Critical)
+            .with_user(vortex_common::UserId(user_id))
+            .with_username(username)
+            .with_database(db_name)
+            .with_resource("user", user_id.to_string())
+            .with_details(serde_json::json!({
+                "alert": "brute_force_lockout",
+                "reason": "failed_login_threshold_exceeded",
+                "threshold": super::password_policy::MAX_FAILED_ATTEMPTS,
+                "database": db_name,
+            }));
+        if let Some(ip) = client_ip {
+            alert = alert.with_source_ip(ip.to_string());
+        }
+        if let Err(e) = state.audit.log(alert).await {
+            error!("WORM audit write failed for SecurityAlert: {}", e);
+        }
+        warn!(
+            "SECURITY: brute-force lock-out for user '{}' (db {}) after {} failed attempts",
+            username, db_name, super::password_policy::MAX_FAILED_ATTEMPTS
+        );
+    }
+    newly_locked
+}
+
+#[derive(serde::Deserialize)]
+struct ChangePasswordQuery {
+    db: Option<String>,
+    user: Option<String>,
+    reason: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct ChangePasswordForm {
+    database: Option<String>,
+    username: String,
+    current_password: String,
+    new_password: String,
+    confirm_password: String,
+}
+
+/// Render the standalone change-password page. `banner` explains *why* the
+/// user is here (expiry / admin-forced); `error` shows a validation failure.
+fn render_change_password_page(
+    db: &str,
+    username: &str,
+    banner: Option<&str>,
+    error: Option<&str>,
+) -> String {
+    let banner_html = banner
+        .map(|m| format!(
+            r#"<div class="alert alert-warning mb-4 text-sm"><span>{}</span></div>"#,
+            html_escape(m)
+        ))
+        .unwrap_or_default();
+    let error_html = error
+        .map(|m| format!(
+            r#"<div class="alert alert-error mb-4 text-sm"><span>{}</span></div>"#,
+            html_escape(m)
+        ))
+        .unwrap_or_default();
+
+    format!(
+        r##"<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Change your password</title>
+<script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script>
+<link href="/static/vendor/daisyui.min.css" rel="stylesheet">
+<link href="/static/vortex.css?v=20" rel="stylesheet"/>
+<link href="/static/tailwind.css?v=21" rel="stylesheet"/>
+</head>
+<body class="min-h-screen bg-base-200 flex items-center justify-center p-6">
+<div class="card bg-base-100 shadow-xl max-w-md w-full"><div class="card-body">
+<h1 class="card-title">Change your password</h1>
+{banner_html}
+{error_html}
+<form method="post" action="/auth/change-password" class="space-y-3">
+<input type="hidden" name="database" value="{db}"/>
+<input type="hidden" name="username" value="{username}"/>
+<div class="form-control">
+<label class="label"><span class="label-text">Current password</span></label>
+<input type="password" name="current_password" required autocomplete="current-password" class="input input-bordered w-full"/>
+</div>
+<div class="form-control">
+<label class="label"><span class="label-text">New password</span></label>
+<input type="password" name="new_password" required autocomplete="new-password" class="input input-bordered w-full"/>
+</div>
+<div class="form-control">
+<label class="label"><span class="label-text">Confirm new password</span></label>
+<input type="password" name="confirm_password" required autocomplete="new-password" class="input input-bordered w-full"/>
+</div>
+<p class="text-xs text-base-content/60">{hint}</p>
+<div class="card-actions justify-end mt-4">
+<a href="/login" class="btn btn-ghost">Cancel</a>
+<button type="submit" class="btn btn-primary">Update password</button>
+</div>
+</form>
+</div></div>
+</body></html>"##,
+        db = html_escape(db),
+        username = html_escape(username),
+        hint = html_escape(super::password_policy::POLICY_HINT),
+    )
+}
+
+/// `GET /auth/change-password` — public form reached from the login flow when a
+/// password is expired or admin-flagged for change. Prefilled with the db /
+/// username carried in the redirect; the POST re-verifies the current password.
+async fn change_password_page(
+    Query(q): Query<ChangePasswordQuery>,
+) -> Html<String> {
+    let db = q.db.unwrap_or_default();
+    let username = q.user.unwrap_or_default();
+    let banner = match q.reason.as_deref() {
+        Some("expired") => Some("Your password has expired and must be changed before you can continue."),
+        Some("must_change") => Some("You must change your password before continuing."),
+        _ => Some("Please set a new password to continue."),
+    };
+    Html(render_change_password_page(&db, &username, banner, None))
+}
+
+/// `POST /auth/change-password` — re-authenticate with the current password,
+/// enforce the complexity policy on the new one, rotate it, and start a
+/// session. Public + rate-limited (shares the login limiter).
+async fn change_password_submit(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Form(form): Form<ChangePasswordForm>,
+) -> Response {
+    let (client_ip, _ua) = request_fingerprint(&headers);
+
+    // Resolve the target database through the same host-guarded path as login,
+    // so a crafted POST can't rotate a password in another tenant.
+    let db_name = resolve_database(&state, &headers, form.database.as_deref()).await;
+    let pool = match state.pool_manager.get_pool(&db_name).await {
+        Ok(p) => p,
+        Err(e) => {
+            error!("Failed to get pool for database '{}': {}", db_name, e);
+            return error_response("Database unavailable");
+        }
+    };
+    let db = pool.pool().clone();
+
+    // Re-render the form with an error, preserving db/username context.
+    let reject = |msg: &str| -> Response {
+        Html(render_change_password_page(&db_name, &form.username, None, Some(msg))).into_response()
+    };
+
+    let user = sqlx::query_as::<_, LoginUserRow>(
+        r#"
+        SELECT id, username, password_hash, active, locked,
+               locked_until, password_changed_at, must_change_password,
+               last_login_at, failed_login_attempts,
+               mfa_enabled, mfa_secret
+        FROM users
+        WHERE username = $1
+        "#,
+    )
+    .bind(&form.username)
+    .fetch_optional(&db)
+    .await;
+
+    let user = match user {
+        Ok(Some(u)) => u,
+        // Don't disclose whether the account exists — same generic failure.
+        Ok(None) => return reject("Current password is incorrect."),
+        Err(e) => {
+            error!("change_password_submit user lookup failed: {}", e);
+            return error_response("Login failed");
+        }
+    };
+
+    if !user.active {
+        return error_response("Account is disabled");
+    }
+    let timed_lock = user.locked_until.map_or(false, |t| t > chrono::Utc::now());
+    if user.locked || timed_lock {
+        return error_response("Account is locked. Contact your administrator.");
+    }
+
+    // Re-verify the current password. A wrong one counts as a failed login and
+    // feeds the same lock-out counter, so this page is not a brute-force bypass.
+    if !verify_password(&form.current_password, &user.password_hash) {
+        let locked_now = note_failed_login(
+            &state,
+            &db,
+            &db_name,
+            user.id,
+            &user.username,
+            client_ip.as_deref(),
+        )
+        .await;
+        let mut entry = AuditEntry::new(AuditAction::LoginFailure, AuditSeverity::Warning)
+            .with_user(vortex_common::UserId(user.id))
+            .with_username(&user.username)
+            .with_database(&db_name)
+            .with_resource("session", user.id.to_string())
+            .with_error("invalid_password")
+            .with_details(serde_json::json!({
+                "reason": "invalid_password",
+                "channel": "change_password",
+                "database": db_name,
+            }));
+        if let Some(ip) = &client_ip {
+            entry = entry.with_source_ip(ip.clone());
+        }
+        let _ = state.audit.log(entry).await;
+        if locked_now {
+            return error_response(
+                "Account locked after too many failed attempts. Contact your administrator.",
+            );
+        }
+        return reject("Current password is incorrect.");
+    }
+
+    // Validate the new password.
+    if form.new_password != form.confirm_password {
+        return reject("New passwords don't match.");
+    }
+    if let Err(reason) = super::password_policy::validate(&form.new_password) {
+        return reject(&reason);
+    }
+    if form.new_password == form.current_password {
+        return reject("New password must be different from the current one.");
+    }
+
+    // Rotate: new hash, reset the expiry clock, clear the change flag and any
+    // failed-attempt count.
+    let new_hash = hash_password(&form.new_password);
+    let updated = sqlx::query(
+        "UPDATE users \
+         SET password_hash = $1, password_changed_at = NOW(), \
+             must_change_password = false, failed_login_attempts = 0, updated_at = NOW() \
+         WHERE id = $2",
+    )
+    .bind(&new_hash)
+    .bind(user.id)
+    .execute(&db)
+    .await;
+    if let Err(e) = updated {
+        error!("change_password_submit update failed: {}", e);
+        return error_response("Could not update password");
+    }
+
+    // Audit the change through the WORM ledger.
+    let mut entry = AuditEntry::new(AuditAction::PasswordChange, AuditSeverity::Info)
+        .with_user(vortex_common::UserId(user.id))
+        .with_username(&user.username)
+        .with_database(&db_name)
+        .with_resource("user", user.id.to_string())
+        .with_details(serde_json::json!({
+            "reason": "self_service_change",
+            "database": db_name,
+        }));
+    if let Some(ip) = &client_ip {
+        entry = entry.with_source_ip(ip.clone());
+    }
+    if let Err(e) = state.audit.log(entry).await {
+        error!("WORM audit write failed for PasswordChange: {}", e);
+    }
+
+    // Password rotated. If the user has a second factor, don't mint the
+    // session here — route through the MFA challenge (otherwise the
+    // forced-change flow would be an MFA bypass).
+    if user.mfa_enabled && user.mfa_secret.is_some() {
+        let token = sign_mfa_token(
+            &db_name,
+            user.id,
+            user.last_login_at.map(|t| t.timestamp()).unwrap_or(0),
+        );
+        let mut out = HeaderMap::new();
+        out.insert(
+            header::SET_COOKIE,
+            format!("vortex_mfa={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=300")
+                .parse()
+                .unwrap(),
+        );
+        out.insert(header::LOCATION, "/auth/mfa".parse().unwrap());
+        return (StatusCode::FOUND, out).into_response();
+    }
+    // Enforce the MFA-required policy on this path too: arriving through the
+    // forced-change flow bypasses the login gate, so a non-enrolled user on an
+    // `mfa.required` deployment must not obtain a session by rotating their
+    // password.
+    if mfa_required(&db).await {
+        return error_response(
+            "Your administrator requires multi-factor authentication. Enrol using the Vortex mobile app, or contact your administrator.",
+        );
+    }
+
+    // Password rotated — mint a session, exactly like a fresh login.
+    let session_token = generate_session_token();
+    let token_hash = hash_token(&session_token);
+    let session_result = sqlx::query(
+        "INSERT INTO sessions (user_id, token_hash, expires_at, ip_address) \
+         VALUES ($1, $2, NOW() + make_interval(mins => $3), NULL)",
+    )
+    .bind(user.id)
+    .bind(&token_hash)
+    .bind(SESSION_IDLE_MINUTES as i32)
+    .execute(&db)
+    .await;
+    if let Err(e) = session_result {
+        error!("Failed to create session after password change: {}", e);
+        // Password IS changed; send them to login to sign in with the new one.
+        return Redirect::to("/login").into_response();
+    }
+    let evicted = enforce_session_cap(&db, user.id).await;
+    if evicted > 0 {
+        info!(
+            "Concurrent-session cap: revoked {} older session(s) for {}",
+            evicted, user.username
+        );
+    }
+    let _ = sqlx::query("UPDATE users SET last_login_at = NOW() WHERE id = $1")
+        .bind(user.id)
+        .execute(&db)
+        .await;
+
+    // A session was minted here — record the LoginSuccess like every other
+    // session-mint path (the change-password flow only audited PasswordChange).
+    let mut ok_entry = AuditEntry::new(AuditAction::LoginSuccess, AuditSeverity::Info)
+        .with_user(vortex_common::UserId(user.id))
+        .with_username(&user.username)
+        .with_database(&db_name)
+        .with_resource("session", user.id.to_string())
+        .with_details(serde_json::json!({"database": db_name, "via": "password_change"}));
+    if let Some(ip) = &client_ip {
+        ok_entry = ok_entry.with_source_ip(ip.clone());
+    }
+    let _ = state.audit.log(ok_entry).await;
+
+    let mut out = HeaderMap::new();
+    out.insert(
+        header::SET_COOKIE,
+        format!(
+            "session={}|{}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}",
+            db_name, session_token, SESSION_COOKIE_MAX_AGE
+        )
+        .parse()
+        .unwrap(),
+    );
+    out.insert(header::LOCATION, "/home".parse().unwrap());
+    (StatusCode::FOUND, out).into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct MfaForm {
+    code: String,
+}
+
+/// Render the standalone MFA challenge page (HTMX form posting to
+/// `/auth/mfa`). `error` shows a failed attempt.
+fn render_mfa_page(error: Option<&str>) -> String {
+    let error_html = error
+        .map(|m| format!(
+            r#"<div class="alert alert-error text-sm mb-2"><span>{}</span></div>"#,
+            html_escape(m)
+        ))
+        .unwrap_or_default();
+    format!(
+        r##"<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Two-factor authentication</title>
+<script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script>
+<link href="/static/vendor/daisyui.min.css" rel="stylesheet">
+<link href="/static/vortex.css?v=18" rel="stylesheet"/>
+<script src="/static/vendor/htmx.min.js"></script>
+</head>
+<body class="min-h-screen bg-base-200 flex items-center justify-center p-6">
+<div class="card bg-base-100 shadow-xl max-w-sm w-full"><div class="card-body">
+<h1 class="card-title">Two-factor authentication</h1>
+<p class="text-base-content/70 text-sm">Enter the 6-digit code from your authenticator app.</p>
+<div id="mfa-error"></div>
+<form hx-post="/auth/mfa" hx-target="#mfa-error" hx-swap="innerHTML" class="space-y-3 mt-2">
+{error_html}
+<input type="text" name="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]*"
+       maxlength="6" required autofocus placeholder="123456"
+       class="input input-bordered w-full tracking-widest text-center text-lg"/>
+<div class="card-actions justify-end">
+<a href="/login" class="btn btn-ghost">Cancel</a>
+<button type="submit" class="btn btn-primary">Verify</button>
+</div>
+</form>
+</div></div>
+</body></html>"##
+    )
+}
+
+/// `GET /auth/mfa` — the second-factor prompt, reached from the login flow with
+/// a valid pending-MFA cookie. Without one, bounce to login.
+async fn mfa_page(headers: HeaderMap) -> Response {
+    match cookie_value(&headers, "vortex_mfa").as_deref().and_then(verify_mfa_token) {
+        Some(_) => Html(render_mfa_page(None)).into_response(),
+        None => Redirect::to("/login").into_response(),
+    }
+}
+
+/// `POST /auth/mfa` — verify the TOTP code against the pending-MFA identity and,
+/// on success, mint the session. Public + rate-limited (shares the login
+/// limiter).
+async fn mfa_submit(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Form(form): Form<MfaForm>,
+) -> Response {
+    let (client_ip, _ua) = request_fingerprint(&headers);
+
+    let Some((db_name, user_id, token_last_login)) =
+        cookie_value(&headers, "vortex_mfa").as_deref().and_then(verify_mfa_token)
+    else {
+        // Expired/forged/absent pending token → restart the login.
+        let mut headers = HeaderMap::new();
+        headers.insert("HX-Redirect", "/login".parse().unwrap());
+        return (StatusCode::OK, headers, Html("")).into_response();
+    };
+
+    let pool = match state.pool_manager.get_pool(&db_name).await {
+        Ok(p) => p,
+        Err(_) => return error_response("Database unavailable"),
+    };
+    let db = pool.pool().clone();
+
+    let user = sqlx::query_as::<_, LoginUserRow>(
+        r#"
+        SELECT id, username, password_hash, active, locked,
+               locked_until, password_changed_at, must_change_password,
+               last_login_at, failed_login_attempts,
+               mfa_enabled, mfa_secret
+        FROM users WHERE id = $1
+        "#,
+    )
+    .bind(user_id)
+    .fetch_optional(&db)
+    .await
+    .ok()
+    .flatten();
+
+    let Some(user) = user else {
+        return Html(render_mfa_page(Some("Session expired. Please sign in again."))).into_response();
+    };
+    if !user.active || user.locked {
+        return error_response("Account is not available. Contact your administrator.");
+    }
+    // Single-use: the token embeds the `last_login_at` from the password step.
+    // A successful MFA advances `last_login_at`, so a replayed token no longer
+    // matches and is refused here (no server-side token store required).
+    let current_last_login = user.last_login_at.map(|t| t.timestamp()).unwrap_or(0);
+    if current_last_login != token_last_login {
+        return Html(render_mfa_page(Some("This sign-in has already been used or expired. Please sign in again."))).into_response();
+    }
+
+    // Verify the code against the (unsealed) TOTP secret.
+    let now = chrono::Utc::now().timestamp() as u64;
+    let ok = user
+        .mfa_secret
+        .as_deref()
+        .and_then(vortex_security::mfa::open_secret)
+        .map(|secret| vortex_security::mfa::verify(&secret, form.code.trim(), now))
+        .unwrap_or(false);
+
+    if !ok {
+        // A wrong TOTP counts toward the same lock-out threshold as a wrong
+        // password, so a stolen pre-auth cookie can't be used to brute-force
+        // the 6-digit code (the shared per-IP limiter alone is not enough).
+        let locked_now =
+            note_failed_login(&state, &db, &db_name, user.id, &user.username, client_ip.as_deref())
+                .await;
+        let mut entry = AuditEntry::new(AuditAction::MfaFailure, AuditSeverity::Warning)
+            .with_user(vortex_common::UserId(user.id))
+            .with_username(&user.username)
+            .with_database(&db_name)
+            .with_details(serde_json::json!({"database": db_name, "channel": "web"}));
+        if let Some(ip) = &client_ip {
+            entry = entry.with_source_ip(ip.clone());
+        }
+        let _ = state.audit.log(entry).await;
+        if locked_now {
+            return Html(r#"<div class="alert alert-error text-sm"><span>Account locked after too many failed attempts. Contact your administrator.</span></div>"#)
+                .into_response();
+        }
+        return Html(r#"<div class="alert alert-error text-sm"><span>Invalid code. Try again.</span></div>"#)
+            .into_response();
+    }
+
+    let mut entry = AuditEntry::new(AuditAction::MfaSuccess, AuditSeverity::Info)
+        .with_user(vortex_common::UserId(user.id))
+        .with_username(&user.username)
+        .with_database(&db_name)
+        .with_details(serde_json::json!({"database": db_name, "channel": "web"}));
+    if let Some(ip) = &client_ip {
+        entry = entry.with_source_ip(ip.clone());
+    }
+    let _ = state.audit.log(entry).await;
+
+    issue_web_session(
+        &state,
+        &db,
+        &db_name,
+        user.id,
+        &user.username,
+        user.last_login_at,
+        user.failed_login_attempts,
+        client_ip.as_deref(),
+    )
+    .await
 }
 
 fn generate_session_token() -> String {
@@ -5765,9 +6793,19 @@ async fn logout(
 async fn home_page(
     State(state): State<Arc<AppState>>,
     Db(db): Db,
+    headers: HeaderMap,
     Extension(user): Extension<AuthUser>,
     Extension(db_ctx): Extension<DatabaseContext>,
-) -> Html<String> {
+) -> Response {
+    // Previous-logon notification: a one-shot banner from the login flow's
+    // `vortex_authfb` cookie. Present only right after sign-in; render once
+    // then clear it below.
+    let authfb_cookie = cookie_value(&headers, "vortex_authfb");
+    let auth_feedback = authfb_cookie
+        .as_deref()
+        .map(auth_feedback_banner)
+        .unwrap_or_default();
+
     let display_name = user.full_name.as_deref().unwrap_or(&user.username);
     let initials = get_initials(display_name);
     let installed = db_ctx.installed_modules.clone();
@@ -5901,7 +6939,7 @@ async fn home_page(
     let body = format!(
         r#"
 <div class="mb-6"><h1 class="text-2xl font-bold">Welcome, {display_name}</h1><p class="text-base-content/60">Here's what's happening today</p></div>
-
+{auth_feedback}
 {admin_overview}
 <!-- Announcements (full width) -->
 <div class="card bg-base-100 shadow mb-6">
@@ -5963,7 +7001,18 @@ async fn home_page(
         &format!("\n{}\n", shortcuts_js),
     );
 
-    Html(html)
+    // Clear the one-shot feedback cookie so the banner shows only once.
+    if authfb_cookie.is_some() {
+        let mut out = HeaderMap::new();
+        out.insert(
+            header::SET_COOKIE,
+            "vortex_authfb=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0"
+                .parse()
+                .unwrap(),
+        );
+        return (out, Html(html)).into_response();
+    }
+    Html(html).into_response()
 }
 
 // NOTE: get_initials moved to vortex_framework::ui
@@ -7974,9 +9023,9 @@ async fn users_create(
         return error_response("Select at least one role");
     }
 
-    // Validate password
-    if password.len() < 12 {
-        return error_response("Password must be at least 12 characters");
+    // Validate password against the shared complexity policy.
+    if let Err(reason) = super::password_policy::validate(&password) {
+        return error_response(&reason);
     }
 
     // Hash password
@@ -8220,8 +9269,8 @@ async fn users_update(
 
     // Update user
     let result = if let Some(password) = password {
-        if password.len() < 12 {
-            return error_response("Password must be at least 12 characters");
+        if let Err(reason) = super::password_policy::validate(&password) {
+            return error_response(&reason);
         }
         let password_hash = hash_password(&password);
         sqlx::query(
