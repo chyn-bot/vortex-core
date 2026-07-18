@@ -30,7 +30,7 @@ use uuid::Uuid;
 
 use crate::auth::{AuthUser, Db};
 use crate::shell::render_app_shell;
-use crate::sidebar::build_sidebar;
+use crate::sidebar::{build_sidebar, custom_apps_nav};
 use crate::state::{AppState, DatabaseContext};
 use crate::ui::{forbidden_page, format_time_ago, get_initials, html_escape};
 
@@ -49,10 +49,11 @@ pub fn admin_routes() -> Router<Arc<AppState>> {
 
 /// Wrap a page body in the standard app shell with the sidebar, marking the
 /// "Batch Runs" nav entry active.
-fn shell(state: &AppState, user: &AuthUser, db_ctx: &DatabaseContext, title: &str, body: &str) -> String {
+async fn shell(state: &AppState, user: &AuthUser, db_ctx: &DatabaseContext, title: &str, body: &str) -> String {
     let display_name = user.full_name.as_deref().unwrap_or(&user.username);
     let initials = get_initials(display_name);
     let installed = db_ctx.installed_modules.clone();
+    let apps_html = custom_apps_nav(db_ctx.pool.pool(), "").await;
     let sidebar = build_sidebar(
         "batch",
         display_name,
@@ -61,7 +62,7 @@ fn shell(state: &AppState, user: &AuthUser, db_ctx: &DatabaseContext, title: &st
         user.is_admin(),
         &state.plugin_registry,
         &user.roles,
-        &db_ctx.custom_apps_html,
+        &apps_html,
     );
     render_app_shell(title, &sidebar, body)
 }
@@ -152,7 +153,7 @@ async fn runs_list(
         rows = table_rows
     );
 
-    Html(shell(&state, &user, &db_ctx, "Batch Runs", &body)).into_response()
+    Html(shell(&state, &user, &db_ctx, "Batch Runs", &body).await).into_response()
 }
 
 // ─── GET /batch/runs/{id} ────────────────────────────────────────────────
@@ -170,7 +171,7 @@ async fn run_detail(
 
     let run = match crate::batch::get_run(&db, id).await {
         Ok(Some(r)) => r,
-        Ok(None) => return (axum::http::StatusCode::NOT_FOUND, Html(shell(&state, &user, &db_ctx, "Batch Run", "<div class=\"p-6\">Run not found.</div>"))).into_response(),
+        Ok(None) => return (axum::http::StatusCode::NOT_FOUND, Html(shell(&state, &user, &db_ctx, "Batch Run", "<div class=\"p-6\">Run not found.</div>").await)).into_response(),
         Err(e) => return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
 
@@ -263,7 +264,7 @@ async fn run_detail(
         exceptions_block = exceptions_block,
     );
 
-    Html(shell(&state, &user, &db_ctx, "Batch Run", &body)).into_response()
+    Html(shell(&state, &user, &db_ctx, "Batch Run", &body).await).into_response()
 }
 
 // ─── GET /batch/runs/{id}/exceptions ─────────────────────────────────────
@@ -326,7 +327,7 @@ async fn exceptions_page(
         )
     };
 
-    Html(shell(&state, &user, &db_ctx, "Exception Queue", &body)).into_response()
+    Html(shell(&state, &user, &db_ctx, "Exception Queue", &body).await).into_response()
 }
 
 // ─── POST retry ──────────────────────────────────────────────────────────
