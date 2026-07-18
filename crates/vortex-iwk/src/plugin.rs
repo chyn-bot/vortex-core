@@ -12,6 +12,7 @@ const MIG_001_INIT: &str = include_str!("../migrations/001_init/postgres.sql");
 const MIG_002_GL: &str = include_str!("../migrations/002_gl/postgres.sql");
 const MIG_003_CONTRACTS: &str = include_str!("../migrations/003_contracts/postgres.sql");
 const MIG_004_PAYMENTS: &str = include_str!("../migrations/004_payments/postgres.sql");
+const MIG_005_PREMISE: &str = include_str!("../migrations/005_premise/postgres.sql");
 
 pub struct IwkPlugin;
 
@@ -150,6 +151,14 @@ impl Plugin for IwkPlugin {
                 // summarized collection-posting ledger.
                 name: "004_payments",
                 up_sql: MIG_004_PAYMENTS,
+                down_sql: None,
+                requires_core_migration: Some("124_record_stages"),
+            },
+            PluginMigration {
+                // First-class premise (premise_no + service address) on the
+                // account — one owner, many accounts, each at a premise.
+                name: "005_premise",
+                up_sql: MIG_005_PREMISE,
                 down_sql: None,
                 requires_core_migration: Some("124_record_stages"),
             },

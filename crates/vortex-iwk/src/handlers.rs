@@ -508,6 +508,11 @@ async fn post_run(
 
 #[derive(Deserialize)]
 struct RegisterForm {
+    /// When present, attach the account to this existing customer (contact);
+    /// the name/address fields are ignored.
+    #[serde(default)]
+    contact_id: String,
+    #[serde(default)]
     name: String,
     #[serde(default)]
     street: String,
@@ -524,45 +529,19 @@ struct RegisterForm {
     connection_date: String,
     #[serde(default)]
     deposit: String,
+    #[serde(default)]
+    premise_no: String,
+    #[serde(default)]
+    premise_address: String,
 }
 
-/// GET /iwk/accounts/new — register a customer and open a contract.
-async fn register_form(
-    State(state): State<Arc<AppState>>,
-    Db(_db): Db,
-    Extension(user): Extension<AuthUser>,
-    Extension(db_ctx): Extension<DatabaseContext>,
-    Query(q): Query<std::collections::HashMap<String, String>>,
-) -> Response {
-    let esc = vortex_plugin_sdk::framework::ui::html_escape;
-    let sidebar = sidebar_for(&state, &user, &db_ctx);
-    let today = chrono::Utc::now().date_naive();
-
-    let flash = match q.get("ok") {
-        Some(acct) => format!(
-            "<div class=\"alert alert-success mb-4\">Customer registered — sewerage account <span class=\"font-mono font-bold\">{}</span> opened. \
-             It will be billed on the next generation run.</div>",
-            esc(acct)
-        ),
-        None => String::new(),
-    };
-
-    let content = format!(
-        r##"<div class="max-w-2xl mx-auto">
-<div class="flex items-center justify-between mb-6">
-  <h1 class="text-2xl font-bold">Register Customer <span class="text-base-content/40 text-base font-normal">open a sewerage contract</span></h1>
-  <a href="/iwk" class="btn btn-ghost btn-sm">← Bills</a>
-</div>
-{flash}
-<form method="post" action="/iwk/accounts/create" class="card bg-base-100 shadow"><div class="card-body space-y-4">
-  <div class="text-xs uppercase opacity-60">Customer</div>
-  <label class="form-control"><span class="label-text">Name</span>
-    <input name="name" required class="input input-bordered" placeholder="Full name / company"></label>
-  <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-    <label class="form-control"><span class="label-text">Street</span><input name="street" class="input input-bordered"></label>
-    <label class="form-control"><span class="label-text">City</span><input name="city" class="input input-bordered"></label>
-  </div>
-  <label class="form-control"><span class="label-text">Phone</span><input name="phone" class="input input-bordered"></label>
+/// The contract + premise fields, shared by both registration modes.
+fn contract_fields_html(today: &str) -> String {
+    format!(
+        r##"<div class="divider my-1"></div>
+  <div class="text-xs uppercase opacity-60">Premise (serviced property)</div>
+  <label class="form-control"><span class="label-text">Service address</span><input name="premise_address" class="input input-bordered" placeholder="Address of the property being serviced"></label>
+  <label class="form-control"><span class="label-text">Premise ref <span class="opacity-50">(optional — auto if blank)</span></span><input name="premise_no" class="input input-bordered" placeholder="PR…"></label>
 
   <div class="divider my-1"></div>
   <div class="text-xs uppercase opacity-60">Contract</div>
@@ -580,16 +559,127 @@ async fn register_form(
     <label class="form-control"><span class="label-text">Deposit (RM)</span>
       <input name="deposit" type="number" step="0.01" min="0" value="0.00" class="input input-bordered"></label>
   </div>
-  <div class="text-xs opacity-60">The tariff is applied automatically from the rate card at billing time. First bill is due on the connection date.</div>
+  <div class="text-xs opacity-60">The tariff is applied automatically from the rate card at billing time. First bill is due on the connection date.</div>"##,
+        today = today,
+    )
+}
+
+/// GET /iwk/accounts/new — register a customer / open a contract.
+/// Modes: `?contact=<id>` opens an account for an existing customer;
+/// `?q=<term>` searches existing customers; otherwise new-customer form.
+async fn register_form(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let esc = vortex_plugin_sdk::framework::ui::html_escape;
+    let sidebar = sidebar_for(&state, &user, &db_ctx);
+    let today = chrono::Utc::now().date_naive().to_string();
+
+    let flash = match q.get("ok") {
+        Some(acct) => format!(
+            "<div class=\"alert alert-success mb-4\">Sewerage account <span class=\"font-mono font-bold\">{}</span> opened. It will be billed on the next generation run.</div>",
+            esc(acct)
+        ),
+        None => String::new(),
+    };
+
+    // ── Mode 1: existing customer (contact preselected) ──────────────────
+    if let Some(cid) = q.get("contact").filter(|s| !s.is_empty()) {
+        let name: String = vortex_plugin_sdk::sqlx::query_scalar("SELECT name FROM contacts WHERE id = $1::uuid")
+            .bind(cid)
+            .fetch_optional(&db)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let content = format!(
+            r##"<div class="max-w-2xl mx-auto">
+<div class="flex items-center justify-between mb-6">
+  <h1 class="text-2xl font-bold">Open Account <span class="text-base-content/40 text-base font-normal">for an existing customer</span></h1>
+  <a href="/iwk/accounts/new" class="btn btn-ghost btn-sm">New customer instead</a>
+</div>
+{flash}
+<div class="alert alert-info mb-4">Opening a new account for <b>{name}</b> (<a href="/contacts/{cid}" class="link">view customer</a>). Same owner, additional premise.</div>
+<form method="post" action="/iwk/accounts/create" class="card bg-base-100 shadow"><div class="card-body space-y-4">
+  <input type="hidden" name="contact_id" value="{cid}">
+  {fields}
+  <div class="flex justify-end"><button class="btn btn-primary" type="submit">Open account</button></div>
+</div></form></div>"##,
+            flash = flash, name = esc(&name), cid = esc(cid), fields = contract_fields_html(&today),
+        );
+        return Html(page_shell(&sidebar, "Open Account", &content)).into_response();
+    }
+
+    // ── Mode 2: search results (if a query was entered) ──────────────────
+    let mut search_block = String::new();
+    let term = q.get("q").map(|s| s.trim()).unwrap_or("");
+    if !term.is_empty() {
+        let like = format!("%{}%", term);
+        let rows = vortex_plugin_sdk::sqlx::query(
+            "SELECT c.id, c.name, c.phone, c.city FROM contacts c \
+             WHERE COALESCE(c.name,'') ILIKE $1 \
+                OR c.id = (SELECT contact_id FROM iwk_account WHERE account_no = $2 LIMIT 1) \
+             LIMIT 20",
+        )
+        .bind(&like)
+        .bind(term)
+        .fetch_all(&db)
+        .await
+        .unwrap_or_default();
+        let mut items = String::new();
+        for r in &rows {
+            let id: Uuid = match r.try_get("id") { Ok(v) => v, Err(_) => continue };
+            let nm: String = r.try_get("name").ok().flatten().unwrap_or_default();
+            let ph: String = r.try_get("phone").ok().flatten().unwrap_or_default();
+            let ci: String = r.try_get("city").ok().flatten().unwrap_or_default();
+            items.push_str(&format!(
+                "<a href=\"/iwk/accounts/new?contact={id}\" class=\"flex items-center justify-between p-2 hover:bg-base-200 rounded\">\
+                 <span><b>{nm}</b> <span class=\"opacity-60 text-sm\">{ci}</span></span>\
+                 <span class=\"text-sm opacity-60\">{ph} →</span></a>",
+                id = id, nm = esc(&nm), ci = esc(&ci), ph = esc(&ph),
+            ));
+        }
+        if items.is_empty() {
+            items.push_str("<div class=\"p-2 opacity-60 text-sm\">No existing customer matched — register a new one below.</div>");
+        }
+        search_block = format!("<div class=\"card bg-base-100 shadow mb-4\"><div class=\"card-body p-3\"><div class=\"text-xs uppercase opacity-60 mb-1\">Existing customers</div>{items}</div></div>");
+    }
+
+    // ── Mode 3: the page (search box + new-customer form) ─────────────────
+    let content = format!(
+        r##"<div class="max-w-2xl mx-auto">
+<div class="flex items-center justify-between mb-6">
+  <h1 class="text-2xl font-bold">Register Customer <span class="text-base-content/40 text-base font-normal">search existing, or add new</span></h1>
+  <a href="/iwk/accounts" class="btn btn-ghost btn-sm">← Contracts</a>
+</div>
+{flash}
+<form method="get" action="/iwk/accounts/new" class="flex gap-2 mb-4">
+  <input name="q" value="{term}" class="input input-bordered flex-1" placeholder="Search existing customer by name or account no…">
+  <button class="btn btn-outline" type="submit">Search</button>
+</form>
+{search_block}
+<div class="divider text-xs opacity-60">or register a new customer</div>
+<form method="post" action="/iwk/accounts/create" class="card bg-base-100 shadow"><div class="card-body space-y-4">
+  <div class="text-xs uppercase opacity-60">Customer</div>
+  <label class="form-control"><span class="label-text">Name</span>
+    <input name="name" required class="input input-bordered" placeholder="Full name / company"></label>
+  <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+    <label class="form-control"><span class="label-text">Street</span><input name="street" class="input input-bordered"></label>
+    <label class="form-control"><span class="label-text">City</span><input name="city" class="input input-bordered"></label>
+  </div>
+  <label class="form-control"><span class="label-text">Phone</span><input name="phone" class="input input-bordered"></label>
+  {fields}
   <div class="flex justify-end"><button class="btn btn-primary" type="submit">Register &amp; open account</button></div>
 </div></form></div>"##,
-        flash = flash,
-        today = today,
+        flash = flash, term = esc(term), search_block = search_block, fields = contract_fields_html(&today),
     );
     Html(page_shell(&sidebar, "Register Customer", &content)).into_response()
 }
 
-/// POST /iwk/accounts/create — create the contact + contract.
+/// POST /iwk/accounts/create — open an account for a new or existing customer.
 async fn register_submit(
     Db(db): Db,
     Extension(_user): Extension<AuthUser>,
@@ -599,23 +689,28 @@ async fn register_submit(
     let deposit = form.deposit.trim().parse::<rust_decimal::Decimal>().unwrap_or_default();
     let connection_date = chrono::NaiveDate::parse_from_str(form.connection_date.trim(), "%Y-%m-%d")
         .unwrap_or_else(|_| chrono::Utc::now().date_naive());
+    let premise_no = form.premise_no.trim();
+    let premise_address = form.premise_address.trim();
 
-    match crate::billing::register_customer(
-        &db,
-        form.name.trim(),
-        form.street.trim(),
-        form.city.trim(),
-        form.phone.trim(),
-        &form.category,
-        &form.system_type,
-        units,
-        &form.billing_cycle,
-        connection_date,
-        deposit,
-    )
-    .await
-    {
-        Ok(r) => Redirect::to(&format!("/iwk/accounts/new?ok={}", r.account_no)).into_response(),
+    // Existing customer → just open another account; else create the contact too.
+    let result = if !form.contact_id.trim().is_empty() {
+        match Uuid::parse_str(form.contact_id.trim()) {
+            Ok(cid) => crate::billing::open_account(
+                &db, cid, &form.category, &form.system_type, units, &form.billing_cycle,
+                connection_date, deposit, premise_no, premise_address,
+            ).await,
+            Err(_) => Err("invalid customer id".to_string()),
+        }
+    } else {
+        crate::billing::register_customer(
+            &db, form.name.trim(), form.street.trim(), form.city.trim(), form.phone.trim(),
+            &form.category, &form.system_type, units, &form.billing_cycle, connection_date,
+            deposit, premise_no, premise_address,
+        ).await
+    };
+
+    match result {
+        Ok(r) => Redirect::to(&format!("/iwk/accounts/new?contact={}&ok={}", r.contact_id, r.account_no)).into_response(),
         Err(e) => {
             error!("iwk register failed: {e}");
             (StatusCode::BAD_REQUEST, format!("Registration failed: {e}")).into_response()
@@ -702,6 +797,7 @@ async fn account_detail(
 
     let row = match vortex_plugin_sdk::sqlx::query(
         "SELECT a.account_no, a.category, a.system_type, a.units, a.billing_cycle, a.status, \
+                a.premise_no, a.premise_address, \
                 to_char(a.deposit,'FM999,990.00') AS deposit, \
                 to_char(a.connection_date,'DD/MM/YYYY') AS connection_date, \
                 to_char(a.next_bill_date,'DD/MM/YYYY') AS next_bill_date, \
@@ -818,6 +914,9 @@ async fn account_detail(
     <a href="/iwk/billing" class="btn btn-sm btn-outline">Generate bills</a>
   </div>
   <div class="divider my-2"></div>
+  <div class="mb-3 text-sm"><span class="opacity-60 text-xs uppercase">Premise</span>
+    <span class="font-mono ml-2">{premise_no}</span>
+    <span class="opacity-70 ml-2">{premise_address}</span></div>
   <div class="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
     <div><div class="opacity-60 text-xs uppercase">Category</div>{category}</div>
     <div><div class="opacity-60 text-xs uppercase">System</div>{system_type}</div>
@@ -863,6 +962,8 @@ async fn account_detail(
         connected = esc(&g("connection_date")),
         next_bill = esc(&g("next_bill_date")),
         deposit = esc(&g("deposit")),
+        premise_no = esc(&g("premise_no")),
+        premise_address = esc(&g("premise_address")),
         bill_rows = bill_rows,
     );
     Html(page_shell(&sidebar, &format!("Contract {account_no}"), &content)).into_response()

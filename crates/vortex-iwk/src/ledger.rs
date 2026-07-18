@@ -70,7 +70,10 @@ pub async fn contact_panel(db: &PgPool, contact_id: Uuid) -> Result<String, Stri
     <div><span class="opacity-60">Paid:</span> <b>RM {paid}</b></div>
     <div><span class="opacity-60">Outstanding:</span> <b>RM {outstanding}</b></div>
   </div>
-  <a href="/iwk/customers/{contact_id}" class="btn btn-sm btn-primary">Customer ledger →</a>
+  <div class="flex gap-2">
+    <a href="/iwk/accounts/new?contact={contact_id}" class="btn btn-sm btn-outline">Open another account</a>
+    <a href="/iwk/customers/{contact_id}" class="btn btn-sm btn-primary">Customer ledger →</a>
+  </div>
 </div>
 <table class="table table-sm">
   <thead><tr><th>Account</th><th>Type</th><th>Status</th><th>Next bill</th><th class="text-right">Credit</th></tr></thead>

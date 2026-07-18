@@ -28,8 +28,55 @@ pub struct RegisterResult {
     pub account_no: String,
 }
 
-/// Register a new customer (creates the contact) and open their sewerage
-/// contract (`iwk_account`). The first bill is due on the connection date.
+/// The account-open INSERT (shared by new-customer and existing-customer
+/// paths). `$8` premise_no is minted from the sequence when blank; `$9`
+/// premise_address may be empty. First bill is due on the connection date.
+const ACCOUNT_INSERT: &str = "INSERT INTO iwk_account \
+       (account_no, contact_id, category, system_type, units, status, billing_cycle, \
+        connection_date, next_bill_date, deposit, active, premise_no, premise_address) \
+     VALUES ('PB' || lpad(nextval('iwk_account_seq')::text, 10, '0'), \
+             $1, $2, $3, $4, 'active', $5, $6, $6, $7, true, \
+             COALESCE(NULLIF($8, ''), 'PR' || lpad(nextval('iwk_premise_seq')::text, 8, '0')), \
+             NULLIF($9, '')) \
+     RETURNING id, account_no";
+
+/// Open a sewerage account (contract) for an **existing** customer — the
+/// utility norm of one Business Partner holding many accounts/premises.
+#[allow(clippy::too_many_arguments)]
+pub async fn open_account(
+    db: &PgPool,
+    contact_id: Uuid,
+    category: &str,
+    system_type: &str,
+    units: i32,
+    billing_cycle: &str,
+    connection_date: chrono::NaiveDate,
+    deposit: Decimal,
+    premise_no: &str,
+    premise_address: &str,
+) -> Result<RegisterResult, String> {
+    let row = vortex_plugin_sdk::sqlx::query(ACCOUNT_INSERT)
+        .bind(contact_id)
+        .bind(category)
+        .bind(system_type)
+        .bind(units)
+        .bind(billing_cycle)
+        .bind(connection_date)
+        .bind(deposit)
+        .bind(premise_no)
+        .bind(premise_address)
+        .fetch_one(db)
+        .await
+        .map_err(|e| format!("open account: {e}"))?;
+    Ok(RegisterResult {
+        contact_id,
+        account_id: row.try_get("id").map_err(|e| e.to_string())?,
+        account_no: row.try_get("account_no").map_err(|e| e.to_string())?,
+    })
+}
+
+/// Register a **new** customer (creates the contact) and open their first
+/// sewerage account in one transaction.
 #[allow(clippy::too_many_arguments)]
 pub async fn register_customer(
     db: &PgPool,
@@ -43,6 +90,8 @@ pub async fn register_customer(
     billing_cycle: &str,
     connection_date: chrono::NaiveDate,
     deposit: Decimal,
+    premise_no: &str,
+    premise_address: &str,
 ) -> Result<RegisterResult, String> {
     let mut tx = db.begin().await.map_err(|e| e.to_string())?;
 
@@ -59,24 +108,19 @@ pub async fn register_customer(
     .await
     .map_err(|e| format!("create contact: {e}"))?;
 
-    let row = vortex_plugin_sdk::sqlx::query(
-        "INSERT INTO iwk_account \
-           (account_no, contact_id, category, system_type, units, status, billing_cycle, \
-            connection_date, next_bill_date, deposit, active) \
-         VALUES ('PB' || lpad(nextval('iwk_account_seq')::text, 10, '0'), \
-                 $1, $2, $3, $4, 'active', $5, $6, $6, $7, true) \
-         RETURNING id, account_no",
-    )
-    .bind(contact_id)
-    .bind(category)
-    .bind(system_type)
-    .bind(units)
-    .bind(billing_cycle)
-    .bind(connection_date)
-    .bind(deposit)
-    .fetch_one(&mut *tx)
-    .await
-    .map_err(|e| format!("open account: {e}"))?;
+    let row = vortex_plugin_sdk::sqlx::query(ACCOUNT_INSERT)
+        .bind(contact_id)
+        .bind(category)
+        .bind(system_type)
+        .bind(units)
+        .bind(billing_cycle)
+        .bind(connection_date)
+        .bind(deposit)
+        .bind(premise_no)
+        .bind(premise_address)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| format!("open account: {e}"))?;
 
     let account_id: Uuid = row.try_get("id").map_err(|e| e.to_string())?;
     let account_no: String = row.try_get("account_no").map_err(|e| e.to_string())?;
