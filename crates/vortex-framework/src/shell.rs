@@ -36,6 +36,7 @@ pub fn render_app_shell_with(
     format!(
         r#"<!DOCTYPE html><html data-theme="dark"><head><script>(function(){{var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t)}})()</script><style>[data-theme="corporate"] .theme-icon-sun{{display:none !important}}[data-theme="corporate"] .theme-icon-moon{{display:inline-block !important}}</style><title>{title}</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="vortex-idle" content="900">
 <link href="/static/vendor/daisyui.min.css" rel="stylesheet"/>
 <link href="/static/vortex.css?v=18" rel="stylesheet"/>
 <script src="/static/vortex.js?v=18" defer></script>
