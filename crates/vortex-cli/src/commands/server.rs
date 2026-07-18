@@ -5945,34 +5945,14 @@ fn auth_feedback_banner(raw: &str) -> String {
 
 // ─── MFA (web second-factor challenge) ───────────────────────────────────
 
-/// HMAC key for the MFA pre-auth token, derived from the deployment secret so
-/// the pending-MFA cookie can't be forged to skip the second factor.
-fn mfa_token_key() -> Vec<u8> {
-    std::env::var("VORTEX_SECRET_KEY")
-        .ok()
-        .filter(|k| !k.is_empty())
-        .map(|k| k.into_bytes())
-        .unwrap_or_else(|| b"vortex.mfa.preauth.v1".to_vec())
-}
-
+/// HMAC-SHA256 (hex) of `msg` under the deployment master key, via the audited
+/// ring-backed helper (`vortex_security::crypto`). The pre-auth token is signed
+/// with the same `master_key()` that seals TOTP secrets — so the pending-MFA
+/// cookie can't be forged to skip the second factor. `master_key()` warns
+/// loudly (and uses a dev key) if `VORTEX_SECRET_KEY` is unset; there is no
+/// silent, source-visible fallback key here.
 fn mfa_hmac(msg: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let key = mfa_token_key();
-    let mut k = [0u8; 64];
-    if key.len() > 64 {
-        k[..32].copy_from_slice(&Sha256::digest(&key));
-    } else {
-        k[..key.len()].copy_from_slice(&key);
-    }
-    let mut ipad = [0x36u8; 64];
-    let mut opad = [0x5cu8; 64];
-    for i in 0..64 {
-        ipad[i] ^= k[i];
-        opad[i] ^= k[i];
-    }
-    let inner = Sha256::new().chain_update(ipad).chain_update(msg.as_bytes()).finalize();
-    let outer = Sha256::new().chain_update(opad).chain_update(inner).finalize();
-    hex::encode(outer)
+    vortex_security::crypto::hmac_sha256_hex(&vortex_security::crypto::master_key(), msg.as_bytes())
 }
 
 /// Constant-time string equality — no early return on the first differing byte,
@@ -6483,6 +6463,15 @@ async fn change_password_submit(
         out.insert(header::LOCATION, "/auth/mfa".parse().unwrap());
         return (StatusCode::FOUND, out).into_response();
     }
+    // Enforce the MFA-required policy on this path too: arriving through the
+    // forced-change flow bypasses the login gate, so a non-enrolled user on an
+    // `mfa.required` deployment must not obtain a session by rotating their
+    // password.
+    if mfa_required(&db).await {
+        return error_response(
+            "Your administrator requires multi-factor authentication. Enrol using the Vortex mobile app, or contact your administrator.",
+        );
+    }
 
     // Password rotated — mint a session, exactly like a fresh login.
     let session_token = generate_session_token();
@@ -6512,6 +6501,19 @@ async fn change_password_submit(
         .bind(user.id)
         .execute(&db)
         .await;
+
+    // A session was minted here — record the LoginSuccess like every other
+    // session-mint path (the change-password flow only audited PasswordChange).
+    let mut ok_entry = AuditEntry::new(AuditAction::LoginSuccess, AuditSeverity::Info)
+        .with_user(vortex_common::UserId(user.id))
+        .with_username(&user.username)
+        .with_database(&db_name)
+        .with_resource("session", user.id.to_string())
+        .with_details(serde_json::json!({"database": db_name, "via": "password_change"}));
+    if let Some(ip) = &client_ip {
+        ok_entry = ok_entry.with_source_ip(ip.clone());
+    }
+    let _ = state.audit.log(ok_entry).await;
 
     let mut out = HeaderMap::new();
     out.insert(
@@ -6645,6 +6647,12 @@ async fn mfa_submit(
         .unwrap_or(false);
 
     if !ok {
+        // A wrong TOTP counts toward the same lock-out threshold as a wrong
+        // password, so a stolen pre-auth cookie can't be used to brute-force
+        // the 6-digit code (the shared per-IP limiter alone is not enough).
+        let locked_now =
+            note_failed_login(&state, &db, &db_name, user.id, &user.username, client_ip.as_deref())
+                .await;
         let mut entry = AuditEntry::new(AuditAction::MfaFailure, AuditSeverity::Warning)
             .with_user(vortex_common::UserId(user.id))
             .with_username(&user.username)
@@ -6654,6 +6662,10 @@ async fn mfa_submit(
             entry = entry.with_source_ip(ip.clone());
         }
         let _ = state.audit.log(entry).await;
+        if locked_now {
+            return Html(r#"<div class="alert alert-error text-sm"><span>Account locked after too many failed attempts. Contact your administrator.</span></div>"#)
+                .into_response();
+        }
         return Html(r#"<div class="alert alert-error text-sm"><span>Invalid code. Try again.</span></div>"#)
             .into_response();
     }
