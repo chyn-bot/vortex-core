@@ -1,0 +1,2 @@
+DROP TABLE IF EXISTS rule;
+DROP TABLE IF EXISTS rule_set;

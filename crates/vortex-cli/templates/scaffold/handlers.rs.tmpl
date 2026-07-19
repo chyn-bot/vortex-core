@@ -104,7 +104,16 @@ async fn list_items(
         <crate::model::__PASCAL__Item as vortex_plugin_sdk::orm::model::Model>::meta(),
     )
     .detail_url("/__KEBAB__/{id}")
-    .create("+ New", "/__KEBAB__/new");
+    .create("+ New", "/__KEBAB__/new")
+    // Scale-ready by default (paired with the indexes in the migration):
+    //  - estimate_count(): O(1) reltuples total for the unfiltered browse
+    //    instead of an O(rows) COUNT(*).
+    //  - search_prefilter(): index-served search via a base-table subquery so a
+    //    pg_trgm index can serve the leading-wildcard ILIKE.
+    // For a table expected to reach millions of rows, also add `.keyset()` —
+    // it swaps numbered pages for O(log n) Prev/Next cursor navigation.
+    .estimate_count()
+    .search_prefilter();
 
     let params = ListParams::from_query(&query);
     let table = match execute_list(&db, &config, &params).await {

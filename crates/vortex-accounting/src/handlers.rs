@@ -357,7 +357,7 @@ async fn list_moves(
              COALESCE(p.name, '') AS partner_name, m.move_type, m.state, \
              m.total_amount::text AS total_amount",
         )
-        .column(ListColumn::new("number", "Number").sortable().code().sql_expr("m.number"))
+        .column(ListColumn::new("number", "Number").sortable().searchable().code().sql_expr("m.number"))
         .column(
             ListColumn::new("journal_code", "Journal")
                 .sortable()
@@ -390,6 +390,11 @@ async fn list_moves(
         )
         .detail_url("/accounting/moves/{id}")
         .create("New Journal Entry", "/accounting/moves/new")
+        // Scale for large ledgers (indexes in migration 017): reltuples total,
+        // index-served search on number/ref via the base-table prefilter.
+        .estimate_count()
+        .search_prefilter()
+        .pk_expr("m.id")
         .default_sort("move_date")
         .group_by_options(&[("journal_code", "Journal"), ("state", "Status")]);
 

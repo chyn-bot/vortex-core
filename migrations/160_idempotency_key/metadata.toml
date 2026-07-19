@@ -1,0 +1,5 @@
+[migration]
+module = "core"
+description = "Generic idempotency-key guard (idempotency_key): once-only side-effects keyed on (scope, key)"
+reversible = true
+dependencies = ["159_batch_run"]

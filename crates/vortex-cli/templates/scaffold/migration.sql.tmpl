@@ -24,6 +24,19 @@ CREATE TABLE IF NOT EXISTS __SNAKE___item (
 
 CREATE INDEX IF NOT EXISTS idx___SNAKE___item_state ON __SNAKE___item(record_state);
 
+-- ── Scale-ready indexes (see the list config in handlers.rs) ──────────────
+-- Browse: the list sorts by name with an id tiebreaker; this index serves that
+-- ordering directly (Index Scan) instead of sorting the whole table per page.
+CREATE INDEX IF NOT EXISTS idx___SNAKE___item_name_id ON __SNAKE___item (name, id);
+-- Search: `search_prefilter()` runs `id IN (SELECT id FROM __SNAKE___item WHERE
+-- COALESCE(col::text,'') ILIKE $1 ...)`. A pg_trgm GIN index on the exact
+-- expression lets a leading-wildcard ILIKE use an index instead of a seq scan.
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+CREATE INDEX IF NOT EXISTS idx___SNAKE___item_name_trgm
+    ON __SNAKE___item USING gin ((COALESCE(name::text, '')) gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS idx___SNAKE___item_desc_trgm
+    ON __SNAKE___item USING gin ((COALESCE(description::text, '')) gin_trgm_ops);
+
 -- NOTE: the model registry (ir_model / ir_model_field) is populated from
 -- `#[derive(Model)]` via `Plugin::models()` on `db migrate` — not seeded here.
 

@@ -375,8 +375,20 @@ fn render_cell(row: &sqlx::postgres::PgRow, col: &super::config::ListColumn) -> 
 
 /// Render pagination controls.
 fn render_pagination(result: &ListResult, params: &ListParams, base_url: &str) -> String {
+    // Keyset lists navigate by cursor (Prev / Next) — no total, no page numbers.
+    if result.is_keyset() {
+        return render_keyset_pagination(result, params, base_url);
+    }
+
     let start = params.offset() + 1;
     let end = (params.offset() + params.page_size).min(result.total as u64);
+    // An estimated total is shown as approximate; the end of the current window
+    // can exceed a stale estimate, so clamp the label to at least `end`.
+    let total_label = if result.estimated {
+        format!("~{}", result.total.max(end as i64))
+    } else {
+        result.total.to_string()
+    };
 
     let mut html = String::new();
     html.push_str(&format!(
@@ -385,7 +397,7 @@ fn render_pagination(result: &ListResult, params: &ListParams, base_url: &str) -
 <div class="join">"#,
         start = start,
         end = end,
-        total = result.total,
+        total = total_label,
     ));
 
     // Previous
@@ -433,13 +445,58 @@ fn render_pagination(result: &ListResult, params: &ListParams, base_url: &str) -
     html
 }
 
+/// Cursor-based Prev/Next controls for keyset lists. `«` / `»` seek to the
+/// adjacent page via `?before=` / `?after=`; each is disabled when its cursor
+/// is absent (no adjacent page in that direction).
+fn render_keyset_pagination(result: &ListResult, params: &ListParams, base_url: &str) -> String {
+    let mut html = String::from(
+        r#"<div class="flex items-center justify-end p-4 text-sm text-base-content/60"><div class="join">"#,
+    );
+
+    match &result.prev_cursor {
+        Some(c) => {
+            let qs = params.to_query_with(&[("before", c.as_str())]);
+            html.push_str(&format!(
+                r#"<a href="{base_url}?{qs}" class="join-item btn btn-sm">«&nbsp;Prev</a>"#
+            ));
+        }
+        None => html.push_str(
+            r#"<button class="join-item btn btn-sm btn-disabled">«&nbsp;Prev</button>"#,
+        ),
+    }
+
+    match &result.next_cursor {
+        Some(c) => {
+            let qs = params.to_query_with(&[("after", c.as_str())]);
+            html.push_str(&format!(
+                r#"<a href="{base_url}?{qs}" class="join-item btn btn-sm">Next&nbsp;»</a>"#
+            ));
+        }
+        None => html.push_str(
+            r#"<button class="join-item btn btn-sm btn-disabled">Next&nbsp;»</button>"#,
+        ),
+    }
+
+    html.push_str("</div></div>");
+    html
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::list::config::ListColumn;
 
     fn empty_result(total: i64, page: u64, page_size: u64, total_pages: u64) -> ListResult {
-        ListResult { rows: Vec::new(), total, page, page_size, total_pages }
+        ListResult {
+            rows: Vec::new(),
+            total,
+            page,
+            page_size,
+            total_pages,
+            next_cursor: None,
+            prev_cursor: None,
+            estimated: false,
+        }
     }
 
     #[test]

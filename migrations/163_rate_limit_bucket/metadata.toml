@@ -1,0 +1,5 @@
+[migration]
+module = "core"
+description = "Shared rate-limit counter (rate_limit_bucket): fixed-window request counts keyed by (scope, client, window) so auth-endpoint limits hold across every app instance on one database — the last piece of per-instance request state, moved to Postgres for honest horizontal scale-out"
+reversible = true
+dependencies = ["162_rule_engine"]

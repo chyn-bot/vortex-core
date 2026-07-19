@@ -1,0 +1,5 @@
+[migration]
+module = "core"
+description = "Deterministic snapshot/freeze primitive (snapshot_set, snapshot_record): versioned immutable inputs for reproducible computation"
+reversible = true
+dependencies = ["160_idempotency_key"]

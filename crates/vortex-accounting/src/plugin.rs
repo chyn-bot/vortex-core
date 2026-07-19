@@ -40,6 +40,8 @@ const MIG_015_LINE_PRODUCT: &str =
     include_str!("../migrations/015_line_product/postgres.sql");
 const MIG_016_PAYMENT_TERMS: &str =
     include_str!("../migrations/016_payment_terms/postgres.sql");
+const MIG_017_SCALE_INDEXES: &str =
+    include_str!("../migrations/017_scale_indexes/postgres.sql");
 
 pub struct AccountingPlugin;
 
@@ -454,6 +456,17 @@ impl Plugin for AccountingPlugin {
                 name: "016_payment_terms",
                 up_sql: MIG_016_PAYMENT_TERMS,
                 down_sql: None,
+                requires_core_migration: Some("119_commerce_primitives"),
+            },
+            PluginMigration {
+                name: "017_scale_indexes",
+                up_sql: MIG_017_SCALE_INDEXES,
+                down_sql: Some(
+                    "DROP INDEX IF EXISTS idx_acc_move_movedate_id; \
+                     DROP INDEX IF EXISTS idx_acc_move_type_invdate_id; \
+                     DROP INDEX IF EXISTS idx_acc_move_number_trgm; \
+                     DROP INDEX IF EXISTS idx_acc_move_ref_trgm;",
+                ),
                 requires_core_migration: Some("119_commerce_primitives"),
             },
         ]

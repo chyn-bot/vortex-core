@@ -28,11 +28,13 @@
 //! ```
 
 pub mod blueprint;
+pub mod bulk;
 pub mod cache;
 pub mod commerce;
 pub mod connection;
 pub mod dialect;
 pub mod field;
+pub mod idempotency;
 pub mod migration;
 pub mod model;
 pub mod model_impl;

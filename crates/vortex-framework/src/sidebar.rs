@@ -62,6 +62,43 @@ pub fn build_sidebar(
 </aside>"##, nav_html, initials, user_name)
 }
 
+/// Render the "Custom Apps" sidebar section for Blueprint-authored models that
+/// opted into the menu (`blueprint.show_in_menu`). Returns an empty string when
+/// there are none, so callers can pass the result straight to
+/// [`build_sidebar`]'s `apps_html` slot. `active_model` marks the matching entry
+/// active. This is the framework-level source of truth; the host binary's own
+/// pages call it too.
+pub async fn custom_apps_nav(db: &sqlx::PgPool, active_model: &str) -> String {
+    let rows = sqlx::query_as::<_, (String, String)>(
+        "SELECT m.name, m.display_name \
+         FROM ir_model m JOIN blueprint b ON b.model_id = m.id \
+         WHERE m.source = 'blueprint' AND m.is_active = true \
+           AND b.status = 'active' AND b.show_in_menu = true \
+         ORDER BY m.display_name",
+    )
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+    if rows.is_empty() {
+        return String::new();
+    }
+    // One generic "cube" glyph for every custom app — Blueprint models don't
+    // carry a per-item sidebar icon yet.
+    const ICON: &str = r#"<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4"/></svg>"#;
+    let mut html = String::from(r#"<li class="menu-title mt-2">Custom Apps</li>"#);
+    for (name, label) in &rows {
+        let active = if name == active_model { " active" } else { "" };
+        html.push_str(&format!(
+            r#"<li><a href="/list/{name}" class="{active}">{icon}{label}</a></li>"#,
+            name = html_escape(name),
+            active = active,
+            icon = ICON,
+            label = html_escape(label),
+        ));
+    }
+    html
+}
+
 /// Render just the inner navigation `<li>` items (core + plugin), without
 /// the surrounding `<aside>` / user-footer chrome. The generic model views
 /// (list / kanban / graph / calendar / pivot) embed this inside their own
@@ -109,6 +146,11 @@ pub fn build_sidebar_nav(
         // hardcoded here alongside Audit/Users/Settings (it is not a plugin).
         let active = if active_page == "blueprints" { " active" } else { "" };
         nav_html.push_str(&format!(r##"<li><a href="/blueprints" class="{}"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"/></svg>Blueprints</a></li>"##, active));
+
+        // Batch Runs — generic batch-processing engine operations (progress,
+        // exception queue, retry). Admin-only host feature (core primitive).
+        let active = if active_page == "batch" { " active" } else { "" };
+        nav_html.push_str(&format!(r##"<li><a href="/batch/runs" class="{}"><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 10h16M4 14h10M4 18h10"/></svg>Batch Runs</a></li>"##, active));
     }
 
     // NOTE: the legacy hardcoded `if installed.contains("contacts")`

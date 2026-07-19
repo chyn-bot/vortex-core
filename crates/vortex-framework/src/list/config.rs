@@ -141,6 +141,32 @@ pub struct ListConfig {
     /// next to the create button. Typically `/pivot/<model>?rows=<field>`.
     /// Requires the model to be registered in `ir_model` / `ir_model_field`.
     pub pivot_url: Option<&'static str>,
+    /// Opt into keyset (cursor) pagination for large tables. When enabled and
+    /// the sort is a plain base-table column (no `custom_from` JOIN), the list
+    /// seeks by a `(sort, id)` cursor instead of `LIMIT/OFFSET` and drops the
+    /// `COUNT(*)` — so navigation stays O(log n) at any depth on millions of
+    /// rows, at the cost of Prev/Next navigation instead of numbered pages.
+    /// Falls back to OFFSET when not applicable.
+    pub keyset: bool,
+    /// Use a statistical row-count estimate (`pg_class.reltuples`) instead of an
+    /// exact `COUNT(*)` for the *unfiltered* total — the exact count is O(rows)
+    /// and dominates a large-table browse. Applies only when there is no base
+    /// filter, search, or column filter (any of those falls back to an exact
+    /// count, which is correct because it's cheap once the result set is small).
+    /// A never-analysed table also falls back to the exact count.
+    pub estimate_count: bool,
+    /// Route free-text search through an index-served prefilter on the base
+    /// table instead of an inline `ILIKE` OR across the (possibly JOINed) select
+    /// list. When set, search becomes `pk IN (SELECT id FROM table WHERE <OR of
+    /// base-column ILIKEs>)`, which a `pg_trgm` GIN index on each base column
+    /// can serve — a leading-wildcard `ILIKE` over a JOINed column otherwise
+    /// forces a full scan. JOINed search columns are excluded from the fast
+    /// path (search them via a filter instead). See [`Self::pk_expr`].
+    pub search_prefilter: bool,
+    /// The primary-key expression as referenced in the *outer* query — `"id"`
+    /// for a plain table, or the aliased form (e.g. `"c.id"`) when `custom_from`
+    /// introduces a table alias. Used by the search prefilter's `IN` clause.
+    pub pk_expr: &'static str,
 }
 
 impl ListConfig {
@@ -158,6 +184,10 @@ impl ListConfig {
             custom_from: None,
             custom_select: None,
             pivot_url: None,
+            keyset: false,
+            estimate_count: false,
+            search_prefilter: false,
+            pk_expr: "id",
         }
     }
 
@@ -209,6 +239,52 @@ impl ListConfig {
     pub fn pivot_url(mut self, url: &'static str) -> Self {
         self.pivot_url = Some(url);
         self
+    }
+
+    /// Opt into keyset (cursor) pagination — see [`ListConfig::keyset`]. Enable
+    /// for large tables where deep OFFSET paging would scan-and-discard.
+    pub fn keyset(mut self) -> Self {
+        self.keyset = true;
+        self
+    }
+
+    /// Use a `reltuples` estimate for the unfiltered total instead of an exact
+    /// `COUNT(*)` — see [`ListConfig::estimate_count`]. Enable for large tables.
+    pub fn estimate_count(mut self) -> Self {
+        self.estimate_count = true;
+        self
+    }
+
+    /// Route free-text search through an index-served base-table prefilter — see
+    /// [`ListConfig::search_prefilter`]. Pair with `pg_trgm` GIN indexes on the
+    /// searchable base columns.
+    pub fn search_prefilter(mut self) -> Self {
+        self.search_prefilter = true;
+        self
+    }
+
+    /// Set the outer-query primary-key expression (default `"id"`; use e.g.
+    /// `"c.id"` when `custom_from` aliases the base table). See [`ListConfig::pk_expr`].
+    pub fn pk_expr(mut self, expr: &'static str) -> Self {
+        self.pk_expr = expr;
+        self
+    }
+
+    /// Base-table field names of the searchable columns eligible for the search
+    /// prefilter: those that are real columns of `table` (no `sql_expr`, or an
+    /// `sql_expr` that is just the aliased base column, e.g. `c.name` for field
+    /// `name`). JOINed searchable columns (e.g. `co.name`) are excluded — the
+    /// prefilter subquery runs on the base table alone.
+    pub fn prefilter_search_fields(&self) -> Vec<&'static str> {
+        self.columns
+            .iter()
+            .filter(|c| c.searchable)
+            .filter(|c| match c.sql_expr {
+                None => true,
+                Some(expr) => expr.ends_with(&format!(".{}", c.field)),
+            })
+            .map(|c| c.field)
+            .collect()
     }
 
     /// Get searchable SQL expressions (uses `sql_expr` when set).

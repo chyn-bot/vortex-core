@@ -190,6 +190,15 @@ async fn list_contacts(
         .detail_url("/contacts/{id}")
         .create("New Contact", "/contacts/new")
         .pivot_url("/pivot/contacts?rows=contact_type")
+        // Large-table browse: use a reltuples estimate for the unfiltered total
+        // instead of a COUNT(*) over the JOIN (which dominates the request on
+        // big tenants). Filtered/searched views still get an exact count.
+        .estimate_count()
+        // Index-served search: prefilter on the base contacts columns (served by
+        // pg_trgm indexes, migration 009) instead of an inline ILIKE OR across
+        // the JOIN. Country is excluded from quick-search — filter by it instead.
+        .search_prefilter()
+        .pk_expr("c.id")
         .default_sort("name")
         .group_by_options(&[
             ("contact_type", "Type"),

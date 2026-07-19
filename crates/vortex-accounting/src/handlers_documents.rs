@@ -823,7 +823,13 @@ async fn document_list(
         .custom_from(from)
         .custom_select(select)
         .base_filter(type_filter)
-        .column(ListColumn::new("number", "Number").sortable().code().sql_expr("m.number"))
+        // Index-served search on the document number (indexes in migration 017).
+        // estimate_count is intentionally omitted: this list is filtered by
+        // move_type, so a whole-table reltuples estimate wouldn't apply — the
+        // (move_type, invoice_date, id) index serves the filtered browse.
+        .search_prefilter()
+        .pk_expr("m.id")
+        .column(ListColumn::new("number", "Number").sortable().searchable().code().sql_expr("m.number"))
         .column(ListColumn::new("partner_name", "Partner").sortable().searchable().sql_expr("p.name"))
         .column(ListColumn::new("invoice_date", "Date").sortable().sql_expr("m.invoice_date"))
         .column(ListColumn::new("due_date", "Due").sortable().sql_expr("m.due_date"))
