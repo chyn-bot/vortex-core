@@ -66,15 +66,27 @@ At the query level, deep pagination is likewise proven: on 200k rows with that
 index, a deep `OFFSET 175000` reads 175,025 rows (**~93 ms**) while a keyset seek to
 the same depth is **~0.18 ms** (`ListConfig::keyset()`).
 
-### Honest gaps
+### Search (also fixed)
 
-- **Search does not yet scale.** The list search ORs `ILIKE '%term%'` across several
-  columns *including a JOINed one* (`co.name`). A leading-wildcard `ILIKE` needs a
-  `pg_trgm` GIN index, and one unindexed OR branch forces a full seq scan of the
-  whole set (**~375 ms**, and it times out under load). Making search fast means: an
-  **expression** trigram index per searchable base column — `gin ((COALESCE(col::text,''))
-  gin_trgm_ops)` to match the framework's exact search predicate — *and* a decision on
-  the JOINed `co.name` column (index `countries.name` or drop it from the search set).
-  That "search prefilter" work is the next scalability item.
-- **Measure on real hardware + release build for headline numbers.** These are 2-vCPU
-  dev-box figures.
+The list search is a leading-wildcard `ILIKE '%term%'`, which a btree index can't
+serve; and it originally ORed across several columns *including a JOINed one*
+(`co.name`), so one unindexed branch forced a full seq scan (**~375 ms**, timing out
+under load). Two changes fixed it:
+
+- **`ListConfig::search_prefilter()`** rewrites search to `pk IN (SELECT id FROM
+  table WHERE <base-column ILIKEs>)` — the subquery runs on the base table so
+  trigram indexes apply, and the JOINed `co.name` is excluded from the fast path
+  (search it via a filter instead).
+- **Expression `pg_trgm` GIN indexes** on `COALESCE(col::text,'')` for each base
+  searchable column (contacts migration `009_search_indexes`), matching the
+  prefilter's exact predicate.
+
+| contacts search @ 200k rows | req/s (c=1…100) | p50 @ c=1 |
+|---|---|---|
+| before (inline OR, seq scan) | ~1 … 2 (times out ≥ c=50) | 662 ms |
+| **after (prefilter + trigram)** | **~181 … ~366** | **5 ms** |
+
+### Note
+
+Measure on real hardware + a release build for headline numbers — these are 2-vCPU
+dev-box figures.

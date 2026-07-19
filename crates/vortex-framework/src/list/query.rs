@@ -377,19 +377,46 @@ fn build_where(config: &ListConfig, params: &ListParams) -> (Vec<String>, Vec<St
         conditions.push(base.to_string());
     }
 
-    // Free-text search — ILIKE across all searchable columns (uses sql_expr for JOINed columns)
-    let searchable = config.searchable_exprs();
+    // Free-text search. Two forms:
+    // - Prefilter (opt-in): `pk IN (SELECT id FROM table WHERE <base-column
+    //   ILIKEs>)`. The subquery runs on the bare base table, so a `pg_trgm` GIN
+    //   index on each base column serves the leading-wildcard ILIKE. JOINed
+    //   search columns are excluded (a JOINed ILIKE branch would force a scan).
+    // - Inline (default): `ILIKE` OR across every searchable expression,
+    //   including JOINed ones — correct, but not index-served on large tables.
     if let Some(search) = &params.search {
-        if !searchable.is_empty() && !search.trim().is_empty() {
-            param_idx += 1;
-            let ilike_parts: Vec<String> = searchable
-                .iter()
-                .map(|expr| format!("COALESCE({}::text, '') ILIKE ${}", expr, param_idx))
-                .collect();
-            conditions.push(format!("({})", ilike_parts.join(" OR ")));
-            bind_values.push(format!("%{}%",
-                search.replace('%', "\\%").replace('_', "\\_")
-            ));
+        if !search.trim().is_empty() {
+            let escaped = format!("%{}%", search.replace('%', "\\%").replace('_', "\\_"));
+            let prefilter_fields = if config.search_prefilter {
+                config.prefilter_search_fields()
+            } else {
+                Vec::new()
+            };
+            if !prefilter_fields.is_empty() {
+                param_idx += 1;
+                let ors: Vec<String> = prefilter_fields
+                    .iter()
+                    .map(|f| format!("COALESCE({}::text, '') ILIKE ${}", f, param_idx))
+                    .collect();
+                conditions.push(format!(
+                    "{} IN (SELECT id FROM {} WHERE ({}))",
+                    config.pk_expr,
+                    config.table,
+                    ors.join(" OR ")
+                ));
+                bind_values.push(escaped);
+            } else {
+                let searchable = config.searchable_exprs();
+                if !searchable.is_empty() {
+                    param_idx += 1;
+                    let ilike_parts: Vec<String> = searchable
+                        .iter()
+                        .map(|expr| format!("COALESCE({}::text, '') ILIKE ${}", expr, param_idx))
+                        .collect();
+                    conditions.push(format!("({})", ilike_parts.join(" OR ")));
+                    bind_values.push(escaped);
+                }
+            }
         }
     }
 
@@ -698,6 +725,59 @@ mod tests {
     #[test]
     fn estimate_count_off_without_optin() {
         assert!(!build_list_sql(&contacts_config(), &ListParams::default()).estimate_count);
+    }
+
+    // ── Search prefilter ──────────────────────────────────────────────────
+
+    fn prefilter_config() -> ListConfig {
+        ListConfig::new("Contacts", "contacts")
+            .custom_from("contacts c LEFT JOIN countries co ON co.id = c.country_id")
+            .custom_select("c.id, c.name, co.name AS country_name")
+            .column(ListColumn::new("name", "Name").searchable().sql_expr("c.name"))
+            .column(ListColumn::new("email", "Email").searchable().sql_expr("c.email"))
+            .column(ListColumn::new("country_name", "Country").searchable().sql_expr("co.name"))
+            .default_sort("name")
+            .search_prefilter()
+            .pk_expr("c.id")
+    }
+
+    #[test]
+    fn search_prefilter_builds_base_subquery_excluding_joined() {
+        let params = params_with(|p| p.search = Some("ac".into()));
+        let sql = build_list_sql(&prefilter_config(), &params);
+        // Index-served IN over the BASE table, using base column names (not the
+        // aliased c.name), with the JOINed co.name column excluded.
+        assert!(sql.data_sql.contains(
+            "c.id IN (SELECT id FROM contacts WHERE (COALESCE(name::text, '') ILIKE $1 OR COALESCE(email::text, '') ILIKE $1))"
+        ), "got: {}", sql.data_sql);
+        assert!(!sql.data_sql.contains("co.name::text, '') ILIKE"), "JOINed column must be excluded");
+        assert_eq!(sql.binds, vec!["%ac%".to_string()]);
+        // Count and data must share the same prefilter.
+        assert!(sql.count_sql.contains("c.id IN (SELECT id FROM contacts WHERE"));
+    }
+
+    #[test]
+    fn search_prefilter_value_is_bound_never_interpolated() {
+        let params = params_with(|p| p.search = Some("'; DROP TABLE contacts; --".into()));
+        let sql = build_list_sql(&prefilter_config(), &params);
+        assert!(!sql.data_sql.to_uppercase().contains("DROP"));
+        assert_eq!(sql.binds, vec![r"%'; DROP TABLE contacts; --%".to_string()]);
+    }
+
+    #[test]
+    fn search_prefilter_falls_back_to_inline_without_base_fields() {
+        // Only a JOINed searchable column → no base field to prefilter on →
+        // fall back to the inline OR so search still works.
+        let cfg = ListConfig::new("X", "contacts")
+            .custom_from("contacts c LEFT JOIN countries co ON co.id = c.country_id")
+            .column(ListColumn::new("country_name", "Country").searchable().sql_expr("co.name"))
+            .default_sort("country_name")
+            .search_prefilter()
+            .pk_expr("c.id");
+        let params = params_with(|p| p.search = Some("ac".into()));
+        let sql = build_list_sql(&cfg, &params);
+        assert!(!sql.data_sql.contains("IN (SELECT id FROM"));
+        assert!(sql.data_sql.contains("COALESCE(co.name::text, '') ILIKE $1"));
     }
 
     #[test]
