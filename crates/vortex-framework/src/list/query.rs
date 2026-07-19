@@ -33,6 +33,9 @@ pub struct ListResult {
     pub next_cursor: Option<String>,
     /// Keyset cursor for the *previous* page. Feed back as `?before=`.
     pub prev_cursor: Option<String>,
+    /// `total` is a `reltuples` estimate, not an exact count (unfiltered browse
+    /// on an estimate-enabled list). The UI shows it as approximate (`~N`).
+    pub estimated: bool,
 }
 
 impl ListResult {
@@ -66,6 +69,9 @@ pub(crate) struct ListSql {
     /// True when this is a *backward* (`before`) keyset query: the rows come
     /// back in reversed order and must be flipped to display order.
     pub reversed: bool,
+    /// True when the total should come from a `reltuples` estimate rather than
+    /// running `count_sql` (unfiltered browse on an estimate-enabled list).
+    pub estimate_count: bool,
 }
 
 /// Resolve the effective sort expression and direction from params, falling
@@ -152,7 +158,10 @@ pub(crate) fn build_list_sql(config: &ListConfig, params: &ListParams) -> ListSq
                 "SELECT {} FROM {} {} ORDER BY {} LIMIT {}",
                 select_fields, from_clause, where_clause, order_clause, params.page_size + 1,
             );
-            return ListSql { count_sql: String::new(), data_sql, binds, keyset: true, reversed };
+            return ListSql {
+                count_sql: String::new(), data_sql, binds,
+                keyset: true, reversed, estimate_count: false,
+            };
         }
 
         // Keyset first page: no cursor, no offset, no count — just the head.
@@ -162,10 +171,16 @@ pub(crate) fn build_list_sql(config: &ListConfig, params: &ListParams) -> ListSq
             "SELECT {} FROM {} {} ORDER BY {} LIMIT {}",
             select_fields, from_clause, where_clause, order_clause, params.page_size + 1,
         );
-        return ListSql { count_sql: String::new(), data_sql, binds, keyset: true, reversed: false };
+        return ListSql {
+            count_sql: String::new(), data_sql, binds,
+            keyset: true, reversed: false, estimate_count: false,
+        };
     }
 
     // ── OFFSET path (default) ────────────────────────────────────────────
+    // A reltuples estimate is only valid for the whole table, so it applies
+    // only when nothing narrows the result (no base filter / search / filter).
+    let estimate_count = config.estimate_count && conditions.is_empty();
     let where_clause = assemble_where(&conditions);
     let count_sql = format!("SELECT COUNT(*) FROM {} {}", from_clause, where_clause);
     let order_clause = build_order_clause(config, params, false);
@@ -173,7 +188,7 @@ pub(crate) fn build_list_sql(config: &ListConfig, params: &ListParams) -> ListSq
         "SELECT {} FROM {} {} ORDER BY {} LIMIT {} OFFSET {}",
         select_fields, from_clause, where_clause, order_clause, params.page_size, params.offset(),
     );
-    ListSql { count_sql, data_sql, binds, keyset: false, reversed: false }
+    ListSql { count_sql, data_sql, binds, keyset: false, reversed: false, estimate_count }
 }
 
 /// Build the `ORDER BY` body (without the `ORDER BY` keyword).
@@ -233,16 +248,27 @@ pub async fn execute_list(
         return execute_keyset(pool, params, sql).await;
     }
 
-    let ListSql { count_sql, data_sql, binds, .. } = sql;
+    let ListSql { count_sql, data_sql, binds, estimate_count, .. } = sql;
 
-    let mut count_q = sqlx::query_scalar::<_, i64>(&count_sql);
-    for val in &binds {
-        count_q = count_q.bind(val);
-    }
-    let total = count_q
-        .fetch_one(pool)
+    // Unfiltered browse on an estimate-enabled list: use the planner's
+    // reltuples estimate (O(1)) instead of an exact COUNT(*) (O(rows)). A
+    // never-analysed table reports reltuples < 0 → fall back to the exact count.
+    let (total, estimated) = if estimate_count {
+        let est: Option<i64> = sqlx::query_scalar(
+            "SELECT reltuples::bigint FROM pg_class WHERE oid = to_regclass($1)",
+        )
+        .bind(config.table)
+        .fetch_optional(pool)
         .await
-        .map_err(|e| VortexError::QueryExecution(format!("list count: {e}")))?;
+        .ok()
+        .flatten();
+        match est {
+            Some(n) if n >= 0 => (n, true),
+            _ => (run_exact_count(pool, &count_sql, &binds).await?, false),
+        }
+    } else {
+        (run_exact_count(pool, &count_sql, &binds).await?, false)
+    };
 
     let mut data_q = sqlx::query(&data_sql);
     for val in &binds {
@@ -267,7 +293,20 @@ pub async fn execute_list(
         total_pages,
         next_cursor: None,
         prev_cursor: None,
+        estimated,
     })
+}
+
+/// Run the exact `COUNT(*)` for the list's WHERE clause.
+async fn run_exact_count(pool: &PgPool, count_sql: &str, binds: &[String]) -> VortexResult<i64> {
+    let mut count_q = sqlx::query_scalar::<_, i64>(count_sql);
+    for val in binds {
+        count_q = count_q.bind(val);
+    }
+    count_q
+        .fetch_one(pool)
+        .await
+        .map_err(|e| VortexError::QueryExecution(format!("list count: {e}")))
 }
 
 /// Keyset execution: run only the data query, trim the sentinel extra row,
@@ -319,6 +358,7 @@ async fn execute_keyset(pool: &PgPool, params: &ListParams, sql: ListSql) -> Vor
         page: params.page,
         page_size: params.page_size,
         total_pages: 0,
+        estimated: false,
         next_cursor,
         prev_cursor,
     })
@@ -633,6 +673,31 @@ mod tests {
         assert!(sql.data_sql.contains("ILIKE $1"));
         assert!(sql.data_sql.contains("id = $2::uuid"), "got: {}", sql.data_sql);
         assert_eq!(sql.binds, vec![r"%ac%".to_string(), CUR.to_string()]);
+    }
+
+    // ── Count estimate ────────────────────────────────────────────────────
+
+    #[test]
+    fn estimate_count_engages_only_when_unfiltered() {
+        let cfg = contacts_config().estimate_count();
+        // Unfiltered browse → estimate.
+        assert!(build_list_sql(&cfg, &ListParams::default()).estimate_count);
+        // A search narrows the set → exact count.
+        let searched = params_with(|p| p.search = Some("x".into()));
+        assert!(!build_list_sql(&cfg, &searched).estimate_count);
+        // A column filter → exact count.
+        let mut f = HashMap::new();
+        f.insert("contact_type".to_string(), "customer".to_string());
+        let filtered = params_with(|p| p.filters = f);
+        assert!(!build_list_sql(&cfg, &filtered).estimate_count);
+        // A base filter → exact count (the whole-table estimate wouldn't match).
+        let based = contacts_config().estimate_count().base_filter("active = true");
+        assert!(!build_list_sql(&based, &ListParams::default()).estimate_count);
+    }
+
+    #[test]
+    fn estimate_count_off_without_optin() {
+        assert!(!build_list_sql(&contacts_config(), &ListParams::default()).estimate_count);
     }
 
     #[test]

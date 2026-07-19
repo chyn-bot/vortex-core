@@ -148,6 +148,13 @@ pub struct ListConfig {
     /// rows, at the cost of Prev/Next navigation instead of numbered pages.
     /// Falls back to OFFSET when not applicable.
     pub keyset: bool,
+    /// Use a statistical row-count estimate (`pg_class.reltuples`) instead of an
+    /// exact `COUNT(*)` for the *unfiltered* total — the exact count is O(rows)
+    /// and dominates a large-table browse. Applies only when there is no base
+    /// filter, search, or column filter (any of those falls back to an exact
+    /// count, which is correct because it's cheap once the result set is small).
+    /// A never-analysed table also falls back to the exact count.
+    pub estimate_count: bool,
 }
 
 impl ListConfig {
@@ -166,6 +173,7 @@ impl ListConfig {
             custom_select: None,
             pivot_url: None,
             keyset: false,
+            estimate_count: false,
         }
     }
 
@@ -223,6 +231,13 @@ impl ListConfig {
     /// for large tables where deep OFFSET paging would scan-and-discard.
     pub fn keyset(mut self) -> Self {
         self.keyset = true;
+        self
+    }
+
+    /// Use a `reltuples` estimate for the unfiltered total instead of an exact
+    /// `COUNT(*)` — see [`ListConfig::estimate_count`]. Enable for large tables.
+    pub fn estimate_count(mut self) -> Self {
+        self.estimate_count = true;
         self
     }
 

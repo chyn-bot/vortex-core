@@ -382,6 +382,13 @@ fn render_pagination(result: &ListResult, params: &ListParams, base_url: &str) -
 
     let start = params.offset() + 1;
     let end = (params.offset() + params.page_size).min(result.total as u64);
+    // An estimated total is shown as approximate; the end of the current window
+    // can exceed a stale estimate, so clamp the label to at least `end`.
+    let total_label = if result.estimated {
+        format!("~{}", result.total.max(end as i64))
+    } else {
+        result.total.to_string()
+    };
 
     let mut html = String::new();
     html.push_str(&format!(
@@ -390,7 +397,7 @@ fn render_pagination(result: &ListResult, params: &ListParams, base_url: &str) -
 <div class="join">"#,
         start = start,
         end = end,
-        total = result.total,
+        total = total_label,
     ));
 
     // Previous
@@ -488,6 +495,7 @@ mod tests {
             total_pages,
             next_cursor: None,
             prev_cursor: None,
+            estimated: false,
         }
     }
 
