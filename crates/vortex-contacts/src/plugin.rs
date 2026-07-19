@@ -19,6 +19,7 @@ const MIG_006_CONTACT_WORKFLOW: &str =
     include_str!("../migrations/006_contact_workflow/postgres.sql");
 const MIG_007_CONTACT_APPROVALS: &str =
     include_str!("../migrations/007_contact_approvals/postgres.sql");
+const MIG_008_BROWSE_INDEX: &str = include_str!("../migrations/008_browse_index/postgres.sql");
 
 pub struct ContactsPlugin;
 
@@ -118,6 +119,12 @@ impl Plugin for ContactsPlugin {
                 up_sql: MIG_007_CONTACT_APPROVALS,
                 down_sql: None,
                 requires_core_migration: Some("126_approvals"),
+            },
+            PluginMigration {
+                name: "008_browse_index",
+                up_sql: MIG_008_BROWSE_INDEX,
+                down_sql: Some("DROP INDEX IF EXISTS idx_contacts_name_id;"),
+                requires_core_migration: Some("010_contacts"),
             },
         ]
     }

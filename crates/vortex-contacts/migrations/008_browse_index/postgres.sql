@@ -1,0 +1,16 @@
+-- Browse-ordering index for the contacts list.
+--
+-- The list sorts by name with an id tiebreaker (`ORDER BY name, id`). Without a
+-- matching index Postgres sorts the whole table on every page — a top-N heapsort
+-- over the full table (measured: ~92 ms of a request's time on 200k rows, and it
+-- only gets worse). This index makes the ordering index-served (Index Scan, no
+-- sort — ~1 ms), which is what lets the browse hold up under concurrency.
+--
+-- Note: the pre-existing `(company_id, name)` index cannot serve `ORDER BY name`
+-- because company_id is the leading column and the list query does not filter by
+-- it. This composite leads with the sort key + the pk tiebreaker.
+--
+-- On a very large existing table, build this out-of-band with CREATE INDEX
+-- CONCURRENTLY instead (it cannot run inside a migration transaction), then mark
+-- the migration applied.
+CREATE INDEX IF NOT EXISTS idx_contacts_name_id ON contacts (name, id);

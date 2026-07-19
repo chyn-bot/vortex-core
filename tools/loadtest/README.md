@@ -44,26 +44,37 @@ the default `debug` build. Always load-test a release binary.
 A real list/search endpoint measures the whole stack (auth → policy → query →
 render) and is what actually bounds concurrent users.
 
-## Reference measurements (2-vCPU dev box, **debug** build — indicative only)
+## Reference measurements (2-vCPU dev box, contacts @ 200k rows)
 
-| Endpoint | Throughput ceiling | Latency behaviour |
+The contacts **browse**, tuned step by step, shows what each fix is worth:
+
+| Configuration | req/s (c=1 … c=100) | p50 @ c=1 |
 |---|---|---|
-| `/health` (no DB) | ~2,300 req/s, 0 errors | p50 0.7 ms → 85 ms at c=200 |
-| `/contacts` list, 200k rows (JOIN + `COUNT(*)`, **no keyset**) | ~5–14 req/s | p50 200 ms → 6.7 s at c=50 |
+| debug, no index, exact `COUNT(*)` | ~5 … 14 | 200 ms |
+| release, no index, `COUNT(*)` | ~7 … 26 | 141 ms |
+| **release, `+ estimate_count() + index(name,id)`** | **~394 … ~1,000** | **2 ms** |
 
-The second row is the honest cautionary data point: the current contacts list runs
-a `COUNT(*)` over a 200k-row JOIN on every request, which is O(rows) and does not
-scale — this is precisely the path keyset pagination + a count estimate are meant
-to replace. At the query level that fix is already proven:
+Two changes carried that ~40× throughput / ~64× latency improvement:
 
-```
--- 200k rows, index on (name, id):
-Deep OFFSET (175000):  ~93 ms   (Index Only Scan reads 175,025 rows)
-Keyset seek to depth:  ~0.18 ms (pk-index boundary lookup + ROW(name,id) > ROW(...))
-```
+- **`ListConfig::estimate_count()`** — replaces the exact `COUNT(*)` over the JOIN
+  (measured **59 ms**) with a `pg_class.reltuples` estimate (**1.8 ms**).
+- **An index on `(name, id)`** matching `ORDER BY name, id` — turns a top-N
+  heapsort over the whole table (**92 ms**) into an Index Scan (**1.1 ms**). Shipped
+  as contacts migration `008_browse_index`.
 
-**Bottom line:** the list framework *has* keyset (see `ListConfig::keyset()`), and
-it's O(log n) at any depth — but no high-volume production list is wired to it yet
-(contacts is blocked by its JOIN). Wiring keyset + a `(sort_col, id)` index into a
-plain-table list, on a release build and real hardware, is the step that turns
-these component numbers into a defensible end-to-end "N concurrent users" figure.
+At the query level, deep pagination is likewise proven: on 200k rows with that
+index, a deep `OFFSET 175000` reads 175,025 rows (**~93 ms**) while a keyset seek to
+the same depth is **~0.18 ms** (`ListConfig::keyset()`).
+
+### Honest gaps
+
+- **Search does not yet scale.** The list search ORs `ILIKE '%term%'` across several
+  columns *including a JOINed one* (`co.name`). A leading-wildcard `ILIKE` needs a
+  `pg_trgm` GIN index, and one unindexed OR branch forces a full seq scan of the
+  whole set (**~375 ms**, and it times out under load). Making search fast means: an
+  **expression** trigram index per searchable base column — `gin ((COALESCE(col::text,''))
+  gin_trgm_ops)` to match the framework's exact search predicate — *and* a decision on
+  the JOINed `co.name` column (index `countries.name` or drop it from the search set).
+  That "search prefilter" work is the next scalability item.
+- **Measure on real hardware + release build for headline numbers.** These are 2-vCPU
+  dev-box figures.
