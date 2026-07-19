@@ -2695,11 +2695,12 @@ fn build_router(state: Arc<AppState>) -> Router {
     // Layer order mirrors the login routes: `Extension` outermost so the
     // rate-limit middleware can read the limiter; the context middleware is a
     // `route_layer` (inner) so the pool is present when the handler runs.
-    let intake_limiter = RateLimiter::new(RateLimitConfig {
+    let intake_limiter = RateLimiter::postgres(RateLimitConfig {
         max_requests: 20,
         window: std::time::Duration::from_secs(60),
         per_user: false,
-    });
+    }, state.pool.pool().clone(), "intake");
+    intake_limiter.spawn_pruner();
     let intake_public = Router::new()
         .route("/i/{slug}", get(intake_form_page).post(intake_submit))
         // Allow file uploads (axum's default body limit is 2 MB).
@@ -2709,11 +2710,12 @@ fn build_router(state: Arc<AppState>) -> Router {
         .layer(Extension(intake_limiter));
 
     // Login-specific rate limiter: 5 attempts per 60 seconds per IP
-    let login_limiter = RateLimiter::new(RateLimitConfig {
+    let login_limiter = RateLimiter::postgres(RateLimitConfig {
         max_requests: 5,
         window: std::time::Duration::from_secs(60),
         per_user: false,
-    });
+    }, state.pool.pool().clone(), "login");
+    login_limiter.spawn_pruner();
 
     // Rate-limited login route. The `Extension` must be the outermost layer
     // (added last) so the rate-limit middleware can read the `RateLimiter`
@@ -2737,11 +2739,12 @@ fn build_router(state: Arc<AppState>) -> Router {
     // Public, rate-limited mobile auth: credential login + refresh rotation.
     // These MUST stay outside `api_auth_middleware` (they mint the very token
     // that middleware requires). Static paths outrank `/api/v1/{model}`.
-    let mobile_auth_limiter = RateLimiter::new(RateLimitConfig {
+    let mobile_auth_limiter = RateLimiter::postgres(RateLimitConfig {
         max_requests: 10,
         window: std::time::Duration::from_secs(60),
         per_user: false,
-    });
+    }, state.pool.pool().clone(), "mobile_auth");
+    mobile_auth_limiter.spawn_pruner();
     let mobile_auth_public = Router::new()
         .route("/api/v1/auth/login", post(mobile_login))
         .route("/api/v1/auth/mfa/enroll", post(mobile_mfa_enroll))
@@ -2790,11 +2793,12 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route_layer(middleware::from_fn_with_state(state.clone(), portal_auth_middleware));
 
     // Public portal login (pre-auth), rate-limited like the staff login.
-    let portal_login_limiter = RateLimiter::new(RateLimitConfig {
+    let portal_login_limiter = RateLimiter::postgres(RateLimitConfig {
         max_requests: 5,
         window: std::time::Duration::from_secs(60),
         per_user: false,
-    });
+    }, state.pool.pool().clone(), "portal_login");
+    portal_login_limiter.spawn_pruner();
     let portal_public = Router::new()
         .route("/portal/login", get(portal_login_page).post(portal_login_submit))
         // Invite acceptance (set-password) is pre-auth, like login.
