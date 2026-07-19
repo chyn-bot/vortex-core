@@ -1,0 +1,19 @@
+[package]
+name = "vortex-loadtest"
+version = "0.1.0"
+edition = "2021"
+description = "Standalone HTTP load harness for Vortex Core — ramps concurrency and reports latency percentiles + throughput."
+
+# Detached from the parent workspace so it never affects the product build.
+[workspace]
+
+[[bin]]
+name = "vortex-loadtest"
+path = "main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "cookies"] }
+
+[profile.release]
+opt-level = 3
