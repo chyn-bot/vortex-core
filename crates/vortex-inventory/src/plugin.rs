@@ -18,6 +18,8 @@ const MIG_006_PRODUCT_DEFAULTS: &str =
     include_str!("../migrations/006_product_defaults/postgres.sql");
 const MIG_007_LIST_PRICE: &str =
     include_str!("../migrations/007_list_price/postgres.sql");
+const MIG_008_SCALE_INDEXES: &str =
+    include_str!("../migrations/008_scale_indexes/postgres.sql");
 
 pub struct InventoryPlugin;
 
@@ -202,6 +204,15 @@ impl Plugin for InventoryPlugin {
                 name: "007_list_price",
                 up_sql: MIG_007_LIST_PRICE,
                 down_sql: None,
+                requires_core_migration: Some("119_commerce_primitives"),
+            },
+            PluginMigration {
+                name: "008_scale_indexes",
+                up_sql: MIG_008_SCALE_INDEXES,
+                down_sql: Some(
+                    "DROP INDEX IF EXISTS idx_stock_move_reference_id; \
+                     DROP INDEX IF EXISTS idx_stock_move_reference_trgm;",
+                ),
                 requires_core_migration: Some("119_commerce_primitives"),
             },
         ]

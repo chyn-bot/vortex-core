@@ -1884,7 +1884,7 @@ async fn list_moves(
              sl.code AS source_code, dl.code AS dest_code, m.state, \
              m.scheduled_date::text AS scheduled_date",
         )
-        .column(ListColumn::new("reference", "Reference").sortable().code().sql_expr("m.reference"))
+        .column(ListColumn::new("reference", "Reference").sortable().searchable().code().sql_expr("m.reference"))
         .column(ListColumn::new("product_name", "Product").searchable().sql_expr("p.name"))
         .column(ListColumn::new("quantity", "Qty").sql_expr("m.quantity"))
         .column(ListColumn::new("lot_name", "Lot/Serial").code().searchable().sql_expr("lo.name"))
@@ -1906,6 +1906,11 @@ async fn list_moves(
                 .sql_expr("m.state"),
         )
         .create("New Move", "/inventory/moves/new")
+        // Scale for high-volume movement history (indexes in migration 008):
+        // reltuples total + index-served search on the move reference.
+        .estimate_count()
+        .search_prefilter()
+        .pk_expr("m.id")
         .default_sort("reference")
         .group_by_options(&[("state", "Status")]);
 
