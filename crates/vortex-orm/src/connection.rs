@@ -119,6 +119,10 @@ pub struct ConnectionPool {
     inner: Arc<PoolInner>,
     dialect: Arc<dyn SqlDialect>,
     config: DatabaseConfig,
+    /// Optional process-local record cache (Grid). Attached per-pool so cache
+    /// keys are naturally scoped to this database — the same `(model, pk)` in
+    /// two tenant databases never collide. `None` = caching off for this pool.
+    cache: Option<Arc<crate::cache::RecordCache>>,
 }
 
 impl ConnectionPool {
@@ -184,6 +188,7 @@ impl ConnectionPool {
             inner: Arc::new(inner),
             dialect,
             config,
+            cache: None,
         })
     }
 
@@ -195,7 +200,22 @@ impl ConnectionPool {
             inner: Arc::new(PoolInner::Postgres(pool)),
             dialect: Arc::new(PostgresDialect),
             config,
+            cache: None,
         }
+    }
+
+    /// Attach a process-local record cache (Grid) to this pool. Consumes and
+    /// returns `self` so it composes with the constructors. The ORM read path
+    /// (`find`) consults it read-through and the write path (`save`/`delete`)
+    /// invalidates it, both gated by the cache's per-model opt-in allowlist.
+    pub fn with_cache(mut self, cache: Arc<crate::cache::RecordCache>) -> Self {
+        self.cache = Some(cache);
+        self
+    }
+
+    /// The record cache attached to this pool, if any.
+    pub fn cache(&self) -> Option<&Arc<crate::cache::RecordCache>> {
+        self.cache.as_ref()
     }
 
     /// Get the SQL dialect for this connection

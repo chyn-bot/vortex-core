@@ -1784,8 +1784,28 @@ pub async fn run(host: String, port: u16, _workers: Option<usize>) -> Result<()>
     // Seed core roles if they don't exist
     seed_core_roles(&db).await;
 
+    // ─── Record cache (Grid) ──────────────────────────────────────────
+    // Process-local read-through cache, default OFF. Enabled per
+    // deployment via VORTEX_CACHE_ENABLED + a per-model opt-in allowlist
+    // (VORTEX_CACHE_MODELS). Attached per-pool so keys are DB-scoped; the
+    // pool manager applies the same policy to lazily-created tenant pools.
+    let record_cache_config = vortex_orm::cache::CacheConfig::from_env();
+    if let Some(cfg) = &record_cache_config {
+        info!(
+            "Record cache (Grid) ENABLED — {} model(s) opted in, ttl {}s, max {} entries",
+            cfg.models.len(),
+            cfg.ttl.as_secs(),
+            cfg.max_entries,
+        );
+    }
+
     // Create connection pool wrapper for plugin handlers
-    let pool = Arc::new(ConnectionPool::from_pg_pool(db.clone(), &database_url));
+    let mut primary_pool = ConnectionPool::from_pg_pool(db.clone(), &database_url);
+    if let Some(cfg) = &record_cache_config {
+        primary_pool =
+            primary_pool.with_cache(Arc::new(vortex_orm::cache::RecordCache::new(cfg.clone())));
+    }
+    let pool = Arc::new(primary_pool);
 
     // ─── WORM Audit Ledger (Phase 0.1 + Phase 0.7 KMS) ─────────────────
     // Phase 0.1 shipped with an env-var-backed Ed25519 signer. Phase
@@ -1868,8 +1888,10 @@ pub async fn run(host: String, port: u16, _workers: Option<usize>) -> Result<()>
             global_max_connections: global_budget,
             ..PoolManagerConfig::default()
         };
-        let pm = Arc::new(DatabasePoolManager::new(config));
-        // Register the default database pool
+        let pm = Arc::new(
+            DatabasePoolManager::new(config).with_cache_config(record_cache_config.clone()),
+        );
+        // Register the default database pool (already carries its own cache).
         pm.register_pool(&default_db, pool.clone()).await;
         pm
     } else {

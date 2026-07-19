@@ -1,6 +1,6 @@
 //! Record caching with intelligent invalidation
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -70,6 +70,11 @@ pub struct CacheConfig {
     pub ttl: Duration,
     /// Cleanup interval
     pub cleanup_interval: Duration,
+    /// Per-model opt-in allowlist. Read-through caching is applied **only**
+    /// to models named here. Empty = cache nothing (the safe default), which
+    /// keeps audit/session/token tables out of the cache unless a deployment
+    /// deliberately opts them in.
+    pub models: HashSet<String>,
 }
 
 impl Default for CacheConfig {
@@ -78,7 +83,51 @@ impl Default for CacheConfig {
             max_entries: 10_000,
             ttl: Duration::from_secs(300), // 5 minutes
             cleanup_interval: Duration::from_secs(60),
+            models: HashSet::new(),
         }
+    }
+}
+
+impl CacheConfig {
+    /// Build a cache configuration from environment, or `None` when caching is
+    /// disabled (the default). This is the global kill-switch:
+    ///
+    /// - `VORTEX_CACHE_ENABLED` — `1`/`true`/`yes`/`on` turns the record cache
+    ///   on. Absent or anything else → `None` (caching off).
+    /// - `VORTEX_CACHE_MODELS` — comma-separated per-model opt-in allowlist
+    ///   (`ir_model.name` values). Nothing is cached until a model is listed.
+    /// - `VORTEX_CACHE_TTL_SECS` / `VORTEX_CACHE_MAX_ENTRIES` — optional tuning.
+    ///
+    /// The cache is process-local; do not enable it across multiple app
+    /// instances without cross-process invalidation (see the pool's
+    /// `LISTEN/NOTIFY` invalidation wiring).
+    pub fn from_env() -> Option<Self> {
+        let enabled = std::env::var("VORTEX_CACHE_ENABLED")
+            .ok()
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false);
+        if !enabled {
+            return None;
+        }
+        let mut cfg = Self::default();
+        if let Ok(models) = std::env::var("VORTEX_CACHE_MODELS") {
+            cfg.models = models
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+        }
+        if let Ok(ttl) = std::env::var("VORTEX_CACHE_TTL_SECS") {
+            if let Ok(n) = ttl.parse::<u64>() {
+                cfg.ttl = Duration::from_secs(n);
+            }
+        }
+        if let Ok(max) = std::env::var("VORTEX_CACHE_MAX_ENTRIES") {
+            if let Ok(n) = max.parse::<usize>() {
+                cfg.max_entries = n;
+            }
+        }
+        Some(cfg)
     }
 }
 
@@ -117,6 +166,18 @@ impl RecordCache {
             config,
             stats: RwLock::new(CacheStats::default()),
         }
+    }
+
+    /// Whether records of `model` are eligible for read-through caching, per
+    /// the per-model opt-in allowlist. Callers must gate `get`/`put` on this so
+    /// that non-opted-in models (audit, sessions, tokens) are never cached.
+    pub fn is_cacheable(&self, model: &str) -> bool {
+        self.config.models.contains(model)
+    }
+
+    /// The configuration this cache was built with.
+    pub fn config(&self) -> &CacheConfig {
+        &self.config
     }
 
     /// Get a record from cache
@@ -296,5 +357,84 @@ impl DependencyTracker {
 impl Default for DependencyTracker {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cache_with(models: &[&str]) -> RecordCache {
+        let mut cfg = CacheConfig::default();
+        cfg.models = models.iter().map(|s| s.to_string()).collect();
+        RecordCache::new(cfg)
+    }
+
+    fn rec(name: &str) -> HashMap<String, FieldValue> {
+        let mut m = HashMap::new();
+        m.insert("name".to_string(), FieldValue::String(name.to_string()));
+        m
+    }
+
+    #[tokio::test]
+    async fn miss_then_put_then_hit() {
+        let cache = cache_with(&["Widget"]);
+        let key = RecordKey::new("Widget", "1");
+
+        assert!(cache.get(&key).await.is_none());
+        cache.put(key.clone(), rec("v1")).await;
+        let hit = cache.get(&key).await.expect("should hit");
+        assert_eq!(hit.get("name"), Some(&FieldValue::String("v1".into())));
+
+        let stats = cache.stats().await;
+        assert_eq!(stats.hits, 1);
+        assert_eq!(stats.misses, 1);
+    }
+
+    #[tokio::test]
+    async fn invalidate_removes_entry() {
+        let cache = cache_with(&["Widget"]);
+        let key = RecordKey::new("Widget", "1");
+        cache.put(key.clone(), rec("v1")).await;
+        cache.invalidate(&key).await;
+        assert!(cache.get(&key).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn company_scoping_isolates_keys() {
+        let cache = cache_with(&["Widget"]);
+        let a = RecordKey::new("Widget", "1").with_company("aaaaaaaa-0000-0000-0000-000000000001");
+        let b = RecordKey::new("Widget", "1").with_company("bbbbbbbb-0000-0000-0000-000000000002");
+        cache.put(a.clone(), rec("tenant-a")).await;
+        assert!(cache.get(&b).await.is_none(), "other tenant must not see it");
+        assert_eq!(
+            cache.get(&a).await.and_then(|v| v.get("name").cloned()),
+            Some(FieldValue::String("tenant-a".into()))
+        );
+    }
+
+    #[test]
+    fn is_cacheable_respects_allowlist() {
+        let cache = cache_with(&["Widget", "Gadget"]);
+        assert!(cache.is_cacheable("Widget"));
+        assert!(cache.is_cacheable("Gadget"));
+        assert!(!cache.is_cacheable("audit_log"));
+        // Empty allowlist (the default) caches nothing.
+        let none = RecordCache::new(CacheConfig::default());
+        assert!(!none.is_cacheable("Widget"));
+    }
+
+    #[tokio::test]
+    async fn expired_entry_is_a_miss() {
+        let mut cfg = CacheConfig::default();
+        cfg.ttl = Duration::from_millis(0); // everything is immediately stale
+        cfg.models = ["Widget".to_string()].into_iter().collect();
+        let cache = RecordCache::new(cfg);
+        let key = RecordKey::new("Widget", "1");
+        cache.put(key.clone(), rec("v1")).await;
+        // ttl == 0 → is_expired is true on the next read.
+        assert!(cache.get(&key).await.is_none());
+        let stats = cache.stats().await;
+        assert_eq!(stats.expirations, 1);
     }
 }

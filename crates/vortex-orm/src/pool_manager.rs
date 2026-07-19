@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
+use crate::cache::{CacheConfig, RecordCache};
 use crate::connection::{ConnectionPool, DatabaseConfig};
 use vortex_common::{VortexError, VortexResult};
 
@@ -101,6 +102,10 @@ pub struct DatabasePoolManager {
     /// requests for a new tenant produce one pool, not several.
     /// std Mutex: never held across an await.
     creating: Mutex<HashMap<String, u32>>,
+    /// Record-cache policy (Grid). When `Some`, every pool this manager
+    /// creates gets its own `RecordCache` built from this config. `None`
+    /// (the default) leaves caching off.
+    cache_config: Option<CacheConfig>,
 }
 
 impl DatabasePoolManager {
@@ -110,7 +115,22 @@ impl DatabasePoolManager {
             config,
             pools: RwLock::new(HashMap::new()),
             creating: Mutex::new(HashMap::new()),
+            cache_config: None,
         }
+    }
+
+    /// Set the record-cache policy applied to every pool this manager creates.
+    /// `None` disables caching (the default). See [`CacheConfig::from_env`].
+    pub fn with_cache_config(mut self, cache_config: Option<CacheConfig>) -> Self {
+        self.cache_config = cache_config;
+        self
+    }
+
+    /// Build a fresh per-pool record cache from the manager's policy, if set.
+    fn new_cache(&self) -> Option<Arc<RecordCache>> {
+        self.cache_config
+            .as_ref()
+            .map(|cfg| Arc::new(RecordCache::new(cfg.clone())))
     }
 
     /// Create a pool manager that wraps a single existing pool (backward-compatible mode).
@@ -130,6 +150,7 @@ impl DatabasePoolManager {
             config: PoolManagerConfig::default(),
             pools: RwLock::new(pools),
             creating: Mutex::new(HashMap::new()),
+            cache_config: None,
         }
     }
 
@@ -223,7 +244,11 @@ impl DatabasePoolManager {
 
             // Reservation stays alive across the connect so concurrent
             // budget math counts it; its Drop releases it on any exit.
-            let pool = Arc::new(ConnectionPool::new(db_config).await?);
+            let mut pool = ConnectionPool::new(db_config).await?;
+            if let Some(cache) = self.new_cache() {
+                pool = pool.with_cache(cache);
+            }
+            let pool = Arc::new(pool);
 
             let mut pools = self.pools.write().await;
             // A pool may have been registered while we were connecting

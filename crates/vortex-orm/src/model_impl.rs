@@ -297,6 +297,18 @@ impl<M: Model> ModelExt for M {
         let pk_value = pk.into();
         let dialect = pool.dialect();
 
+        // Read-through cache (Grid). Company scope on the key mirrors the
+        // tenant filter below: keyed by company only for multi-tenant models.
+        let cache_company = if meta.multi_tenant { ctx.company_id.as_ref() } else { None };
+        let cache_key = make_cache_key(meta, &pk_value, cache_company);
+        if let Some(cache) = pool.cache() {
+            if cache.is_cacheable(&meta.name) {
+                if let Some(values) = cache.get(&cache_key).await {
+                    return Ok(Some(M::from_values(values)?));
+                }
+            }
+        }
+
         // Build SELECT query with tenant filter
         let mut sql = format!(
             "SELECT {} FROM {} WHERE {} = $1",
@@ -337,6 +349,12 @@ impl<M: Model> ModelExt for M {
         match row_opt {
             Some(row) => {
                 let values = row_to_values(&row, meta);
+                // Populate the cache on miss so the next read is served hot.
+                if let Some(cache) = pool.cache() {
+                    if cache.is_cacheable(&meta.name) {
+                        cache.put(cache_key, values.clone()).await;
+                    }
+                }
                 let model = M::from_values(values)?;
                 Ok(Some(model))
             }
@@ -488,6 +506,18 @@ impl<M: Model> ModelExt for M {
             self.after_update(ctx).await?;
         }
 
+        // Invalidate the cache after a successful write. Uses the post-write
+        // pk (INSERT may have assigned a generated key) so the next read misses
+        // and repopulates from the row of record. Invalidate-on-write, not
+        // write-through, keeps the cache from ever holding a half-computed row.
+        if let Some(cache) = pool.cache() {
+            if cache.is_cacheable(&meta.name) {
+                let company = if meta.multi_tenant { self.company_id() } else { None };
+                let key = make_cache_key(meta, &self.pk(), company.as_ref());
+                cache.invalidate(&key).await;
+            }
+        }
+
         Ok(())
     }
 
@@ -546,6 +576,16 @@ impl<M: Model> ModelExt for M {
                     model: meta.name.clone(),
                     id: field_value_to_record_id(&pk_value),
                 });
+            }
+        }
+
+        // Drop the deleted (or soft-deleted) record from the cache so a stale
+        // copy can't outlive it.
+        if let Some(cache) = pool.cache() {
+            if cache.is_cacheable(&meta.name) {
+                let company = if meta.multi_tenant { self.company_id() } else { None };
+                let key = make_cache_key(meta, &pk_value, company.as_ref());
+                cache.invalidate(&key).await;
             }
         }
 
