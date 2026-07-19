@@ -2487,6 +2487,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/chatter/attachments/{id}", delete(chatter_delete_attachment))
         // Activity types management
         .route("/settings", get(settings_index))
+        .route("/settings/sizing", get(settings_sizing_page))
         .route("/audit", get(audit_log_page))
         .route("/notifications", get(notifications_page))
         .route("/settings/custom-fields", get(custom_fields_list))
@@ -16201,6 +16202,180 @@ async fn notifications_page(
 // Settings Index
 // ============================================================================
 
+/// Admin-only server-sizing estimator (Settings ▸ Server Sizing). A client-side
+/// calculator: given concurrent users + per-user activity + workload mix, it
+/// extrapolates the app + PostgreSQL footprint from Vortex's load-tested
+/// throughput. No server state — the model runs entirely in the browser.
+async fn settings_sizing_page(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+) -> Response {
+    if !user.is_admin() {
+        return (StatusCode::FORBIDDEN, Html("<h1 class=\"p-8\">Admins only.</h1>")).into_response();
+    }
+    let display_name = user.full_name.as_deref().unwrap_or(&user.username);
+    let initials = get_initials(display_name);
+    let apps = custom_apps_nav(db_ctx.pool.pool(), "").await;
+    let sidebar = build_sidebar(
+        "settings",
+        display_name,
+        &initials,
+        &db_ctx.installed_modules,
+        user.is_admin(),
+        &state.plugin_registry,
+        &user.roles,
+        &apps,
+    );
+    let body = format!("{}{}", SIZING_BODY, SIZING_SCRIPT);
+    Html(vortex_framework::render_app_shell("Server Sizing - Remicle", &sidebar, &body))
+        .into_response()
+}
+
+const SIZING_BODY: &str = r##"<div class="max-w-4xl mx-auto">
+  <div class="mb-6">
+    <a href="/settings" class="text-sm link link-hover opacity-70">← Settings</a>
+    <h1 class="text-2xl font-bold mt-1">Server Sizing</h1>
+    <p class="text-sm opacity-70 mt-1 max-w-2xl">Estimate the app and database hardware for a given user load, extrapolated from Vortex Core's load-tested throughput. Vortex is a single async Rust binary using all cores — it is <span class="text-success font-medium">throughput-bound, not worker-bound</span> — so sizing follows measured requests/second, with the per-user request rate as the assumption you control.</p>
+  </div>
+
+  <div class="card bg-base-100 shadow mb-6"><div class="card-body">
+    <h2 class="card-title text-base mb-2">Your workload</h2>
+
+    <div class="mb-5">
+      <label class="flex justify-between items-baseline text-sm font-semibold mb-1"><span>Concurrent active users (peak)</span><span class="text-success font-mono text-base" id="usersVal">500</span></label>
+      <input type="range" id="users" min="10" max="50000" step="10" value="500" class="range range-success range-sm">
+      <input type="number" id="usersNum" min="1" max="500000" value="500" class="input input-bordered input-sm w-32 mt-2 font-mono">
+      <span class="text-xs opacity-60 ml-2">people using the system at the same time</span>
+    </div>
+
+    <div class="mb-5">
+      <label class="text-sm font-semibold mb-2 block">Per-user activity</label>
+      <div class="flex flex-wrap gap-2" id="activity">
+        <button type="button" class="btn btn-sm btn-outline" data-rpm="3">Light · 3/min</button>
+        <button type="button" class="btn btn-sm btn-success" data-rpm="6">Typical · 6/min</button>
+        <button type="button" class="btn btn-sm btn-outline" data-rpm="15">Heavy · 15/min</button>
+        <button type="button" class="btn btn-sm btn-outline" data-rpm="30">Power / API · 30/min</button>
+      </div>
+      <p class="text-xs opacity-60 mt-2">One request ≈ a page, list, save, or API call. "Typical" ≈ an action every 10&nbsp;s during active work, allowing for reading/typing between clicks.</p>
+    </div>
+
+    <div class="mb-2">
+      <label class="text-sm font-semibold mb-2 block">Workload mix</label>
+      <div class="flex flex-wrap gap-2" id="mix">
+        <button type="button" class="btn btn-sm btn-outline" data-mix="browse">Browse / read-heavy</button>
+        <button type="button" class="btn btn-sm btn-success" data-mix="balanced">Balanced</button>
+        <button type="button" class="btn btn-sm btn-outline" data-mix="search">Search-heavy</button>
+      </div>
+    </div>
+
+    <details class="mt-4 pt-3 border-t border-base-300">
+      <summary class="text-sm text-success cursor-pointer font-medium">Advanced</summary>
+      <div class="mt-3">
+        <label class="flex justify-between items-baseline text-sm font-semibold mb-1"><span>Target utilisation (headroom)</span><span class="text-success font-mono" id="utilVal">65%</span></label>
+        <input type="range" id="util" min="40" max="85" step="5" value="65" class="range range-success range-sm">
+        <p class="text-xs opacity-60 mt-1">Plan each instance to this fraction of its measured ceiling, leaving room for spikes. Lower = more headroom = more hardware.</p>
+      </div>
+    </details>
+  </div></div>
+
+  <div class="card bg-base-100 shadow mb-6"><div class="card-body">
+    <h2 class="card-title text-base mb-3">Recommended footprint</h2>
+    <div class="grid grid-cols-2 md:grid-cols-5 gap-3">
+      <div class="rounded-lg border border-success/40 bg-success/5 p-3"><div class="text-2xl font-bold text-success font-mono" id="rRps">50</div><div class="text-xs mt-1 font-medium">req/s peak</div><div class="text-[10px] opacity-60 font-mono mt-0.5" id="rRpsSub">500 × 6/min</div></div>
+      <div class="rounded-lg border border-base-300 p-3"><div class="text-2xl font-bold font-mono" id="rNodes">1</div><div class="text-xs mt-1 font-medium">app instance(s)</div><div class="text-[10px] opacity-60 font-mono mt-0.5">2 vCPU / 8 GB each</div></div>
+      <div class="rounded-lg border border-base-300 p-3"><div class="text-2xl font-bold font-mono" id="rVcpu">2</div><div class="text-xs mt-1 font-medium">total app vCPU</div><div class="text-[10px] opacity-60 font-mono mt-0.5" id="rRam">8 GB RAM</div></div>
+      <div class="rounded-lg border border-base-300 p-3"><div class="text-2xl font-bold font-mono" id="rDb">2</div><div class="text-xs mt-1 font-medium">PostgreSQL vCPU</div><div class="text-[10px] opacity-60 font-mono mt-0.5" id="rDbSub">8 GB · primary</div></div>
+      <div class="rounded-lg border border-base-300 p-3"><div class="text-2xl font-bold font-mono" id="rPerNode">—</div><div class="text-xs mt-1 font-medium">users / 2-vCPU node</div><div class="text-[10px] opacity-60 font-mono mt-0.5">at your settings</div></div>
+    </div>
+    <div class="alert bg-success/10 border border-success/30 text-sm mt-4 block" id="summary"></div>
+    <div class="overflow-x-auto mt-3">
+      <table class="table table-sm">
+        <thead><tr><th>Tier</th><th>Spec</th><th>AWS</th><th>GCP</th><th>Azure</th></tr></thead>
+        <tbody id="skuBody"></tbody>
+      </table>
+    </div>
+  </div></div>
+
+  <div class="card bg-base-100 shadow"><div class="card-body">
+    <h2 class="card-title text-base mb-2">How this is calculated</h2>
+    <p class="text-sm opacity-80 mb-2"><span class="font-semibold">The model:</span> <span class="font-mono text-xs bg-base-200 px-1 rounded">req/s = users × (req/min ÷ 60)</span>, then <span class="font-mono text-xs bg-base-200 px-1 rounded">instances = ⌈ req/s ÷ (measured-capacity × utilisation) ⌉</span>. The database tier is sized from the same req/s. Instances are quoted in 2-vCPU units to match the measurement basis — consolidate into fewer larger boxes if you prefer (same total vCPU).</p>
+    <p class="text-sm opacity-80 mb-2"><span class="font-semibold">The measured basis</span> (load test, release build, 2-vCPU box, 200k-row table): one instance sustains ≈ <span class="text-success font-semibold">1,000 req/s</span> of list browsing (p50 2&nbsp;ms) and ≈ <span class="text-success font-semibold">300 req/s</span> of search (p50 5&nbsp;ms), zero errors. Planning capacity per node by mix: browse-heavy 900, balanced 500, search-heavy 300 req/s — set below the raw browse ceiling to leave room for writes, rendering, and search.</p>
+    <p class="text-sm opacity-80 mb-2"><span class="font-semibold">vs the Odoo rule of thumb</span> (<span class="font-mono text-xs">workers = cores×2+1</span>, ≈ 6 users/worker → a 2-core box ≈ 30 users): that model fits a synchronous, process-per-worker Python runtime where each worker blocks on one request. Vortex is asynchronous Rust — one process, all cores, no per-worker ceiling — so it is limited by raw throughput and the database, which is why the per-node figure is much higher for light-to-typical usage.</p>
+    <p class="text-sm opacity-80"><span class="font-semibold text-success">Read as a planning estimate, not a guarantee.</span> The numbers extrapolate measured req/s using your per-user rate and headroom. Real workloads vary (write-heavy flows, reports and big exports cost more) and the database is usually the first ceiling. Validate the final sizing on your target instance type with the load harness in the repo (<span class="font-mono text-xs">tools/loadtest</span>) before committing.</p>
+  </div></div>
+</div>"##;
+
+const SIZING_SCRIPT: &str = r##"<script>
+(function(){
+  var CAP = { browse:900, balanced:500, search:300 };
+  var MIXLABEL = { browse:"browse / read-heavy", balanced:"balanced", search:"search-heavy" };
+  var state = { users:500, rpm:6, mix:"balanced", util:0.65 };
+  var $ = function(id){ return document.getElementById(id); };
+  function fmt(n){ return n.toLocaleString("en-US"); }
+  function dbTier(rps){
+    if(rps < 300)   return {v:2,  r:8,   note:"primary",                        aws:"db.m6i.large",   gcp:"db-custom-2-8",    azure:"D2s v5"};
+    if(rps < 1200)  return {v:4,  r:16,  note:"primary",                        aws:"db.m6i.xlarge",  gcp:"db-custom-4-16",   azure:"D4s v5"};
+    if(rps < 4000)  return {v:8,  r:32,  note:"primary + 1 read replica",       aws:"db.m6i.2xlarge", gcp:"db-custom-8-32",   azure:"D8s v5"};
+    if(rps < 12000) return {v:16, r:64,  note:"primary + read replicas",        aws:"db.m6i.4xlarge", gcp:"db-custom-16-64",  azure:"D16s v5"};
+    return               {v:32, r:128, note:"replicas + consider partitioning", aws:"db.m6i.8xlarge", gcp:"db-custom-32-128", azure:"D32s v5"};
+  }
+  function compute(){
+    var rps = state.users * state.rpm / 60;
+    var usable = CAP[state.mix] * state.util;
+    var nodes = Math.max(1, Math.ceil(rps / usable));
+    var perNode = Math.floor(usable / (state.rpm/60));
+    return { rps:rps, nodes:nodes, perNode:perNode, db:dbTier(rps) };
+  }
+  function render(){
+    var r = compute();
+    $("rRps").textContent = fmt(Math.ceil(r.rps));
+    $("rRpsSub").textContent = fmt(state.users) + " × " + state.rpm + "/min";
+    $("rNodes").textContent = fmt(r.nodes);
+    $("rVcpu").textContent = fmt(r.nodes*2);
+    $("rRam").textContent = fmt(r.nodes*8) + " GB RAM";
+    $("rDb").textContent = r.db.v;
+    $("rDbSub").textContent = r.db.r + " GB · " + r.db.note;
+    $("rPerNode").textContent = "~" + fmt(r.perNode);
+    var scaleWord = r.nodes === 1 ? "a single instance" : (r.nodes + " instances behind a load balancer");
+    $("summary").innerHTML =
+      "At <b>" + fmt(state.users) + "</b> concurrent users (" + state.rpm + " req/min, " + MIXLABEL[state.mix] +
+      "), plan for <b>~" + fmt(Math.ceil(r.rps)) + " req/s</b> → <b>" + scaleWord + "</b> " +
+      "(<span class='font-mono'>" + fmt(r.nodes*2) + " vCPU / " + fmt(r.nodes*8) + " GB</span> app tier) on a <b>" +
+      r.db.v + "-vCPU / " + r.db.r + " GB PostgreSQL</b> " + r.db.note +
+      ". Add app instances as users grow — the tier is stateless.";
+    var app2 = {aws:"m6i.large", gcp:"e2-standard-2", azure:"D2s v5"};
+    $("skuBody").innerHTML =
+      "<tr><td class='font-mono'>App node ×" + r.nodes + "</td><td>2 vCPU / 8 GB</td><td>" + app2.aws + "</td><td>" + app2.gcp + "</td><td>" + app2.azure + "</td></tr>" +
+      "<tr><td class='font-mono'>PostgreSQL</td><td>" + r.db.v + " vCPU / " + r.db.r + " GB</td><td>" + r.db.aws + "</td><td>" + r.db.gcp + "</td><td>" + r.db.azure + "</td></tr>";
+  }
+  var usersR = $("users"), usersN = $("usersNum");
+  function setUsers(v){
+    v = Math.max(1, Math.min(500000, Math.round(v||1)));
+    state.users = v;
+    $("usersVal").textContent = fmt(v);
+    if(+usersN.value !== v) usersN.value = v;
+    if(+usersR.value !== Math.min(v,50000)) usersR.value = Math.min(v,50000);
+    render();
+  }
+  usersR.addEventListener("input", function(){ setUsers(+usersR.value); });
+  usersN.addEventListener("input", function(){ setUsers(+usersN.value); });
+  function chipGroup(gid, apply){
+    document.querySelectorAll("#"+gid+" button").forEach(function(c){
+      c.addEventListener("click", function(){
+        document.querySelectorAll("#"+gid+" button").forEach(function(x){ x.classList.remove("btn-success"); x.classList.add("btn-outline"); });
+        c.classList.remove("btn-outline"); c.classList.add("btn-success");
+        apply(c); render();
+      });
+    });
+  }
+  chipGroup("activity", function(c){ state.rpm = +c.dataset.rpm; });
+  chipGroup("mix", function(c){ state.mix = c.dataset.mix; });
+  $("util").addEventListener("input", function(){ state.util = +this.value/100; $("utilVal").textContent = this.value + "%"; render(); });
+  render();
+})();
+</script>"##;
+
 async fn settings_index(
     Extension(user): Extension<AuthUser>,
 ) -> Response {
@@ -16455,6 +16630,12 @@ async fn settings_index(
                     <div class="card-body p-4">
                         <h3 class="card-title text-base md:text-lg">Computed Fields</h3>
                         <p class="text-muted text-sm">Derived fields: formulas &amp; related values — no code</p>
+                    </div>
+                </a>
+                <a href="/settings/sizing" class="card transition-all">
+                    <div class="card-body p-4">
+                        <h3 class="card-title text-base md:text-lg">Server Sizing</h3>
+                        <p class="text-muted text-sm">Estimate app &amp; database hardware for your user load</p>
                     </div>
                 </a>
                 <a href="/dashboards" class="card transition-all">
