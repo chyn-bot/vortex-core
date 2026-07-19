@@ -1806,6 +1806,8 @@ pub async fn run(host: String, port: u16, _workers: Option<usize>) -> Result<()>
             primary_pool.with_cache(Arc::new(vortex_orm::cache::RecordCache::new(cfg.clone())));
     }
     let pool = Arc::new(primary_pool);
+    // Cross-process cache invalidation: listen for other instances' writes.
+    pool.spawn_cache_listener();
 
     // ─── WORM Audit Ledger (Phase 0.1 + Phase 0.7 KMS) ─────────────────
     // Phase 0.1 shipped with an env-var-backed Ed25519 signer. Phase

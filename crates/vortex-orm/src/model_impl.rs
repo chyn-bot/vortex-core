@@ -510,11 +510,12 @@ impl<M: Model> ModelExt for M {
         // pk (INSERT may have assigned a generated key) so the next read misses
         // and repopulates from the row of record. Invalidate-on-write, not
         // write-through, keeps the cache from ever holding a half-computed row.
+        // `invalidate_record` also broadcasts to other app instances.
         if let Some(cache) = pool.cache() {
             if cache.is_cacheable(&meta.name) {
                 let company = if meta.multi_tenant { self.company_id() } else { None };
                 let key = make_cache_key(meta, &self.pk(), company.as_ref());
-                cache.invalidate(&key).await;
+                pool.invalidate_record(&key).await;
             }
         }
 
@@ -580,12 +581,12 @@ impl<M: Model> ModelExt for M {
         }
 
         // Drop the deleted (or soft-deleted) record from the cache so a stale
-        // copy can't outlive it.
+        // copy can't outlive it — locally and on every other app instance.
         if let Some(cache) = pool.cache() {
             if cache.is_cacheable(&meta.name) {
                 let company = if meta.multi_tenant { self.company_id() } else { None };
                 let key = make_cache_key(meta, &pk_value, company.as_ref());
-                cache.invalidate(&key).await;
+                pool.invalidate_record(&key).await;
             }
         }
 

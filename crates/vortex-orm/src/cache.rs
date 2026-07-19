@@ -4,9 +4,14 @@ use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{debug, trace};
 use vortex_common::FieldValue;
+
+/// Postgres `NOTIFY` channel used to broadcast record-cache invalidations to
+/// every app instance connected to the same database (Grid, cross-process).
+pub const CACHE_INVALIDATE_CHANNEL: &str = "vortex_cache_invalidate";
 
 /// Cache entry with metadata
 #[derive(Clone)]
@@ -39,10 +44,13 @@ impl<V: Clone> CacheEntry<V> {
 }
 
 /// Cache key for records
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RecordKey {
+    #[serde(rename = "m")]
     pub model: String,
+    #[serde(rename = "p")]
     pub pk: String,
+    #[serde(rename = "c", default, skip_serializing_if = "Option::is_none")]
     pub company_id: Option<String>,
 }
 
@@ -58,6 +66,18 @@ impl RecordKey {
     pub fn with_company(mut self, company_id: impl Into<String>) -> Self {
         self.company_id = Some(company_id.into());
         self
+    }
+
+    /// Serialize this key to a compact JSON payload for a `pg_notify`
+    /// broadcast on [`CACHE_INVALIDATE_CHANNEL`].
+    pub fn to_notify_payload(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
+
+    /// Parse a key from a `NOTIFY` payload produced by [`Self::to_notify_payload`].
+    /// Returns `None` on malformed input (a bad payload must not crash the listener).
+    pub fn from_notify_payload(payload: &str) -> Option<Self> {
+        serde_json::from_str(payload).ok()
     }
 }
 
@@ -422,6 +442,21 @@ mod tests {
         // Empty allowlist (the default) caches nothing.
         let none = RecordCache::new(CacheConfig::default());
         assert!(!none.is_cacheable("Widget"));
+    }
+
+    #[test]
+    fn notify_payload_roundtrips() {
+        let k = RecordKey::new("Widget", "42").with_company("11111111-2222-3333-4444-555555555555");
+        let payload = k.to_notify_payload();
+        assert_eq!(RecordKey::from_notify_payload(&payload), Some(k));
+
+        // Company-less key roundtrips too.
+        let k2 = RecordKey::new("Widget", "7");
+        assert_eq!(RecordKey::from_notify_payload(&k2.to_notify_payload()), Some(k2));
+
+        // Malformed payloads never panic — they just yield None.
+        assert_eq!(RecordKey::from_notify_payload("not json"), None);
+        assert_eq!(RecordKey::from_notify_payload(""), None);
     }
 
     #[tokio::test]

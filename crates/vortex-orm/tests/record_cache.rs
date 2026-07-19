@@ -78,19 +78,25 @@ impl Model for CacheRec {
     }
 }
 
+async fn ensure_table(pg: &sqlx::PgPool) {
+    // Shared, idempotent table so the two integration tests can run in parallel
+    // (each owns a distinct row id) without racing a DROP/CREATE. Serialize the
+    // DDL through a process-local lock — concurrent `CREATE TABLE IF NOT EXISTS`
+    // can still collide on the Postgres system catalog.
+    static DDL_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    let _guard = DDL_LOCK.get_or_init(|| tokio::sync::Mutex::new(())).lock().await;
+    sqlx::query(&format!(
+        "CREATE TABLE IF NOT EXISTS {TABLE} (id uuid PRIMARY KEY, name text NOT NULL)"
+    ))
+    .execute(pg)
+    .await
+    .expect("ensure table");
+}
+
 async fn setup() -> Option<(ConnectionPool, Arc<RecordCache>)> {
     let url = std::env::var("CACHE_TEST_DATABASE_URL").ok()?;
     let pg = sqlx::PgPool::connect(&url).await.ok()?;
-    sqlx::query(&format!("DROP TABLE IF EXISTS {TABLE}"))
-        .execute(&pg)
-        .await
-        .ok()?;
-    sqlx::query(&format!(
-        "CREATE TABLE {TABLE} (id uuid PRIMARY KEY, name text NOT NULL)"
-    ))
-    .execute(&pg)
-    .await
-    .ok()?;
+    ensure_table(&pg).await;
 
     let mut cfg = CacheConfig::default();
     cfg.models = [MODEL.to_string()].into_iter().collect();
@@ -108,7 +114,12 @@ async fn read_through_populates_and_writes_invalidate() {
     let ctx = Context::system();
     let id = Uuid::from_u128(0x1234_5678);
 
-    // Seed a row directly (bypass the cache).
+    // Seed a row directly (bypass the cache). Clear any residue from a prior run.
+    sqlx::query(&format!("DELETE FROM {TABLE} WHERE id = $1"))
+        .bind(id)
+        .execute(pool.pool())
+        .await
+        .ok();
     sqlx::query(&format!("INSERT INTO {TABLE} (id, name) VALUES ($1, 'v1')"))
         .bind(id)
         .execute(pool.pool())
@@ -158,10 +169,85 @@ async fn read_through_populates_and_writes_invalidate() {
         .await
         .expect("find5");
     assert!(r5.is_none(), "deleted record must not be served from cache");
+    // The row was removed by delete(); leave the shared table in place for the
+    // sibling test (they own disjoint row ids).
+}
 
-    // Clean up.
-    sqlx::query(&format!("DROP TABLE IF EXISTS {TABLE}"))
-        .execute(pool.pool())
+/// Two `ConnectionPool`s on the same database stand in for two app instances.
+/// A write through instance A must invalidate instance B's cache via the
+/// Postgres `LISTEN/NOTIFY` broadcast — otherwise B would serve a stale row.
+#[tokio::test]
+async fn write_on_one_instance_invalidates_another() {
+    let Some(url) = std::env::var("CACHE_TEST_DATABASE_URL").ok() else {
+        eprintln!("CACHE_TEST_DATABASE_URL not set — skipping cross-process cache test");
+        return;
+    };
+    let admin = sqlx::PgPool::connect(&url).await.expect("connect");
+    ensure_table(&admin).await;
+
+    let make_instance = || async {
+        let pg = sqlx::PgPool::connect(&url).await.expect("connect");
+        let mut cfg = CacheConfig::default();
+        cfg.models = [MODEL.to_string()].into_iter().collect();
+        let cache = Arc::new(RecordCache::new(cfg));
+        let pool = ConnectionPool::from_pg_pool(pg, &url).with_cache(cache.clone());
+        pool.spawn_cache_listener();
+        (pool, cache)
+    };
+    let (pool_a, _cache_a) = make_instance().await;
+    let (pool_b, cache_b) = make_instance().await;
+
+    // Give both listeners a moment to establish their LISTEN.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let ctx = Context::system();
+    let id = Uuid::from_u128(0xABCD_EF01);
+
+    // Seed + prime instance B's cache with "v1" (clear residue first).
+    sqlx::query(&format!("DELETE FROM {TABLE} WHERE id = $1"))
+        .bind(id)
+        .execute(&admin)
+        .await
+        .ok();
+    sqlx::query(&format!("INSERT INTO {TABLE} (id, name) VALUES ($1, 'v1')"))
+        .bind(id)
+        .execute(pool_b.pool())
+        .await
+        .expect("seed");
+    let b1 = CacheRec::find(&pool_b, &ctx, FieldValue::Uuid(id))
+        .await
+        .expect("b find1")
+        .expect("exists");
+    assert_eq!(b1.name, "v1");
+    assert_eq!(cache_b.size().await, 1, "B should have cached the row");
+
+    // Instance A writes "v2" — this invalidates A locally and broadcasts.
+    let mut rec = CacheRec { id, name: "v2".to_string() };
+    rec.save(&pool_a, &ctx).await.expect("a save");
+
+    // Instance B must observe the write after its listener applies the
+    // broadcast invalidation. Poll B's find until it reflects "v2".
+    let mut observed = String::new();
+    for _ in 0..50 {
+        let b = CacheRec::find(&pool_b, &ctx, FieldValue::Uuid(id))
+            .await
+            .expect("b find")
+            .expect("exists");
+        observed = b.name.clone();
+        if observed == "v2" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        observed, "v2",
+        "instance B must see instance A's write via cross-process invalidation"
+    );
+
+    // Clean up just our row; leave the shared table for the sibling test.
+    sqlx::query(&format!("DELETE FROM {TABLE} WHERE id = $1"))
+        .bind(id)
+        .execute(&admin)
         .await
         .ok();
 }

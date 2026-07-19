@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::info;
+use tracing::{info, trace};
 use vortex_common::{VortexError, VortexResult};
 
 use crate::dialect::{DatabaseBackend, SqlDialect, PostgresDialect};
@@ -218,6 +218,38 @@ impl ConnectionPool {
         self.cache.as_ref()
     }
 
+    /// Invalidate a record everywhere: drop it from this instance's local
+    /// cache immediately (so a read on this same instance right after a write
+    /// is never stale) and broadcast the invalidation on
+    /// [`CACHE_INVALIDATE_CHANNEL`](crate::cache::CACHE_INVALIDATE_CHANNEL) so
+    /// every *other* app instance on this database drops its copy too. The
+    /// broadcast is best-effort — a NOTIFY failure never fails the write.
+    pub async fn invalidate_record(&self, key: &crate::cache::RecordKey) {
+        let Some(cache) = &self.cache else { return };
+        cache.invalidate(key).await;
+        if let Some(pg) = self.pg_pool() {
+            if let Err(e) = sqlx::query("SELECT pg_notify($1, $2)")
+                .bind(crate::cache::CACHE_INVALIDATE_CHANNEL)
+                .bind(key.to_notify_payload())
+                .execute(pg)
+                .await
+            {
+                tracing::warn!(error = %e, "cache invalidation broadcast (pg_notify) failed");
+            }
+        }
+    }
+
+    /// Spawn the background listener that applies cross-process cache
+    /// invalidations broadcast by other app instances. No-op when this pool has
+    /// no cache or isn't Postgres. Idempotent to call once per pool at startup;
+    /// the task reconnects with backoff if the LISTEN connection drops.
+    pub fn spawn_cache_listener(&self) {
+        let Some(cache) = self.cache.clone() else { return };
+        let Some(pg) = self.pg_pool().cloned() else { return };
+        let db = self.config.url.rsplit('/').next().unwrap_or("").to_string();
+        tokio::spawn(async move { run_cache_listener(pg, cache, db).await });
+    }
+
     /// Get the SQL dialect for this connection
     pub fn dialect(&self) -> &dyn SqlDialect {
         &*self.dialect
@@ -391,6 +423,60 @@ impl ConnectionPool {
             #[cfg(feature = "mssql")]
             PoolInner::MsSql(pool) => pool.close().await,
         }
+    }
+}
+
+/// Background task body for [`ConnectionPool::spawn_cache_listener`]. Listens on
+/// [`CACHE_INVALIDATE_CHANNEL`](crate::cache::CACHE_INVALIDATE_CHANNEL) and
+/// applies each broadcast invalidation to the local cache. Reconnects with a
+/// capped backoff if the listen connection drops, so a transient DB blip
+/// doesn't permanently silence cross-process invalidation.
+async fn run_cache_listener(
+    pg: sqlx::postgres::PgPool,
+    cache: Arc<crate::cache::RecordCache>,
+    db: String,
+) {
+    use crate::cache::{RecordKey, CACHE_INVALIDATE_CHANNEL};
+
+    let mut backoff = Duration::from_millis(500);
+    const MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+    loop {
+        match sqlx::postgres::PgListener::connect_with(&pg).await {
+            Ok(mut listener) => {
+                if let Err(e) = listener.listen(CACHE_INVALIDATE_CHANNEL).await {
+                    tracing::warn!(db = %db, error = %e, "cache listener LISTEN failed; retrying");
+                } else {
+                    info!(db = %db, "record cache cross-process invalidation listener started");
+                    backoff = Duration::from_millis(500); // reset after a clean connect
+                    loop {
+                        match listener.recv().await {
+                            Ok(notification) => {
+                                if let Some(key) = RecordKey::from_notify_payload(notification.payload()) {
+                                    trace!(db = %db, ?key, "applying broadcast cache invalidation");
+                                    cache.invalidate(&key).await;
+                                } else {
+                                    tracing::warn!(
+                                        db = %db,
+                                        payload = %notification.payload(),
+                                        "ignoring malformed cache-invalidation payload"
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(db = %db, error = %e, "cache listener recv failed; reconnecting");
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(db = %db, error = %e, "cache listener could not connect; retrying");
+            }
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(MAX_BACKOFF);
     }
 }
 

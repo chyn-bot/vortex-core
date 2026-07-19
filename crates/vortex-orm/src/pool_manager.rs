@@ -245,10 +245,17 @@ impl DatabasePoolManager {
             // Reservation stays alive across the connect so concurrent
             // budget math counts it; its Drop releases it on any exit.
             let mut pool = ConnectionPool::new(db_config).await?;
-            if let Some(cache) = self.new_cache() {
+            let has_cache = if let Some(cache) = self.new_cache() {
                 pool = pool.with_cache(cache);
-            }
+                true
+            } else {
+                false
+            };
             let pool = Arc::new(pool);
+            // Cross-process cache invalidation for this tenant DB.
+            if has_cache {
+                pool.spawn_cache_listener();
+            }
 
             let mut pools = self.pools.write().await;
             // A pool may have been registered while we were connecting
