@@ -141,6 +141,13 @@ pub struct ListConfig {
     /// next to the create button. Typically `/pivot/<model>?rows=<field>`.
     /// Requires the model to be registered in `ir_model` / `ir_model_field`.
     pub pivot_url: Option<&'static str>,
+    /// Opt into keyset (cursor) pagination for large tables. When enabled and
+    /// the sort is a plain base-table column (no `custom_from` JOIN), the list
+    /// seeks by a `(sort, id)` cursor instead of `LIMIT/OFFSET` and drops the
+    /// `COUNT(*)` — so navigation stays O(log n) at any depth on millions of
+    /// rows, at the cost of Prev/Next navigation instead of numbered pages.
+    /// Falls back to OFFSET when not applicable.
+    pub keyset: bool,
 }
 
 impl ListConfig {
@@ -158,6 +165,7 @@ impl ListConfig {
             custom_from: None,
             custom_select: None,
             pivot_url: None,
+            keyset: false,
         }
     }
 
@@ -208,6 +216,13 @@ impl ListConfig {
     /// Enable the pivot-view button in the list header.
     pub fn pivot_url(mut self, url: &'static str) -> Self {
         self.pivot_url = Some(url);
+        self
+    }
+
+    /// Opt into keyset (cursor) pagination — see [`ListConfig::keyset`]. Enable
+    /// for large tables where deep OFFSET paging would scan-and-discard.
+    pub fn keyset(mut self) -> Self {
+        self.keyset = true;
         self
     }
 

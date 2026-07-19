@@ -49,6 +49,13 @@ pub struct ListParams {
     pub group_by: Option<String>,
     pub page: u64,
     pub page_size: u64,
+    /// Keyset cursor: fetch the page *after* this row id (forward nav). The
+    /// value is an opaque id; correctness comes from the total `(sort, id)`
+    /// order. Mutually exclusive with `before`; ignored unless the list opts
+    /// into keyset mode (`ListConfig::keyset`).
+    pub after: Option<String>,
+    /// Keyset cursor: fetch the page *before* this row id (backward nav).
+    pub before: Option<String>,
 }
 
 impl Default for ListParams {
@@ -61,6 +68,8 @@ impl Default for ListParams {
             group_by: None,
             page: 1,
             page_size: 25,
+            after: None,
+            before: None,
         }
     }
 }
@@ -93,7 +102,16 @@ impl ListParams {
             }
         }
 
-        Self { search, filters, sort_field, sort_dir, group_by, page, page_size }
+        // Keyset cursors. `before` wins if both are somehow present so a
+        // request is never ambiguous about direction.
+        let before = q.get("before").filter(|s| !s.is_empty()).cloned();
+        let after = if before.is_some() {
+            None
+        } else {
+            q.get("after").filter(|s| !s.is_empty()).cloned()
+        };
+
+        Self { search, filters, sort_field, sort_dir, group_by, page, page_size, after, before }
     }
 
     /// Build URL query string from current params, overriding one key.
@@ -126,10 +144,25 @@ impl ListParams {
             parts.push(format!("group={}", urlencoded(g)));
         }
 
-        let page = ov.remove("page")
-            .and_then(|p| p.parse::<u64>().ok())
-            .unwrap_or(self.page);
-        parts.push(format!("page={}", page));
+        // Keyset cursors are emitted only when explicitly overridden (i.e. by
+        // the Prev/Next links). They are never carried over from `self`, so a
+        // sort / filter / search / page link naturally resets to the first
+        // page of the new ordering instead of seeking from a stale cursor.
+        if let Some(after) = ov.remove("after") {
+            if !after.is_empty() {
+                parts.push(format!("after={}", urlencoded(after)));
+            }
+        } else if let Some(before) = ov.remove("before") {
+            if !before.is_empty() {
+                parts.push(format!("before={}", urlencoded(before)));
+            }
+        } else {
+            // Only paginate by page number when not seeking by cursor.
+            let page = ov.remove("page")
+                .and_then(|p| p.parse::<u64>().ok())
+                .unwrap_or(self.page);
+            parts.push(format!("page={}", page));
+        }
         parts.push(format!("page_size={}", self.page_size));
 
         for (field, value) in &self.filters {
