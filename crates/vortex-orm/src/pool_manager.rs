@@ -34,6 +34,11 @@ pub struct PoolManagerConfig {
     pub pool_idle_timeout: Duration,
     /// Connection acquire timeout per pool
     pub acquire_timeout: Duration,
+    /// Optional least-privilege role every tenant pool `SET ROLE`s to on
+    /// connect (see [`crate::connection::DatabaseConfig::runtime_role`]).
+    /// `None` preserves the historical behaviour of running as the connecting
+    /// (owner) role.
+    pub runtime_role: Option<String>,
 }
 
 impl Default for PoolManagerConfig {
@@ -45,6 +50,7 @@ impl Default for PoolManagerConfig {
             max_per_pool: 20,
             pool_idle_timeout: Duration::from_secs(30 * 60), // 30 minutes
             acquire_timeout: Duration::from_secs(30),
+            runtime_role: None,
         }
     }
 }
@@ -218,6 +224,7 @@ impl DatabasePoolManager {
                 min_connections: self.config.min_per_pool.min(alloc),
                 max_connections: alloc,
                 acquire_timeout: self.config.acquire_timeout,
+                runtime_role: self.config.runtime_role.clone(),
                 ..DatabaseConfig::default()
             };
 

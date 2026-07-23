@@ -48,11 +48,16 @@ pub struct PdfOptions {
     pub print_background: bool,
     /// Uniform page margin, inches.
     pub margin_in: f64,
+    /// Exact `(width, height)` in inches. When set it overrides `paper`, forces
+    /// zero margins, and prefers the document's CSS `@page` size — used by the
+    /// banded report engine so pixel-perfect layouts print 1:1. `None` keeps
+    /// the classic paper-size behaviour.
+    pub exact_in: Option<(f64, f64)>,
 }
 
 impl Default for PdfOptions {
     fn default() -> Self {
-        Self { landscape: false, paper: Paper::A4, print_background: true, margin_in: 0.4 }
+        Self { landscape: false, paper: Paper::A4, print_background: true, margin_in: 0.4, exact_in: None }
     }
 }
 
@@ -113,7 +118,11 @@ pub async fn html_to_pdf(html: &str, opts: &PdfOptions) -> Result<Vec<u8>, PdfEr
     use chromiumoxide::cdp::browser_protocol::page::PrintToPdfParams;
     use futures::StreamExt;
 
-    let (w, h) = opts.paper.inches();
+    // Exact geometry (banded reports) overrides the named paper size and lets
+    // the document's CSS `@page` rule drive the print box.
+    let (w, h) = opts.exact_in.unwrap_or_else(|| opts.paper.inches());
+    let margin = if opts.exact_in.is_some() { 0.0 } else { opts.margin_in };
+    let prefer_css = opts.exact_in.is_some();
 
     let mut builder = BrowserConfig::builder()
         // Container-safe flags: no sandbox, avoid tiny /dev/shm crashes.
@@ -159,11 +168,11 @@ pub async fn html_to_pdf(html: &str, opts: &PdfOptions) -> Result<Vec<u8>, PdfEr
             .print_background(opts.print_background)
             .paper_width(w)
             .paper_height(h)
-            .margin_top(opts.margin_in)
-            .margin_bottom(opts.margin_in)
-            .margin_left(opts.margin_in)
-            .margin_right(opts.margin_in)
-            .prefer_css_page_size(false)
+            .margin_top(margin)
+            .margin_bottom(margin)
+            .margin_left(margin)
+            .margin_right(margin)
+            .prefer_css_page_size(prefer_css)
             .build();
         page.pdf(params).await.map_err(|e| PdfError::Render(e.to_string()))
     }

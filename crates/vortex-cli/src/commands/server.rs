@@ -383,6 +383,33 @@ fn api_error(status: StatusCode, code: &str, message: &str) -> Response {
 /// Write one audit entry for an API operation, scoped to the tenant database.
 /// `id` is the record UUID for single-record ops, or `None` for collection
 /// events (list views) where `resource_id` (a UUID column) must stay null.
+/// Build the audit entry for a generic-API operation. Shared by the
+/// best-effort read path ([`api_audit`]) and the transaction-bound write path
+/// ([`api_audit_tx`]).
+fn api_audit_entry(
+    db_name: &str,
+    user: &AuthUser,
+    action: AuditAction,
+    severity: AuditSeverity,
+    model: &str,
+    id: Option<&str>,
+    details: serde_json::Value,
+) -> AuditEntry {
+    let mut entry = AuditEntry::new(action, severity)
+        .with_database(db_name)
+        .with_user(vortex_common::UserId(user.id))
+        .with_username(&user.username)
+        .with_resource_name(model)
+        .with_details(details);
+    if let Some(id) = id {
+        entry = entry.with_resource(model, id);
+    }
+    entry
+}
+
+/// Post-commit, best-effort audit — used for **reads** (list/get), where there
+/// is no mutation to keep consistent with, so a failed audit need not fail the
+/// request.
 async fn api_audit(
     state: &AppState,
     db_name: &str,
@@ -393,18 +420,36 @@ async fn api_audit(
     id: Option<&str>,
     details: serde_json::Value,
 ) {
-    let mut entry = AuditEntry::new(action, severity)
-        .with_database(db_name)
-        .with_user(vortex_common::UserId(user.id))
-        .with_username(&user.username)
-        .with_resource_name(model)
-        .with_details(details);
-    if let Some(id) = id {
-        entry = entry.with_resource(model, id);
-    }
+    let entry = api_audit_entry(db_name, user, action, severity, model, id, details);
     if let Err(e) = state.audit.log(entry).await {
         error!("API audit write failed: {e}");
     }
+}
+
+/// Transaction-bound audit for **writes**. Logs the entry inside `tx` so the
+/// WORM record and the business mutation commit or roll back together; a failed
+/// audit write aborts the mutation. Returns `Err(response)` (500) so the caller
+/// can early-return without committing.
+async fn api_audit_tx(
+    state: &AppState,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    db_name: &str,
+    user: &AuthUser,
+    action: AuditAction,
+    severity: AuditSeverity,
+    model: &str,
+    id: Option<&str>,
+    details: serde_json::Value,
+) -> Result<(), Response> {
+    let entry = api_audit_entry(db_name, user, action, severity, model, id, details);
+    state.audit.log_tx(entry, tx).await.map_err(|e| {
+        error!("API audit write failed inside transaction; rolling back mutation: {e}");
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "audit_failed",
+            "the operation was not recorded in the audit ledger and was rolled back",
+        )
+    })
 }
 
 /// Bearer-token auth for `/api/v1/*`. Resolves the token against the tenant
@@ -1259,6 +1304,9 @@ async fn api_list_records(
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
 
+    if let Some(resp) = api_policy_check(&state, &user, "read", &model, None).await {
+        return resp;
+    }
     match vortex_framework::api::list_records(&db, &model, &filters, limit, offset).await {
         Ok(page) => {
             api_audit(
@@ -1283,6 +1331,9 @@ async fn api_get_record(
     Extension(db_ctx): Extension<DatabaseContext>,
     Path((model, id)): Path<(String, uuid::Uuid)>,
 ) -> Response {
+    if let Some(resp) = api_policy_check(&state, &user, "read", &model, Some(&id.to_string())).await {
+        return resp;
+    }
     match vortex_framework::api::get_record(&db, &model, id).await {
         Ok(Some(rec)) => {
             api_audit(
@@ -1306,6 +1357,107 @@ fn require_write(tok: &vortex_framework::api::ResolvedToken) -> Option<Response>
     }
 }
 
+/// Whether generic-API Cedar denials are enforced (`true`) or only logged
+/// (`false`, warn mode). Now **enforce by default** — the zero-trust posture
+/// the cloud-risk assessment commits to; the API path must actually gate on
+/// policy, not just log. Migration 164_api_authz_baseline seeds a permissive
+/// `resource is Record` baseline so flipping enforcement on does not break
+/// existing integrations (it only default-denies non-`Record` types, which the
+/// generic API never serves). Set `API_POLICY_ENFORCED=warn` (or `0`/`false`)
+/// to fall back to log-only — e.g. on a tenant DB that has not yet received
+/// migration 164, to avoid default-deny locking out the API.
+fn api_policy_enforced() -> bool {
+    match std::env::var("API_POLICY_ENFORCED") {
+        Ok(v) if v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("warn") => {
+            false
+        }
+        _ => true,
+    }
+}
+
+/// Cedar authorization for the generic record API. Returns `None` to allow, or
+/// `Some(response)` to reject. In warn mode a denial is logged and allowed; in
+/// enforce mode it returns 403. A policy-evaluation error fails open in warn
+/// mode and closed in enforce mode. The resource is typed `Record` with the
+/// model + action as attributes, so tenant policies can scope by model
+/// (`resource.model == "acc_move"`) without affecting other resource types.
+async fn api_policy_check(
+    state: &AppState,
+    user: &AuthUser,
+    action: &str,
+    model: &str,
+    id: Option<&str>,
+) -> Option<Response> {
+    let principal = PolicyPrincipal {
+        user_id: user.id,
+        username: user.username.clone(),
+        company_id: uuid::Uuid::nil(),
+        roles: user.roles.clone(),
+    };
+    let resource = PolicyResource {
+        type_name: "Record".to_string(),
+        id: id.unwrap_or(model).to_string(),
+        attributes: serde_json::json!({ "model": model, "action": action }),
+    };
+    match state.policy.check(&principal, action, &resource).await {
+        Ok(Decision::Allow { .. }) => None,
+        Ok(Decision::Deny { .. }) => {
+            if api_policy_enforced() {
+                Some(api_error(
+                    StatusCode::FORBIDDEN,
+                    "not_permitted",
+                    &format!("Policy denies '{action}' on '{model}'."),
+                ))
+            } else {
+                tracing::warn!(action, model, user = %user.username, "generic-API policy DENY (warn mode — allowed)");
+                None
+            }
+        }
+        Err(e) => {
+            tracing::error!("generic-API policy check error: {e}");
+            if api_policy_enforced() {
+                Some(api_error(StatusCode::INTERNAL_SERVER_ERROR, "policy_error", "Authorization check failed."))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Per-token rate limit for the generic data API. Keys on the bearer token
+/// (hashed, non-cryptographic) so a mobile fleet behind shared NAT isn't
+/// throttled as a single IP; falls back to the forwarded IP when no token is
+/// present. Returns 429 when the per-window budget is exceeded.
+async fn api_rate_limit_middleware(request: Request, next: Next) -> Result<Response, StatusCode> {
+    let key = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(|h| {
+            // SHA-256, not DefaultHasher: a non-cryptographic 64-bit hash is
+            // trivially collidable, so an attacker could craft tokens that map
+            // to a victim's bucket (or dodge their own) and evade the per-token
+            // limit. Truncate to 128 bits — ample against collision here.
+            use sha2::{Digest, Sha256};
+            let digest = Sha256::digest(h.as_bytes());
+            format!("tok:{}", hex::encode(&digest[..16]))
+        })
+        .or_else(|| {
+            request
+                .headers()
+                .get("x-forwarded-for")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| format!("ip:{s}"))
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+    if let Some(limiter) = request.extensions().get::<RateLimiter>().cloned() {
+        if !limiter.check(&key).await {
+            return Err(StatusCode::TOO_MANY_REQUESTS);
+        }
+    }
+    Ok(next.run(request).await)
+}
+
 /// `POST /api/v1/{model}` — create a record from a JSON body.
 async fn api_create_record(
     State(state): State<Arc<AppState>>,
@@ -1319,13 +1471,27 @@ async fn api_create_record(
     if let Some(resp) = require_write(&tok) {
         return resp;
     }
-    match vortex_framework::api::create_record(&db, &model, &body).await {
+    if let Some(resp) = api_policy_check(&state, &user, "create", &model, None).await {
+        return resp;
+    }
+    // Mutation + WORM audit share one transaction: if the audit write fails,
+    // the create rolls back, so the ledger can never diverge from the data.
+    let mut tx = match db.begin().await {
+        Ok(t) => t,
+        Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, "tx_failed", &e.to_string()),
+    };
+    match vortex_framework::api::create_record_tx(&db, &mut tx, &model, &body).await {
         Ok(id) => {
-            api_audit(
-                &state, &db_ctx.db_name, &user,
+            if let Err(resp) = api_audit_tx(
+                &state, &mut tx, &db_ctx.db_name, &user,
                 AuditAction::RecordCreated, AuditSeverity::Info, &model, Some(&id.to_string()),
                 serde_json::json!({"via": "api"}),
-            ).await;
+            ).await {
+                return resp;
+            }
+            if let Err(e) = tx.commit().await {
+                return api_error(StatusCode::INTERNAL_SERVER_ERROR, "commit_failed", &e.to_string());
+            }
             let rec = vortex_framework::api::get_record(&db, &model, id).await.ok().flatten();
             vortex_framework::webhooks::emit(
                 &state.db, &db, &db_ctx.db_name, "record.created",
@@ -1352,6 +1518,9 @@ async fn api_duplicate_record(
     Path((model, id)): Path<(String, uuid::Uuid)>,
 ) -> Response {
     if let Some(resp) = require_write(&tok) {
+        return resp;
+    }
+    if let Some(resp) = api_policy_check(&state, &user, "create", &model, Some(&id.to_string())).await {
         return resp;
     }
     match vortex_framework::api::duplicate_record(&db, &model, id, Some(user.id)).await {
@@ -1388,13 +1557,25 @@ async fn api_update_record(
     if let Some(resp) = require_write(&tok) {
         return resp;
     }
-    match vortex_framework::api::update_record(&db, &model, id, &body).await {
+    if let Some(resp) = api_policy_check(&state, &user, "update", &model, Some(&id.to_string())).await {
+        return resp;
+    }
+    let mut tx = match db.begin().await {
+        Ok(t) => t,
+        Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, "tx_failed", &e.to_string()),
+    };
+    match vortex_framework::api::update_record_tx(&db, &mut tx, &model, id, &body).await {
         Ok(true) => {
-            api_audit(
-                &state, &db_ctx.db_name, &user,
+            if let Err(resp) = api_audit_tx(
+                &state, &mut tx, &db_ctx.db_name, &user,
                 AuditAction::RecordUpdated, AuditSeverity::Info, &model, Some(&id.to_string()),
                 serde_json::json!({"via": "api"}),
-            ).await;
+            ).await {
+                return resp;
+            }
+            if let Err(e) = tx.commit().await {
+                return api_error(StatusCode::INTERNAL_SERVER_ERROR, "commit_failed", &e.to_string());
+            }
             let rec = vortex_framework::api::get_record(&db, &model, id).await.ok().flatten();
             vortex_framework::webhooks::emit(
                 &state.db, &db, &db_ctx.db_name, "record.updated",
@@ -1421,13 +1602,25 @@ async fn api_delete_record(
     if let Some(resp) = require_write(&tok) {
         return resp;
     }
-    match vortex_framework::api::delete_record(&db, &model, id).await {
+    if let Some(resp) = api_policy_check(&state, &user, "delete", &model, Some(&id.to_string())).await {
+        return resp;
+    }
+    let mut tx = match db.begin().await {
+        Ok(t) => t,
+        Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, "tx_failed", &e.to_string()),
+    };
+    match vortex_framework::api::delete_record_tx(&db, &mut tx, &model, id).await {
         Ok(true) => {
-            api_audit(
-                &state, &db_ctx.db_name, &user,
+            if let Err(resp) = api_audit_tx(
+                &state, &mut tx, &db_ctx.db_name, &user,
                 AuditAction::RecordDeleted, AuditSeverity::Warning, &model, Some(&id.to_string()),
                 serde_json::json!({"via": "api"}),
-            ).await;
+            ).await {
+                return resp;
+            }
+            if let Err(e) = tx.commit().await {
+                return api_error(StatusCode::INTERNAL_SERVER_ERROR, "commit_failed", &e.to_string());
+            }
             vortex_framework::webhooks::emit(
                 &state.db, &db, &db_ctx.db_name, "record.deleted",
                 serde_json::json!({"model": model, "id": id}),
@@ -1772,9 +1965,105 @@ fn base_url_from_full(url: &str) -> String {
     }
 }
 
+/// Resolve the secrets-at-rest key provider from the environment.
+///
+/// `VORTEX_KEY_PROVIDER` selects the backend (`local` default, `aws-kms`,
+/// `vault`). The KMS/Vault variants only exist when the binary is built with
+/// the matching `kms-aws` / `kms-vault` feature — a config that names them in
+/// a binary built without the feature is a hard startup error, never a silent
+/// downgrade to the local key.
+fn key_provider_config_from_env() -> Result<vortex_security::keyprovider::KeyProviderConfig> {
+    use vortex_security::keyprovider::KeyProviderConfig;
+    let kind = std::env::var("VORTEX_KEY_PROVIDER").unwrap_or_else(|_| "local".to_string());
+    match kind.trim().to_ascii_lowercase().as_str() {
+        "" | "local" => Ok(KeyProviderConfig::Local),
+        "aws-kms" | "aws" | "kms" => {
+            #[cfg(feature = "kms-aws")]
+            {
+                use vortex_security::keyprovider::config::AwsKmsConfig;
+                Ok(KeyProviderConfig::AwsKms(AwsKmsConfig {
+                    key_id: std::env::var("VORTEX_KMS_KEY_ID")
+                        .map_err(|_| anyhow::anyhow!("VORTEX_KMS_KEY_ID not set"))?,
+                    region: std::env::var("VORTEX_KMS_REGION")
+                        .map_err(|_| anyhow::anyhow!("VORTEX_KMS_REGION not set"))?,
+                    access_key_env: std::env::var("VORTEX_KMS_ACCESS_KEY_ENV")
+                        .unwrap_or_else(|_| "AWS_ACCESS_KEY_ID".to_string()),
+                    secret_key_env: std::env::var("VORTEX_KMS_SECRET_KEY_ENV")
+                        .unwrap_or_else(|_| "AWS_SECRET_ACCESS_KEY".to_string()),
+                    session_token_env: Some(
+                        std::env::var("VORTEX_KMS_SESSION_TOKEN_ENV")
+                            .unwrap_or_else(|_| "AWS_SESSION_TOKEN".to_string()),
+                    ),
+                }))
+            }
+            #[cfg(not(feature = "kms-aws"))]
+            {
+                anyhow::bail!(
+                    "VORTEX_KEY_PROVIDER=aws-kms but this binary was built without the \
+                     `kms-aws` feature (rebuild: cargo build -p vortex-cli --features kms-aws)"
+                )
+            }
+        }
+        "vault" | "openbao" => {
+            #[cfg(feature = "kms-vault")]
+            {
+                use vortex_security::keyprovider::config::VaultConfig;
+                Ok(KeyProviderConfig::Vault(VaultConfig {
+                    address: std::env::var("VORTEX_VAULT_ADDR")
+                        .map_err(|_| anyhow::anyhow!("VORTEX_VAULT_ADDR not set"))?,
+                    key_name: std::env::var("VORTEX_VAULT_KEY")
+                        .map_err(|_| anyhow::anyhow!("VORTEX_VAULT_KEY not set"))?,
+                    mount: std::env::var("VORTEX_VAULT_MOUNT")
+                        .unwrap_or_else(|_| "transit".to_string()),
+                    token_env: std::env::var("VORTEX_VAULT_TOKEN_ENV")
+                        .unwrap_or_else(|_| "VORTEX_VAULT_TOKEN".to_string()),
+                    namespace: std::env::var("VORTEX_VAULT_NAMESPACE").ok(),
+                }))
+            }
+            #[cfg(not(feature = "kms-vault"))]
+            {
+                anyhow::bail!(
+                    "VORTEX_KEY_PROVIDER=vault but this binary was built without the \
+                     `kms-vault` feature (rebuild: cargo build -p vortex-cli --features kms-vault)"
+                )
+            }
+        }
+        other => anyhow::bail!("unknown VORTEX_KEY_PROVIDER `{other}` (expected local|aws-kms|vault)"),
+    }
+}
+
 pub async fn run(host: String, port: u16, _workers: Option<usize>) -> Result<()> {
     // Load environment variables
     dotenvy::dotenv().ok();
+
+    // Resolve the secrets-at-rest key provider before anything is sealed.
+    let key_provider_config = key_provider_config_from_env()?;
+
+    // Fail closed on the master encryption key — but only when the local
+    // provider is in use. Everything sealed at rest (SMTP passwords,
+    // integration API keys, TOTP seeds) and the MFA pre-auth MAC derive from
+    // VORTEX_SECRET_KEY, so booting the local provider on the built-in dev key
+    // would silently void those guarantees. A KMS/Vault deployment derives
+    // confidentiality from the external key instead, so it may boot without a
+    // master key — we only warn that legacy rows (sealed before the migration)
+    // will be unreadable until VORTEX_SECRET_KEY is also supplied.
+    if key_provider_config.requires_master_key() {
+        if let Err(msg) = vortex_security::crypto::require_master_key() {
+            eprintln!("\nRefusing to start — insecure key configuration.\n\n{msg}\n");
+            anyhow::bail!("VORTEX_SECRET_KEY is not configured");
+        }
+    } else if !vortex_security::crypto::master_key_configured() {
+        tracing::warn!(
+            "Key provider `{}` is active and VORTEX_SECRET_KEY is unset — secrets sealed \
+             under the previous local master key cannot be read until it is supplied.",
+            key_provider_config.backend_name()
+        );
+    }
+
+    // Build the provider (opens the KMS/Vault connection; errors stop boot).
+    let key_provider = vortex_security::keyprovider::build_key_provider(&key_provider_config)
+        .map_err(|e| anyhow::anyhow!("key provider `{}` init failed: {e}", key_provider_config.backend_name()))?;
+    tracing::info!("Secrets-at-rest key provider: {}", key_provider_config.backend_name());
 
     // Get database URL
     let database_url = std::env::var("DATABASE_URL")
@@ -1788,10 +2077,34 @@ pub async fn run(host: String, port: u16, _workers: Option<usize>) -> Result<()>
 
     // Connect to database
     info!("Connecting to database...");
-    let db = PgPoolOptions::new()
-        .max_connections(10)
-        .connect(&database_url)
-        .await?;
+    // Primary pool. When VORTEX_DB_RUNTIME_ROLE is set, drop every connection
+    // to that least-privilege role via `SET ROLE` — the same mechanism the
+    // per-tenant pools use (vortex-orm), applied here too so SINGLE-TENANT
+    // deployments (which serve out of the primary pool, not a pool_manager
+    // tenant pool) actually run unprivileged rather than as the owner.
+    let runtime_role = std::env::var("VORTEX_DB_RUNTIME_ROLE").ok().filter(|s| !s.trim().is_empty());
+    let mut db_opts = PgPoolOptions::new().max_connections(10);
+    if let Some(role) = runtime_role.clone() {
+        // Identifier is validated in vortex-orm; re-validate here since we build
+        // the SET ROLE string ourselves for the primary pool.
+        if !role.chars().enumerate().all(|(i, c)| {
+            (i == 0 && (c.is_ascii_alphabetic() || c == '_'))
+                || (i > 0 && (c.is_ascii_alphanumeric() || c == '_'))
+        }) || role.len() > 63 {
+            anyhow::bail!("VORTEX_DB_RUNTIME_ROLE {role:?} is not a valid role identifier");
+        }
+        let set_role = format!("SET ROLE \"{role}\"");
+        db_opts = db_opts.after_connect(move |conn, _meta| {
+            let sql = set_role.clone();
+            Box::pin(async move {
+                use sqlx::Executor;
+                conn.execute(sql.as_str()).await?;
+                Ok(())
+            })
+        });
+        info!("Primary pool runtime role: SET ROLE {role} on every connection");
+    }
+    let db = db_opts.connect(&database_url).await?;
 
     // Verify connection
     sqlx::query("SELECT 1").execute(&db).await?;
@@ -1882,6 +2195,12 @@ pub async fn run(host: String, port: u16, _workers: Option<usize>) -> Result<()>
         let config = PoolManagerConfig {
             base_url: base_url_from_full(&database_url),
             global_max_connections: global_budget,
+            // Per-tenant least-privilege: when VORTEX_DB_RUNTIME_ROLE is set
+            // (e.g. `vortex_runtime`), every tenant pool SET ROLEs to it on
+            // connect, so the server runs with only the privileges migration
+            // 166 grants that role — not the owner's. Off by default so
+            // existing deployments (which connect as the owner) are unchanged.
+            runtime_role: std::env::var("VORTEX_DB_RUNTIME_ROLE").ok().filter(|s| !s.trim().is_empty()),
             ..PoolManagerConfig::default()
         };
         let pm = Arc::new(DatabasePoolManager::new(config));
@@ -2054,6 +2373,7 @@ pub async fn run(host: String, port: u16, _workers: Option<usize>) -> Result<()>
     // (migrations, sequences, translations, scheduled actions,
     // reports, audit logging).
     plugin_registry.register(Arc::new(vortex_contacts::ContactsPlugin::new()));
+    plugin_registry.register(Arc::new(vortex_recon::ReconPlugin::new()));
     // Accounting — the double-entry base (chart of accounts, journals,
     // posting engine). Registered early: it is a primitive-style plugin
     // other modules adopt via its service API; its migrations only need
@@ -2271,6 +2591,7 @@ pub async fn run(host: String, port: u16, _workers: Option<usize>) -> Result<()>
         files,
         av,
         captcha,
+        key_provider,
     });
 
     // Spawn the scheduler supervisor now that AppState exists.
@@ -2541,6 +2862,14 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/reports/runs", get(report_runs_page))
         .route("/reports/runs/{id}/download", get(report_run_download))
         .route("/reports/runs/{id}/retry", post(report_run_retry))
+        // Report Studio — pixel-perfect banded designer
+        .route("/reports/design/{id}", get(banded_designer))
+        .route("/reports/design/{id}/save", post(banded_save))
+        .route("/reports/design/{id}/preview", post(banded_preview))
+        .route("/reports/design/{id}/fields", get(banded_fields))
+        .route("/reports/design/{id}/export", get(banded_export))
+        .route("/reports/design/{id}/import", post(banded_import))
+        .route("/reports/design/{id}/scaffold", post(banded_scaffold))
         // Localization master data (countries / states)
         .route("/settings/countries", get(countries_list))
         .route("/settings/countries", post(country_create))
@@ -2697,11 +3026,15 @@ fn build_router(state: Arc<AppState>) -> Router {
     // Layer order mirrors the login routes: `Extension` outermost so the
     // rate-limit middleware can read the limiter; the context middleware is a
     // `route_layer` (inner) so the pool is present when the handler runs.
-    let intake_limiter = RateLimiter::new(RateLimitConfig {
-        max_requests: 20,
-        window: std::time::Duration::from_secs(60),
-        per_user: false,
-    });
+    // Shared across instances via `rate_limit_bucket` on the primary DB.
+    // Fail-open: a public submission form must not hard-fail on a limiter blip.
+    let intake_limiter =
+        RateLimiter::postgres(RateLimitConfig {
+            max_requests: 20,
+            window: std::time::Duration::from_secs(60),
+            per_user: false,
+        }, state.db.clone(), "intake");
+    intake_limiter.spawn_pruner();
     let intake_public = Router::new()
         .route("/i/{slug}", get(intake_form_page).post(intake_submit))
         // Allow file uploads (axum's default body limit is 2 MB).
@@ -2710,12 +3043,15 @@ fn build_router(state: Arc<AppState>) -> Router {
         .layer(middleware::from_fn(vortex_server::middleware::rate_limit::rate_limit_middleware))
         .layer(Extension(intake_limiter));
 
-    // Login-specific rate limiter: 5 attempts per 60 seconds per IP
-    let login_limiter = RateLimiter::new(RateLimitConfig {
-        max_requests: 5,
-        window: std::time::Duration::from_secs(60),
-        per_user: false,
-    });
+    // Login-specific rate limiter: 5 attempts per 60 seconds per IP, shared
+    // across instances. Fail-open so a limiter-DB blip can't lock out login.
+    let login_limiter =
+        RateLimiter::postgres(RateLimitConfig {
+            max_requests: 5,
+            window: std::time::Duration::from_secs(60),
+            per_user: false,
+        }, state.db.clone(), "login");
+    login_limiter.spawn_pruner();
 
     // Rate-limited login route. The `Extension` must be the outermost layer
     // (added last) so the rate-limit middleware can read the `RateLimiter`
@@ -2733,17 +3069,23 @@ fn build_router(state: Arc<AppState>) -> Router {
         // Second-factor challenge (public, reached from login with a signed
         // pending-MFA cookie). Shares the login limiter.
         .route("/auth/mfa", get(mfa_page).post(mfa_submit))
+        // OIDC identity federation (Gap 1): begin + callback. Public, shares
+        // the login rate-limiter against callback floods.
+        .route("/auth/oidc/login", get(oidc_login))
+        .route("/auth/oidc/callback", get(oidc_callback))
         .layer(middleware::from_fn(vortex_server::middleware::rate_limit::rate_limit_middleware))
         .layer(Extension(login_limiter));
 
     // Public, rate-limited mobile auth: credential login + refresh rotation.
     // These MUST stay outside `api_auth_middleware` (they mint the very token
     // that middleware requires). Static paths outrank `/api/v1/{model}`.
-    let mobile_auth_limiter = RateLimiter::new(RateLimitConfig {
-        max_requests: 10,
-        window: std::time::Duration::from_secs(60),
-        per_user: false,
-    });
+    let mobile_auth_limiter =
+        RateLimiter::postgres(RateLimitConfig {
+            max_requests: 10,
+            window: std::time::Duration::from_secs(60),
+            per_user: false,
+        }, state.db.clone(), "mobile_auth");
+    mobile_auth_limiter.spawn_pruner();
     let mobile_auth_public = Router::new()
         .route("/api/v1/auth/login", post(mobile_login))
         .route("/api/v1/auth/mfa/enroll", post(mobile_mfa_enroll))
@@ -2758,6 +3100,19 @@ fn build_router(state: Arc<AppState>) -> Router {
     // Bearer-token authenticated, JSON in/out, separate from the cookie
     // tree. Static segments (`whoami`, `models`) take precedence over the
     // `{model}` parameter in the router, so they are not shadowed.
+    // Per-token rate limit on the data API (300 req / 60s / token). Keyed by
+    // token, not IP, so a shared-NAT mobile fleet isn't throttled as one client.
+    // Fail-CLOSED: the data API is the abuse-sensitive surface the cloud-risk
+    // assessment calls out, so its rate guard must never be silently disabled
+    // by a limiter-DB error (and if the counter DB is down, the request's own
+    // data query would fail anyway).
+    let api_limiter =
+        RateLimiter::postgres_strict(RateLimitConfig {
+            max_requests: 300,
+            window: std::time::Duration::from_secs(60),
+            per_user: true,
+        }, state.db.clone(), "api");
+    api_limiter.spawn_pruner();
     let api_routes = Router::new()
         // Bearer-authenticated mobile auth: logout, identity, device sessions.
         .route("/api/v1/auth/logout", post(mobile_logout))
@@ -2772,7 +3127,9 @@ fn build_router(state: Arc<AppState>) -> Router {
             get(api_get_record).patch(api_update_record).delete(api_delete_record),
         )
         .route("/api/v1/{model}/{id}/duplicate", post(api_duplicate_record))
-        .route_layer(middleware::from_fn_with_state(state.clone(), api_auth_middleware));
+        .route_layer(middleware::from_fn_with_state(state.clone(), api_auth_middleware))
+        .route_layer(middleware::from_fn(api_rate_limit_middleware))
+        .layer(Extension(api_limiter));
 
     // ─── External portal (/portal/*) ──────────────────────────────
     // Protected surface: only `is_portal` users, guarded by
@@ -2792,11 +3149,13 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route_layer(middleware::from_fn_with_state(state.clone(), portal_auth_middleware));
 
     // Public portal login (pre-auth), rate-limited like the staff login.
-    let portal_login_limiter = RateLimiter::new(RateLimitConfig {
-        max_requests: 5,
-        window: std::time::Duration::from_secs(60),
-        per_user: false,
-    });
+    let portal_login_limiter =
+        RateLimiter::postgres(RateLimitConfig {
+            max_requests: 5,
+            window: std::time::Duration::from_secs(60),
+            per_user: false,
+        }, state.db.clone(), "portal_login");
+    portal_login_limiter.spawn_pruner();
     let portal_public = Router::new()
         .route("/portal/login", get(portal_login_page).post(portal_login_submit))
         // Invite acceptance (set-password) is pre-auth, like login.
@@ -3077,6 +3436,241 @@ struct LoginForm {
     username: String,
     password: String,
     database: Option<String>,
+}
+
+// ─── OIDC identity federation (Gap 1) ──────────────────────────────────────
+// Two public routes, share the login rate-limiter:
+//   GET /auth/oidc/login    → redirect to the tenant's IdP
+//   GET /auth/oidc/callback → validate, resolve user, mint a session
+// The session is minted by the SAME `issue_web_session` the password path
+// uses, so federated logins get identical cap-enforcement + WORM audit.
+
+/// Password-hash sentinel for federated-only accounts. It is not a valid PHC
+/// string, so `verify_password` can never match it — a JIT-provisioned SSO
+/// user has no usable local password and cannot log in via the password form.
+const FEDERATED_SENTINEL_HASH: &str = "!federated-no-local-password";
+
+/// State freshness window for the OIDC round-trip (signed into `state`).
+const OIDC_STATE_MAX_AGE_SECS: u64 = 600;
+
+#[derive(sqlx::FromRow)]
+struct IdpRow {
+    id: uuid::Uuid,
+    display_name: String,
+    issuer: String,
+    client_id: String,
+    client_secret_enc: Option<Vec<u8>>,
+    redirect_uri: String,
+    scopes: String,
+    claim_mapping: serde_json::Value,
+    jit_provisioning: bool,
+    default_role: Option<String>,
+}
+
+/// Decrypt the stored client secret (via the key provider) and assemble the
+/// runtime OIDC config from an `identity_provider` row.
+fn build_oidc_config(
+    state: &AppState,
+    row: IdpRow,
+) -> Result<vortex_framework::federation::OidcConfig, String> {
+    let client_secret = match row.client_secret_enc {
+        Some(blob) => {
+            let bytes = state
+                .key_provider
+                .unseal(&blob)
+                .map_err(|_| "client secret unseal failed".to_string())?;
+            String::from_utf8(bytes).map_err(|_| "client secret not utf8".to_string())?
+        }
+        None => String::new(),
+    };
+    let cm = &row.claim_mapping;
+    let claim = |k: &str, default: &str| {
+        cm.get(k).and_then(|v| v.as_str()).unwrap_or(default).to_string()
+    };
+    Ok(vortex_framework::federation::OidcConfig {
+        provider_id: row.id,
+        display_name: row.display_name,
+        issuer: row.issuer,
+        client_id: row.client_id,
+        client_secret,
+        redirect_uri: row.redirect_uri,
+        scopes: row.scopes,
+        subject_claim: claim("subject", "sub"),
+        email_claim: claim("email", "email"),
+        name_claim: claim("name", "name"),
+        jit: row.jit_provisioning,
+        default_role: row.default_role,
+    })
+}
+
+const IDP_SELECT: &str = "SELECT id, display_name, issuer, client_id, client_secret_enc, \
+     redirect_uri, scopes, claim_mapping, jit_provisioning, default_role \
+     FROM identity_provider";
+
+/// `GET /auth/oidc/login` — begin the authorization-code flow. Loads the
+/// tenant's enabled OIDC provider (optionally `?provider=<id>`), signs a
+/// `state` binding tenant + nonce, and redirects to the IdP.
+async fn oidc_login(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let db_name = resolve_database(&state, &headers, q.get("database").map(|s| s.as_str())).await;
+    let pool = match state.pool_manager.get_pool(&db_name).await {
+        Ok(p) => p,
+        Err(_) => return error_response("Database unavailable"),
+    };
+    let db = pool.pool().clone();
+
+    // Pick the requested provider, else the first enabled OIDC provider.
+    let row: Option<IdpRow> = if let Some(pid) = q.get("provider").and_then(|s| uuid::Uuid::parse_str(s).ok()) {
+        sqlx::query_as::<_, IdpRow>(&format!("{IDP_SELECT} WHERE id = $1 AND enabled AND provider_type='oidc'"))
+            .bind(pid).fetch_optional(&db).await.ok().flatten()
+    } else {
+        sqlx::query_as::<_, IdpRow>(&format!("{IDP_SELECT} WHERE enabled AND provider_type='oidc' ORDER BY created_at LIMIT 1"))
+            .fetch_optional(&db).await.ok().flatten()
+    };
+    let Some(row) = row else {
+        return error_response("No identity provider is configured for this tenant");
+    };
+
+    let cfg = match build_oidc_config(&state, row) {
+        Ok(c) => c,
+        Err(e) => { error!("oidc config: {e}"); return error_response("Identity provider misconfigured"); }
+    };
+    let disc = match vortex_framework::federation::discover(&cfg.issuer).await {
+        Ok(d) => d,
+        Err(e) => { error!("oidc discovery: {e}"); return error_response("Identity provider unreachable"); }
+    };
+
+    let nonce = generate_session_token();
+    let key = vortex_security::crypto::master_key();
+    let signed = vortex_framework::federation::sign_state(&db_name, cfg.provider_id, &nonce, &key);
+    match vortex_framework::federation::authorize_url(&cfg, &disc, &signed, &nonce) {
+        Ok(url) => axum::response::Redirect::to(&url).into_response(),
+        Err(e) => { error!("oidc authorize url: {e}"); error_response("Login could not be started") }
+    }
+}
+
+/// `GET /auth/oidc/callback` — validate the IdP response, resolve/provision the
+/// local user, and mint a session.
+async fn oidc_callback(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let (client_ip, _ua) = request_fingerprint(&headers);
+    let Some(code) = q.get("code") else { return error_response("Missing authorization code"); };
+    let Some(state_param) = q.get("state") else { return error_response("Missing state"); };
+
+    // Verify the signed state first — CSRF/replay protection before any work.
+    let key = vortex_security::crypto::master_key();
+    let sd = match vortex_framework::federation::verify_state(state_param, &key, OIDC_STATE_MAX_AGE_SECS) {
+        Ok(sd) => sd,
+        Err(e) => { warn!("oidc state rejected: {e}"); return error_response("Login session expired or invalid"); }
+    };
+
+    let pool = match state.pool_manager.get_pool(&sd.db_name).await {
+        Ok(p) => p,
+        Err(_) => return error_response("Database unavailable"),
+    };
+    let db = pool.pool().clone();
+
+    let row: Option<IdpRow> = sqlx::query_as::<_, IdpRow>(&format!("{IDP_SELECT} WHERE id = $1 AND enabled"))
+        .bind(sd.provider_id).fetch_optional(&db).await.ok().flatten();
+    let Some(row) = row else { return error_response("Identity provider no longer available"); };
+    let cfg = match build_oidc_config(&state, row) {
+        Ok(c) => c,
+        Err(e) => { error!("oidc config: {e}"); return error_response("Identity provider misconfigured"); }
+    };
+    let disc = match vortex_framework::federation::discover(&cfg.issuer).await {
+        Ok(d) => d,
+        Err(e) => { error!("oidc discovery: {e}"); return error_response("Identity provider unreachable"); }
+    };
+
+    // Exchange code, then validate the ID token (signature + iss/aud/exp/nonce).
+    let id_token = match vortex_framework::federation::exchange_code(&cfg, &disc, code).await {
+        Ok(t) => t,
+        Err(e) => { warn!("oidc token exchange: {e}"); return error_response("Login failed at the identity provider"); }
+    };
+    let claims = match vortex_framework::federation::validate_id_token(&cfg, &disc, &id_token, &sd.nonce).await {
+        Ok(c) => c,
+        Err(e) => { warn!("oidc token validation: {e}"); return error_response("Identity could not be verified"); }
+    };
+
+    // Resolve the local user: existing link → link-by-verified-email → JIT create.
+    let linked: Option<uuid::Uuid> = sqlx::query_scalar(
+        "SELECT user_id FROM user_federated_identity WHERE provider_id = $1 AND subject = $2")
+        .bind(cfg.provider_id).bind(&claims.subject)
+        .fetch_optional(&db).await.ok().flatten();
+
+    let user_id = if let Some(uid) = linked {
+        uid
+    } else if cfg.jit {
+        // Link by verified email if a local account already owns it, else create.
+        let existing: Option<uuid::Uuid> = if let Some(email) = &claims.email {
+            sqlx::query_scalar("SELECT id FROM users WHERE email = $1 AND active ORDER BY created_at LIMIT 1")
+                .bind(email).fetch_optional(&db).await.ok().flatten()
+        } else { None };
+
+        let uid = if let Some(uid) = existing {
+            uid
+        } else {
+            let company_id: Option<uuid::Uuid> =
+                sqlx::query_scalar("SELECT id FROM companies ORDER BY created_at LIMIT 1")
+                    .fetch_optional(&db).await.ok().flatten();
+            let username = claims.email.clone().unwrap_or_else(|| format!("oidc_{}", claims.subject));
+            let full_name = claims.name.clone().unwrap_or_else(|| username.clone());
+            let created: Result<uuid::Uuid, _> = sqlx::query_scalar(
+                "INSERT INTO users (company_id, username, email, password_hash, full_name, active, \
+                 mfa_enabled, password_changed_at, must_change_password) \
+                 VALUES ($1, $2, $3, $4, $5, true, false, NOW(), false) RETURNING id")
+                .bind(company_id).bind(&username).bind(&claims.email)
+                .bind(FEDERATED_SENTINEL_HASH).bind(&full_name)
+                .fetch_one(&db).await;
+            match created {
+                Ok(id) => {
+                    if let Some(role) = &cfg.default_role {
+                        let _ = sqlx::query(
+                            "INSERT INTO user_roles (user_id, role_id) \
+                             SELECT $1, id FROM roles WHERE name = $2 \
+                             ON CONFLICT DO NOTHING")
+                            .bind(id).bind(role).execute(&db).await;
+                    }
+                    id
+                }
+                Err(e) => { error!("oidc JIT provisioning failed: {e}"); return error_response("Could not provision account"); }
+            }
+        };
+
+        // Record/refresh the identity link.
+        let _ = sqlx::query(
+            "INSERT INTO user_federated_identity (user_id, provider_id, subject, email, last_login_at) \
+             VALUES ($1, $2, $3, $4, NOW()) \
+             ON CONFLICT (provider_id, subject) DO UPDATE SET last_login_at = NOW(), email = EXCLUDED.email")
+            .bind(uid).bind(cfg.provider_id).bind(&claims.subject).bind(&claims.email)
+            .execute(&db).await;
+        uid
+    } else {
+        return error_response("No account is linked to this identity (JIT provisioning disabled)");
+    };
+
+    // Refresh link timestamp for the already-linked path too.
+    let _ = sqlx::query("UPDATE user_federated_identity SET last_login_at = NOW() WHERE provider_id = $1 AND subject = $2")
+        .bind(cfg.provider_id).bind(&claims.subject).execute(&db).await;
+
+    // Read the fields issue_web_session needs, then mint the session.
+    let urow: Option<(String, bool, Option<chrono::DateTime<chrono::Utc>>, i32)> = sqlx::query_as(
+        "SELECT username, active, last_login_at, failed_login_attempts FROM users WHERE id = $1")
+        .bind(user_id).fetch_optional(&db).await.ok().flatten();
+    let Some((username, active, prev_last, prev_failed)) = urow else {
+        return error_response("Account not found after login");
+    };
+    if !active { return error_response("Account is disabled"); }
+
+    issue_web_session(
+        &state, &db, &sd.db_name, user_id, &username, prev_last, prev_failed, client_ip.as_deref(),
+    ).await
 }
 
 /// Row for the interactive login path. Wider than [`UserRow`] because the
@@ -5953,6 +6547,23 @@ async fn security_headers_middleware(
         headers.insert("X-Frame-Options", "DENY".parse().unwrap());
     }
     headers.insert("X-Content-Type-Options", "nosniff".parse().unwrap());
+    // HSTS. Emitted only when the request actually arrived over TLS (or the
+    // deployment forces it), because pinning HSTS from a plain-HTTP dev server
+    // would lock the browser out of localhost. Duration is one year with
+    // subdomains, and is overridable for deployments that share a parent domain
+    // with hosts that are not yet HTTPS-only.
+    if secure_cookies {
+        let hsts = std::env::var("VORTEX_HSTS")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "max-age=31536000; includeSubDomains".to_string());
+        if !hsts.eq_ignore_ascii_case("off") {
+            if let Ok(v) = hsts.parse() {
+                headers.insert("Strict-Transport-Security", v);
+            }
+        }
+    }
     headers.insert("X-XSS-Protection", "1; mode=block".parse().unwrap());
     headers.insert("Referrer-Policy", "strict-origin-when-cross-origin".parse().unwrap());
     headers.insert("Permissions-Policy", "camera=(), microphone=(), geolocation=()".parse().unwrap());
@@ -6541,6 +7152,11 @@ async fn change_password_submit(
     if form.new_password == form.current_password {
         return reject("New password must be different from the current one.");
     }
+    // Refuse recently-used passwords, so expiry can't be satisfied by rotating
+    // between two familiar values.
+    if password_is_reused(&db, user.id, &form.new_password).await {
+        return reject(super::password_policy::HISTORY_HINT);
+    }
 
     // Rotate: new hash, reset the expiry clock, clear the change flag and any
     // failed-attempt count.
@@ -6555,6 +7171,12 @@ async fn change_password_submit(
     .bind(user.id)
     .execute(&db)
     .await;
+    if updated.is_ok() {
+        // Remember the retired password as well as the new one, so the very
+        // first rotation already blocks going straight back.
+        record_password_history(&db, user.id, &user.password_hash).await;
+        record_password_history(&db, user.id, &new_hash).await;
+    }
     if let Err(e) = updated {
         error!("change_password_submit update failed: {}", e);
         return error_response("Could not update password");
@@ -9759,8 +10381,24 @@ async fn users_update(
         if let Err(reason) = super::password_policy::validate(&password) {
             return error_response(&reason);
         }
+        // The reuse window applies to an administrator-set password too —
+        // otherwise "ask the admin to reset it" is a way around the rule.
+        if password_is_reused(&db, user_id, &password).await {
+            return error_response(
+                "New password must not match any of this user's last 5 passwords.",
+            );
+        }
+        // Capture the outgoing hash before it is overwritten, so it can be
+        // remembered alongside the new one.
+        let previous_hash: Option<String> =
+            sqlx::query_scalar("SELECT password_hash FROM users WHERE id = $1")
+                .bind(&user_id)
+                .fetch_optional(&db)
+                .await
+                .ok()
+                .flatten();
         let password_hash = hash_password(&password);
-        sqlx::query(
+        let res = sqlx::query(
             r#"
             UPDATE users
             SET email = $1, full_name = $2, password_hash = $3, active = $4,
@@ -9775,7 +10413,14 @@ async fn users_update(
         .bind(&auth_user.id)
         .bind(&user_id)
         .execute(&db)
-        .await
+        .await;
+        if res.is_ok() {
+            if let Some(prev) = previous_hash {
+                record_password_history(&db, user_id, &prev).await;
+            }
+            record_password_history(&db, user_id, &password_hash).await;
+        }
+        res
     } else {
         sqlx::query(
             r#"
@@ -9914,6 +10559,57 @@ async fn users_unlock(
             error_response("Failed to unlock user")
         }
     }
+}
+
+/// True when `candidate` matches the user's current password or any of the
+/// last [`password_policy::HISTORY_DEPTH`] retired ones.
+///
+/// Each stored value is an argon2id hash with its own salt, so this cannot be
+/// a SQL comparison — every remembered hash has to be verified in turn. The
+/// depth is small and this runs only on a password change, so the cost is
+/// bounded and deliberate.
+async fn password_is_reused(db: &PgPool, user_id: uuid::Uuid, candidate: &str) -> bool {
+    let hashes: Vec<String> = sqlx::query_scalar(
+        "SELECT password_hash FROM password_history \
+         WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2",
+    )
+    .bind(user_id)
+    .bind(super::password_policy::HISTORY_DEPTH)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+
+    hashes.iter().any(|h| verify_password(candidate, h))
+}
+
+/// Record a retired password hash and trim the history to the policy depth.
+///
+/// Failures are logged, not fatal: a rotation that succeeded must not be
+/// reported to the user as failed because the history write lost a race. The
+/// audit ledger still records the change itself.
+async fn record_password_history(db: &PgPool, user_id: uuid::Uuid, hash: &str) {
+    if let Err(e) = sqlx::query(
+        "INSERT INTO password_history (user_id, password_hash) VALUES ($1, $2)",
+    )
+    .bind(user_id)
+    .bind(hash)
+    .execute(db)
+    .await
+    {
+        error!("password history insert failed for {user_id}: {e}");
+        return;
+    }
+    // Keep only the most recent N — the table is a rolling window, not a
+    // permanent record of every password a user has ever held.
+    let _ = sqlx::query(
+        "DELETE FROM password_history WHERE user_id = $1 AND id NOT IN ( \
+             SELECT id FROM password_history WHERE user_id = $1 \
+             ORDER BY created_at DESC LIMIT $2 )",
+    )
+    .bind(user_id)
+    .bind(super::password_policy::HISTORY_DEPTH)
+    .execute(db)
+    .await;
 }
 
 fn hash_password(password: &str) -> String {
@@ -23229,6 +23925,7 @@ async fn reports_list(Db(db): Db, Extension(user): Extension<AuthUser>) -> Respo
                     <select name="report_type" class="select select-bordered">
                         <option value="tabular">Tabular (columns + groups)</option>
                         <option value="template">Template (HTML document)</option>
+                        <option value="banded">Banded (pixel-perfect designer)</option>
                     </select></div>
             </div>
             <div class="modal-action">
@@ -23261,7 +23958,7 @@ async fn report_create(
     if code.is_empty() || name.is_empty() || model.is_empty() {
         return settings_write_error("/settings/reports", "Code, name and model are required.");
     }
-    let rtype = match form.report_type.as_deref() { Some("template") => "template", _ => "tabular" };
+    let rtype = match form.report_type.as_deref() { Some("template") => "template", Some("banded") => "banded", _ => "tabular" };
     let row = sqlx::query(
         "INSERT INTO ir_report (code, name, model_name, report_type, created_by) \
          VALUES ($1,$2,$3,$4,$5) RETURNING id",
@@ -23278,7 +23975,325 @@ async fn report_create(
         .with_database(&db_ctx.db_name).with_resource("ir_report", &code).with_resource_name(&name)
         .with_details(serde_json::json!({"action":"create","model":model,"type":rtype}));
     let _ = state.audit.log(entry).await;
+    // Banded reports open in the pixel-perfect designer; seed a starter layout.
+    if rtype == "banded" {
+        let seed = seed_banded_layout(&name);
+        if let Ok(doc) = serde_json::from_value::<vortex_framework::banded_report::ReportLayout>(seed) {
+            let _ = vortex_framework::banded_report::save_document(&db, new_id, &doc, Some(user.id)).await;
+        }
+        return Redirect::to(&format!("/reports/design/{new_id}")).into_response();
+    }
     Redirect::to(&format!("/settings/reports/{new_id}")).into_response()
+}
+
+/// Starter layout document for a freshly created banded report: A4, a title
+/// band with the report name, an empty detail band, and a "Page N of M" footer.
+fn seed_banded_layout(name: &str) -> serde_json::Value {
+    serde_json::json!({
+        "unit": "pt",
+        "page": {"size":"A4","orientation":"portrait","width":595.0,"height":842.0,
+                 "margin":{"top":36.0,"right":36.0,"bottom":36.0,"left":36.0}},
+        "bands": {
+            "title": {"height":48.0,"elements":[
+                {"id":"title_text","type":"staticText","x":0.0,"y":8.0,"w":523.0,"h":28.0,
+                 "text":name,"style":{"size":18.0,"bold":true}}]},
+            "columnHeader": {"height":0.0,"elements":[]},
+            "detail": {"height":22.0,"elements":[]},
+            "pageFooter": {"height":24.0,"elements":[
+                {"id":"page_footer","type":"field","x":0.0,"y":6.0,"w":523.0,"h":14.0,
+                 "expr":"\"Page \" + page() + \" of \" + pages()",
+                 "style":{"align":"right","size":8.0,"color":"#888888"}}]},
+            "summary": {"height":0.0,"elements":[]}
+        }
+    })
+}
+
+// ─── Report Studio: banded, pixel-perfect designer ───────────────────────
+
+/// Field descriptors for the designer palette, as JSON.
+async fn banded_field_list(db: &sqlx::PgPool, model: &str) -> Vec<serde_json::Value> {
+    if model.is_empty() {
+        return Vec::new();
+    }
+    let rows = sqlx::query(
+        "SELECT f.name, f.display_name, f.field_type FROM ir_model_field f \
+         JOIN ir_model m ON m.id = f.model_id WHERE m.name = $1 ORDER BY f.sequence, f.name",
+    )
+    .bind(model)
+    .fetch_all(db)
+    .await
+    .unwrap_or_default();
+    rows.iter()
+        .map(|r| {
+            let name: String = r.get("name");
+            let label: String = r.try_get::<Option<String>, _>("display_name").ok().flatten().unwrap_or_else(|| name.clone());
+            let ftype: String = r.get("field_type");
+            serde_json::json!({"name": name, "label": label, "type": ftype})
+        })
+        .collect()
+}
+
+/// GET /reports/design/{id}/fields — palette field list (JSON).
+async fn banded_fields(Db(db): Db, Extension(user): Extension<AuthUser>, Path(id): Path<uuid::Uuid>) -> Response {
+    if !report_author(&user) {
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!({"error": "forbidden"}))).into_response();
+    }
+    let report = match vortex_framework::banded_report::load(&db, id).await {
+        Ok(Some(r)) => r,
+        _ => return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "not found"}))).into_response(),
+    };
+    Json(banded_field_list(&db, &report.model_name).await).into_response()
+}
+
+/// GET /reports/design/{id} — the WYSIWYG designer shell.
+async fn banded_designer(Db(db): Db, Extension(user): Extension<AuthUser>, Path(id): Path<uuid::Uuid>) -> Response {
+    if !report_author(&user) {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Report Studio"))).into_response();
+    }
+    let report = match vortex_framework::banded_report::load(&db, id).await {
+        Ok(Some(r)) => r,
+        Ok(None) => return (StatusCode::NOT_FOUND, Html("Banded report not found")).into_response(),
+        Err(e) => return (StatusCode::BAD_REQUEST, Html(format!("Report error: {}", html_escape(&e)))).into_response(),
+    };
+    let layout_json = serde_json::to_string(&report.layout).unwrap_or_else(|_| "{}".into());
+    let fields = banded_field_list(&db, &report.model_name).await;
+    let fields_json = serde_json::to_string(&fields).unwrap_or_else(|_| "[]".into());
+    // Bootstrap data as JSON in a typed script tag (no inline behaviour → CSP-safe).
+    let boot = serde_json::json!({
+        "reportId": id.to_string(),
+        "name": report.name,
+        "model": report.model_name,
+        "layout": serde_json::from_str::<serde_json::Value>(&layout_json).unwrap_or_default(),
+        "fields": serde_json::from_str::<serde_json::Value>(&fields_json).unwrap_or_default(),
+    });
+    let boot_json = serde_json::to_string(&boot).unwrap_or_else(|_| "{}".into());
+
+    let html = format!(
+        r##"<!DOCTYPE html><html lang="en" data-theme="light"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Report Studio — {name}</title>
+<link href="/static/vendor/daisyui.min.css" rel="stylesheet">
+<link href="/static/tailwind.css?v=21" rel="stylesheet"/>
+<link href="/static/report-studio.css?v=2" rel="stylesheet"/>
+</head><body class="rs-body">
+<script id="rs-boot" type="application/json">{boot}</script>
+<div id="rs-app" data-run-url="/reports/run/{id}"></div>
+<script src="/static/report-studio.js?v=2" defer></script>
+</body></html>"##,
+        name = html_escape(&report.name),
+        boot = boot_json,
+        id = id,
+    );
+    Html(html).into_response()
+}
+
+/// POST /reports/design/{id}/save — persist the layout document (JSON body).
+async fn banded_save(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<uuid::Uuid>,
+    Json(doc): Json<serde_json::Value>,
+) -> Response {
+    if !report_author(&user) {
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!({"ok": false, "error": "forbidden"}))).into_response();
+    }
+    let layout = match serde_json::from_value::<vortex_framework::banded_report::ReportLayout>(doc) {
+        Ok(l) => l,
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"ok": false, "error": format!("bad layout: {e}")}))).into_response(),
+    };
+    let issues = vortex_framework::banded_report::validate(&layout);
+    if !issues.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"ok": false, "issues": issues}))).into_response();
+    }
+    match vortex_framework::banded_report::save_document(&db, id, &layout, Some(user.id)).await {
+        Ok(()) => {
+            let entry = AuditEntry::new(AuditAction::ConfigChanged, AuditSeverity::Info)
+                .with_user(vortex_common::UserId(user.id)).with_username(&user.username)
+                .with_database(&db_ctx.db_name).with_resource("ir_report_layout", id.to_string())
+                .with_details(serde_json::json!({"action": "save_layout"}));
+            let _ = state.audit.log(entry).await;
+            Json(serde_json::json!({"ok": true})).into_response()
+        }
+        Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({"ok": false, "error": e}))).into_response(),
+    }
+}
+
+/// POST /reports/design/{id}/preview — render the posted (unsaved) layout with
+/// live data, returning HTML for the designer's preview pane.
+async fn banded_preview(
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Path(id): Path<uuid::Uuid>,
+    Json(doc): Json<serde_json::Value>,
+) -> Response {
+    if !report_author(&user) {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Report Studio"))).into_response();
+    }
+    let mut report = match vortex_framework::banded_report::load(&db, id).await {
+        Ok(Some(r)) => r,
+        _ => return (StatusCode::NOT_FOUND, Html("Report not found")).into_response(),
+    };
+    match serde_json::from_value::<vortex_framework::banded_report::ReportLayout>(doc) {
+        Ok(l) => report.layout = l,
+        Err(e) => return (StatusCode::BAD_REQUEST, Html(format!("Bad layout: {}", html_escape(&e.to_string())))).into_response(),
+    }
+    // Cap rows so a live preview of a huge dataset stays snappy.
+    report.row_limit = report.row_limit.min(500);
+    let provided = std::collections::BTreeMap::new();
+    match vortex_framework::banded_report::render_to_html(&db, &report, &provided).await {
+        Ok(html) => Html(html).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, Html(format!("Preview error: {}", html_escape(&e)))).into_response(),
+    }
+}
+
+/// GET /reports/design/{id}/export — portable layout manifest (JSON download).
+async fn banded_export(Db(db): Db, Extension(user): Extension<AuthUser>, Path(id): Path<uuid::Uuid>) -> Response {
+    if !report_author(&user) {
+        return (StatusCode::FORBIDDEN, Html(forbidden_page("Report Studio"))).into_response();
+    }
+    let report = match vortex_framework::banded_report::load(&db, id).await {
+        Ok(Some(r)) => r,
+        _ => return (StatusCode::NOT_FOUND, Html("Report not found")).into_response(),
+    };
+    let doc = serde_json::to_value(&report.layout).unwrap_or_default();
+    // Integrity hash over the canonical document bytes (tamper-evidence for
+    // transporting a layout between tenants).
+    let bytes = serde_json::to_vec(&doc).unwrap_or_default();
+    let checksum = {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(&bytes);
+        format!("{:x}", h.finalize())
+    };
+    let manifest = serde_json::json!({
+        "kind": "vortex.report_studio.layout",
+        "version": 1,
+        "code": report.code,
+        "name": report.name,
+        "model": report.model_name,
+        "checksum_sha256": checksum,
+        "document": doc,
+    });
+    let body = serde_json::to_string_pretty(&manifest).unwrap_or_default();
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, "application/json".to_string()),
+            (axum::http::header::CONTENT_DISPOSITION, format!("attachment; filename=\"{}.report.json\"", report.code)),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+/// POST /reports/design/{id}/import — replace the layout from a manifest or a
+/// bare layout document.
+async fn banded_import(
+    State(state): State<Arc<AppState>>,
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Extension(db_ctx): Extension<DatabaseContext>,
+    Path(id): Path<uuid::Uuid>,
+    Json(payload): Json<serde_json::Value>,
+) -> Response {
+    if !report_author(&user) {
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!({"ok": false, "error": "forbidden"}))).into_response();
+    }
+    // Accept either a full manifest ({document: {...}}) or a bare layout.
+    let doc = payload.get("document").cloned().unwrap_or(payload);
+    let layout = match serde_json::from_value::<vortex_framework::banded_report::ReportLayout>(doc) {
+        Ok(l) => l,
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"ok": false, "error": format!("bad layout: {e}")}))).into_response(),
+    };
+    match vortex_framework::banded_report::save_document(&db, id, &layout, Some(user.id)).await {
+        Ok(()) => {
+            let entry = AuditEntry::new(AuditAction::ConfigChanged, AuditSeverity::Info)
+                .with_user(vortex_common::UserId(user.id)).with_username(&user.username)
+                .with_database(&db_ctx.db_name).with_resource("ir_report_layout", id.to_string())
+                .with_details(serde_json::json!({"action": "import_layout"}));
+            let _ = state.audit.log(entry).await;
+            Json(serde_json::json!({"ok": true})).into_response()
+        }
+        Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({"ok": false, "error": e}))).into_response(),
+    }
+}
+
+/// POST /reports/design/{id}/scaffold — replace the layout with a starter
+/// template (`invoice` | `statement` | `labels`).
+async fn banded_scaffold(
+    Db(db): Db,
+    Extension(user): Extension<AuthUser>,
+    Path(id): Path<uuid::Uuid>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    if !report_author(&user) {
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!({"ok": false, "error": "forbidden"}))).into_response();
+    }
+    let report = match vortex_framework::banded_report::load(&db, id).await {
+        Ok(Some(r)) => r,
+        _ => return (StatusCode::NOT_FOUND, Json(serde_json::json!({"ok": false, "error": "not found"}))).into_response(),
+    };
+    let tmpl = body.get("template").and_then(|v| v.as_str()).unwrap_or("");
+    let Some(doc) = vortex_framework::banded_report::sample_layout(tmpl, &report.name) else {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"ok": false, "error": "unknown template"}))).into_response();
+    };
+    let layout = match serde_json::from_value::<vortex_framework::banded_report::ReportLayout>(doc) {
+        Ok(l) => l,
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"ok": false, "error": e.to_string()}))).into_response(),
+    };
+    match vortex_framework::banded_report::save_document(&db, id, &layout, Some(user.id)).await {
+        Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({"ok": false, "error": e}))).into_response(),
+    }
+}
+
+/// Render a banded report for `report_run` (view HTML or `?format=pdf`).
+async fn run_banded_report(
+    state: &Arc<AppState>,
+    db: &sqlx::PgPool,
+    user: &AuthUser,
+    db_ctx: &DatabaseContext,
+    id: uuid::Uuid,
+    q: &std::collections::HashMap<String, String>,
+) -> Response {
+    use vortex_framework::banded_report as br;
+    let report = match br::load(db, id).await {
+        Ok(Some(r)) => r,
+        Ok(None) => return (StatusCode::NOT_FOUND, Html("Report not found")).into_response(),
+        Err(e) => return (StatusCode::BAD_REQUEST, Html(format!("Report error: {}", html_escape(&e)))).into_response(),
+    };
+    let format = q.get("format").map(|s| s.as_str()).unwrap_or("html");
+    let mut provided = std::collections::BTreeMap::new();
+    for (k, v) in q {
+        if k != "format" {
+            provided.insert(k.clone(), v.clone());
+        }
+    }
+    let entry = AuditEntry::new(AuditAction::BulkExport, AuditSeverity::Info)
+        .with_user(vortex_common::UserId(user.id)).with_username(&user.username)
+        .with_database(&db_ctx.db_name).with_resource("ir_report", report.code.clone()).with_resource_name(&report.name)
+        .with_details(serde_json::json!({"action": "run", "format": format, "shape": "banded"}));
+    let _ = state.audit.log(entry).await;
+
+    if format == "pdf" {
+        if !vortex_framework::pdf::available() {
+            return (StatusCode::NOT_IMPLEMENTED, Html("PDF engine not enabled in this build (rebuild with --features pdf).")).into_response();
+        }
+        return match br::render_to_pdf(db, &report, &provided).await {
+            Ok(bytes) => (
+                [(axum::http::header::CONTENT_TYPE, "application/pdf"),
+                 (axum::http::header::CONTENT_DISPOSITION, &format!("inline; filename=\"{}.pdf\"", report.code))],
+                bytes,
+            )
+                .into_response(),
+            Err(e) => (StatusCode::BAD_REQUEST, Html(format!("PDF render failed: {}", html_escape(&e)))).into_response(),
+        };
+    }
+    match br::render_to_html(db, &report, &provided).await {
+        Ok(html) => Html(html).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, Html(format!("Report error: {}", html_escape(&e)))).into_response(),
+    }
 }
 
 async fn report_edit(Db(db): Db, Extension(user): Extension<AuthUser>, Path(id): Path<uuid::Uuid>) -> Response {
@@ -23618,6 +24633,10 @@ async fn report_run(
     if !def.can_run(&user.roles, user.is_admin()) {
         return (StatusCode::FORBIDDEN, Html(forbidden_page(&def.name))).into_response();
     }
+    // Banded (pixel-perfect) reports render through the Report Studio engine.
+    if def.report_type == "banded" {
+        return run_banded_report(&state, &db, &user, &db_ctx, id, &q).await;
+    }
     let format = q.get("format").map(|s| s.as_str()).unwrap_or("html");
 
     // Audit the run (read/export) against the tenant DB.
@@ -23663,6 +24682,7 @@ async fn report_run(
             paper: pdf::Paper::parse(&def.paper_size),
             print_background: true,
             margin_in: 0.4,
+            ..Default::default()
         };
         return match pdf::html_to_pdf(&printable, &opts).await {
             Ok(bytes) => ([(axum::http::header::CONTENT_TYPE, "application/pdf"),

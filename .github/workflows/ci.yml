@@ -108,3 +108,25 @@ jobs:
         uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Licence, source and duplicate-dependency policy. cargo-audit only
+      # covers known vulnerabilities; deny.toml is where "no copyleft, no
+      # unvetted registries, no unknown git sources" is actually enforced.
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@cargo-deny
+      - name: cargo deny check
+        run: cargo deny --all-features check
+
+      # Software bill of materials, published as a build artifact so a
+      # customer or auditor can be handed the exact dependency set of a
+      # given commit rather than a claim about it.
+      - name: Install cargo-cyclonedx
+        run: cargo install cargo-cyclonedx --locked
+      - name: Generate SBOM (CycloneDX)
+        run: cargo cyclonedx --all --format json
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-cyclonedx
+          path: '**/*.cdx.json'
+          if-no-files-found: error

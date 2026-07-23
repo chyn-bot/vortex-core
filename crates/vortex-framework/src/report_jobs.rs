@@ -184,7 +184,17 @@ async fn render_and_store(
         .await
         .ok_or("report definition no longer exists")?;
 
-    let (bytes, ext, mime): (Vec<u8>, &str, &str) = if format == "csv" {
+    let (bytes, ext, mime): (Vec<u8>, &str, &str) = if def.report_type == "banded" {
+        // Pixel-perfect reports render through the Report Studio engine. CSV is
+        // n/a for positioned layout, so anything but PDF falls back to HTML.
+        let report = crate::banded_report::load(pool, report_id).await?.ok_or("banded report no longer exists")?;
+        let provided = std::collections::BTreeMap::new();
+        if format == "pdf" {
+            (crate::banded_report::render_to_pdf(pool, &report, &provided).await?, "pdf", "application/pdf")
+        } else {
+            (crate::banded_report::render_to_html(pool, &report, &provided).await?.into_bytes(), "html", "text/html; charset=utf-8")
+        }
+    } else if format == "csv" {
         let res = ur::run_tabular(pool, &def).await?;
         (ur::render_tabular_csv(&res), "csv", "text/csv")
     } else {
@@ -210,6 +220,7 @@ async fn render_and_store(
                     paper: crate::pdf::Paper::parse(&def.paper_size),
                     print_background: true,
                     margin_in: 0.4,
+                    ..Default::default()
                 };
                 let bytes = crate::pdf::html_to_pdf(&page, &opts)
                     .await

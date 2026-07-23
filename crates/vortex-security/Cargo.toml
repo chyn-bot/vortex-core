@@ -52,6 +52,18 @@ thiserror = { workspace = true }
 # Logging
 tracing = { workspace = true }
 
+# Cloud key-provider backends (KMS / Vault) make a synchronous HTTPS
+# round-trip via a thread-isolated blocking client. Optional so a deployment
+# that never uses them pays no dependency cost — see keyprovider/.
+reqwest = { workspace = true, optional = true, features = ["blocking"] }
+
+[features]
+default = []
+# Wrap data keys with AWS KMS (hand-rolled SigV4, no aws-sdk-*).
+aws-kms = ["dep:reqwest"]
+# Wrap data keys with HashiCorp Vault / OpenBao Transit.
+vault = ["dep:reqwest"]
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util", "macros"] }
 # Temporary token directory for the SoftHSM2 integration test.

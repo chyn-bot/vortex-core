@@ -14,6 +14,7 @@ members = [
     "crates/vortex-cli",
     "crates/vortex-change",
     "crates/vortex-contacts",
+    "crates/vortex-recon",
     "crates/vortex-iwk",
     "crates/vortex-accounting",
     "crates/vortex-inventory",
@@ -36,6 +37,12 @@ rust-version = "1.93"
 # Async runtime
 tokio = { version = "1.43", features = ["full"] }
 async-trait = "0.1"
+
+# Tabular ingest for the reconciliation vertical: M3 ERP extracts arrive as
+# CSV or Excel. `csv` handles delimited text; `calamine` reads .xlsx/.xls
+# (pulls quick-xml + zip). Pinned; keep `cargo audit` clean.
+csv = "1.3"
+calamine = "0.26"
 
 # Database
 # Note: MSSQL support requires sqlx 0.7 or alternative like tiberius
@@ -80,6 +87,17 @@ lettre = { version = "0.11", default-features = false, features = ["builder", "s
 # there is no system-openssl or system-cert dependency; JSON body support.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
+# Remote invoice pickup (recon SFTP/FTP auto-ingest). Pure-Rust, no system libs:
+# russh(-sftp) for async SFTP over SSH; suppaftp SYNC + rustls for FTP/FTPS
+# (its async client is async-std-based, so we run the blocking client in
+# spawn_blocking rather than mix runtimes). rustls/webpki-roots build the FTPS
+# TLS connector.
+russh = "0.45"
+russh-sftp = "2"
+suppaftp = { version = "6", features = ["rustls"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+webpki-roots = "1"
+
 # Security & Crypto
 argon2 = "0.5"
 ring = "0.17"
@@ -87,6 +105,7 @@ jsonwebtoken = "9"
 uuid = { version = "1.11", features = ["v4", "v7", "serde"] }
 sha2 = "0.10"
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+barcoders = { version = "1.0", default-features = false, features = ["svg"] }
 base64 = "0.22"
 hex = "0.4"
 rand = "0.8"
@@ -128,6 +147,7 @@ vortex-chatter = { path = "crates/vortex-chatter" }
 vortex-server = { path = "crates/vortex-server" }
 vortex-change = { path = "crates/vortex-change" }
 vortex-contacts = { path = "crates/vortex-contacts" }
+vortex-recon = { path = "crates/vortex-recon" }
 vortex-iwk = { path = "crates/vortex-iwk" }
 vortex-accounting = { path = "crates/vortex-accounting" }
 vortex-inventory = { path = "crates/vortex-inventory" }

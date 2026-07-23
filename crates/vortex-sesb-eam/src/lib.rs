@@ -20,5 +20,6 @@
 
 pub mod handlers;
 pub mod plugin;
+pub mod workflow;
 
 pub use plugin::SesbEamPlugin;

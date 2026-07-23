@@ -1,0 +1,5 @@
+[migration]
+module = "core"
+description = "Engage least-privilege vortex_runtime role across all current tables + re-assert WORM audit REVOKEs + GRANT CONNECT, so the server can SET ROLE to it (VORTEX_DB_RUNTIME_ROLE) and run without owner privileges"
+reversible = false
+dependencies = ["165_rate_limit_bucket"]

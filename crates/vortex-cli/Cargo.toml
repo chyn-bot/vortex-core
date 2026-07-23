@@ -25,6 +25,7 @@ vortex-change = { workspace = true, optional = true }
 # Contacts plugin — always enabled; it's the platform smoke-test
 # vertical and the universal "res.partner" equivalent.
 vortex-contacts = { workspace = true }
+vortex-recon = { workspace = true }
 vortex-iwk = { workspace = true }
 # Inventory plugin — a generic, always-on stock primitive (products,
 # locations, double-entry moves, on-hand) that maintenance and
@@ -92,3 +93,8 @@ cr = ["dep:vortex-change"]
 # Enables the headless-Chromium PDF backend for report export (`?format=pdf`).
 # Off by default — build with `--features pdf` and ship a Chromium binary.
 pdf = ["vortex-framework/pdf-chromium"]
+# Cloud key-provider backends for secrets-at-rest (envelope encryption so the
+# wrapping key never leaves the customer's KMS). Off by default; select at
+# runtime with VORTEX_KEY_PROVIDER once built in.
+kms-aws = ["vortex-security/aws-kms"]
+kms-vault = ["vortex-security/vault"]

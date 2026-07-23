@@ -28,6 +28,15 @@ pub enum CryptoError {
     BadKey,
     #[error("ciphertext too short")]
     Truncated,
+    /// A pluggable key provider (KMS / Vault) failed to wrap or unwrap a data
+    /// key. Deliberately opaque to callers; the concrete cause (network,
+    /// auth, throttling) is logged internally, never surfaced, so the error
+    /// cannot become a decryption oracle.
+    #[error("key provider unavailable")]
+    Provider,
+    /// A sealed blob did not parse as a valid envelope.
+    #[error("malformed sealed envelope")]
+    Envelope,
 }
 
 const KEY_LEN: usize = 32;
@@ -62,6 +71,55 @@ pub fn master_key() -> [u8; KEY_LEN] {
     // Fixed development key — NOT secret. Only reachable when the env is unset
     // or malformed; production must set a real key.
     *b"vortex-dev-insecure-key-32bytes!"
+}
+
+/// Env var that explicitly authorises running on the built-in development
+/// key. Only a developer should ever set this; production deployments must
+/// supply a real key instead.
+pub const ALLOW_DEV_KEY_ENV: &str = "VORTEX_ALLOW_DEV_KEY";
+
+/// Whether `VORTEX_SECRET_KEY` is present and well-formed (base64 of exactly
+/// 32 bytes). `false` means [`master_key`] would fall back to the built-in
+/// development key.
+pub fn master_key_configured() -> bool {
+    std::env::var(MASTER_KEY_ENV)
+        .ok()
+        .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64.trim()).ok())
+        .map(|bytes| bytes.len() == KEY_LEN)
+        .unwrap_or(false)
+}
+
+/// Fail-closed startup gate for the master encryption key.
+///
+/// Returns `Err(message)` when no usable key is configured and the operator
+/// has not explicitly opted into the insecure development key via
+/// `VORTEX_ALLOW_DEV_KEY`. Callers are expected to refuse to start: a process
+/// that seals tenant secrets under a key published in this source file offers
+/// no confidentiality at all, so booting anyway would be worse than not
+/// booting.
+pub fn require_master_key() -> Result<(), String> {
+    if master_key_configured() {
+        return Ok(());
+    }
+    let allowed = std::env::var(ALLOW_DEV_KEY_ENV)
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false);
+    if allowed {
+        tracing::warn!(
+            "{MASTER_KEY_ENV} is not set and {ALLOW_DEV_KEY_ENV} is on — running on the \
+             built-in development key. Secrets sealed now are NOT confidential."
+        );
+        return Ok(());
+    }
+    Err(format!(
+        "{MASTER_KEY_ENV} is not set (or is not base64 of exactly 32 bytes).\n\
+         Secrets at rest — SMTP passwords, API keys, TOTP seeds — would be sealed under a \
+         development key that is published in the Vortex source, and the MFA pre-auth token \
+         would be forgeable.\n\n\
+         Generate one with:  openssl rand -base64 32\n\
+         then set it, e.g.:  {MASTER_KEY_ENV}=<base64-32-bytes>\n\n\
+         For local development only, set {ALLOW_DEV_KEY_ENV}=1 to proceed on the insecure key."
+    ))
 }
 
 /// Generate a fresh random 32-byte key, base64-encoded — for operators to

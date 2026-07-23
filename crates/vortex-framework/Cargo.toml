@@ -35,6 +35,7 @@ sqlx = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 qrcode = { workspace = true }
+barcoders = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
@@ -42,6 +43,10 @@ rust_decimal = { workspace = true }
 rust_decimal_macros = { workspace = true }
 lettre = { workspace = true }
 reqwest = { workspace = true }
+# OIDC ID-token (RS256) validation for identity federation — see federation/.
+jsonwebtoken = { workspace = true }
+# base64url for the signed OIDC state parameter.
+base64 = "0.22"
 thiserror = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }

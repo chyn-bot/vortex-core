@@ -144,3 +144,83 @@ pub fn test_record(id: Uuid, name: &str, text: &str, priority: i32) -> PolicyRec
         updated_at: Utc::now(),
     }
 }
+
+/// Tests for the core generic-API authorization baseline shipped in
+/// migration 164. Loads the exact `.cedar` source the migration seeds and
+/// asserts its allow/deny semantics + resource-type scoping.
+#[cfg(test)]
+mod api_baseline_tests {
+    use super::{test_record, InMemoryPolicyStore};
+    use crate::service::PolicyService;
+    use crate::{Decision, PolicyPrincipal, PolicyResource};
+    use std::sync::Arc;
+
+    const BASELINE: &str =
+        include_str!("../../../migrations/164_api_authz_baseline/api_baseline.cedar");
+    const MIGRATION_SQL: &str =
+        include_str!("../../../migrations/164_api_authz_baseline/postgres.sql");
+
+    async fn svc() -> PolicyService {
+        let store = InMemoryPolicyStore::with(vec![test_record(
+            uuid::Uuid::new_v4(),
+            "api_record_authz_baseline",
+            BASELINE,
+            50,
+        )]);
+        let svc = PolicyService::load(Arc::new(store)).await.expect("loads");
+        assert!(
+            svc.parse_errors().await.is_empty(),
+            "baseline must parse: {:?}",
+            svc.parse_errors().await
+        );
+        svc
+    }
+
+    fn principal(roles: &[&str]) -> PolicyPrincipal {
+        PolicyPrincipal {
+            user_id: uuid::Uuid::new_v4(),
+            username: "svc".into(),
+            company_id: uuid::Uuid::nil(),
+            roles: roles.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    fn record(model: &str, action: &str) -> PolicyResource {
+        PolicyResource {
+            type_name: "Record".into(),
+            id: uuid::Uuid::new_v4().to_string(),
+            attributes: serde_json::json!({ "model": model, "action": action }),
+        }
+    }
+
+    #[tokio::test]
+    async fn baseline_permits_all_actions_on_record() {
+        let svc = svc().await;
+        for action in ["read", "create", "update", "delete"] {
+            let d = svc.check(&principal(&[]), action, &record("acc_move", action)).await.unwrap();
+            assert!(matches!(d, Decision::Allow { .. }), "baseline should permit {action}");
+        }
+    }
+
+    #[tokio::test]
+    async fn baseline_does_not_cover_non_record_resources() {
+        let svc = svc().await;
+        // A WorkflowInstance is NOT a Record, so the baseline permit must not
+        // apply — default-deny governs (proving the `resource is Record` scope).
+        let other = PolicyResource {
+            type_name: "WorkflowInstance".into(),
+            id: uuid::Uuid::new_v4().to_string(),
+            attributes: serde_json::json!({ "workflow_type": "change_request" }),
+        };
+        let d = svc.check(&principal(&["EAM Manager"]), "delete", &other).await.unwrap();
+        assert!(matches!(d, Decision::Deny { .. }), "baseline must not leak to non-Record types");
+    }
+
+    #[test]
+    fn migration_sql_embeds_the_exact_cedar_source() {
+        assert!(
+            MIGRATION_SQL.contains(BASELINE.trim()),
+            "migration 164 postgres.sql must embed api_baseline.cedar byte-for-byte"
+        );
+    }
+}

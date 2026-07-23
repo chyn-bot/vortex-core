@@ -20,6 +20,16 @@ pub const PASSWORD_MAX_AGE_DAYS: i64 = 90;
 /// Minimum password length.
 pub const MIN_LENGTH: usize = 8;
 
+/// How many previous passwords are remembered and refused on change. The
+/// current password counts as one of them, so a depth of 5 means a user must
+/// cycle through five distinct passwords before an old one becomes available
+/// again.
+pub const HISTORY_DEPTH: i64 = 5;
+
+/// Message shown when a proposed password matches one in the remembered
+/// history.
+pub const HISTORY_HINT: &str = "New password must not match any of your last 5 passwords.";
+
 /// Human-readable statement of the complexity policy, for form hints and
 /// CLI messages. Keep in sync with [`validate`].
 pub const POLICY_HINT: &str =

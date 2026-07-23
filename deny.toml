@@ -1,0 +1,86 @@
+# cargo-deny — supply-chain policy for the Vortex workspace.
+#
+# `cargo audit` answers "is any dependency known-vulnerable?". This file
+# answers the questions an enterprise procurement or security review actually
+# asks: what licences are in the tree, where did the code come from, and are
+# we carrying multiple versions of security-relevant crates.
+#
+# Run locally with:  cargo deny --all-features check
+# CI runs the same command; a failure blocks the merge.
+
+[graph]
+all-features = true
+
+# ─── Known vulnerabilities ────────────────────────────────────────────────
+[advisories]
+version = 2
+# Deny anything with a filed advisory. Unmaintained crates are surfaced as a
+# warning rather than a hard failure: they are a real risk signal but not an
+# exploitable defect, and blocking a merge on an upstream maintainer going
+# quiet would make the gate something people route around.
+yanked = "deny"
+unmaintained = "workspace"
+ignore = []
+
+# ─── Licences ─────────────────────────────────────────────────────────────
+[licenses]
+version = 2
+# Permissive licences only, plus the weak/file-level copyleft (MPL-2.0) that
+# does not reach our own source. Strong copyleft in a *dependency* would
+# change the licensing position of a customer deployment, so it is absent
+# from this list by design and adding one is a deliberate policy decision.
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-1-Clause",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "Unlicense",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "Unicode-3.0",
+    "MPL-2.0",
+    # Vortex's own crates. Listed explicitly rather than skipped, so the
+    # workspace's licence is visible in the same policy as everyone else's.
+    "AGPL-3.0",
+]
+confidence-threshold = 0.9
+
+[[licenses.exceptions]]
+# ring vendors BoringSSL-derived code under a mix of OpenSSL/ISC terms that
+# SPDX cannot express cleanly; it is reviewed and permitted.
+name = "ring"
+allow = ["OpenSSL", "ISC", "MIT", "Apache-2.0"]
+
+[[licenses.clarify]]
+name = "ring"
+expression = "ISC AND MIT AND OpenSSL"
+license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+
+# ─── Duplicate and banned crates ──────────────────────────────────────────
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+deny = [
+    # TLS is rustls throughout; a transitive pull of native-tls would drag in
+    # a system OpenSSL and quietly change the crypto and CVE surface of a
+    # deployment. Keep it out of the tree entirely.
+    { name = "openssl" },
+    { name = "openssl-sys" },
+    { name = "native-tls" },
+]
+
+# ─── Provenance ───────────────────────────────────────────────────────────
+[sources]
+# Everything must come from crates.io. An unvetted registry or a git
+# dependency pointing at a branch is an unreviewed code path into a product
+# that ships to regulated customers.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

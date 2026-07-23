@@ -179,48 +179,96 @@ async fn get_maintenance(
 }
 
 /// POST body: action=accept|reject|start|hold|resume|complete (+reason).
+///
+/// Authorization: the transition must be a legal edge in `work_order_machine()`
+/// **and** permitted by Cedar for this principal (see
+/// [`crate::workflow::guarded_transition`]) — this replaces the old hardcoded
+/// `match` that let any authenticated token drive the state machine. The domain
+/// `UPDATE` and the WORM audit entry are then committed in one tenant-pool
+/// transaction, so a failed audit write rolls the state change back.
 pub async fn maintenance_action(
     State(state): State<Arc<AppState>>, Db(db): Db,
     Extension(user): Extension<AuthUser>, Extension(db_ctx): Extension<DatabaseContext>,
     Path(id): Path<Uuid>, Form(form): Form<HashMap<String, String>>,
 ) -> Response {
+    use crate::workflow::{guarded_transition, policy_enforced, work_order_machine, Guard};
+    use vortex_plugin_sdk::policy::{PolicyPrincipal, PolicyResource};
+
     let action = form.get("action").cloned().unwrap_or_default();
     let cur: Option<String> = vortex_plugin_sdk::sqlx::query_scalar("SELECT state FROM eam_maintenance WHERE id=$1").bind(id).fetch_optional(&db).await.ok().flatten();
     let cur = match cur { Some(c) => c, None => return err(StatusCode::NOT_FOUND, "work order not found") };
-    let now = vortex_plugin_sdk::chrono::Utc::now();
-    let to: Result<&str, &str> = match (action.as_str(), cur.as_str()) {
-        ("accept", "scheduled") | ("accept", "assigned") | ("start", "scheduled") | ("start", "assigned") => {
-            let _ = vortex_plugin_sdk::sqlx::query("UPDATE eam_maintenance SET state='in_progress', accepted_by=$2, acceptance_date=$3, start_date=COALESCE(start_date,$3) WHERE id=$1").bind(id).bind(user.id).bind(now).execute(&db).await;
-            Ok("in_progress")
-        }
-        ("reject", "scheduled") | ("reject", "assigned") => {
-            let _ = vortex_plugin_sdk::sqlx::query("UPDATE eam_maintenance SET state='scheduled', assigned_to=NULL, rejected_by=$2, rejection_date=$3, rejection_reason=$4, rejection_count=rejection_count+1 WHERE id=$1").bind(id).bind(user.id).bind(now).bind(opt_str(&form, "reason")).execute(&db).await;
-            Ok("scheduled")
-        }
-        ("hold", "in_progress") => { let _ = vortex_plugin_sdk::sqlx::query("UPDATE eam_maintenance SET state='on_hold' WHERE id=$1").bind(id).execute(&db).await; Ok("on_hold") }
-        ("resume", "on_hold") => { let _ = vortex_plugin_sdk::sqlx::query("UPDATE eam_maintenance SET state='in_progress' WHERE id=$1").bind(id).execute(&db).await; Ok("in_progress") }
-        ("complete", "in_progress") | ("complete", "on_hold") => {
-            let missing: i64 = vortex_plugin_sdk::sqlx::query_scalar(
-                "SELECT COUNT(*) FROM eam_checklist_line WHERE maintenance_id=$1 AND is_required AND value_pass_fail IS NULL AND value_yes_no IS NULL AND value_measurement IS NULL AND value_text IS NULL AND value_selection IS NULL AND value_rating IS NULL")
-                .bind(id).fetch_one(&db).await.unwrap_or(0);
-            if missing > 0 { return err(StatusCode::CONFLICT, "required checklist items incomplete"); }
-            let _ = vortex_plugin_sdk::sqlx::query("UPDATE eam_maintenance SET state='completed', end_date=$2, actual_duration_hours = CASE WHEN start_date IS NOT NULL THEN EXTRACT(EPOCH FROM ($2 - start_date))/3600.0 END WHERE id=$1").bind(id).bind(now).execute(&db).await;
-            Ok("completed")
-        }
-        _ => Err("illegal transition"),
+
+    // ── Authorization: legality (state machine) + Cedar policy ──────────
+    let principal = PolicyPrincipal {
+        user_id: user.id,
+        username: user.username.clone(),
+        company_id: default_company(&db).await.unwrap_or_default(),
+        roles: user.roles.clone(),
     };
-    match to {
-        Ok(to) => {
-            let entry = vortex_plugin_sdk::security::AuditEntry::new(
-                vortex_plugin_sdk::security::AuditAction::RecordUpdated, vortex_plugin_sdk::security::AuditSeverity::Info,
-            ).with_user(vortex_plugin_sdk::common::UserId(user.id)).with_username(&user.username)
-             .with_database(&db_ctx.db_name).with_resource("eam_maintenance", id.to_string())
-             .with_details(json!({"api": true, "action": action, "from": cur, "to": to}));
-            let _ = state.audit.log(entry).await;
-            Json(json!({"ok": true, "state": to})).into_response()
-        }
-        Err(m) => err(StatusCode::CONFLICT, &format!("{m}: cannot {action} from {cur}")),
+    let resource = PolicyResource {
+        type_name: "WorkOrder".into(),
+        id: id.to_string(),
+        attributes: json!({ "from_state": cur, "action": action }),
+    };
+    let to = match guarded_transition(
+        state.policy.as_ref(), work_order_machine(), &cur, &action, &principal, resource, policy_enforced(),
+    ).await {
+        Guard::Allow(to) => to,
+        Guard::Illegal => return err(StatusCode::CONFLICT, &format!("illegal transition: cannot {action} from {cur}")),
+        Guard::Denied => return err(StatusCode::FORBIDDEN, &format!("not permitted to {action} this work order")),
+        Guard::Error(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, &format!("policy check failed: {e}")),
+    };
+
+    let now = vortex_plugin_sdk::chrono::Utc::now();
+
+    // `complete` gate: all required checklist lines must carry a value.
+    if action == "complete" {
+        let missing: i64 = vortex_plugin_sdk::sqlx::query_scalar(
+            "SELECT COUNT(*) FROM eam_checklist_line WHERE maintenance_id=$1 AND is_required AND value_pass_fail IS NULL AND value_yes_no IS NULL AND value_measurement IS NULL AND value_text IS NULL AND value_selection IS NULL AND value_rating IS NULL")
+            .bind(id).fetch_one(&db).await.unwrap_or(0);
+        if missing > 0 { return err(StatusCode::CONFLICT, "required checklist items incomplete"); }
     }
+
+    // ── Domain side-effects + WORM audit, committed atomically ──────────
+    let mut tx = match db.begin().await {
+        Ok(t) => t,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, &format!("tx begin: {e}")),
+    };
+    let upd = match action.as_str() {
+        "accept" | "start" => vortex_plugin_sdk::sqlx::query(
+            "UPDATE eam_maintenance SET state=$2, accepted_by=$3, acceptance_date=$4, start_date=COALESCE(start_date,$4) WHERE id=$1")
+            .bind(id).bind(&to).bind(user.id).bind(now).execute(&mut *tx).await,
+        "reject" => vortex_plugin_sdk::sqlx::query(
+            "UPDATE eam_maintenance SET state=$2, assigned_to=NULL, rejected_by=$3, rejection_date=$4, rejection_reason=$5, rejection_count=rejection_count+1 WHERE id=$1")
+            .bind(id).bind(&to).bind(user.id).bind(now).bind(opt_str(&form, "reason")).execute(&mut *tx).await,
+        "hold" | "resume" => vortex_plugin_sdk::sqlx::query(
+            "UPDATE eam_maintenance SET state=$2 WHERE id=$1")
+            .bind(id).bind(&to).execute(&mut *tx).await,
+        "complete" => vortex_plugin_sdk::sqlx::query(
+            "UPDATE eam_maintenance SET state=$2, end_date=$3, actual_duration_hours = CASE WHEN start_date IS NOT NULL THEN EXTRACT(EPOCH FROM ($3 - start_date))/3600.0 END WHERE id=$1")
+            .bind(id).bind(&to).bind(now).execute(&mut *tx).await,
+        // Unreachable: the state machine already rejected any action not
+        // handled above with `Guard::Illegal`.
+        other => { let _ = tx.rollback().await; return err(StatusCode::CONFLICT, &format!("unhandled action {other}")); }
+    };
+    if let Err(e) = upd {
+        let _ = tx.rollback().await;
+        return err(StatusCode::INTERNAL_SERVER_ERROR, &format!("update failed: {e}"));
+    }
+
+    let entry = vortex_plugin_sdk::security::AuditEntry::new(
+        vortex_plugin_sdk::security::AuditAction::WorkflowTransition, vortex_plugin_sdk::security::AuditSeverity::Info,
+    ).with_user(vortex_plugin_sdk::common::UserId(user.id)).with_username(&user.username)
+     .with_database(&db_ctx.db_name).with_resource("eam_maintenance", id.to_string())
+     .with_details(json!({"api": true, "action": action, "from": cur, "to": to}));
+    if let Err(e) = state.audit.log_tx(entry, &mut tx).await {
+        let _ = tx.rollback().await;
+        return err(StatusCode::INTERNAL_SERVER_ERROR, &format!("audit write failed: {e}"));
+    }
+    if let Err(e) = tx.commit().await {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, &format!("commit failed: {e}"));
+    }
+    Json(json!({"ok": true, "state": to})).into_response()
 }
 
 /// POST one typed checklist-line value.

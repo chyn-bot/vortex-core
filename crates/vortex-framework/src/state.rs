@@ -127,6 +127,14 @@ pub struct AppState {
     /// server-side before a public form writes anything. Forms opt in per-form.
     /// See `crate::captcha`.
     pub captcha: Arc<dyn crate::captcha::CaptchaVerifier>,
+    /// Key provider for secrets-at-rest (`[keyprovider]` in vortex.toml). The
+    /// default `local` provider seals under `VORTEX_SECRET_KEY`, byte-compatible
+    /// with pre-existing rows; `aws-kms` / `vault` backends use envelope
+    /// encryption so the wrapping key never leaves the customer's KMS (BNM RMiT
+    /// 8c/8d). Consumers seal/unseal via `state.key_provider` instead of
+    /// pairing `crypto::encrypt_str` with `crypto::master_key` directly. See
+    /// `vortex_security::keyprovider`.
+    pub key_provider: Arc<dyn vortex_security::keyprovider::KeyProvider>,
 }
 
 /// Database context injected by the auth middleware for request-scoped

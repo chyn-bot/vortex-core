@@ -1,0 +1,5 @@
+[migration]
+module = "core"
+description = "Report Studio: pixel-perfect banded report layouts (ir_report_layout). Adds the 'banded' report_type shape alongside tabular/template — a JSONB layout document (page geometry, bands, XY-positioned elements, expressions/variables) authored by the WYSIWYG designer and rendered deterministically to PDF."
+reversible = true
+dependencies = ["128_user_reports"]

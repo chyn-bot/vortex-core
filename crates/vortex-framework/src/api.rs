@@ -434,6 +434,25 @@ fn value_expr(col: &str, udt: &str) -> String {
 /// Create a record from a JSON body. Unspecified columns take their DB
 /// defaults; identity/audit columns are ignored if supplied. Returns the new id.
 pub async fn create_record(db: &PgPool, model: &str, body: &Value) -> Result<Uuid, String> {
+    let mut tx = db.begin().await.map_err(|e| format!("tx begin failed: {e}"))?;
+    let id = create_record_tx(db, &mut tx, model, body).await?;
+    tx.commit().await.map_err(|e| format!("commit failed: {e}"))?;
+    Ok(id)
+}
+
+/// Transaction-bound variant of [`create_record`]. The final `INSERT` runs on
+/// `tx`, so a caller can enroll the WORM audit write in the **same**
+/// transaction (`AuditLog::log_tx`) and have the mutation and its audit record
+/// commit or roll back together — the generic API path's correctness fix for
+/// the cloud-risk assessment (audit was previously post-commit best-effort).
+/// Metadata reads (`model_table`, `writable_columns`) run on the pool; only
+/// the mutation needs to be inside the transaction.
+pub async fn create_record_tx(
+    db: &PgPool,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    model: &str,
+    body: &Value,
+) -> Result<Uuid, String> {
     let table = model_table(db, model).await.ok_or("unknown model")?;
     let columns = writable_columns(db, &table).await;
     let (cols, filtered) = writable_assignments(&columns, body)?;
@@ -449,7 +468,7 @@ pub async fn create_record(db: &PgPool, model: &str, body: &Value) -> Result<Uui
     let sql = format!("INSERT INTO {table} ({col_list}) VALUES ({val_list}) RETURNING id");
     let id: Uuid = sqlx::query_scalar(&sql)
         .bind(&filtered)
-        .fetch_one(db)
+        .fetch_one(&mut **tx)
         .await
         .map_err(|e| format!("insert failed: {e}"))?;
     Ok(id)
@@ -474,6 +493,20 @@ pub async fn duplicate_record(
 /// body are written; `updated_at` is bumped when the column exists. Returns
 /// whether a row matched.
 pub async fn update_record(db: &PgPool, model: &str, id: Uuid, body: &Value) -> Result<bool, String> {
+    let mut tx = db.begin().await.map_err(|e| format!("tx begin failed: {e}"))?;
+    let ok = update_record_tx(db, &mut tx, model, id, body).await?;
+    tx.commit().await.map_err(|e| format!("commit failed: {e}"))?;
+    Ok(ok)
+}
+
+/// Transaction-bound variant of [`update_record`]. See [`create_record_tx`].
+pub async fn update_record_tx(
+    db: &PgPool,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    model: &str,
+    id: Uuid,
+    body: &Value,
+) -> Result<bool, String> {
     let table = model_table(db, model).await.ok_or("unknown model")?;
     let columns = writable_columns(db, &table).await;
     let (cols, filtered) = writable_assignments(&columns, body)?;
@@ -489,7 +522,7 @@ pub async fn update_record(db: &PgPool, model: &str, id: Uuid, body: &Value) -> 
     let res = sqlx::query(&sql)
         .bind(&filtered)
         .bind(id)
-        .execute(db)
+        .execute(&mut **tx)
         .await
         .map_err(|e| format!("update failed: {e}"))?;
     Ok(res.rows_affected() > 0)
@@ -497,11 +530,24 @@ pub async fn update_record(db: &PgPool, model: &str, id: Uuid, body: &Value) -> 
 
 /// Delete a record by id. Returns whether a row matched.
 pub async fn delete_record(db: &PgPool, model: &str, id: Uuid) -> Result<bool, String> {
+    let mut tx = db.begin().await.map_err(|e| format!("tx begin failed: {e}"))?;
+    let ok = delete_record_tx(db, &mut tx, model, id).await?;
+    tx.commit().await.map_err(|e| format!("commit failed: {e}"))?;
+    Ok(ok)
+}
+
+/// Transaction-bound variant of [`delete_record`]. See [`create_record_tx`].
+pub async fn delete_record_tx(
+    db: &PgPool,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    model: &str,
+    id: Uuid,
+) -> Result<bool, String> {
     let table = model_table(db, model).await.ok_or("unknown model")?;
     let sql = format!("DELETE FROM {table} WHERE id = $1");
     let res = sqlx::query(&sql)
         .bind(id)
-        .execute(db)
+        .execute(&mut **tx)
         .await
         .map_err(|e| format!("delete failed: {e}"))?;
     Ok(res.rows_affected() > 0)

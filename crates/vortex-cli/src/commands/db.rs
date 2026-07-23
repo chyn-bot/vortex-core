@@ -20,6 +20,7 @@ use crate::DbCommands;
 fn build_migration_registry() -> PluginRegistry {
     let mut registry = PluginRegistry::new();
     registry.register(Arc::new(vortex_contacts::ContactsPlugin::new()));
+    registry.register(Arc::new(vortex_recon::ReconPlugin::new()));
     registry.register(Arc::new(vortex_accounting::AccountingPlugin::new()));
     // IWK posts summarized journals through accounting, and its 002 migration
     // seeds GL accounts into acc_account — so it must register *after* it.

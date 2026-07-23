@@ -1,0 +1,5 @@
+[migration]
+module = "core"
+description = "Shared rate-limit counter (rate_limit_bucket): fixed-window request counts keyed by (scope, client, window) so auth- and data-API limits hold across every app instance on one database, replacing the per-instance in-memory limiter"
+reversible = true
+dependencies = ["164_api_authz_baseline"]

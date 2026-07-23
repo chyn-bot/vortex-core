@@ -1,0 +1,5 @@
+[migration]
+module = "core"
+description = "Generic record-API (/api/v1) authorization baseline: enables Cedar policy evaluation on generic CRUD with a permissive, tenant-tightenable default (scoped to Record resources). Enforced when API_POLICY_ENFORCED is set."
+reversible = true
+dependencies = ["115_policy_engine"]

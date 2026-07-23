@@ -42,6 +42,7 @@ pub mod controller;
 pub mod crypto;
 pub mod csv_loader;
 pub mod domain;
+pub mod keyprovider;
 pub mod mfa;
 pub mod password;
 pub mod rbac;
@@ -66,6 +67,10 @@ pub mod prelude {
         MemoryAuditStorage, PgAuditStorage,
     };
     pub use crate::auth::{AuthService, Credentials};
+    pub use crate::keyprovider::{
+        build_key_provider, DekWrapper, EnvelopeProvider, KeyProvider, KeyProviderConfig,
+        LocalKeyProvider,
+    };
     pub use crate::password::{PasswordHasher, PasswordPolicy};
     pub use crate::rbac::{Permission, Role, RoleManager};
     pub use crate::session::{Session, SessionManager};

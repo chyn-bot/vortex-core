@@ -14,6 +14,7 @@ const MIG_004_NETWORKS: &str = include_str!("../migrations/004_eam_networks/post
 const MIG_005_OPERATIONS: &str = include_str!("../migrations/005_eam_operations/postgres.sql");
 const MIG_006_GOVERNANCE: &str = include_str!("../migrations/006_eam_governance/postgres.sql");
 const MIG_007_FIELD_PORTAL: &str = include_str!("../migrations/007_eam_field_portal/postgres.sql");
+const MIG_008_POLICY: &str = include_str!("../migrations/008_eam_policy/postgres.sql");
 
 pub struct SesbEamPlugin;
 
@@ -214,6 +215,14 @@ impl Plugin for SesbEamPlugin {
                 up_sql: MIG_007_FIELD_PORTAL,
                 down_sql: Some(include_str!("../migrations/007_eam_field_portal/postgres_down.sql")),
                 requires_core_migration: Some("011_countries"),
+            },
+            // Starter Cedar policy for work-order transitions. Requires the
+            // core policy engine (migration 115: `policy_rules` + Cedar).
+            PluginMigration {
+                name: "008_eam_policy",
+                up_sql: MIG_008_POLICY,
+                down_sql: Some(include_str!("../migrations/008_eam_policy/postgres_down.sql")),
+                requires_core_migration: Some("115_policy_engine"),
             },
         ]
     }

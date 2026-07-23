@@ -15,6 +15,19 @@ pub use sqlx::postgres::PgRow;
 #[cfg(feature = "mssql")]
 pub use sqlx::mssql::MssqlRow;
 
+/// Whether `s` is a safe unquoted SQL role identifier for `SET ROLE`. Rejects
+/// anything outside `[A-Za-z_][A-Za-z0-9_]*` so a role name from config can
+/// never carry SQL. Postgres role names can be richer, but Vortex-managed
+/// runtime roles (e.g. `vortex_runtime`, `t_<db>`) always fit this shape.
+fn is_valid_role_ident(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    s.len() <= 63 && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 /// Database configuration
 #[derive(Debug, Clone)]
 pub struct DatabaseConfig {
@@ -34,6 +47,14 @@ pub struct DatabaseConfig {
     pub ssl_mode: SslMode,
     /// Application name for monitoring
     pub application_name: String,
+    /// Optional least-privilege role to `SET ROLE` to on every new connection.
+    /// When set, the connecting principal (typically the DB owner named in the
+    /// URL) is dropped to this role for the session, so the running server has
+    /// only the privileges granted to it — the dormant `vortex_runtime`
+    /// defence layer from migration 114, finally engaged. The role name is
+    /// validated (`[A-Za-z_][A-Za-z0-9_]*`) and rejected otherwise; a bad name
+    /// fails pool creation rather than running unprivileged-of-intent.
+    pub runtime_role: Option<String>,
 }
 
 impl Default for DatabaseConfig {
@@ -47,6 +68,7 @@ impl Default for DatabaseConfig {
             max_lifetime: Duration::from_secs(1800),
             ssl_mode: SslMode::Prefer,
             application_name: "vortex".to_string(),
+            runtime_role: None,
         }
     }
 }
@@ -138,12 +160,33 @@ impl ConnectionPool {
 
         let (inner, dialect): (PoolInner, Arc<dyn SqlDialect>) = match backend {
             DatabaseBackend::Postgres => {
-                let pool = sqlx::postgres::PgPoolOptions::new()
+                let mut opts = sqlx::postgres::PgPoolOptions::new()
                     .min_connections(config.min_connections)
                     .max_connections(config.max_connections)
                     .acquire_timeout(config.acquire_timeout)
                     .idle_timeout(Some(config.idle_timeout))
-                    .max_lifetime(Some(config.max_lifetime))
+                    .max_lifetime(Some(config.max_lifetime));
+
+                // Drop every new connection to the least-privilege runtime role.
+                if let Some(role) = &config.runtime_role {
+                    if !is_valid_role_ident(role) {
+                        return Err(VortexError::ConfigurationError(format!(
+                            "invalid runtime_role identifier: {role:?} (expected [A-Za-z_][A-Za-z0-9_]*)"
+                        )));
+                    }
+                    // Validated identifier; safe to interpolate. Quote defensively.
+                    let set_role_sql = format!("SET ROLE \"{role}\"");
+                    opts = opts.after_connect(move |conn, _meta| {
+                        let sql = set_role_sql.clone();
+                        Box::pin(async move {
+                            use sqlx::Executor;
+                            conn.execute(sql.as_str()).await?;
+                            Ok(())
+                        })
+                    });
+                }
+
+                let pool = opts
                     .connect(&config.url)
                     .await
                     .map_err(|e| VortexError::DatabaseConnection(e.to_string()))?;
@@ -444,5 +487,27 @@ impl Transaction {
                 Ok(result.rows_affected())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod role_ident_tests {
+    use super::is_valid_role_ident;
+
+    #[test]
+    fn accepts_vortex_runtime_names() {
+        assert!(is_valid_role_ident("vortex_runtime"));
+        assert!(is_valid_role_ident("t_acc_dev"));
+        assert!(is_valid_role_ident("_role1"));
+    }
+
+    #[test]
+    fn rejects_injection_and_bad_shapes() {
+        assert!(!is_valid_role_ident("")); // empty
+        assert!(!is_valid_role_ident("1role")); // leading digit
+        assert!(!is_valid_role_ident("role; DROP DATABASE x")); // sql
+        assert!(!is_valid_role_ident("role\"admin")); // quote break-out
+        assert!(!is_valid_role_ident("role name")); // space
+        assert!(!is_valid_role_ident(&"a".repeat(64))); // too long
     }
 }

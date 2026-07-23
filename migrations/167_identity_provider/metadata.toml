@@ -1,0 +1,5 @@
+[migration]
+module = "core"
+description = "Identity federation tables: identity_provider (per-tenant IdP config, sealed client secret, claim mapping, JIT flag) + user_federated_identity (IdP subject → local user link). OIDC first; SAML/LDAP share the shape"
+reversible = true
+dependencies = ["166_tenant_runtime_role"]

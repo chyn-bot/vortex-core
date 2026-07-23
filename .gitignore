@@ -43,3 +43,6 @@ logs/
 
 # User-uploaded runtime content (chatter attachments, etc.)
 /uploads/
+
+# Nested cargo build outputs (tools/*/target, etc.)
+**/target/
