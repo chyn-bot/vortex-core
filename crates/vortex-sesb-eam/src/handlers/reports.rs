@@ -94,9 +94,10 @@ async fn hub(
 
 async fn work_order(
     State(_s): State<Arc<AppState>>, Db(db): Db,
-    Extension(_u): Extension<AuthUser>, Extension(_c): Extension<DatabaseContext>,
+    Extension(user): Extension<AuthUser>, Extension(_c): Extension<DatabaseContext>,
     Path(id): Path<Uuid>, Query(q): Query<HashMap<String, String>>,
 ) -> Response {
+    if let Err(resp) = division::guard_division(&db, &user, "eam_maintenance", id).await { return resp; }
     let row = match vortex_plugin_sdk::sqlx::query(
         "SELECT m.name, m.description, m.state, m.maintenance_type, m.priority, e.name AS equip, e.code AS equip_code, m.request_date::text AS rd, m.scheduled_date::text AS sd, m.start_date::text AS st, m.end_date::text AS et, m.actual_duration_hours::text AS dur, m.work_description, m.findings, m.actions_taken, m.recommendations, m.labor_cost::text AS labor, m.materials_cost::text AS mat, m.total_cost::text AS tot, m.signed_by_name, m.verification_rating FROM eam_maintenance m LEFT JOIN eam_equipment e ON e.id=m.equipment_id WHERE m.id=$1")
         .bind(id).fetch_optional(&db).await { Ok(Some(r)) => r, _ => return (StatusCode::NOT_FOUND, "Not found").into_response() };
@@ -150,9 +151,10 @@ async fn work_order(
 
 async fn equipment_datasheet(
     State(_s): State<Arc<AppState>>, Db(db): Db,
-    Extension(_u): Extension<AuthUser>, Extension(_c): Extension<DatabaseContext>,
+    Extension(user): Extension<AuthUser>, Extension(_c): Extension<DatabaseContext>,
     Path(id): Path<Uuid>, Query(q): Query<HashMap<String, String>>,
 ) -> Response {
+    if let Err(resp) = division::guard_division(&db, &user, "eam_equipment", id).await { return resp; }
     let row = match vortex_plugin_sdk::sqlx::query(
         "SELECT e.name, e.code, e.asset_id, e.equipment_category, e.condition_status, e.operational_status, e.risk_level, e.commissioning_date::text AS cd, e.useful_life_years, e.failure_record, s.name AS sub, mf.name AS maker FROM eam_equipment e LEFT JOIN eam_substation s ON s.id=e.substation_id LEFT JOIN eam_manufacturer mf ON mf.id=e.manufacturer_id WHERE e.id=$1")
         .bind(id).fetch_optional(&db).await { Ok(Some(r)) => r, _ => return (StatusCode::NOT_FOUND, "Not found").into_response() };
@@ -192,9 +194,10 @@ async fn equipment_datasheet(
 
 async fn asset_register(
     State(_s): State<Arc<AppState>>, Db(db): Db,
-    Extension(_u): Extension<AuthUser>, Extension(_c): Extension<DatabaseContext>,
+    Extension(user): Extension<AuthUser>, Extension(_c): Extension<DatabaseContext>,
     Path(id): Path<Uuid>, Query(q): Query<HashMap<String, String>>,
 ) -> Response {
+    if let Err(resp) = division::guard_division(&db, &user, "eam_substation", id).await { return resp; }
     let sub = match vortex_plugin_sdk::sqlx::query(
         "SELECT s.name, s.code, s.asset_id, s.substation_type, s.customers_served, si.name AS site, r.name AS region FROM eam_substation s LEFT JOIN eam_site si ON si.id=s.site_id LEFT JOIN eam_region r ON r.id=si.region_id WHERE s.id=$1")
         .bind(id).fetch_optional(&db).await { Ok(Some(r)) => r, _ => return (StatusCode::NOT_FOUND, "Not found").into_response() };
@@ -231,22 +234,23 @@ async fn asset_register(
 
 async fn reliability_report(
     State(_s): State<Arc<AppState>>, Db(db): Db,
-    Extension(_u): Extension<AuthUser>, Extension(_c): Extension<DatabaseContext>,
+    Extension(user): Extension<AuthUser>, Extension(_c): Extension<DatabaseContext>,
     Path(id): Path<Uuid>, Query(q): Query<HashMap<String, String>>,
 ) -> Response {
+    if let Err(resp) = division::guard_division(&db, &user, "eam_region", id).await { return resp; }
     let region_name: Option<String> = vortex_plugin_sdk::sqlx::query_scalar("SELECT name FROM eam_region WHERE id=$1").bind(id).fetch_optional(&db).await.ok().flatten();
     let region_name = match region_name { Some(n) => n, None => return (StatusCode::NOT_FOUND, "Region not found").into_response() };
     let now = vortex_plugin_sdk::chrono::Utc::now();
     let year = vortex_plugin_sdk::chrono::Datelike::year(&now);
     let ytd_from = format!("{year}-01-01T00:00:00Z");
-    let ytd = analytics::reliability(&db, Some(id), &ytd_from, &now.to_rfc3339(), true).await;
+    let ytd = analytics::reliability(&db, Some(id), &ytd_from, &now.to_rfc3339(), true, division::DivisionScope::for_user(&user)).await;
 
     // monthly breakdown
     let mut monthly = String::new();
     for m in 1..=12 {
         let mstart = format!("{year}-{m:02}-01T00:00:00Z", year = year, m = m);
         let mend = if m == 12 { format!("{}-12-31T23:59:59Z", year) } else { format!("{year}-{nm:02}-01T00:00:00Z", year = year, nm = m + 1) };
-        let r = analytics::reliability(&db, Some(id), &mstart, &mend, true).await;
+        let r = analytics::reliability(&db, Some(id), &mstart, &mend, true, division::DivisionScope::for_user(&user)).await;
         if r.outage_count == 0 && r.saidi == 0.0 { continue; }
         monthly.push_str(&format!(
             "<tr><td>{year}-{m:02}</td><td class=\"right\">{saidi:.2}</td><td class=\"right\">{saifi:.3}</td><td class=\"right\">{caidi:.2}</td><td class=\"right\">{n}</td></tr>",

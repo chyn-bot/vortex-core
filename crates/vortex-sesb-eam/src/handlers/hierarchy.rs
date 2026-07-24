@@ -84,6 +84,7 @@ async fn list_region(
 ) -> Response {
     let sidebar = render_sidebar_active(&state, &user, &db_ctx, "sesb_eam.regions");
     let config = ListConfig::new("Regions", "eam_region")
+        .scope_filter(division::division_predicate(&user, "division"))
         .column(ListColumn::new("code", "Code").sortable().code())
         .column(ListColumn::new("name", "Name").sortable().searchable())
         .column(ListColumn::new("division", "Division")
@@ -147,6 +148,7 @@ async fn edit_region(
     Extension(user): Extension<AuthUser>, Extension(db_ctx): Extension<DatabaseContext>,
     Path(id): Path<Uuid>,
 ) -> Response {
+    if let Err(resp) = division::guard_division(&db, &user, "eam_region", id).await { return resp; }
     let sidebar = render_sidebar_active(&state, &user, &db_ctx, "sesb_eam.regions");
     let row = match vortex_plugin_sdk::sqlx::query("SELECT code, name, sequence, division, manager_id, description, active FROM eam_region WHERE id=$1")
         .bind(id).fetch_optional(&db).await { Ok(Some(r)) => r, _ => return (StatusCode::NOT_FOUND, "Not found").into_response() };
@@ -192,6 +194,7 @@ async fn list_zon(
 ) -> Response {
     let sidebar = render_sidebar_active(&state, &user, &db_ctx, "sesb_eam.zones");
     let config = ListConfig::new("Zones", "eam_zon")
+        .scope_filter(division::division_predicate(&user, "z.division"))
         .custom_from("eam_zon z LEFT JOIN eam_region r ON r.id = z.region_id")
         .custom_select("z.id, z.code, z.name, r.name AS region_name, z.sequence, z.active")
         .column(ListColumn::new("code", "Code").sortable().code().sql_expr("z.code"))
@@ -256,6 +259,7 @@ async fn edit_zon(
     Extension(user): Extension<AuthUser>, Extension(db_ctx): Extension<DatabaseContext>,
     Path(id): Path<Uuid>,
 ) -> Response {
+    if let Err(resp) = division::guard_division(&db, &user, "eam_zon", id).await { return resp; }
     let sidebar = render_sidebar_active(&state, &user, &db_ctx, "sesb_eam.zones");
     let row = match vortex_plugin_sdk::sqlx::query("SELECT code, name, sequence, region_id, manager_id, description, active FROM eam_zon WHERE id=$1")
         .bind(id).fetch_optional(&db).await { Ok(Some(r)) => r, _ => return (StatusCode::NOT_FOUND, "Not found").into_response() };
@@ -301,6 +305,7 @@ async fn list_kawasan(
 ) -> Response {
     let sidebar = render_sidebar_active(&state, &user, &db_ctx, "sesb_eam.kawasans");
     let config = ListConfig::new("Kawasans", "eam_kawasan")
+        .scope_filter(division::division_predicate(&user, "k.division"))
         .custom_from("eam_kawasan k LEFT JOIN eam_zon z ON z.id = k.zon_id LEFT JOIN eam_region r ON r.id = k.region_id")
         .custom_select("k.id, k.code, k.name, z.name AS zon_name, r.name AS region_name, k.active")
         .column(ListColumn::new("code", "Code").sortable().code().sql_expr("k.code"))
@@ -368,6 +373,7 @@ async fn edit_kawasan(
     Extension(user): Extension<AuthUser>, Extension(db_ctx): Extension<DatabaseContext>,
     Path(id): Path<Uuid>,
 ) -> Response {
+    if let Err(resp) = division::guard_division(&db, &user, "eam_kawasan", id).await { return resp; }
     let sidebar = render_sidebar_active(&state, &user, &db_ctx, "sesb_eam.kawasans");
     let row = match vortex_plugin_sdk::sqlx::query("SELECT code, name, sequence, zon_id, region_id, manager_id, description, active FROM eam_kawasan WHERE id=$1")
         .bind(id).fetch_optional(&db).await { Ok(Some(r)) => r, _ => return (StatusCode::NOT_FOUND, "Not found").into_response() };
@@ -422,6 +428,7 @@ async fn list_site(
 ) -> Response {
     let sidebar = render_sidebar_active(&state, &user, &db_ctx, "sesb_eam.sites");
     let config = ListConfig::new("Sites", "eam_site")
+        .scope_filter(division::division_predicate(&user, "s.division"))
         .custom_from("eam_site s LEFT JOIN eam_region r ON r.id = s.region_id LEFT JOIN eam_kawasan k ON k.id = s.kawasan_id")
         .custom_select("s.id, s.code, s.name, s.site_type, r.name AS region_name, k.name AS kawasan_name, s.state, s.active")
         .column(ListColumn::new("code", "Code").sortable().code().sql_expr("s.code"))
@@ -509,6 +516,7 @@ async fn edit_site(
     Extension(user): Extension<AuthUser>, Extension(db_ctx): Extension<DatabaseContext>,
     Path(id): Path<Uuid>,
 ) -> Response {
+    if let Err(resp) = division::guard_division(&db, &user, "eam_site", id).await { return resp; }
     let sidebar = render_sidebar_active(&state, &user, &db_ctx, "sesb_eam.sites");
     let row = match vortex_plugin_sdk::sqlx::query(
         "SELECT code, name, region_id, kawasan_id, zon_id, site_type, address, gps_latitude::text AS lat, gps_longitude::text AS lng, state, commissioning_date::text AS cdate, decommissioning_date::text AS ddate, notes, active FROM eam_site WHERE id=$1")
@@ -598,6 +606,7 @@ async fn list_substation(
 ) -> Response {
     let sidebar = render_sidebar_active(&state, &user, &db_ctx, "sesb_eam.substations");
     let config = ListConfig::new("Substations", "eam_substation")
+        .scope_filter(division::division_predicate(&user, "s.division"))
         .custom_from("eam_substation s LEFT JOIN eam_site si ON si.id = s.site_id LEFT JOIN eam_region r ON r.id = si.region_id")
         .custom_select("s.id, s.code, s.name, s.asset_id, r.name AS region_name, s.substation_class, s.verification_state, s.state, s.active")
         .column(ListColumn::new("code", "Code").sortable().code().sql_expr("s.code"))
@@ -774,6 +783,7 @@ async fn edit_substation(
     Extension(user): Extension<AuthUser>, Extension(db_ctx): Extension<DatabaseContext>,
     Path(id): Path<Uuid>,
 ) -> Response {
+    if let Err(resp) = division::guard_division(&db, &user, "eam_substation", id).await { return resp; }
     let sidebar = render_sidebar_active(&state, &user, &db_ctx, "sesb_eam.substations");
     let row = match vortex_plugin_sdk::sqlx::query(
         "SELECT code, name, asset_id, asset_type_id, primary_voltage_kv::float8 AS pkv, primary_voltage_kv::text AS pkv_t, site_id, substation_type, busbar_configuration, substation_class, source_from, feeder, customers_served, substation_category, automation_type, site_size, gps_latitude, gps_longitude, ownership, commissioning_date::text AS cdate, design_life_years, state, notes, active, verification_state FROM eam_substation WHERE id=$1")
@@ -979,6 +989,7 @@ async fn edit_bay(
     Extension(user): Extension<AuthUser>, Extension(db_ctx): Extension<DatabaseContext>,
     Path(id): Path<Uuid>,
 ) -> Response {
+    if let Err(resp) = division::guard_division(&db, &user, "eam_bay", id).await { return resp; }
     let sidebar = render_sidebar_active(&state, &user, &db_ctx, "sesb_eam.substations");
     let row = match vortex_plugin_sdk::sqlx::query(
         "SELECT b.code, b.name, b.bay_number, b.asset_id, b.substation_id, b.bay_type, b.voltage_level_id, b.busbar_configuration, b.rated_current_a::text AS rca, b.rated_fault_current_ka::text AS rfc, b.feeder_name, b.feeder_number, b.destination, b.scada_point_group, b.sld_reference, b.state, b.notes, b.active, b.verification_state, s.name AS sub_name FROM eam_bay b LEFT JOIN eam_substation s ON s.id = b.substation_id WHERE b.id=$1")

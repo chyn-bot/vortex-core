@@ -72,6 +72,7 @@ async fn list_agent(
 ) -> Response {
     let sidebar = render_sidebar_active(&state, &user, &db_ctx, "sesb_eam.agents");
     let config = ListConfig::new("Field Agents", "eam_field_agent")
+        .scope_filter(division::division_predicate(&user, "a.division"))
         .custom_from("eam_field_agent a LEFT JOIN eam_region r ON r.id=a.region_id")
         .custom_select("a.id, a.name, a.employee_no, a.agent_level, a.skill_category, r.name AS region, a.is_supervisor, a.active, \
             (SELECT COUNT(*) FROM eam_maintenance m WHERE m.assigned_to=a.user_id AND m.state NOT IN ('completed','verified','cancelled'))::text AS active_jobs")
@@ -169,6 +170,7 @@ async fn edit_agent(
     Extension(user): Extension<AuthUser>, Extension(db_ctx): Extension<DatabaseContext>,
     Path(id): Path<Uuid>,
 ) -> Response {
+    if let Err(resp) = division::guard_division(&db, &user, "eam_field_agent", id).await { return resp; }
     let sidebar = render_sidebar_active(&state, &user, &db_ctx, "sesb_eam.agents");
     let row = match vortex_plugin_sdk::sqlx::query(
         "SELECT name, employee_no, user_id::text AS user_id, agent_level, is_supervisor::text AS is_supervisor, skill_category, region_id::text AS region_id, supervisor_group_id::text AS supervisor_group_id, phone, emergency_contact, max_concurrent_jobs::text AS max_concurrent_jobs, notes, active::text AS active FROM eam_field_agent WHERE id=$1")

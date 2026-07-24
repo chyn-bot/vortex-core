@@ -14,6 +14,7 @@ pub mod checklist;
 pub mod control_room;
 pub mod dashboards;
 pub mod diagrams;
+pub mod division;
 pub mod equipment;
 pub mod hierarchy;
 pub mod jobs;

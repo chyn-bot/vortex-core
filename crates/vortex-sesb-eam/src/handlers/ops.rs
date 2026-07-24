@@ -106,6 +106,7 @@ async fn list_defect(
 ) -> Response {
     let sidebar = render_sidebar_active(&state, &user, &db_ctx, "sesb_eam.defects");
     let config = ListConfig::new("Defects", "eam_defect")
+        .scope_filter(division::division_predicate(&user, "d.division"))
         .custom_from("eam_defect d LEFT JOIN eam_equipment e ON e.id=d.equipment_id")
         .custom_select("d.id, d.name, d.title, e.name AS equipment, d.severity, d.defect_category, d.state, d.discovered_date::text AS dd, d.active")
         .column(ListColumn::new("name", "Number").sortable().code().sql_expr("d.name"))
@@ -184,6 +185,7 @@ async fn edit_defect(
     Extension(user): Extension<AuthUser>, Extension(db_ctx): Extension<DatabaseContext>,
     Path(id): Path<Uuid>,
 ) -> Response {
+    if let Err(resp) = division::guard_division(&db, &user, "eam_defect", id).await { return resp; }
     let sidebar = render_sidebar_active(&state, &user, &db_ctx, "sesb_eam.defects");
     let row = match vortex_plugin_sdk::sqlx::query(
         "SELECT name, title, description, equipment_id::text AS equipment_id, severity, defect_category, assigned_to::text AS assigned_to, state, discovered_date::text AS discovered_date, repair_maintenance_id, repair_notes, active::text AS active FROM eam_defect WHERE id=$1")
@@ -302,6 +304,7 @@ async fn list_inspection(
 ) -> Response {
     let sidebar = render_sidebar_active(&state, &user, &db_ctx, "sesb_eam.inspections");
     let config = ListConfig::new("Inspections", "eam_inspection")
+        .scope_filter(division::division_predicate(&user, "i.division"))
         .custom_from("eam_inspection i LEFT JOIN eam_equipment e ON e.id=i.equipment_id")
         .custom_select("i.id, i.name, e.name AS equipment, i.inspection_type, i.inspection_date::text AS dt, i.overall_condition, i.state, i.active")
         .column(ListColumn::new("name", "Number").sortable().code().sql_expr("i.name"))
@@ -377,6 +380,7 @@ async fn edit_inspection(
     Extension(user): Extension<AuthUser>, Extension(db_ctx): Extension<DatabaseContext>,
     Path(id): Path<Uuid>,
 ) -> Response {
+    if let Err(resp) = division::guard_division(&db, &user, "eam_inspection", id).await { return resp; }
     let sidebar = render_sidebar_active(&state, &user, &db_ctx, "sesb_eam.inspections");
     let row = match vortex_plugin_sdk::sqlx::query(
         "SELECT name, equipment_id::text AS equipment_id, inspection_type, inspection_date::text AS inspection_date, inspector_id::text AS inspector_id, overall_condition, condition_score::text AS condition_score, immediate_action_required::text AS immediate_action_required, findings, defects_found, recommendations, state, active::text AS active FROM eam_inspection WHERE id=$1")
@@ -500,6 +504,7 @@ async fn list_cm(
 ) -> Response {
     let sidebar = render_sidebar_active(&state, &user, &db_ctx, "sesb_eam.condition_monitoring");
     let config = ListConfig::new("Condition Monitoring", "eam_condition_monitoring")
+        .scope_filter(division::division_predicate(&user, "c.division"))
         .custom_from("eam_condition_monitoring c LEFT JOIN eam_equipment e ON e.id=c.equipment_id")
         .custom_select("c.id, c.name, e.name AS equipment, c.test_type, c.test_date::text AS dt, c.result_status, c.state, c.active")
         .column(ListColumn::new("name", "Number").sortable().code().sql_expr("c.name"))
@@ -606,6 +611,7 @@ async fn edit_cm(
     Extension(user): Extension<AuthUser>, Extension(db_ctx): Extension<DatabaseContext>,
     Path(id): Path<Uuid>,
 ) -> Response {
+    if let Err(resp) = division::guard_division(&db, &user, "eam_condition_monitoring", id).await { return resp; }
     let sidebar = render_sidebar_active(&state, &user, &db_ctx, "sesb_eam.condition_monitoring");
     let mut select_cols = vec!["name".to_string(), "equipment_id::text AS equipment_id".into(), "test_type".into(), "test_date::text AS test_date".into(), "result_status".into(), "test_lab".into(), "result_summary".into(), "active::text AS active".into()];
     for c in CM_NUM_FIELDS { select_cols.push(format!("{c}::text AS {c}", c = c)); }
@@ -658,6 +664,7 @@ async fn list_patrol(
 ) -> Response {
     let sidebar = render_sidebar_active(&state, &user, &db_ctx, "sesb_eam.patrols");
     let config = ListConfig::new("Line Patrols", "eam_line_patrol")
+        .scope_filter(division::division_predicate(&user, "division"))
         .custom_select("id, name, patrol_type, patrol_date::text AS dt, patrol_method, anomalies_found, state, active")
         .column(ListColumn::new("name", "Number").sortable().code())
         .column(ListColumn::new("patrol_type", "Type").filterable(&[("routine","Routine"),("cbm","CBM"),("storm","Storm"),("vegetation","Vegetation"),("emergency","Emergency")]))
@@ -731,6 +738,7 @@ async fn edit_patrol(
     Extension(user): Extension<AuthUser>, Extension(db_ctx): Extension<DatabaseContext>,
     Path(id): Path<Uuid>,
 ) -> Response {
+    if let Err(resp) = division::guard_division(&db, &user, "eam_line_patrol", id).await { return resp; }
     let sidebar = render_sidebar_active(&state, &user, &db_ctx, "sesb_eam.patrols");
     let row = match vortex_plugin_sdk::sqlx::query("SELECT name, patrol_type, patrol_date::text AS patrol_date, patrol_method, transmission_line_id::text AS transmission_line_id, distribution_line_id::text AS distribution_line_id, anomalies_found::text AS anomalies_found, vegetation_issues::text AS vegetation_issues, tower_issues::text AS tower_issues, findings, active::text AS active FROM eam_line_patrol WHERE id=$1")
         .bind(id).fetch_optional(&db).await { Ok(Some(r)) => r, _ => return (StatusCode::NOT_FOUND, "Not found").into_response() };
@@ -775,6 +783,7 @@ async fn list_outage(
 ) -> Response {
     let sidebar = render_sidebar_active(&state, &user, &db_ctx, "sesb_eam.outages");
     let config = ListConfig::new("Outages", "eam_outage")
+        .scope_filter(division::division_predicate(&user, "o.division"))
         .custom_from("eam_outage o LEFT JOIN eam_substation s ON s.id=o.substation_id")
         .custom_select("o.id, o.name, s.name AS substation, o.outage_type, o.start_datetime::text AS st, o.customers_affected, o.state, \
             round(EXTRACT(EPOCH FROM (COALESCE(o.end_datetime, NOW()) - o.start_datetime))/60.0)::text AS dur_min")
@@ -855,6 +864,7 @@ async fn edit_outage(
     Extension(user): Extension<AuthUser>, Extension(db_ctx): Extension<DatabaseContext>,
     Path(id): Path<Uuid>,
 ) -> Response {
+    if let Err(resp) = division::guard_division(&db, &user, "eam_outage", id).await { return resp; }
     let sidebar = render_sidebar_active(&state, &user, &db_ctx, "sesb_eam.outages");
     let row = match vortex_plugin_sdk::sqlx::query("SELECT name, substation_id::text AS substation_id, feeder, outage_type, cause_category, cause_detail, to_char(start_datetime,'YYYY-MM-DD\"T\"HH24:MI') AS start_datetime, to_char(end_datetime,'YYYY-MM-DD\"T\"HH24:MI') AS end_datetime, customers_affected::text AS customers_affected, state, is_major_event::text AS is_major_event, description FROM eam_outage WHERE id=$1")
         .bind(id).fetch_optional(&db).await { Ok(Some(r)) => r, _ => return (StatusCode::NOT_FOUND, "Not found").into_response() };
@@ -895,6 +905,7 @@ async fn list_veg(
 ) -> Response {
     let sidebar = render_sidebar_active(&state, &user, &db_ctx, "sesb_eam.vegetation");
     let config = ListConfig::new("Vegetation Sections", "eam_vegetation_section")
+        .scope_filter(division::division_predicate(&user, "division"))
         .custom_select("id, name, division, terrain, required_clearance_m::text AS req, actual_clearance_m::text AS act, last_cleared_date::text AS lc, active")
         .column(ListColumn::new("name", "Name").searchable())
         .column(ListColumn::new("division", "Division").filterable(&[("transmission","Transmission"),("distribution","Distribution")]))
@@ -958,6 +969,7 @@ async fn edit_veg(
     Extension(user): Extension<AuthUser>, Extension(db_ctx): Extension<DatabaseContext>,
     Path(id): Path<Uuid>,
 ) -> Response {
+    if let Err(resp) = division::guard_division(&db, &user, "eam_vegetation_section", id).await { return resp; }
     let sidebar = render_sidebar_active(&state, &user, &db_ctx, "sesb_eam.vegetation");
     let row = match vortex_plugin_sdk::sqlx::query("SELECT name, division, terrain, transmission_line_id::text AS transmission_line_id, distribution_line_id::text AS distribution_line_id, length_m::text AS length_m, required_clearance_m::text AS required_clearance_m, actual_clearance_m::text AS actual_clearance_m, last_cleared_date::text AS last_cleared_date, notes, active::text AS active FROM eam_vegetation_section WHERE id=$1")
         .bind(id).fetch_optional(&db).await { Ok(Some(r)) => r, _ => return (StatusCode::NOT_FOUND, "Not found").into_response() };

@@ -54,6 +54,7 @@ async fn list_plan(
 ) -> Response {
     let sidebar = render_sidebar_active(&state, &user, &db_ctx, "sesb_eam.plans");
     let config = ListConfig::new("Maintenance Plans", "eam_maintenance_plan")
+        .scope_filter(division::division_predicate(&user, "p.division"))
         .custom_from("eam_maintenance_plan p LEFT JOIN eam_equipment e ON e.id=p.equipment_id")
         .custom_select("p.id, p.name, e.name AS equipment, p.maintenance_type, p.risk_tier, (p.frequency_interval::text||' '||p.frequency_unit) AS freq, p.next_maintenance_date::text AS nmd, p.state, p.active")
         .column(ListColumn::new("name", "Number").sortable().code().sql_expr("p.name"))
@@ -163,6 +164,7 @@ async fn edit_plan(
     Extension(user): Extension<AuthUser>, Extension(db_ctx): Extension<DatabaseContext>,
     Path(id): Path<Uuid>,
 ) -> Response {
+    if let Err(resp) = division::guard_division(&db, &user, "eam_maintenance_plan", id).await { return resp; }
     let sidebar = render_sidebar_active(&state, &user, &db_ctx, "sesb_eam.plans");
     let row = match vortex_plugin_sdk::sqlx::query(
         "SELECT name, equipment_id::text AS equipment_id, maintenance_type, priority, risk_tier, procedure_reference, planned_duration_hours::text AS planned_duration_hours, assigned_to::text AS assigned_to, checklist_template_id::text AS checklist_template_id, start_date::text AS start_date, next_maintenance_date::text AS next_maintenance_date, frequency_interval::text AS frequency_interval, frequency_unit, planning_horizon_interval::text AS planning_horizon_interval, planning_horizon_unit, frequency_unlocked, frequency_change_count::text AS frequency_change_count, state, notes, active::text AS active, \

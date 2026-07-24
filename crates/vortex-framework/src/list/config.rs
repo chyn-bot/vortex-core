@@ -126,6 +126,12 @@ pub struct ListConfig {
     pub default_sort: &'static str,
     /// Extra WHERE clause appended to every query (e.g. "active = true").
     pub base_filter: Option<&'static str>,
+    /// Per-request row-level scope predicate, AND-ed into both the count and
+    /// data queries alongside [`base_filter`]. Unlike `base_filter` this is an
+    /// owned `String` so it can be computed from the caller (e.g. a division /
+    /// tenant / ownership scope). The author is responsible for its safety:
+    /// bind or hard-code any values — never interpolate request input.
+    pub scope_filter: Option<String>,
     /// Available group-by columns.
     pub group_options: Vec<(&'static str, &'static str)>, // (field, label)
     /// Custom FROM clause with JOINs. When set, overrides the simple
@@ -185,6 +191,7 @@ impl ListConfig {
             create_url: None,
             default_sort: "id",
             base_filter: None,
+            scope_filter: None,
             group_options: Vec::new(),
             custom_from: None,
             custom_select: None,
@@ -218,6 +225,13 @@ impl ListConfig {
 
     pub fn base_filter(mut self, clause: &'static str) -> Self {
         self.base_filter = Some(clause);
+        self
+    }
+
+    /// Set a per-request row-level scope predicate (see [`ListConfig::scope_filter`]).
+    /// `None` clears it. AND-ed into every query alongside `base_filter`.
+    pub fn scope_filter(mut self, clause: Option<String>) -> Self {
+        self.scope_filter = clause;
         self
     }
 

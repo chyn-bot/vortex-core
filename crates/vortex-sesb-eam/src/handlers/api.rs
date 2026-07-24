@@ -73,17 +73,21 @@ async fn me(
 }
 
 async fn list_equipment(
-    Db(db): Db, Extension(_u): Extension<AuthUser>, Query(q): Query<HashMap<String, String>>,
+    Db(db): Db, Extension(user): Extension<AuthUser>, Query(q): Query<HashMap<String, String>>,
 ) -> Response {
     let (limit, offset) = paged(&q);
     let search = q.get("search").cloned().unwrap_or_default();
     let like = format!("%{}%", search);
-    let total: i64 = vortex_plugin_sdk::sqlx::query_scalar(
-        "SELECT COUNT(*)::bigint FROM eam_equipment WHERE ($1='' OR name ILIKE $2 OR code ILIKE $2 OR asset_id ILIKE $2)")
+    // Division boundary (§6.3): scope the REST list too, so a DAMS token can
+    // never enumerate transmission assets by any route.
+    let scope = division::division_predicate(&user, "division")
+        .map(|p| format!(" AND {p}")).unwrap_or_default();
+    let total: i64 = vortex_plugin_sdk::sqlx::query_scalar(&format!(
+        "SELECT COUNT(*)::bigint FROM eam_equipment WHERE ($1='' OR name ILIKE $2 OR code ILIKE $2 OR asset_id ILIKE $2){scope}"))
         .bind(&search).bind(&like).fetch_one(&db).await.unwrap_or(0);
-    let rows = vortex_plugin_sdk::sqlx::query(
+    let rows = vortex_plugin_sdk::sqlx::query(&format!(
         "SELECT id, code, asset_id, name, equipment_category, condition_status, operational_status, risk_level \
-         FROM eam_equipment WHERE ($1='' OR name ILIKE $2 OR code ILIKE $2 OR asset_id ILIKE $2) ORDER BY code LIMIT $3 OFFSET $4")
+         FROM eam_equipment WHERE ($1='' OR name ILIKE $2 OR code ILIKE $2 OR asset_id ILIKE $2){scope} ORDER BY code LIMIT $3 OFFSET $4"))
         .bind(&search).bind(&like).bind(limit).bind(offset).fetch_all(&db).await.unwrap_or_default();
     let results: Vec<Value> = rows.iter().map(equip_json).collect();
     Json(json!({"total": total, "count": results.len(), "offset": offset, "limit": limit, "results": results})).into_response()
@@ -105,8 +109,9 @@ fn equip_json(r: &vortex_plugin_sdk::sqlx::postgres::PgRow) -> Value {
 }
 
 async fn get_equipment(
-    Db(db): Db, Extension(_u): Extension<AuthUser>, Path(id): Path<Uuid>,
+    Db(db): Db, Extension(user): Extension<AuthUser>, Path(id): Path<Uuid>,
 ) -> Response {
+    if let Err(resp) = division::guard_division(&db, &user, "eam_equipment", id).await { return resp; }
     let row = vortex_plugin_sdk::sqlx::query(
         "SELECT id, code, asset_id, name, equipment_category, condition_status, operational_status, risk_level FROM eam_equipment WHERE id=$1")
         .bind(id).fetch_optional(&db).await.ok().flatten();
@@ -119,10 +124,12 @@ async fn list_maintenance(
     let (limit, offset) = paged(&q);
     let state_f = q.get("state").cloned().unwrap_or_default();
     let mine = q.get("assigned_to_me").map(|s| s == "1" || s == "true").unwrap_or(false);
+    let scope = division::division_predicate(&user, "m.division")
+        .map(|p| format!(" AND {p}")).unwrap_or_default();
     let sql = format!(
         "SELECT m.id, m.name, m.description, m.state, m.maintenance_type, m.priority, m.scheduled_date::text AS sd, e.name AS equip, e.code AS equip_code \
          FROM eam_maintenance m LEFT JOIN eam_equipment e ON e.id=m.equipment_id \
-         WHERE ($1='' OR m.state=$1) {mine} ORDER BY m.scheduled_date NULLS LAST, m.created_at DESC LIMIT $3 OFFSET $4",
+         WHERE ($1='' OR m.state=$1) {mine}{scope} ORDER BY m.scheduled_date NULLS LAST, m.created_at DESC LIMIT $3 OFFSET $4",
         mine = if mine { "AND m.assigned_to=$2" } else { "" });
     let q2 = vortex_plugin_sdk::sqlx::query(&sql).bind(&state_f).bind(user.id).bind(limit).bind(offset);
     let rows = q2.fetch_all(&db).await.unwrap_or_default();
@@ -141,8 +148,9 @@ async fn list_maintenance(
 }
 
 async fn get_maintenance(
-    Db(db): Db, Extension(_u): Extension<AuthUser>, Path(id): Path<Uuid>,
+    Db(db): Db, Extension(user): Extension<AuthUser>, Path(id): Path<Uuid>,
 ) -> Response {
+    if let Err(resp) = division::guard_division(&db, &user, "eam_maintenance", id).await { return resp; }
     let m = vortex_plugin_sdk::sqlx::query(
         "SELECT m.id, m.name, m.description, m.state, m.maintenance_type, m.priority, m.scheduled_date::text AS sd, m.work_description, e.name AS equip FROM eam_maintenance m LEFT JOIN eam_equipment e ON e.id=m.equipment_id WHERE m.id=$1")
         .bind(id).fetch_optional(&db).await.ok().flatten();
@@ -291,12 +299,14 @@ async fn checklist_line(
 }
 
 async fn list_defects(
-    Db(db): Db, Extension(_u): Extension<AuthUser>, Query(q): Query<HashMap<String, String>>,
+    Db(db): Db, Extension(user): Extension<AuthUser>, Query(q): Query<HashMap<String, String>>,
 ) -> Response {
     let (limit, offset) = paged(&q);
     let state_f = q.get("state").cloned().unwrap_or_default();
-    let rows = vortex_plugin_sdk::sqlx::query(
-        "SELECT d.id, d.name, d.title, d.severity, d.defect_category, d.state, e.name AS equip FROM eam_defect d LEFT JOIN eam_equipment e ON e.id=d.equipment_id WHERE ($1='' OR d.state=$1) ORDER BY d.created_at DESC LIMIT $2 OFFSET $3")
+    let scope = division::division_predicate(&user, "d.division")
+        .map(|p| format!(" AND {p}")).unwrap_or_default();
+    let rows = vortex_plugin_sdk::sqlx::query(&format!(
+        "SELECT d.id, d.name, d.title, d.severity, d.defect_category, d.state, e.name AS equip FROM eam_defect d LEFT JOIN eam_equipment e ON e.id=d.equipment_id WHERE ($1='' OR d.state=$1){scope} ORDER BY d.created_at DESC LIMIT $2 OFFSET $3"))
         .bind(&state_f).bind(limit).bind(offset).fetch_all(&db).await.unwrap_or_default();
     let results: Vec<Value> = rows.iter().map(|r| json!({
         "id": r.get::<Uuid,_>("id"),

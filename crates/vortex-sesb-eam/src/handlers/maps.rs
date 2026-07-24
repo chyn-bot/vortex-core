@@ -74,13 +74,17 @@ async fn tower_map(
     Extension(user): Extension<AuthUser>, Extension(db_ctx): Extension<DatabaseContext>,
 ) -> Response {
     let sidebar = render_sidebar_active(&state, &user, &db_ctx, "sesb_eam.tower_map");
-    let content = match render_tower_map(&db).await {
+    let content = match render_tower_map(&db, division::DivisionScope::for_user(&user)).await {
         Ok(h) => h, Err(e) => { error!(error=%e, "tower map"); "<h1>Failed to load tower map</h1>".into() }
     };
     Html(page_shell(&sidebar, "Tower Map", &content)).into_response()
 }
 
-async fn render_tower_map(db: &PgPool) -> Result<String, vortex_plugin_sdk::sqlx::Error> {
+async fn render_tower_map(db: &PgPool, scope: division::DivisionScope) -> Result<String, vortex_plugin_sdk::sqlx::Error> {
+    // Elevated read (§6.3): row rules don't apply here, so re-apply the caller's
+    // division scope by hand. Towers are transmission-constant, so a DAMS-only
+    // user's map comes back empty rather than leaking.
+    let dv = scope.sql_predicate("t.division").map(|p| format!(" AND {p}")).unwrap_or_default();
     let rows = vortex_plugin_sdk::sqlx::query(&format!(
         "SELECT t.id, t.name, t.code, t.tower_number, t.tower_type, t.height_m, \
            t.gps_latitude::float8 AS lat, t.gps_longitude::float8 AS lng, \
@@ -92,7 +96,7 @@ async fn render_tower_map(db: &PgPool) -> Result<String, vortex_plugin_sdk::sqlx
          LEFT JOIN eam_transmission_line l ON l.id=t.transmission_line_id \
          LEFT JOIN eam_voltage_level v ON v.id=t.voltage_level_id \
          WHERE t.active AND t.gps_latitude IS NOT NULL AND t.gps_longitude IS NOT NULL \
-           AND t.gps_latitude <> 0 AND t.gps_longitude <> 0"))
+           AND t.gps_latitude <> 0 AND t.gps_longitude <> 0{dv}"))
         .fetch_all(db).await?;
     let towers: Vec<Value> = rows.iter().map(|t| json!({
         "id": t.get::<Uuid,_>("id"), "name": t.try_get::<String,_>("name").unwrap_or_default(),
@@ -182,7 +186,7 @@ async fn site_map(
     Extension(user): Extension<AuthUser>, Extension(db_ctx): Extension<DatabaseContext>,
 ) -> Response {
     let sidebar = render_sidebar_active(&state, &user, &db_ctx, "sesb_eam.site_map");
-    let content = match render_site_map(&db).await {
+    let content = match render_site_map(&db, division::DivisionScope::for_user(&user)).await {
         Ok(h) => h, Err(e) => { error!(error=%e, "site map"); "<h1>Failed to load site map</h1>".into() }
     };
     Html(page_shell(&sidebar, "Site Map", &content)).into_response()
@@ -194,8 +198,9 @@ const SITE_TYPES: &[(&str, &str, &str)] = &[
     ("ss", "SS", "#fd7e14"), ("isolation", "Isolation", "#20c997"), ("other", "Other", "#6c757d"),
 ];
 
-async fn render_site_map(db: &PgPool) -> Result<String, vortex_plugin_sdk::sqlx::Error> {
-    let rows = vortex_plugin_sdk::sqlx::query(
+async fn render_site_map(db: &PgPool, scope: division::DivisionScope) -> Result<String, vortex_plugin_sdk::sqlx::Error> {
+    let dv = scope.sql_predicate("s.division").map(|p| format!(" AND {p}")).unwrap_or_default();
+    let rows = vortex_plugin_sdk::sqlx::query(&format!(
         "SELECT s.id, s.name, s.code, s.site_type, s.state, \
            s.gps_latitude::float8 AS lat, s.gps_longitude::float8 AS lng, \
            s.region_id, r.name AS region_name, \
@@ -203,7 +208,7 @@ async fn render_site_map(db: &PgPool) -> Result<String, vortex_plugin_sdk::sqlx:
            (SELECT COUNT(*) FROM eam_equipment e JOIN eam_substation su ON su.id=e.substation_id WHERE su.site_id=s.id)::int AS equip_count \
          FROM eam_site s LEFT JOIN eam_region r ON r.id=s.region_id \
          WHERE s.active AND s.gps_latitude IS NOT NULL AND s.gps_longitude IS NOT NULL \
-           AND s.gps_latitude <> 0 AND s.gps_longitude <> 0")
+           AND s.gps_latitude <> 0 AND s.gps_longitude <> 0{dv}"))
         .fetch_all(db).await?;
     let sites: Vec<Value> = rows.iter().map(|s| {
         let st: String = s.try_get("site_type").ok().flatten().unwrap_or_default();
@@ -286,8 +291,13 @@ async fn technician_map(
 }
 
 /// Active field-agent locations (mirrors `get_active_locations`). JSON for polling.
-async fn technician_locations(Db(db): Db) -> Response {
-    let rows = vortex_plugin_sdk::sqlx::query(
+async fn technician_locations(Db(db): Db, Extension(user): Extension<AuthUser>) -> Response {
+    // The live technician map is an elevated read that §6.3 explicitly flags as
+    // having leaked across divisions until the filter was re-applied by hand.
+    // Positions are scoped by the agent's home division.
+    let dv = division::DivisionScope::for_user(&user)
+        .sql_predicate("a.division").map(|p| format!(" AND {p}")).unwrap_or_default();
+    let rows = vortex_plugin_sdk::sqlx::query(&format!(
         "SELECT loc.id, loc.user_id, COALESCE(a.name, u.username, loc.name) AS agent, \
            loc.lat::float8 AS lat, loc.lng::float8 AS lng, loc.speed_kmh::float8 AS speed, \
            loc.battery_pct, loc.status, loc.source, r.name AS region, \
@@ -297,7 +307,7 @@ async fn technician_locations(Db(db): Db) -> Response {
          LEFT JOIN users u ON u.id=loc.user_id \
          LEFT JOIN eam_region r ON r.id=loc.region_id \
          LEFT JOIN eam_maintenance m ON m.id=loc.maintenance_id \
-         WHERE loc.is_active AND loc.last_seen >= NOW() - INTERVAL '15 minutes' AND loc.lat <> 0")
+         WHERE loc.is_active AND loc.last_seen >= NOW() - INTERVAL '15 minutes' AND loc.lat <> 0{dv}"))
         .fetch_all(&db).await.unwrap_or_default();
     let techs: Vec<Value> = rows.iter().map(|t| json!({
         "id": t.get::<Uuid,_>("id"),

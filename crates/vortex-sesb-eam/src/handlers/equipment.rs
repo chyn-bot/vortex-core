@@ -161,6 +161,7 @@ async fn list_equipment(
     let sidebar = render_sidebar_active(&state, &user, &db_ctx, "sesb_eam.equipment");
     // health_index computed inline so it can be shown/sorted in the list.
     let config = ListConfig::new("Equipment", "eam_equipment")
+        .scope_filter(division::division_predicate(&user, "e.division"))
         .custom_from(
             "eam_equipment e \
              LEFT JOIN eam_manufacturer m ON m.id = e.manufacturer_id \
@@ -420,6 +421,7 @@ async fn edit_equipment(
     Extension(user): Extension<AuthUser>, Extension(db_ctx): Extension<DatabaseContext>,
     Path(id): Path<Uuid>,
 ) -> Response {
+    if let Err(resp) = division::guard_division(&db, &user, "eam_equipment", id).await { return resp; }
     let sidebar = render_sidebar_active(&state, &user, &db_ctx, "sesb_eam.equipment");
     let row = match vortex_plugin_sdk::sqlx::query(
         "SELECT code, name, asset_id, asset_type_id, mnec_sequence, bay_id, equipment_category, asset_class_id, asset_tag, manufacturer_id, model_number, serial_number, manufacture_date::text AS md, installation_date::text AS instd, commissioning_date::text AS cd, warranty_expiry_date::text AS wd, design_life_years, commission_year, voltage_level_id, rated_voltage_kv::text AS rv, rated_current_a::text AS rc, rated_power_kva::text AS rp, fuse_rating_a::text AS fr, operational_status, condition_status, nomenclature, rating, useful_life_years, failure_record, risk_level, target_replacement_year, ibr_budget_available, ibr_year, notes, active, verification_state FROM eam_equipment WHERE id=$1")
@@ -664,6 +666,7 @@ async fn edit_component(
     Extension(user): Extension<AuthUser>, Extension(db_ctx): Extension<DatabaseContext>,
     Path(id): Path<Uuid>,
 ) -> Response {
+    if let Err(resp) = division::guard_division(&db, &user, "eam_component", id).await { return resp; }
     let sidebar = render_sidebar_active(&state, &user, &db_ctx, "sesb_eam.equipment");
     let row = match vortex_plugin_sdk::sqlx::query(
         "SELECT code, name, equipment_id, component_type, asset_type_id, phase, mnec_sequence, manufacturer_id, model_number, serial_number, installation_date::text AS instd, condition_status, operational_status, position, specification, rating, brand, make_country, risk_level, notes, active FROM eam_component WHERE id=$1")

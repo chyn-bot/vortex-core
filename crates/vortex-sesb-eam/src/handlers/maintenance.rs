@@ -54,6 +54,7 @@ async fn list_wo(
 ) -> Response {
     let sidebar = render_sidebar_active(&state, &user, &db_ctx, "sesb_eam.maintenance");
     let config = ListConfig::new("Work Orders", "eam_maintenance")
+        .scope_filter(division::division_predicate(&user, "m.division"))
         .custom_from("eam_maintenance m LEFT JOIN eam_equipment e ON e.id=m.equipment_id LEFT JOIN users u ON u.id=m.assigned_to")
         .custom_select("m.id, m.name, m.description, e.name AS equipment, m.maintenance_type, m.priority, m.scheduled_date::text AS sched, u.username AS assignee, m.state, \
             (CASE WHEN m.state NOT IN ('completed','verified','cancelled') AND m.scheduled_date < CURRENT_DATE THEN 'Y' ELSE '' END) AS overdue")
@@ -160,6 +161,7 @@ async fn edit_wo(
     Extension(user): Extension<AuthUser>, Extension(db_ctx): Extension<DatabaseContext>,
     Path(id): Path<Uuid>,
 ) -> Response {
+    if let Err(resp) = division::guard_division(&db, &user, "eam_maintenance", id).await { return resp; }
     let sidebar = render_sidebar_active(&state, &user, &db_ctx, "sesb_eam.maintenance");
     let row = match vortex_plugin_sdk::sqlx::query(
         "SELECT m.name, m.description, m.equipment_id, e.name AS equipment_name, m.maintenance_type, m.priority, m.state, m.request_date::text AS rd, m.scheduled_date::text AS sd, m.planned_duration_hours::text AS pdh, m.assigned_to, m.work_description, m.findings, m.actions_taken, m.recommendations, m.labor_cost::text AS labor, m.materials_cost::text AS mat, m.total_cost::text AS tot, m.rejection_reason, m.verification_rating, m.verification_notes, m.start_date::text AS st, m.end_date::text AS et FROM eam_maintenance m LEFT JOIN eam_equipment e ON e.id=m.equipment_id WHERE m.id=$1")

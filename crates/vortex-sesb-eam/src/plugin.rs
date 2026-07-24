@@ -15,6 +15,7 @@ const MIG_005_OPERATIONS: &str = include_str!("../migrations/005_eam_operations/
 const MIG_006_GOVERNANCE: &str = include_str!("../migrations/006_eam_governance/postgres.sql");
 const MIG_007_FIELD_PORTAL: &str = include_str!("../migrations/007_eam_field_portal/postgres.sql");
 const MIG_008_POLICY: &str = include_str!("../migrations/008_eam_policy/postgres.sql");
+const MIG_009_DIVISION: &str = include_str!("../migrations/009_eam_division_boundary/postgres.sql");
 
 pub struct SesbEamPlugin;
 
@@ -223,6 +224,14 @@ impl Plugin for SesbEamPlugin {
                 up_sql: MIG_008_POLICY,
                 down_sql: Some(include_str!("../migrations/008_eam_policy/postgres_down.sql")),
                 requires_core_migration: Some("115_policy_engine"),
+            },
+            // The DAMS/TAMS division boundary (§6.3): division column + derivation
+            // triggers + orthogonal DAMS/TAMS roles. FKs into core `roles`.
+            PluginMigration {
+                name: "009_eam_division_boundary",
+                up_sql: MIG_009_DIVISION,
+                down_sql: Some(include_str!("../migrations/009_eam_division_boundary/postgres_down.sql")),
+                requires_core_migration: Some("011_countries"),
             },
         ]
     }

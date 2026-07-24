@@ -95,6 +95,7 @@ async fn list_tline(
 ) -> Response {
     let sidebar = render_sidebar_active(&state, &user, &db_ctx, "sesb_eam.transmission_lines");
     let config = ListConfig::new("Transmission Lines", "eam_transmission_line")
+        .scope_filter(division::division_predicate(&user, "t.division"))
         .custom_from("eam_transmission_line t LEFT JOIN eam_region r ON r.id=t.region_id LEFT JOIN eam_voltage_level v ON v.id=t.voltage_level_id LEFT JOIN (SELECT transmission_line_id, COUNT(*) c FROM eam_transmission_tower GROUP BY transmission_line_id) tw ON tw.transmission_line_id=t.id")
         .custom_select("t.id, t.code, t.name, t.asset_id, r.name AS region_name, v.name AS voltage, COALESCE(tw.c,0)::text AS towers, t.state, t.active")
         .column(ListColumn::new("code", "Code").sortable().code().sql_expr("t.code"))
@@ -202,6 +203,7 @@ async fn edit_tline(
     Extension(user): Extension<AuthUser>, Extension(db_ctx): Extension<DatabaseContext>,
     Path(id): Path<Uuid>,
 ) -> Response {
+    if let Err(resp) = division::guard_division(&db, &user, "eam_transmission_line", id).await { return resp; }
     let sidebar = render_sidebar_active(&state, &user, &db_ctx, "sesb_eam.transmission_lines");
     let row = match vortex_plugin_sdk::sqlx::query(
         "SELECT code, name, asset_id, region_id, voltage_level_id, from_substation_id, to_substation_id, line_length_km::text AS llk, conductor_type, conductor_size_mm2::text AS cs, number_of_circuits, earth_wire_type, rated_current_a::text AS rc, max_sag_m::text AS ms, state, commissioning_date::text AS cd, design_life_years, ownership, notes, active FROM eam_transmission_line WHERE id=$1")
@@ -462,6 +464,7 @@ async fn edit_tower(
     Extension(user): Extension<AuthUser>, Extension(db_ctx): Extension<DatabaseContext>,
     Path(id): Path<Uuid>,
 ) -> Response {
+    if let Err(resp) = division::guard_division(&db, &user, "eam_transmission_tower", id).await { return resp; }
     let sidebar = render_sidebar_active(&state, &user, &db_ctx, "sesb_eam.transmission_lines");
     // Load row into a name→string map (text-cast everything).
     let mut cols: Vec<String> = vec!["transmission_line_id::text AS transmission_line_id".into(), "voltage_level_id::text AS voltage_level_id".into(), "asset_type_id::text AS asset_type_id".into(), "code".into(), "active::text AS active".into()];
@@ -604,6 +607,7 @@ async fn list_dline(
 ) -> Response {
     let sidebar = render_sidebar_active(&state, &user, &db_ctx, "sesb_eam.distribution_lines");
     let config = ListConfig::new("Distribution Lines", "eam_distribution_line")
+        .scope_filter(division::division_predicate(&user, "d.division"))
         .custom_from("eam_distribution_line d LEFT JOIN eam_region r ON r.id=d.region_id")
         .custom_select("d.id, d.code, d.name, d.line_type, r.name AS region_name, d.route_length_km::text AS len, d.state, d.active")
         .column(ListColumn::new("code", "Code").sortable().code().sql_expr("d.code"))
@@ -675,6 +679,7 @@ async fn edit_dline(
     Extension(user): Extension<AuthUser>, Extension(db_ctx): Extension<DatabaseContext>,
     Path(id): Path<Uuid>,
 ) -> Response {
+    if let Err(resp) = division::guard_division(&db, &user, "eam_distribution_line", id).await { return resp; }
     let sidebar = render_sidebar_active(&state, &user, &db_ctx, "sesb_eam.distribution_lines");
     let row = match vortex_plugin_sdk::sqlx::query(
         "SELECT code, name, region_id::text AS region_id, line_type, voltage_level_id::text AS voltage_level_id, route_length_km::text AS route_length_km, number_of_circuits::text AS number_of_circuits, conductor_type, conductor_size_mm2::text AS conductor_size_mm2, state, notes, active::text AS active FROM eam_distribution_line WHERE id=$1")
@@ -735,6 +740,7 @@ async fn list_ugc(
 ) -> Response {
     let sidebar = render_sidebar_active(&state, &user, &db_ctx, "sesb_eam.ugc_lines");
     let config = ListConfig::new("UGC Lines", "eam_ugc_line")
+        .scope_filter(division::division_predicate(&user, "u.division"))
         .custom_from("eam_ugc_line u LEFT JOIN eam_region r ON r.id=u.region_id LEFT JOIN eam_voltage_level v ON v.id=u.voltage_level_id")
         .custom_select("u.id, u.code, u.name, u.asset_id, r.name AS region_name, v.name AS voltage, u.distance_km::text AS dist, u.state, u.active")
         .column(ListColumn::new("code", "Code").sortable().code().sql_expr("u.code"))
@@ -821,6 +827,7 @@ async fn edit_ugc(
     Extension(user): Extension<AuthUser>, Extension(db_ctx): Extension<DatabaseContext>,
     Path(id): Path<Uuid>,
 ) -> Response {
+    if let Err(resp) = division::guard_division(&db, &user, "eam_ugc_line", id).await { return resp; }
     let sidebar = render_sidebar_active(&state, &user, &db_ctx, "sesb_eam.ugc_lines");
     let row = match vortex_plugin_sdk::sqlx::query(
         "SELECT code, name, asset_id, region_id::text AS region_id, voltage_level_id::text AS voltage_level_id, from_substation_id::text AS from_substation_id, to_substation_id::text AS to_substation_id, number_of_circuits::text AS number_of_circuits, mva_rating::text AS mva_rating, total_mva::text AS total_mva, distance_km::text AS distance_km, length_cct_km_66::text AS length_cct_km_66, length_cct_km_132::text AS length_cct_km_132, commissioning_date::text AS commissioning_date, design_life_years::text AS design_life_years, state, ownership, notes, active::text AS active FROM eam_ugc_line WHERE id=$1")
@@ -934,6 +941,7 @@ async fn edit_cseg(
     Extension(user): Extension<AuthUser>, Extension(db_ctx): Extension<DatabaseContext>,
     Path(id): Path<Uuid>,
 ) -> Response {
+    if let Err(resp) = division::guard_division(&db, &user, "eam_cable_segment", id).await { return resp; }
     let sidebar = render_sidebar_active(&state, &user, &db_ctx, "sesb_eam.distribution_lines");
     let row = match vortex_plugin_sdk::sqlx::query(
         "SELECT name, code, sequence::text AS sequence, distribution_line_id::text AS distribution_line_id, voltage_level_id::text AS voltage_level_id, start_substation_id::text AS start_substation_id, end_substation_id::text AS end_substation_id, start_chainage_m::text AS start_chainage_m, end_chainage_m::text AS end_chainage_m, cable_type, conductor_size, laying_method, condition, notes, active::text AS active, distribution_line_id AS dline FROM eam_cable_segment WHERE id=$1")

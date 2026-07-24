@@ -123,6 +123,11 @@ fn assemble_where(config: &ListConfig, parts: &Conditions) -> (String, String) {
     if let Some(base) = &parts.base_filter {
         conds.push(base.clone());
     }
+    // Per-request row-level scope (e.g. division boundary). AND-ed like the
+    // base filter into both the count and data queries.
+    if let Some(scope) = &config.scope_filter {
+        conds.push(scope.clone());
+    }
 
     match (&parts.search, config.search_prefilter, config.prefilter_alias()) {
         // Prefiltered search: base + column filters inline, search via a
@@ -469,6 +474,19 @@ mod tests {
         let sql = build_list_sql(&contacts_config(), &params);
         assert!(!sql.data_sql.contains("ILIKE"));
         assert!(sql.binds.is_empty());
+    }
+
+    #[test]
+    fn scope_filter_is_anded_into_count_and_data() {
+        let config = contacts_config()
+            .scope_filter(Some("(division IS NULL OR division = 'distribution')".into()));
+        let sql = build_list_sql(&config, &params_with(|_| {}));
+        for q in [&sql.count_sql, &sql.data_sql] {
+            assert!(q.contains("division = 'distribution'"), "scope missing in: {q}");
+        }
+        // No scope set → clause absent.
+        let plain = build_list_sql(&contacts_config(), &params_with(|_| {}));
+        assert!(!plain.data_sql.contains("division"));
     }
 
     #[test]

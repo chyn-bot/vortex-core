@@ -62,6 +62,14 @@ async fn eam_dashboard(
     let sidebar = render_sidebar_active(&state, &user, &db_ctx, "sesb_eam.dashboard");
     let region = region_param(&q);
     let rc = if region.is_some() { "WHERE region_id=$1" } else { "" };
+    // §6.3 elevated read: re-apply division scope. `dvw` picks WHERE vs AND.
+    let scope = division::DivisionScope::for_user(&user);
+    let dvw = |col: &str, has_where: bool| -> String {
+        match scope.sql_predicate(col) {
+            None => String::new(),
+            Some(p) => if has_where { format!(" AND {p}") } else { format!(" WHERE {p}") },
+        }
+    };
     let scalar = |sql: String| {
         let db = db.clone();
         async move {
@@ -70,10 +78,10 @@ async fn eam_dashboard(
             qx.fetch_one(&db).await.unwrap_or(0)
         }
     };
-    let equip = scalar(format!("SELECT COUNT(*)::bigint FROM eam_equipment {rc}", rc = if region.is_some() {"WHERE region_id=$1"} else {""})).await;
-    let open_wo = scalar(format!("SELECT COUNT(*)::bigint FROM eam_maintenance WHERE state NOT IN ('completed','verified','cancelled') {rc}", rc = if region.is_some() {"AND region_id=$1"} else {""})).await;
-    let open_def = scalar(format!("SELECT COUNT(*)::bigint FROM eam_defect WHERE state NOT IN ('verified','cancelled') {rc}", rc = if region.is_some() {"AND region_id=$1"} else {""})).await;
-    let active_plans = scalar(format!("SELECT COUNT(*)::bigint FROM eam_maintenance_plan WHERE state='active' {rc}", rc = if region.is_some() {"AND region_id=$1"} else {""})).await;
+    let equip = scalar(format!("SELECT COUNT(*)::bigint FROM eam_equipment {rc}{dv}", rc = if region.is_some() {"WHERE region_id=$1"} else {""}, dv = dvw("division", region.is_some()))).await;
+    let open_wo = scalar(format!("SELECT COUNT(*)::bigint FROM eam_maintenance WHERE state NOT IN ('completed','verified','cancelled') {rc}{dv}", rc = if region.is_some() {"AND region_id=$1"} else {""}, dv = dvw("division", true))).await;
+    let open_def = scalar(format!("SELECT COUNT(*)::bigint FROM eam_defect WHERE state NOT IN ('verified','cancelled') {rc}{dv}", rc = if region.is_some() {"AND region_id=$1"} else {""}, dv = dvw("division", true))).await;
+    let active_plans = scalar(format!("SELECT COUNT(*)::bigint FROM eam_maintenance_plan WHERE state='active' {rc}{dv}", rc = if region.is_some() {"AND region_id=$1"} else {""}, dv = dvw("division", true))).await;
     let _ = rc;
     let cards = format!("{}{}{}{}",
         kpi("Equipment", &equip.to_string(), "registered assets"),
@@ -82,13 +90,13 @@ async fn eam_dashboard(
         kpi("Active Plans", &active_plans.to_string(), "recurring schedules"));
 
     // Condition + status breakdowns
-    let cond = breakdown(&db, "eam_equipment", "condition_status", region, "region_id").await;
-    let opstat = breakdown(&db, "eam_equipment", "operational_status", region, "region_id").await;
-    let wo_state = breakdown(&db, "eam_maintenance", "state", region, "region_id").await;
+    let cond = breakdown(&db, "eam_equipment", "condition_status", region, "region_id", scope).await;
+    let opstat = breakdown(&db, "eam_equipment", "operational_status", region, "region_id", scope).await;
+    let wo_state = breakdown(&db, "eam_maintenance", "state", region, "region_id", scope).await;
 
     // Upcoming + recent orders
-    let upcoming = order_list(&db, region, "state IN ('scheduled','assigned') AND scheduled_date >= CURRENT_DATE", "scheduled_date ASC", 8).await;
-    let recent = order_list(&db, region, "state IN ('completed','verified')", "COALESCE(end_date, updated_at) DESC", 8).await;
+    let upcoming = order_list(&db, region, "state IN ('scheduled','assigned') AND scheduled_date >= CURRENT_DATE", "scheduled_date ASC", 8, scope).await;
+    let recent = order_list(&db, region, "state IN ('completed','verified')", "COALESCE(end_date, updated_at) DESC", 8, scope).await;
 
     let chips = region_chips(&db, "/sesb-eam/dashboard", region).await;
     let content = format!(
@@ -106,9 +114,10 @@ async fn eam_dashboard(
     Html(page_shell(&sidebar, "EAM Dashboard", &content)).into_response()
 }
 
-async fn breakdown(db: &PgPool, table: &str, col: &str, region: Option<Uuid>, region_col: &str) -> String {
+async fn breakdown(db: &PgPool, table: &str, col: &str, region: Option<Uuid>, region_col: &str, scope: division::DivisionScope) -> String {
     let rc = if region.is_some() { format!("WHERE {region_col}=$1", region_col = region_col) } else { String::new() };
-    let sql = format!("SELECT {col} AS k, COUNT(*)::bigint AS n FROM {table} {rc} GROUP BY {col} ORDER BY n DESC", col = col, table = table, rc = rc);
+    let dv = match scope.sql_predicate("division") { None => String::new(), Some(p) => if region.is_some() { format!(" AND {p}") } else { format!(" WHERE {p}") } };
+    let sql = format!("SELECT {col} AS k, COUNT(*)::bigint AS n FROM {table} {rc}{dv} GROUP BY {col} ORDER BY n DESC", col = col, table = table, rc = rc, dv = dv);
     let q = vortex_plugin_sdk::sqlx::query(&sql);
     let q = if let Some(r) = region { q.bind(r) } else { q };
     let rows = q.fetch_all(db).await.unwrap_or_default();
@@ -123,11 +132,12 @@ async fn breakdown(db: &PgPool, table: &str, col: &str, region: Option<Uuid>, re
     }).collect()
 }
 
-async fn order_list(db: &PgPool, region: Option<Uuid>, where_extra: &str, order: &str, limit: i64) -> String {
+async fn order_list(db: &PgPool, region: Option<Uuid>, where_extra: &str, order: &str, limit: i64, scope: division::DivisionScope) -> String {
     let rc = if region.is_some() { "AND m.region_id=$1" } else { "" };
+    let dv = scope.sql_predicate("m.division").map(|p| format!(" AND {p}")).unwrap_or_default();
     let sql = format!(
-        "SELECT m.id, m.name, m.description, e.name AS equip, m.scheduled_date::text AS sd, m.state FROM eam_maintenance m LEFT JOIN eam_equipment e ON e.id=m.equipment_id WHERE {we} {rc} ORDER BY {ord} LIMIT {lim}",
-        we = where_extra, rc = rc, ord = order, lim = limit);
+        "SELECT m.id, m.name, m.description, e.name AS equip, m.scheduled_date::text AS sd, m.state FROM eam_maintenance m LEFT JOIN eam_equipment e ON e.id=m.equipment_id WHERE {we} {rc}{dv} ORDER BY {ord} LIMIT {lim}",
+        we = where_extra, rc = rc, dv = dv, ord = order, lim = limit);
     let q = vortex_plugin_sdk::sqlx::query(&sql);
     let q = if let Some(r) = region { q.bind(r) } else { q };
     let rows = q.fetch_all(db).await.unwrap_or_default();
@@ -153,7 +163,7 @@ async fn apm(
 ) -> Response {
     let sidebar = render_sidebar_active(&state, &user, &db_ctx, "sesb_eam.apm");
     let region = region_param(&q);
-    let d = analytics::apm_data(&db, region).await;
+    let d = analytics::apm_data(&db, region, division::DivisionScope::for_user(&user)).await;
     let chips = region_chips(&db, "/sesb-eam/apm", region).await;
     let cards = format!("{}{}{}{}{}",
         kpi("Equipment", &d.total.to_string(), "in scope"),
@@ -200,13 +210,18 @@ async fn executive(
 ) -> Response {
     let sidebar = render_sidebar_active(&state, &user, &db_ctx, "sesb_eam.executive");
     let (from, to) = ytd();
-    let regions = vortex_plugin_sdk::sqlx::query("SELECT id, name FROM eam_region WHERE active ORDER BY sequence, name").fetch_all(&db).await.unwrap_or_default();
+    // §6.3: a scoped user's executive rollup only iterates their own division's
+    // regions, so out-of-division per-region rows never appear.
+    let rdv = division::DivisionScope::for_user(&user)
+        .sql_predicate("division").map(|p| format!(" AND {p}")).unwrap_or_default();
+    let regions = vortex_plugin_sdk::sqlx::query(&format!(
+        "SELECT id, name FROM eam_region WHERE active{rdv} ORDER BY sequence, name")).fetch_all(&db).await.unwrap_or_default();
     let mut rows = String::new();
     for r in &regions {
         let rid: Uuid = r.get("id");
         let rname: String = r.get("name");
-        let pm = analytics::pm_compliance(&db, Some(rid), &from, &to).await;
-        let rel = analytics::reliability(&db, Some(rid), &from, &to, true).await;
+        let pm = analytics::pm_compliance(&db, Some(rid), &from, &to, division::DivisionScope::for_user(&user)).await;
+        let rel = analytics::reliability(&db, Some(rid), &from, &to, true, division::DivisionScope::for_user(&user)).await;
         let cost: f64 = vortex_plugin_sdk::sqlx::query_scalar::<_, Option<f64>>(
             "SELECT SUM(total_cost)::float8 FROM eam_maintenance WHERE region_id=$1 AND state IN ('completed','verified')")
             .bind(rid).fetch_one(&db).await.ok().flatten().unwrap_or(0.0);
@@ -235,7 +250,7 @@ async fn predictive(
 ) -> Response {
     let sidebar = render_sidebar_active(&state, &user, &db_ctx, "sesb_eam.predictive");
     let region = region_param(&q);
-    let d = analytics::predictive(&db, region).await;
+    let d = analytics::predictive(&db, region, division::DivisionScope::for_user(&user)).await;
     let chips = region_chips(&db, "/sesb-eam/predictive", region).await;
     let cards = format!("{}{}{}{}{}",
         kpi("Tracked", &d.total.to_string(), "operational assets"),

@@ -5,6 +5,8 @@
 use vortex_plugin_sdk::sqlx::{PgPool, Row};
 use vortex_plugin_sdk::uuid::Uuid;
 
+use super::division;
+
 /// §4.1 health index from condition + operational status (0–100).
 pub fn health_index(condition: &str, op_status: &str) -> f64 {
     let cond = match condition { "excellent" => 100.0, "good" => 80.0, "fair" => 60.0, "poor" => 40.0, "critical" => 20.0, _ => 50.0 };
@@ -27,17 +29,20 @@ pub struct Reliability {
 
 /// SAIDI/SAIFI/CAIDI over `[from,to]`, optionally scoped to a region. Major
 /// Event Days are excluded by default. Live outages run to NOW().
-pub async fn reliability(db: &PgPool, region_id: Option<Uuid>, from: &str, to: &str, exclude_major: bool) -> Reliability {
+pub async fn reliability(db: &PgPool, region_id: Option<Uuid>, from: &str, to: &str, exclude_major: bool, scope: division::DivisionScope) -> Reliability {
+    // §6.3 elevated read: re-apply the division scope by hand (constants, no bind).
+    let dv = |col: &str| scope.sql_predicate(col).map(|p| format!(" AND {p}")).unwrap_or_default();
     let total_customers: i64 = {
         let sql = format!(
-            "SELECT COALESCE(SUM(s.customers_served),0)::bigint FROM eam_substation s JOIN eam_site si ON si.id=s.site_id WHERE s.active {}",
-            if region_id.is_some() { "AND si.region_id=$1" } else { "" });
+            "SELECT COALESCE(SUM(s.customers_served),0)::bigint FROM eam_substation s JOIN eam_site si ON si.id=s.site_id WHERE s.active {}{}",
+            if region_id.is_some() { "AND si.region_id=$1" } else { "" }, dv("s.division"));
         let q = vortex_plugin_sdk::sqlx::query_scalar(&sql);
         let q = if let Some(r) = region_id { q.bind(r) } else { q };
         q.fetch_one(db).await.unwrap_or(0)
     };
     let major_clause = if exclude_major { "AND NOT o.is_major_event" } else { "" };
     let region_clause = if region_id.is_some() { "AND o.region_id=$3" } else { "" };
+    let odiv = dv("o.division");
     let sql = format!(
         "SELECT \
            COALESCE(SUM(o.customers_affected * EXTRACT(EPOCH FROM (COALESCE(o.end_datetime,NOW())-o.start_datetime))/60.0),0)::float8 AS cust_min, \
@@ -45,8 +50,8 @@ pub async fn reliability(db: &PgPool, region_id: Option<Uuid>, from: &str, to: &
            COALESCE(SUM(CASE WHEN o.outage_type<>'planned' THEN o.customers_affected * EXTRACT(EPOCH FROM (COALESCE(o.end_datetime,NOW())-o.start_datetime))/60.0 ELSE 0 END),0)::float8 AS cust_min_unp, \
            COALESCE(SUM(CASE WHEN o.outage_type<>'planned' THEN o.customers_affected ELSE 0 END),0)::float8 AS cust_aff_unp, \
            COUNT(*)::bigint AS n \
-         FROM eam_outage o WHERE o.start_datetime >= $1::timestamptz AND o.start_datetime <= $2::timestamptz {major} {region}",
-        major = major_clause, region = region_clause);
+         FROM eam_outage o WHERE o.start_datetime >= $1::timestamptz AND o.start_datetime <= $2::timestamptz {major} {region}{odiv}",
+        major = major_clause, region = region_clause, odiv = odiv);
     let q = vortex_plugin_sdk::sqlx::query(&sql).bind(from).bind(to);
     let q = if let Some(r) = region_id { q.bind(r) } else { q };
     let row = match q.fetch_one(db).await { Ok(r) => r, Err(_) => return Reliability { total_customers, ..Default::default() } };
@@ -81,15 +86,16 @@ pub struct PmCompliance {
     pub completion_pct: f64,
 }
 
-pub async fn pm_compliance(db: &PgPool, region_id: Option<Uuid>, from: &str, to: &str) -> PmCompliance {
+pub async fn pm_compliance(db: &PgPool, region_id: Option<Uuid>, from: &str, to: &str, scope: division::DivisionScope) -> PmCompliance {
     let region_clause = if region_id.is_some() { "AND region_id=$3" } else { "" };
+    let dvf = scope.sql_predicate("division").map(|p| format!(" AND {p}")).unwrap_or_default();
     let sql = format!(
         "SELECT \
            COUNT(*) FILTER (WHERE scheduled_date >= $1::date AND scheduled_date <= $2::date)::bigint AS scheduled, \
            COUNT(*) FILTER (WHERE scheduled_date >= $1::date AND scheduled_date <= $2::date AND state IN ('completed','verified'))::bigint AS completed, \
            COUNT(*) FILTER (WHERE scheduled_date >= $1::date AND scheduled_date <= $2::date AND state IN ('completed','verified') AND end_date::date <= scheduled_date)::bigint AS on_time, \
            COUNT(*) FILTER (WHERE state NOT IN ('completed','verified','cancelled') AND scheduled_date < CURRENT_DATE)::bigint AS overdue_open \
-         FROM eam_maintenance WHERE maintenance_type='pm' {region}", region = region_clause);
+         FROM eam_maintenance WHERE maintenance_type='pm' {region}{dvf}", region = region_clause, dvf = dvf);
     let q = vortex_plugin_sdk::sqlx::query(&sql).bind(from).bind(to);
     let q = if let Some(r) = region_id { q.bind(r) } else { q };
     let row = match q.fetch_one(db).await { Ok(r) => r, Err(_) => return PmCompliance::default() };
@@ -137,12 +143,13 @@ pub const RISKS: [&str; 4] = ["low", "medium", "high", "critical"];
 fn risk_weight(r: &str) -> f64 { match r { "low" => 1.0, "medium" => 2.0, "high" => 4.0, "critical" => 8.0, _ => 1.0 } }
 fn condition_weight(c: &str) -> f64 { match c { "excellent" => 1.0, "good" => 1.0, "fair" => 2.0, "poor" => 4.0, "critical" => 8.0, _ => 1.0 } }
 
-pub async fn apm_data(db: &PgPool, region_id: Option<Uuid>) -> ApmData {
+pub async fn apm_data(db: &PgPool, region_id: Option<Uuid>, scope: division::DivisionScope) -> ApmData {
     let region_clause = if region_id.is_some() { "AND e.region_id=$1" } else { "" };
+    let dvf = scope.sql_predicate("e.division").map(|p| format!(" AND {p}")).unwrap_or_default();
     let sql = format!(
         "SELECT e.id, e.name, e.code, e.condition_status, e.risk_level, e.operational_status, \
            CASE WHEN e.useful_life_years > 0 THEN (FLOOR((CURRENT_DATE - e.commissioning_date)/365.25)::float8 / e.useful_life_years * 100.0) ELSE 0 END AS ul_pct \
-         FROM eam_equipment e WHERE e.active {region}", region = region_clause);
+         FROM eam_equipment e WHERE e.active {region}{dvf}", region = region_clause, dvf = dvf);
     let q = vortex_plugin_sdk::sqlx::query(&sql);
     let q = if let Some(r) = region_id { q.bind(r) } else { q };
     let rows = q.fetch_all(db).await.unwrap_or_default();
@@ -198,15 +205,16 @@ pub struct PredictiveData {
     pub worklist: Vec<PredRow>,
 }
 
-pub async fn predictive(db: &PgPool, region_id: Option<Uuid>) -> PredictiveData {
+pub async fn predictive(db: &PgPool, region_id: Option<Uuid>, scope: division::DivisionScope) -> PredictiveData {
     // Pull equipment plus failure stats (cm/emergency completed/verified) and last service.
     let region_clause = if region_id.is_some() { "AND e.region_id=$1" } else { "" };
+    let dvf = scope.sql_predicate("e.division").map(|p| format!(" AND {p}")).unwrap_or_default();
     let sql = format!(
         "SELECT e.id, e.name, e.code, e.condition_status, e.operational_status, e.risk_level, \
            (SELECT COUNT(*) FROM eam_maintenance m WHERE m.equipment_id=e.id AND m.maintenance_type IN ('cm','emergency') AND m.state IN ('completed','verified'))::bigint AS fcount, \
            (SELECT MAX(m.start_date) FROM eam_maintenance m WHERE m.equipment_id=e.id AND m.maintenance_type IN ('cm','emergency') AND m.state IN ('completed','verified')) AS last_fail, \
            (SELECT MAX(m.end_date) FROM eam_maintenance m WHERE m.equipment_id=e.id AND m.state IN ('completed','verified')) AS last_service \
-         FROM eam_equipment e WHERE e.active AND e.operational_status<>'decommissioned' {region}", region = region_clause);
+         FROM eam_equipment e WHERE e.active AND e.operational_status<>'decommissioned' {region}{dvf}", region = region_clause, dvf = dvf);
     let q = vortex_plugin_sdk::sqlx::query(&sql);
     let q = if let Some(r) = region_id { q.bind(r) } else { q };
     let rows = q.fetch_all(db).await.unwrap_or_default();
