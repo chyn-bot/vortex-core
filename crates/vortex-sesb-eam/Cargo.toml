@@ -16,6 +16,7 @@ description = "SESB Enterprise Asset Management — electrical-utility EAM verti
 vortex-plugin-sdk = { workspace = true }
 vortex-inventory = { workspace = true }
 reqwest = { workspace = true }
+csv = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "macros", "test-util"] }

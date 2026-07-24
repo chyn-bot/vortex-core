@@ -5604,6 +5604,7 @@ dependencies = [
 name = "vortex-sesb-eam"
 version = "0.1.0"
 dependencies = [
+ "csv",
  "reqwest",
  "tokio",
  "vortex-inventory",

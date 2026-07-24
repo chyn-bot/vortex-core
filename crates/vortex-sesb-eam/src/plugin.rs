@@ -92,6 +92,8 @@ impl Plugin for SesbEamPlugin {
                 .with_icon("git-fork").with_priority(26).under("sesb_eam.dashboard"),
             MenuEntry::new("sesb_eam.assets", "Asset Register", "/sesb-eam/assets", MenuGroup::Operations)
                 .with_icon("package").with_priority(31).under("sesb_eam.dashboard"),
+            MenuEntry::new("sesb_eam.import", "Asset Import", "/sesb-eam/import", MenuGroup::Operations)
+                .with_icon("upload").with_priority(35).under("sesb_eam.assets"),
             MenuEntry::new("sesb_eam.asset_movements", "Asset Movements", "/sesb-eam/asset-movements", MenuGroup::Operations)
                 .with_icon("truck").with_priority(32).under("sesb_eam.dashboard"),
             MenuEntry::new("sesb_eam.asset_categories", "Asset Categories", "/sesb-eam/asset-categories", MenuGroup::Operations)

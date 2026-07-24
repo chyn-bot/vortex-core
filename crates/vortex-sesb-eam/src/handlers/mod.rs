@@ -18,6 +18,7 @@ pub mod diagrams;
 pub mod division;
 pub mod equipment;
 pub mod hierarchy;
+pub mod import;
 pub mod jobs;
 pub mod maintenance;
 pub mod maps;
@@ -38,6 +39,7 @@ pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .merge(reference::routes())
         .merge(assets::routes())
+        .merge(import::routes())
         .merge(hierarchy::routes())
         .merge(equipment::routes())
         .merge(networks::routes())
