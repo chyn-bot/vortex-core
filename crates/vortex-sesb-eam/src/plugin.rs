@@ -17,6 +17,7 @@ const MIG_007_FIELD_PORTAL: &str = include_str!("../migrations/007_eam_field_por
 const MIG_008_POLICY: &str = include_str!("../migrations/008_eam_policy/postgres.sql");
 const MIG_009_DIVISION: &str = include_str!("../migrations/009_eam_division_boundary/postgres.sql");
 const MIG_010_MNEC: &str = include_str!("../migrations/010_eam_mnec_ids/postgres.sql");
+const MIG_011_ASSET_REGISTER: &str = include_str!("../migrations/011_eam_asset_register/postgres.sql");
 
 pub struct SesbEamPlugin;
 
@@ -89,6 +90,14 @@ impl Plugin for SesbEamPlugin {
                 .with_icon("trending-up").with_priority(24).under("sesb_eam.dashboard"),
             MenuEntry::new("sesb_eam.hierarchy", "Asset Hierarchy", "/sesb-eam/hierarchy", MenuGroup::Operations)
                 .with_icon("git-fork").with_priority(26).under("sesb_eam.dashboard"),
+            MenuEntry::new("sesb_eam.assets", "Asset Register", "/sesb-eam/assets", MenuGroup::Operations)
+                .with_icon("package").with_priority(31).under("sesb_eam.dashboard"),
+            MenuEntry::new("sesb_eam.asset_movements", "Asset Movements", "/sesb-eam/asset-movements", MenuGroup::Operations)
+                .with_icon("truck").with_priority(32).under("sesb_eam.dashboard"),
+            MenuEntry::new("sesb_eam.asset_categories", "Asset Categories", "/sesb-eam/asset-categories", MenuGroup::Operations)
+                .with_icon("folder-tree").with_priority(33).under("sesb_eam.assets"),
+            MenuEntry::new("sesb_eam.asset_locations", "Asset Locations", "/sesb-eam/asset-locations", MenuGroup::Operations)
+                .with_icon("map").with_priority(34).under("sesb_eam.assets"),
             MenuEntry::new("sesb_eam.sld", "Single Line Diagram", "/sesb-eam/sld", MenuGroup::Operations)
                 .with_icon("network").with_priority(27).under("sesb_eam.dashboard"),
             MenuEntry::new("sesb_eam.transmission_sld", "Transmission SLD", "/sesb-eam/transmission-sld", MenuGroup::Operations)
@@ -240,6 +249,13 @@ impl Plugin for SesbEamPlugin {
                 name: "010_eam_mnec_ids",
                 up_sql: MIG_010_MNEC,
                 down_sql: Some(include_str!("../migrations/010_eam_mnec_ids/postgres_down.sql")),
+                requires_core_migration: Some("011_countries"),
+            },
+            // Generic asset register & lifecycle (§3.9, custody scope).
+            PluginMigration {
+                name: "011_eam_asset_register",
+                up_sql: MIG_011_ASSET_REGISTER,
+                down_sql: Some(include_str!("../migrations/011_eam_asset_register/postgres_down.sql")),
                 requires_core_migration: Some("011_countries"),
             },
         ]

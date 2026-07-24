@@ -10,6 +10,7 @@ use vortex_plugin_sdk::uuid::Uuid;
 
 pub mod analytics;
 pub mod api;
+pub mod assets;
 pub mod checklist;
 pub mod control_room;
 pub mod dashboards;
@@ -36,6 +37,7 @@ pub mod workforce;
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .merge(reference::routes())
+        .merge(assets::routes())
         .merge(hierarchy::routes())
         .merge(equipment::routes())
         .merge(networks::routes())
