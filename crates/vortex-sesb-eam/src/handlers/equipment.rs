@@ -321,20 +321,39 @@ fn grid3(fields: &str) -> String {
 
 // MNEC asset_id composition (§4.9): "{parent.asset_id}-{acronym}[-{seq:02d}]"
 async fn compose_asset_id(db: &PgPool, bay_id: Option<Uuid>, asset_type_id: Option<Uuid>, mnec_sequence: Option<i32>) -> Option<String> {
-    let parent: Option<String> = match bay_id {
-        Some(b) => vortex_plugin_sdk::sqlx::query_scalar("SELECT asset_id FROM eam_bay WHERE id=$1").bind(b).fetch_optional(db).await.ok().flatten(),
-        None => None,
-    };
-    let parent = parent.filter(|s| !s.is_empty())?;
+    compose_equipment_asset_id(db, &[(bay_id, "eam_bay")], asset_type_id, mnec_sequence).await
+}
+
+/// Resolve an equipment MNEC id (§4.9) from whichever parent it hangs off.
+/// `parents` is a priority-ordered list of `(id, table)` candidates —
+/// bay | tower | gantry | span | ugc_line | distribution_line — and the first
+/// with a non-empty `asset_id` wins. The pure composition is in [`super::mnec`].
+async fn compose_equipment_asset_id(
+    db: &PgPool,
+    parents: &[(Option<Uuid>, &str)],
+    asset_type_id: Option<Uuid>,
+    mnec_sequence: Option<i32>,
+) -> Option<String> {
+    let mut parent: Option<String> = None;
+    for (id, table) in parents {
+        if let Some(pid) = id {
+            // `table` is an author-supplied literal, never request input.
+            let sql = format!("SELECT asset_id FROM {table} WHERE id=$1");
+            let got: Option<String> = vortex_plugin_sdk::sqlx::query_scalar(&sql)
+                .bind(pid).fetch_optional(db).await.ok().flatten();
+            if let Some(a) = got.filter(|s| !s.is_empty()) {
+                parent = Some(a);
+                break;
+            }
+        }
+    }
+    let parent = parent?;
     let acronym: Option<String> = match asset_type_id {
         Some(a) => vortex_plugin_sdk::sqlx::query_scalar("SELECT acronym FROM eam_asset_type WHERE id=$1").bind(a).fetch_optional(db).await.ok().flatten(),
         None => None,
     };
     let acronym = acronym?;
-    Some(match mnec_sequence.filter(|s| *s > 0) {
-        Some(seq) => format!("{parent}-{acronym}-{seq:02}"),
-        None => format!("{parent}-{acronym}"),
-    })
+    Some(super::mnec::equipment_asset_id(&parent, &acronym, mnec_sequence))
 }
 
 async fn new_equipment(

@@ -639,10 +639,11 @@ async fn substation_body(
 ) -> String {
     let sites = site_options(db, f.site_id.or(site_preselect)).await;
     let atypes = asset_type_options(db, f.asset_type_id).await;
-    let ident = grid2(&format!("{}{}{}{}{}{}",
+    let ident = grid2(&format!("{}{}{}{}{}{}{}",
         text_field("Code", "code", &f.code, true),
         text_field("Name", "name", &f.name, true),
-        text_field("MNEC Asset ID", "asset_id", &f.asset_id, false),
+        text_field("MNEC Asset ID (auto if blank)", "asset_id", &f.asset_id, false),
+        text_field("Location Acronym (for MNEC ID)", "acronym", &f.acronym, false),
         select_field("Asset Type", "asset_type_id", &atypes),
         select_field("Site *", "site_id", &sites),
         select_field("Substation Class", "substation_class", &enum_options(SUB_CLASSES, &f.substation_class)),
@@ -680,7 +681,7 @@ async fn substation_body(
 
 #[derive(Default)]
 struct SubForm {
-    code: String, name: String, asset_id: String, asset_type_id: Option<Uuid>, site_id: Option<Uuid>,
+    code: String, name: String, asset_id: String, acronym: String, asset_type_id: Option<Uuid>, site_id: Option<Uuid>,
     substation_class: String, substation_type: String, busbar_configuration: String,
     primary_voltage_kv: String, customers_served: String, source_from: String, feeder: String,
     automation_type: String, substation_category: String, gps_latitude: String, gps_longitude: String,
@@ -695,7 +696,7 @@ impl SubForm {
     fn from_map(form: &HashMap<String, String>) -> Self {
         let g = |k: &str| form.get(k).cloned().unwrap_or_default();
         SubForm {
-            code: g("code"), name: g("name"), asset_id: g("asset_id"),
+            code: g("code"), name: g("name"), asset_id: g("asset_id"), acronym: g("acronym"),
             asset_type_id: opt_uuid(form, "asset_type_id"), site_id: opt_uuid(form, "site_id"),
             substation_class: g("substation_class"), substation_type: g("substation_type"),
             busbar_configuration: g("busbar_configuration"), primary_voltage_kv: g("primary_voltage_kv"),
@@ -731,10 +732,26 @@ async fn create_substation(
     if f.code.trim().is_empty() || f.name.trim().is_empty() { return bad("Code and name are required"); }
     let company_id = default_company(&db).await;
     let id = Uuid::now_v7();
+    // MNEC asset_id (§4.9): compose SE-{TS|DS}-{kv}-{location}-{seq} when the
+    // user didn't type one. `location` is the acronym (code fallback); `seq`
+    // is the next index among substations sharing that acronym.
+    let location = if f.acronym.trim().is_empty() { f.code.trim().to_string() } else { f.acronym.trim().to_string() };
+    let composed_asset_id: Option<String> = if !f.asset_id.trim().is_empty() {
+        Some(f.asset_id.trim().to_string())
+    } else {
+        let kv = f.primary_voltage_kv.trim().parse::<f64>().ok().map(|v| v.round() as i32).unwrap_or(0);
+        if kv > 0 && !location.is_empty() {
+            let n: i64 = vortex_plugin_sdk::sqlx::query_scalar(
+                "SELECT COUNT(*) FROM eam_substation WHERE company_id=$1 AND acronym=$2")
+                .bind(company_id).bind(&location).fetch_one(&db).await.unwrap_or(0);
+            Some(mnec::substation_asset_id(kv, &location, Some((n + 1) as i32)))
+        } else { None }
+    };
+    let acronym_val: Option<&str> = if f.acronym.trim().is_empty() { None } else { Some(f.acronym.trim()) };
     let res = vortex_plugin_sdk::sqlx::query(
-        "INSERT INTO eam_substation (id, name, code, asset_id, asset_type_id, primary_voltage_kv, site_id, substation_type, busbar_configuration, substation_class, source_from, feeder, customers_served, substation_category, automation_type, site_size, gps_latitude, gps_longitude, ownership, commissioning_date, design_life_years, state, notes, company_id, created_by) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)")
-        .bind(id).bind(&f.name).bind(&f.code).bind(opt_str(&form, "asset_id"))
+        "INSERT INTO eam_substation (id, name, code, asset_id, asset_type_id, primary_voltage_kv, site_id, substation_type, busbar_configuration, substation_class, source_from, feeder, customers_served, substation_category, automation_type, site_size, gps_latitude, gps_longitude, ownership, commissioning_date, design_life_years, state, notes, company_id, created_by, acronym) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)")
+        .bind(id).bind(&f.name).bind(&f.code).bind(composed_asset_id.as_deref())
         .bind(f.asset_type_id).bind(opt_dec(&form, "primary_voltage_kv")).bind(site_id)
         .bind(opt_str(&form, "substation_type")).bind(opt_str(&form, "busbar_configuration"))
         .bind(opt_str(&form, "substation_class")).bind(opt_str(&form, "source_from")).bind(opt_str(&form, "feeder"))
@@ -744,7 +761,7 @@ async fn create_substation(
         .bind(form.get("ownership").map(|s| s.as_str()).unwrap_or("sesb"))
         .bind(opt_date(&form, "commissioning_date")).bind(opt_i32(&form, "design_life_years").unwrap_or(40))
         .bind(form.get("state").map(|s| s.as_str()).unwrap_or("operational"))
-        .bind(opt_str(&form, "notes")).bind(company_id).bind(user.id)
+        .bind(opt_str(&form, "notes")).bind(company_id).bind(user.id).bind(acronym_val)
         .execute(&db).await;
     if let Err(e) = res { error!(error=%e, "substation insert failed"); return bad(&format!("Failed: {e}")); }
     let entry = vortex_plugin_sdk::security::AuditEntry::new(
@@ -786,12 +803,12 @@ async fn edit_substation(
     if let Err(resp) = division::guard_division(&db, &user, "eam_substation", id).await { return resp; }
     let sidebar = render_sidebar_active(&state, &user, &db_ctx, "sesb_eam.substations");
     let row = match vortex_plugin_sdk::sqlx::query(
-        "SELECT code, name, asset_id, asset_type_id, primary_voltage_kv::float8 AS pkv, primary_voltage_kv::text AS pkv_t, site_id, substation_type, busbar_configuration, substation_class, source_from, feeder, customers_served, substation_category, automation_type, site_size, gps_latitude, gps_longitude, ownership, commissioning_date::text AS cdate, design_life_years, state, notes, active, verification_state FROM eam_substation WHERE id=$1")
+        "SELECT code, name, asset_id, COALESCE(acronym,'') AS acronym, asset_type_id, primary_voltage_kv::float8 AS pkv, primary_voltage_kv::text AS pkv_t, site_id, substation_type, busbar_configuration, substation_class, source_from, feeder, customers_served, substation_category, automation_type, site_size, gps_latitude, gps_longitude, ownership, commissioning_date::text AS cdate, design_life_years, state, notes, active, verification_state FROM eam_substation WHERE id=$1")
         .bind(id).fetch_optional(&db).await { Ok(Some(r)) => r, _ => return (StatusCode::NOT_FOUND, "Not found").into_response() };
     let gets = |k: &str| -> String { row.try_get::<Option<String>, _>(k).ok().flatten().unwrap_or_default() };
     let vstate: String = row.get("verification_state");
     let f = SubForm {
-        code: row.get("code"), name: row.get("name"), asset_id: gets("asset_id"),
+        code: row.get("code"), name: row.get("name"), asset_id: gets("asset_id"), acronym: gets("acronym"),
         asset_type_id: row.try_get("asset_type_id").ok(), site_id: row.try_get("site_id").ok(),
         substation_class: gets("substation_class"), substation_type: gets("substation_type"),
         busbar_configuration: gets("busbar_configuration"), primary_voltage_kv: gets("pkv_t"),
@@ -856,7 +873,7 @@ async fn update_substation(
     let site_id = match f.site_id { Some(s) => s, None => return bad("Site is required") };
     if f.code.trim().is_empty() || f.name.trim().is_empty() { return bad("Code and name are required"); }
     let res = vortex_plugin_sdk::sqlx::query(
-        "UPDATE eam_substation SET name=$1, code=$2, asset_id=$3, asset_type_id=$4, primary_voltage_kv=$5, site_id=$6, substation_type=$7, busbar_configuration=$8, substation_class=$9, source_from=$10, feeder=$11, customers_served=$12, substation_category=$13, automation_type=$14, site_size=$15, gps_latitude=$16, gps_longitude=$17, ownership=$18, commissioning_date=$19, design_life_years=$20, state=$21, notes=$22, active=$23, updated_by=$24 WHERE id=$25")
+        "UPDATE eam_substation SET name=$1, code=$2, asset_id=$3, asset_type_id=$4, primary_voltage_kv=$5, site_id=$6, substation_type=$7, busbar_configuration=$8, substation_class=$9, source_from=$10, feeder=$11, customers_served=$12, substation_category=$13, automation_type=$14, site_size=$15, gps_latitude=$16, gps_longitude=$17, ownership=$18, commissioning_date=$19, design_life_years=$20, state=$21, notes=$22, active=$23, updated_by=$24, acronym=$25 WHERE id=$26")
         .bind(&f.name).bind(&f.code).bind(opt_str(&form, "asset_id")).bind(f.asset_type_id)
         .bind(opt_dec(&form, "primary_voltage_kv")).bind(site_id)
         .bind(opt_str(&form, "substation_type")).bind(opt_str(&form, "busbar_configuration"))
@@ -867,7 +884,7 @@ async fn update_substation(
         .bind(form.get("ownership").map(|s| s.as_str()).unwrap_or("sesb"))
         .bind(opt_date(&form, "commissioning_date")).bind(opt_i32(&form, "design_life_years").unwrap_or(40))
         .bind(form.get("state").map(|s| s.as_str()).unwrap_or("operational"))
-        .bind(opt_str(&form, "notes")).bind(form.contains_key("active")).bind(user.id).bind(id)
+        .bind(opt_str(&form, "notes")).bind(form.contains_key("active")).bind(user.id).bind(opt_str(&form, "acronym")).bind(id)
         .execute(&db).await;
     if let Err(e) = res { error!(error=%e, "substation update failed"); return bad(&format!("Failed: {e}")); }
     Redirect::to(&format!("/sesb-eam/substations/{id}")).into_response()

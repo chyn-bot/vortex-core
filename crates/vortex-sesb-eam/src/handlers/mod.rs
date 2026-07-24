@@ -20,6 +20,7 @@ pub mod hierarchy;
 pub mod jobs;
 pub mod maintenance;
 pub mod maps;
+pub mod mnec;
 pub mod networks;
 pub mod ops;
 pub mod planning;
