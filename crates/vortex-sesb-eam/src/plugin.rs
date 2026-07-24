@@ -18,6 +18,7 @@ const MIG_008_POLICY: &str = include_str!("../migrations/008_eam_policy/postgres
 const MIG_009_DIVISION: &str = include_str!("../migrations/009_eam_division_boundary/postgres.sql");
 const MIG_010_MNEC: &str = include_str!("../migrations/010_eam_mnec_ids/postgres.sql");
 const MIG_011_ASSET_REGISTER: &str = include_str!("../migrations/011_eam_asset_register/postgres.sql");
+const MIG_012_PARITY: &str = include_str!("../migrations/012_eam_field_parity/postgres.sql");
 
 pub struct SesbEamPlugin;
 
@@ -258,6 +259,13 @@ impl Plugin for SesbEamPlugin {
                 name: "011_eam_asset_register",
                 up_sql: MIG_011_ASSET_REGISTER,
                 down_sql: Some(include_str!("../migrations/011_eam_asset_register/postgres_down.sql")),
+                requires_core_migration: Some("011_countries"),
+            },
+            // Field-level parity: geo roll-ups + short-tail columns (§3).
+            PluginMigration {
+                name: "012_eam_field_parity",
+                up_sql: MIG_012_PARITY,
+                down_sql: Some(include_str!("../migrations/012_eam_field_parity/postgres_down.sql")),
                 requires_core_migration: Some("011_countries"),
             },
         ]
