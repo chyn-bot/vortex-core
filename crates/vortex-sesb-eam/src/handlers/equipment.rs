@@ -666,15 +666,37 @@ async fn create_component(
     let code = match vortex_plugin_sdk::orm::sequence::next(&state.pool, &CMP_SEQ).await { Ok(c) => c, Err(_) => return bad("Failed to generate code") };
     let company_id = default_company(&db).await;
     let id = Uuid::now_v7();
+    // MNEC asset_id (§4.9): {equipment.asset_id}-[circuit-][acronym-][seq-]phase[-side].
+    let comp_asset_id: Option<String> = {
+        let equip: Option<String> = vortex_plugin_sdk::sqlx::query_scalar::<_, String>("SELECT asset_id FROM eam_equipment WHERE id=$1")
+            .bind(equipment_id).fetch_optional(&db).await.ok().flatten().filter(|s| !s.is_empty());
+        match equip {
+            Some(eq) if !f.phase.trim().is_empty() => {
+                let acronym: Option<String> = match f.asset_type_id {
+                    Some(a) => vortex_plugin_sdk::sqlx::query_scalar::<_, String>("SELECT acronym FROM eam_asset_type WHERE id=$1").bind(a).fetch_optional(&db).await.ok().flatten(),
+                    None => None,
+                };
+                Some(super::mnec::component_asset_id(
+                    &eq,
+                    form.get("circuit").map(|s| s.as_str()),
+                    acronym.as_deref(),
+                    opt_i32(&form, "mnec_sequence"),
+                    f.phase.trim(),
+                    form.get("side").map(|s| s.as_str()),
+                ))
+            }
+            _ => None,
+        }
+    };
     let res = vortex_plugin_sdk::sqlx::query(
-        "INSERT INTO eam_component (id, name, code, equipment_id, component_type, asset_type_id, phase, mnec_sequence, manufacturer_id, model_number, serial_number, installation_date, condition_status, operational_status, position, specification, rating, brand, make_country, risk_level, notes, company_id, created_by) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)")
+        "INSERT INTO eam_component (id, name, code, equipment_id, component_type, asset_type_id, phase, mnec_sequence, manufacturer_id, model_number, serial_number, installation_date, condition_status, operational_status, position, specification, rating, brand, make_country, risk_level, notes, company_id, created_by, asset_id) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)")
         .bind(id).bind(&f.name).bind(&code).bind(equipment_id).bind(&f.component_type).bind(f.asset_type_id)
         .bind(opt_str(&form, "phase")).bind(opt_i32(&form, "mnec_sequence")).bind(f.manufacturer_id)
         .bind(opt_str(&form, "model_number")).bind(opt_str(&form, "serial_number")).bind(opt_date(&form, "installation_date"))
         .bind(&f.condition_status).bind(&f.operational_status).bind(opt_str(&form, "position"))
         .bind(opt_str(&form, "specification")).bind(opt_str(&form, "rating")).bind(opt_str(&form, "brand")).bind(opt_str(&form, "make_country"))
-        .bind(&f.risk_level).bind(opt_str(&form, "notes")).bind(company_id).bind(user.id)
+        .bind(&f.risk_level).bind(opt_str(&form, "notes")).bind(company_id).bind(user.id).bind(comp_asset_id.as_deref())
         .execute(&db).await;
     if let Err(e) = res { error!(error=%e, "component insert failed"); return bad(&format!("Failed: {e}")); }
     Redirect::to(&format!("/sesb-eam/components/{id}")).into_response()

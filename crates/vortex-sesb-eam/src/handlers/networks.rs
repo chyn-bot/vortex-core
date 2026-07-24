@@ -628,11 +628,12 @@ async fn dline_body(db: &PgPool, v: &HashMap<String, String>, is_new: bool) -> S
     let g = |k: &str| v.get(k).map(|s| s.as_str()).unwrap_or("");
     let regions = region_options(db, v.get("region_id").and_then(|s| s.parse().ok())).await;
     let volts = voltage_options(db, v.get("voltage_level_id").and_then(|s| s.parse().ok())).await;
-    let grid = grid3(&format!("{}{}{}{}{}{}{}{}{}",
+    let grid = grid3(&format!("{}{}{}{}{}{}{}{}{}{}",
         text_field("Name", "name", g("name"), true),
         select_field("Region *", "region_id", &regions),
         select_field("Line Type *", "line_type", &enum_options(DL_TYPES, if g("line_type").is_empty() { "overhead" } else { g("line_type") })),
         select_field("Voltage Level", "voltage_level_id", &volts),
+        num_field("Route Number (for MNEC ID)", "route_number", g("route_number"), "1"),
         num_field("Route Length (km)", "route_length_km", g("route_length_km"), "0.0001"),
         num_field("Number of Circuits", "number_of_circuits", g("number_of_circuits"), "1"),
         select_field("Conductor Type", "conductor_type", &enum_options(DL_COND, g("conductor_type"))),
@@ -662,13 +663,30 @@ async fn create_dline(
     let code = vortex_plugin_sdk::orm::sequence::next(&state.pool, &DL_SEQ).await.unwrap_or_default();
     let company_id = default_company(&db).await;
     let id = Uuid::now_v7();
+    // MNEC asset_id (§4.9): a feeder is an L1 root — SE-DF-{kv}-{source_loc}-F{route}.
+    // Source location = source site code, falling back to region code.
+    let route_number = opt_i32(&form, "route_number");
+    let dline_location: Option<String> = match opt_uuid(&form, "site_id") {
+        Some(s) => vortex_plugin_sdk::sqlx::query_scalar::<_, String>("SELECT code FROM eam_site WHERE id=$1").bind(s).fetch_optional(&db).await.ok().flatten(),
+        None => None,
+    }.filter(|s: &String| !s.is_empty()).or(
+        vortex_plugin_sdk::sqlx::query_scalar::<_, String>("SELECT code FROM eam_region WHERE id=$1").bind(region_id).fetch_optional(&db).await.ok().flatten()
+    );
+    let dline_asset_id: Option<String> = match form.get("asset_id").map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        Some(e) => Some(e.to_string()),
+        None => match (mnec_kv(&db, opt_uuid(&form, "voltage_level_id")).await, dline_location, route_number) {
+            (Some(kv), Some(loc), Some(rn)) => Some(super::mnec::distribution_line_asset_id(kv, &loc, rn)),
+            _ => None,
+        },
+    };
     let res = vortex_plugin_sdk::sqlx::query(
-        "INSERT INTO eam_distribution_line (id, name, code, region_id, line_type, voltage_level_id, route_length_km, number_of_circuits, conductor_type, conductor_size_mm2, state, notes, company_id) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)")
+        "INSERT INTO eam_distribution_line (id, name, code, region_id, line_type, voltage_level_id, route_length_km, number_of_circuits, conductor_type, conductor_size_mm2, state, notes, company_id, asset_id, route_number) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)")
         .bind(id).bind(form.get("name")).bind(&code).bind(region_id)
         .bind(form.get("line_type").map(|s| s.as_str()).unwrap_or("overhead")).bind(opt_uuid(&form, "voltage_level_id"))
         .bind(opt_dec(&form, "route_length_km")).bind(opt_i32(&form, "number_of_circuits")).bind(opt_str(&form, "conductor_type"))
         .bind(opt_dec(&form, "conductor_size_mm2")).bind(form.get("state").map(|s| s.as_str()).unwrap_or("operational")).bind(opt_str(&form, "notes")).bind(company_id)
+        .bind(dline_asset_id.as_deref()).bind(route_number)
         .execute(&db).await;
     if let Err(e) = res { error!(error=%e, "dline insert"); return bad(&format!("Failed: {e}")); }
     Redirect::to(&format!("/sesb-eam/distribution-lines/{id}")).into_response()
@@ -797,6 +815,21 @@ async fn new_ugc(
     Html(page_shell(&sidebar, "New UGC Line", &wide_form_page("/sesb-eam/ugc-lines/create", &header, &body))).into_response()
 }
 
+/// Resolve a voltage level's kV (rounded) for MNEC composition.
+async fn mnec_kv(db: &PgPool, voltage_level_id: Option<Uuid>) -> Option<i32> {
+    let v = voltage_level_id?;
+    let kv: Option<f64> = vortex_plugin_sdk::sqlx::query_scalar("SELECT voltage_kv::float8 FROM eam_voltage_level WHERE id=$1")
+        .bind(v).fetch_optional(db).await.ok().flatten();
+    kv.map(|x| x.round() as i32)
+}
+
+/// Resolve a substation's location code (acronym, code fallback) for MNEC.
+async fn mnec_sub_location(db: &PgPool, substation_id: Option<Uuid>) -> Option<String> {
+    let s = substation_id?;
+    vortex_plugin_sdk::sqlx::query_scalar::<_, String>("SELECT COALESCE(NULLIF(acronym,''), code) FROM eam_substation WHERE id=$1")
+        .bind(s).fetch_optional(db).await.ok().flatten().filter(|s| !s.is_empty())
+}
+
 async fn create_ugc(
     State(state): State<Arc<AppState>>, Db(db): Db,
     Extension(_u): Extension<AuthUser>, Extension(_c): Extension<DatabaseContext>,
@@ -808,10 +841,22 @@ async fn create_ugc(
     let code = vortex_plugin_sdk::orm::sequence::next(&state.pool, &UGC_SEQ).await.unwrap_or_default();
     let company_id = default_company(&db).await;
     let id = Uuid::now_v7();
+    // MNEC asset_id (§4.9): SE-TU-{kv}-{from}-{to} when not typed in.
+    let ugc_asset_id: Option<String> = match form.get("asset_id").map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        Some(e) => Some(e.to_string()),
+        None => match (
+            mnec_kv(&db, Some(voltage_id)).await,
+            mnec_sub_location(&db, opt_uuid(&form, "from_substation_id")).await,
+            mnec_sub_location(&db, opt_uuid(&form, "to_substation_id")).await,
+        ) {
+            (Some(kv), Some(from), Some(to)) => Some(super::mnec::ugc_line_asset_id(kv, &from, &to)),
+            _ => None,
+        },
+    };
     let res = vortex_plugin_sdk::sqlx::query(
         "INSERT INTO eam_ugc_line (id, name, code, asset_id, hierarchy_level, region_id, voltage_level_id, from_substation_id, to_substation_id, number_of_circuits, mva_rating, total_mva, distance_km, length_cct_km_66, length_cct_km_132, commissioning_date, design_life_years, state, ownership, notes, company_id) \
          VALUES ($1,$2,$3,$4,1,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)")
-        .bind(id).bind(form.get("name")).bind(&code).bind(opt_str(&form, "asset_id")).bind(region_id).bind(voltage_id)
+        .bind(id).bind(form.get("name")).bind(&code).bind(ugc_asset_id.as_deref()).bind(region_id).bind(voltage_id)
         .bind(opt_uuid(&form, "from_substation_id")).bind(opt_uuid(&form, "to_substation_id")).bind(opt_i32(&form, "number_of_circuits"))
         .bind(opt_dec(&form, "mva_rating")).bind(opt_dec(&form, "total_mva")).bind(opt_dec(&form, "distance_km"))
         .bind(opt_dec(&form, "length_cct_km_66")).bind(opt_dec(&form, "length_cct_km_132")).bind(opt_date(&form, "commissioning_date"))
